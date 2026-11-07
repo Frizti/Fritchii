@@ -55,7 +55,7 @@ jobs:
           install: >-
             git make autoconf libtool automake-wrapper patch jq pactoys ninja
           pacboy: >-
-            toolchain:p clang:p lld:p cmake:p python-pip:p
+            toolchain:p clang:p lld:p llvm-tools:p cmake:p python-pip:p
             qt6-base:p qt6-charts:p qt6-tools:p qt6-translations:p qt6-svg:p
             openssl:p boost:p fmt:p lz4:p nlohmann-json:p zlib:p zstd:p libiconv:p
             vulkan-memory-allocator:p vulkan-devel:p glslang:p enet:p opus:p
@@ -92,6 +92,9 @@ jobs:
             lto=OFF
           fi
           echo "ThinLTO: $lto"
+          # IPO archives hold LLVM bitcode, so they need llvm-ar/llvm-ranlib, not binutils.
+          llvm_ar=$(cygpath -m "$(command -v llvm-ar)")
+          llvm_ranlib=$(cygpath -m "$(command -v llvm-ranlib)")
           profile="-fprofile-use=$(cygpath -m "$PWD/eglantine.profdata") -Wno-backend-plugin \
             -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
           cmake -S . -B build/release -G Ninja \
@@ -115,9 +118,17 @@ jobs:
             -DENABLE_LTO=OFF \
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=$lto \
             -DCMAKE_POLICY_DEFAULT_CMP0069=NEW \
+            "-DCMAKE_AR=$llvm_ar" \
+            "-DCMAKE_RANLIB=$llvm_ranlib" \
+            "-DCMAKE_C_COMPILER_AR=$llvm_ar" \
+            "-DCMAKE_CXX_COMPILER_AR=$llvm_ar" \
+            "-DCMAKE_C_COMPILER_RANLIB=$llvm_ranlib" \
+            "-DCMAKE_CXX_COMPILER_RANLIB=$llvm_ranlib" \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
+            -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld \
+            -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld \
             "-DCMAKE_C_FLAGS=$profile" \
             "-DCMAKE_CXX_FLAGS=$profile"
           grep -E '^CMAKE_CXX_FLAGS|YUZU_BUILD_PRESET|INTERPROCEDURAL' build/release/CMakeCache.txt || true
