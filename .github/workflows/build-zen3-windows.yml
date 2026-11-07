@@ -2,7 +2,8 @@ name: build-zen3-windows
 
 # Windows build tuned for one PC: Ryzen 9 5900X (Zen 3) + Radeon RX 9070 XT.
 # Same MinGW clang + eglantine.profdata PGO build as release-binaries.yml, plus
-# -march=znver3 -mtune=znver3 and optional ThinLTO. Output is a workflow artifact.
+# -march=znver3 -mtune=znver3 and optional ThinLTO. CMake's IPO check fails under MinGW
+# (its test project links with ld.bfd, not lld), so IPO is switched on directly. Output is a workflow artifact.
 
 on:
   workflow_dispatch:
@@ -111,13 +112,15 @@ jobs:
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON \
             -DYUZU_BUILD_PRESET=zen3 \
-            -DENABLE_LTO=$lto \
+            -DENABLE_LTO=OFF \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=$lto \
+            -DCMAKE_POLICY_DEFAULT_CMP0069=NEW \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
             "-DCMAKE_C_FLAGS=$profile" \
             "-DCMAKE_CXX_FLAGS=$profile"
-          grep -E '^CMAKE_CXX_FLAGS|YUZU_BUILD_PRESET|ENABLE_LTO' build/release/CMakeCache.txt || true
+          grep -E '^CMAKE_CXX_FLAGS|YUZU_BUILD_PRESET|INTERPROCEDURAL' build/release/CMakeCache.txt || true
 
       - name: Save CPM downloads
         if: steps.cpm-cache.outputs.cache-hit != 'true'
