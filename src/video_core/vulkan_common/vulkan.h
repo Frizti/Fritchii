@@ -33,6 +33,8 @@
 // Sanitize macros
 #undef CreateEvent
 #undef CreateSemaphore
+#undef Success
+#undef BadValue
 #undef Always
 #undef False
 #undef None
