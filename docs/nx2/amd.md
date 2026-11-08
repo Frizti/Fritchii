@@ -23,6 +23,7 @@ the old way there.
 | Fragment subgroup shuffles | AMD's proprietary driver gets them wrong | Broadcast fallback on that driver | [#273] |
 | Depth-compare samples | Undefined on colour or integer images; AMD returned green | Depth-compare images stay floating point. Binding the null image for depth-compare samples of uncomparable images is proposed in the open PR | [#273]; [#354] (open) |
 | Native FP16 arithmetic | Turned off on AMD as a driver workaround | Turned off, with no override yet. An `EDEN_AMD_FP16=1` switch to keep it for testing is proposed in the open PR | [#378] (open) |
+| Task and mesh programs, on RDNA2 and older | There is no mesh hardware below gfx11, so Mesa lowers `TaskEXT` to a compute dispatch. On gfx10.3 that dispatch carries `COMPUTE_PGM_RSRC2.SCRATCH_EN = 0` even when the program keeps a variable in `Private` memory, so those accesses use base 0: a page fault at `0x0`, and a loop counted down in private memory never ends. The ring times out, the ring reset fails, the whole chip resets and every client loses its VRAM | No automatic gate yet. `EDEN_NX2_NO_MESH=1` skips task and mesh draws, and the geometry drawn that way disappears | Mesa, not fixed here |
 
 Not specific to AMD, but easy to mistake for an AMD bug:
 
@@ -45,6 +46,13 @@ Check these before filing a new one.
 | Out of device memory on 8 GB cards | [#342] |
 | Frame rate (one GPU thread at 99%) | [#403] |
 
+"Driver timeout or device lost at gameplay start" is two different bugs wearing one symptom.
+The one [#165] was opened for is in the translated program's data path and is gone with [#295] on
+AMD's Windows driver; the Linux reports in that same issue are Mesa, and are not. Read the kernel
+line before picking: `ring gfx_0.0.0 timeout` with `Process ... thread VulkanWorker` says the
+emulator's own ring hung, and `RADV_DEBUG=hang` then names the pipeline. A task, mesh and fragment
+pipeline that hangs on RDNA2 is the scratch defect in the table above, not the [#165] data bug.
+
 ## Settings for AMD users
 
 - Keep the split GPU thread on (`EDEN_NX2_SPLIT=2`, the default in `nx2_switches.txt`) and GPU
@@ -54,6 +62,10 @@ Check these before filing a new one.
   ([#403]).
 - The first run compiles every shader and can stall for minutes; later runs load the pipeline
   cache.
+- On RDNA2 or older with Mesa, task and mesh draws can hang the GPU and reset the whole chip
+  (see the table). Set `EDEN_NX2_NO_MESH=1` in `nx2_switches.txt` to skip them.
+  `EDEN_NX2_NO_MESH_FILE=<path>` skips them only while that file exists, checked every 1024
+  draws, so one scene can be compared both ways inside a single run.
 
 ## Investigating an AMD-only bug
 
@@ -73,6 +85,19 @@ Check these before filing a new one.
    doesn't prove the binding is large enough. Ocarina's fog read zeros this way ([#351]).
 5. If you can, compare with an NVIDIA run. A difference that also shows up there is an emulation
    bug, not an AMD one.
+6. A hang is not a wrong image, and the emulator's log cannot tell you which one it is: the loss
+   is reported long after the work that caused it. Get the kernel side first.
+   `VM_L2_PROTECTION_FAULT` is out of bounds, `ring ... timeout` is a job that never finishes,
+   and the `Process` line names whose ring it was. The default `amdgpu.lockup_timeout` is 2000 ms,
+   so a busy GPU can blame an innocent client: boot with `amdgpu.lockup_timeout=20000` and work
+   that merely missed 2 s finishes, while a job that loops forever still times out and now names
+   its own process.
+7. For the Vulkan side of a hang, `RADV_DEBUG=hang` writes `pipeline.log`, `trace.log` and the
+   SPIR-V of the hung pipeline into the working directory, which names the stages involved;
+   `RADV_DEBUG=nomeshshader` is the quickest way to rule the task and mesh path in or out. The
+   kernel's counterpart is `/sys/class/drm/cardN/device/devcoredump/data`, which holds the IP
+   state, the queue pointers and the page-fault record. Save it before closing the game: it is
+   dropped after a few minutes and the next reset overwrites it.
 
 [#127]: https://github.com/zortos293/Lichii/pull/127
 [#163]: https://github.com/zortos293/Lichii/issues/163

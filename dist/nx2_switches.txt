@@ -29,6 +29,17 @@ EDEN_NX2_FENCE_BATCH=1
 # Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
 #EDEN_NX2_NO_REACTIVE=1
 
+# Skip task and mesh draws. RDNA2 and older have no mesh hardware, so Mesa lowers a task program to a
+# compute dispatch, and on gfx10.3 does it with SCRATCH_EN=0 even when the program keeps a variable in
+# private memory: the accesses land at address 0, a loop counted down there never ends, the ring times
+# out and the chip reset takes the whole desktop with it (Ocarina of Time, gfx10.3, Mesa 26.2.6).
+# Costs the geometry drawn by task and mesh programs. See docs/nx2/amd.md.
+#EDEN_NX2_NO_MESH=1
+
+# Same, but only while this file exists (checked every 1024 draws): compare one scene both ways in
+# one run, create and delete the file from another terminal.
+#EDEN_NX2_NO_MESH_FILE=/tmp/nomesh
+
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0
