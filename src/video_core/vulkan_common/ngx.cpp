@@ -94,7 +94,7 @@ bool Prepare(const std::filesystem::path& path, const std::filesystem::path& cac
     if (runtime.phase == Phase::Attached) return true;
     runtime.phase = Phase::Disabled;
     std::error_code error;
-    if (!std::filesystem::is_regular_file(path / "libnvidia-ngx-dlss.so", error)) return false;
+    if (path.empty() || !std::filesystem::is_regular_file(path / "libnvidia-ngx-dlss.so", error)) return false;
     std::filesystem::create_directories(cache, error);
     if (error) return false;
     runtime.path = std::filesystem::absolute(path).wstring();

@@ -10,7 +10,9 @@
 namespace Vulkan::Ngx {
 std::filesystem::path RuntimeDirectory() {
     if (const char* path = std::getenv("EDEN_NGX_DIR"); path && *path) return path;
-    return Common::FS::GetExeDirectory() / "ngx";
+    std::error_code error;
+    const auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+    return error ? std::filesystem::path{} : executable.parent_path() / "ngx";
 }
 bool Start() {
     if (!Settings::values.nvidia_dlss.GetValue()) return false;
