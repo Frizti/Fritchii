@@ -610,6 +610,87 @@ Common::ThreadPinning::Topology ReadPinningTopology() {
 } // Anonymous namespace
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <fstream>
+
+namespace {
+std::string ReadSysfsLine(const std::string& path) {
+    std::ifstream file{path};
+    std::string line;
+    std::getline(file, line);
+    return line;
+}
+
+/// "0-3,8,10-11" as a mask of the logical processors below 64.
+u64 ParseCpuList(const std::string& list) {
+    u64 mask{};
+    std::size_t pos = 0;
+    while (pos < list.size()) {
+        const std::size_t end = std::min(list.find(',', pos), list.size());
+        const std::string part = list.substr(pos, end - pos);
+        const std::size_t dash = part.find('-');
+        const unsigned long first = std::strtoul(part.c_str(), nullptr, 10);
+        const unsigned long last =
+            dash == std::string::npos ? first : std::strtoul(part.c_str() + dash + 1, nullptr, 10);
+        for (unsigned long cpu = first; cpu <= last && cpu < 64; ++cpu) {
+            mask |= u64{1} << cpu;
+        }
+        pos = end + 1;
+    }
+    return mask;
+}
+
+/// The same layout ReadPinningTopology reads on Windows, from sysfs. Intel efficiency cores
+/// (/sys/devices/cpu_atom) rank below the others; every other core ranks the same.
+Common::ThreadPinning::Topology ReadPinningTopology() {
+    Common::ThreadPinning::Topology topology;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return topology;
+    }
+    const u64 atom = ParseCpuList(ReadSysfsLine("/sys/devices/cpu_atom/cpus"));
+    u64 seen{};
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        ++topology.logical_processors;
+        if (cpu >= 64) {
+            continue;
+        }
+        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+        u64 core = ParseCpuList(ReadSysfsLine(base + "/topology/thread_siblings_list"));
+        core = core == 0 ? u64{1} << cpu : core;
+        if ((seen & core) == 0) {
+            seen |= core;
+            const u8 efficiency_class = (atom & core) != 0 ? 0 : 1;
+            topology.cores.push_back({core, efficiency_class});
+        }
+        for (int index = 0;; ++index) {
+            const std::string cache = base + "/cache/index" + std::to_string(index);
+            const std::string level = ReadSysfsLine(cache + "/level");
+            if (level.empty()) {
+                break;
+            }
+            if (level != "3" || ReadSysfsLine(cache + "/type") == "Instruction") {
+                continue;
+            }
+            const u64 shared = ParseCpuList(ReadSysfsLine(cache + "/shared_cpu_list"));
+            const bool known = std::any_of(topology.l3.begin(), topology.l3.end(),
+                                           [&](const auto& l3) { return l3.mask == shared; });
+            if (shared != 0 && !known) {
+                // sysfs gives the size as "32768K".
+                const u64 size = std::strtoull(ReadSysfsLine(cache + "/size").c_str(), nullptr, 10);
+                topology.l3.push_back({shared, size * 1024});
+            }
+        }
+    }
+    return topology;
+}
+} // Anonymous namespace
+#endif
+
 namespace Common {
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
@@ -718,7 +799,7 @@ void SetCurrentThreadToPerformanceCores() {
 }
 
 void PinCurrentThread(PinnedRole role, int guest_core) {
-#ifdef _WIN32
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
     // Off with EDEN_NX2_PIN_THREADS=0, forced with 1, otherwise on with enough performance cores
     // (ThreadPinning::MakePlan): the split's back did about 8% more draws a second at Lake Hylia
     // (Ryzen 7 7800X3D), its worst window 29 -> 54 fps, once no SMT sibling shared its core.
@@ -763,6 +844,7 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
     }
     }
     if (mask != 0) {
+#ifdef _WIN32
         GROUP_AFFINITY affinity{};
         affinity.Mask = static_cast<KAFFINITY>(mask);
         affinity.Group = 0;
@@ -771,9 +853,22 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
         } else if (role != PinnedRole::GuestCore) {
             pinned_gpu_mask.fetch_or(mask, std::memory_order_relaxed);
         }
+#else
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (int cpu = 0; cpu < 64; ++cpu) {
+            if ((mask >> cpu) & 1) {
+                CPU_SET(cpu, &set);
+            }
+        }
+        if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+            LOG_WARNING(Common, "Could not pin thread: {}", std::strerror(errno));
+        }
+#endif
     }
 #else
     (void)role;
+    (void)guest_core;
 #endif
 }
 
