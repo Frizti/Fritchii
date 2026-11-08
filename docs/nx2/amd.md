@@ -23,7 +23,7 @@ the old way there.
 | Fragment subgroup shuffles | AMD's proprietary driver gets them wrong | Broadcast fallback on that driver | [#273] |
 | Depth-compare samples | Undefined on colour or integer images; AMD returned green | Depth-compare images stay floating point. Binding the null image for depth-compare samples of uncomparable images is proposed in the open PR | [#273]; [#354] (open) |
 | Native FP16 arithmetic | Turned off on AMD as a driver workaround | Turned off, with no override yet. An `EDEN_AMD_FP16=1` switch to keep it for testing is proposed in the open PR | [#378] (open) |
-| Task and mesh programs, on RDNA2 and older | There is no mesh hardware below gfx11, so Mesa lowers `TaskEXT` to a compute dispatch. On gfx10.3 that dispatch carries `COMPUTE_PGM_RSRC2.SCRATCH_EN = 0` even when the program keeps a variable in `Private` memory, so those accesses use base 0: a page fault at `0x0`, and a loop counted down in private memory never ends. The ring times out, the ring reset fails, the whole chip resets and every client loses its VRAM | No automatic gate yet. `EDEN_NX2_NO_MESH=1` skips task and mesh draws, and the geometry drawn that way disappears | Mesa, not fixed here |
+| Task and mesh programs, on RDNA2 and older | There is no mesh hardware below gfx11, so Mesa lowers `TaskEXT` to a compute dispatch. On gfx10.3 that dispatch carries `COMPUTE_PGM_RSRC2.SCRATCH_EN = 0` even when the program keeps a variable in `Private` memory, so those accesses use base 0: a page fault at `0x0`, and a loop counted down in private memory never ends. The ring times out, the ring reset fails, the whole chip resets and every client loses its VRAM | No automatic gate yet. `EDEN_NX2_NO_MESH=1` skips task and mesh draws, and the geometry drawn that way disappears | [mesa#16816] (open) |
 
 Not specific to AMD, but easy to mistake for an AMD bug:
 
@@ -48,10 +48,11 @@ Check these before filing a new one.
 
 "Driver timeout or device lost at gameplay start" is two different bugs wearing one symptom.
 The one [#165] was opened for is in the translated program's data path and is gone with [#295] on
-AMD's Windows driver; the Linux reports in that same issue are Mesa, and are not. Read the kernel
-line before picking: `ring gfx_0.0.0 timeout` with `Process ... thread VulkanWorker` says the
-emulator's own ring hung, and `RADV_DEBUG=hang` then names the pipeline. A task, mesh and fragment
-pipeline that hangs on RDNA2 is the scratch defect in the table above, not the [#165] data bug.
+AMD's Windows driver; the Linux reports in that same issue are Mesa, and are not
+([mesa#16816]). Read the kernel line before picking: `ring gfx_0.0.0 timeout` with
+`Process ... thread VulkanWorker` says the emulator's own ring hung, and `RADV_DEBUG=hang`
+then names the pipeline. A task, mesh and fragment pipeline that hangs on RDNA2 is the
+scratch defect in the table above, not the [#165] data bug.
 
 ## Settings for AMD users
 
@@ -117,3 +118,4 @@ pipeline that hangs on RDNA2 is the scratch defect in the table above, not the [
 [#403]: https://github.com/zortos293/Lichii/issues/403
 [#425]: https://github.com/zortos293/Lichii/pull/425
 [#432]: https://github.com/zortos293/Lichii/pull/432
+[mesa#16816]: https://gitlab.freedesktop.org/mesa/mesa/-/issues/16816
