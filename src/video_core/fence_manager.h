@@ -82,8 +82,10 @@ public:
     void SyncOperation(std::function<void()>&& func) {
         // EDEN_NX2_QUERY_BATCH: what the back queues next goes after the query cache's open
         // batch of report completions and counter resets.
-        if (GpuSplit::OnBackThread()) {
-            query_cache.CloseOpBatch();
+        if constexpr (requires { query_cache.CloseOpBatch(); }) {
+            if (GpuSplit::OnBackThread()) {
+                query_cache.CloseOpBatch();
+            }
         }
         // Not only the GPU thread queues these (query cache work runs elsewhere too), while
         // SignalFence moves the list into pending_operations: unguarded, the list was corrupted
@@ -99,8 +101,10 @@ public:
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
         // EDEN_NX2_QUERY_BATCH: the open batch is complete before this fence takes the queued
         // work (the fencing thread runs it only then).
-        if (GpuSplit::OnBackThread()) {
-            query_cache.CloseOpBatch();
+        if constexpr (requires { query_cache.CloseOpBatch(); }) {
+            if (GpuSplit::OnBackThread()) {
+                query_cache.CloseOpBatch();
+            }
         }
         // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
         // at each command list end): read once, every decision of this fence uses one value.
