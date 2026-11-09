@@ -87,6 +87,10 @@ class Symbolizer:
 
     def __init__(self, exe, cache_path, symbolizer="llvm-symbolizer", inlines=True):
         self.exe = exe
+        self.elf = False
+        if exe and os.path.exists(exe):
+            with open(exe, "rb") as file:
+                self.elf = file.read(4) == b"\x7fELF"
         self.inlines = inlines
         self.cache_path = cache_path
         self.symbolizer = symbolizer
@@ -110,8 +114,12 @@ class Symbolizer:
         if missing and self.exe:
             for start in range(0, len(missing), 4096):
                 batch = missing[start:start + 4096]
+                # Windows images take addresses relative to the image base; a Linux PIE takes
+                # them as its own virtual addresses, which start at the lowest mapping (Linux
+                # samples write that mapping's start as the module base).
+                relative = [] if self.elf else ["--relative-address"]
                 output = subprocess.run(
-                    [self.symbolizer, "--obj=" + self.exe, "--relative-address",
+                    [self.symbolizer, "--obj=" + self.exe, *relative,
                      "--inlines" if self.inlines else "--no-inlines", "--output-style=JSON"],
                     input="\n".join("%#x" % rva for rva in batch), capture_output=True, text=True,
                     check=True).stdout

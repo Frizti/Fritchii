@@ -3,8 +3,9 @@
 
 #pragma once
 
-/// EDEN_NX2_SAMPLE_PROFILE=<hz> (Windows): a background thread suspends each sampled thread
-/// <hz> times a second, unwinds its stack (up to 32 frames) and appends the return addresses to
+/// EDEN_NX2_SAMPLE_PROFILE=<hz> (Windows, Linux): a background thread suspends each sampled thread
+/// <hz> times a second (Linux: signals it and records the interrupted PC only), unwinds its stack
+/// (Windows: up to 32 frames) and appends the return addresses to
 /// nx2_samples_<pid>.bin in the log directory; tools/nx2/sample_report.py symbolizes and folds
 /// them. Sampled threads are picked by name when they set it (EDEN_NX2_SAMPLE_THREADS, a comma
 /// list where a trailing * matches a prefix; default GPU,GPUBack,VulkanWorker; adding CPUCore_*
