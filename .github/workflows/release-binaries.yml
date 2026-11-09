@@ -449,19 +449,43 @@ jobs:
           cp dist/lichii.png "$icon"
           export APPIMAGE_EXTRACT_AND_RUN=1
           export QMAKE="$QT_ROOT_DIR/bin/qmake"
-          # Include Wayland platform plugins and their graphics/shell integrations.
-          export EXTRA_QT_MODULES=waylandcompositor
-          export EXTRA_PLATFORM_PLUGINS='libqwayland-egl.so;libqwayland-generic.so'
+          # Qt 6.12 merged the Wayland platform plugins into a single libqwayland.so (#37).
+          export EXTRA_QT_MODULES=waylandclient
+          export EXTRA_PLATFORM_PLUGINS='libqwayland.so'
           # Embedded in the AppImage metadata; matches the release tag (build-N) plus the commit.
           export LDAI_VERSION="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
           export LDAI_OUTPUT="lichii-${GITHUB_SHA}-${{ matrix.platform }}.AppImage"
           export OUTPUT="$LDAI_OUTPUT"
           export ARCH="$arch"
+          # Custom AppRun: linuxdeploy's default is a bare symlink to the binary, and Qt then
+          # resolves its plugin paths through qt.conf alone — which fails on the FUSE mount
+          # ("Could not find the Qt platform plugin ... in \"\""), so the AppImage SIGABRTs on
+          # every mounted launch while a run extracted with --appimage-extract works.
+          cat << 'EOF' > "$RUNNER_TEMP/AppRun"
+          #!/bin/sh
+          APPDIR="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+          export LD_LIBRARY_PATH="${APPDIR}/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export QT_PLUGIN_PATH="${APPDIR}/usr/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+          export QT_QPA_PLATFORM_PLUGIN_PATH="${APPDIR}/usr/plugins/platforms"
+
+          # Mesa keeps no driver pipeline cache of its own, so a precompile recipe needs mode 2
+          # there; NVIDIA proprietary keeps one and stays on the default mode 1. The user's own
+          # EDEN_NX2_PRECOMPILE always wins (only set here when absent).
+          if [ -z "${EDEN_NX2_PRECOMPILE:-}" ] && [ ! -e /proc/driver/nvidia/version ]; then
+              export EDEN_NX2_PRECOMPILE=2
+          fi
+
+          exec "${APPDIR}/usr/bin/lichii" "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/AppRun"
+          # The switches file ships next to the executable (the Windows zips carry it too).
+          cp build/release/bin/nx2_switches.txt AppDir/usr/bin/
           "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
             --executable build/release/bin/lichii \
             --executable build/release/bin/eden-cli \
             --desktop-file dist/io.github.zortos293.lichii.desktop \
             --icon-file "$icon" \
+            --custom-apprun "$RUNNER_TEMP/AppRun" \
             --plugin qt \
             --output appimage
           test -s "$LDAI_OUTPUT"
