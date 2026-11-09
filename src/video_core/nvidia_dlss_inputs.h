@@ -28,6 +28,9 @@ struct NvidiaDlssInputs {
     bool reset;
     bool depth_inverted = true;
     bool hdr = true; ///< Linear HDR colour. False for tonemapped, perceptually encoded colour.
+    /// Native NGX only: the DLSS preset letter ('J' to 'M'), or 0 to leave it to NVIDIA.
+    /// EDEN_NX2_DLSS_PRESET overrides it.
+    char preset = 'K';
 };
 
 } // namespace Vulkan

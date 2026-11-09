@@ -72,7 +72,9 @@ Configuration Config(const NvidiaDlssInputs& in) {
     if (in.hdr && EnvEnabled("EDEN_NX2_DLSS_HDR")) flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
     if (in.hdr && EnvEnabled("EDEN_NX2_DLSS_AUTO_EXPOSURE"))
         flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-    u32 preset = NVSDK_NGX_DLSS_Hint_Render_Preset_K;
+    u32 preset = in.preset >= 'J' && in.preset <= 'M'
+                     ? NVSDK_NGX_DLSS_Hint_Render_Preset_J + static_cast<u32>(in.preset - 'J')
+                     : NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
     if (const char* value = std::getenv("EDEN_NX2_DLSS_PRESET")) {
         if (value[0] >= 'J' && value[0] <= 'M') {
             preset = NVSDK_NGX_DLSS_Hint_Render_Preset_J + static_cast<u32>(value[0] - 'J');

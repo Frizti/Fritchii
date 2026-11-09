@@ -3,6 +3,7 @@
 
 #include <array>
 #include "common/logging.h"
+#include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/ngx.h"
@@ -129,13 +130,36 @@ void NvidiaDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
 }
 
 
-bool NvidiaDlssUpscaler::Upscale(const Inputs& in) {
+namespace {
+// Graphics > DLSS preset, as the Streamline backend reads it.
+char PresetSetting() {
+    switch (Settings::values.nvidia_dlss_preset.GetValue()) {
+    case Settings::DlssPreset::Default:
+        return 0;
+    case Settings::DlssPreset::J:
+        return 'J';
+    case Settings::DlssPreset::L:
+        return 'L';
+    case Settings::DlssPreset::M:
+        return 'M';
+    case Settings::DlssPreset::K:
+    default:
+        return 'K';
+    }
+}
+} // namespace
+
+bool NvidiaDlssUpscaler::Upscale(const Inputs& frame) {
     if (failed) return false;
+    Inputs in = frame;
+    in.preset = PresetSetting();
     const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
         in.render_size.height != render_extent.height || in.upscale_size.width != upscale_extent.width ||
         in.upscale_size.height != upscale_extent.height;
+    // A new preset recreates the NGX feature, which needs the GPU idle like the other options.
     const bool options_changed = extent_changed || in.hdr != hdr_input ||
-                                 in.depth_inverted != depth_inverted_input;
+                                 in.depth_inverted != depth_inverted_input ||
+                                 in.preset != preset_input;
     if (options_changed && output_image) scheduler.Finish();
     if (extent_changed) {
         CreateOutput(in.upscale_size);
@@ -144,6 +168,7 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs& in) {
     }
     hdr_input = in.hdr;
     depth_inverted_input = in.depth_inverted;
+    preset_input = in.preset;
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([this, in, options_changed, index = frame_index++,
                       output_image_handle = *output_image,

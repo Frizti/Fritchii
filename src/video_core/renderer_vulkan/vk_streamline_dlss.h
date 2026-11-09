@@ -68,6 +68,7 @@ private:
     bool hdr_input = true;
 #ifdef EGLANTINE_NGX
     bool depth_inverted_input = true;
+    char preset_input = 'K';
 #endif
     u32 frame_index{};
     vk::Image output_image;
