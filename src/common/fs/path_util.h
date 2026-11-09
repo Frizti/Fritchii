@@ -302,6 +302,12 @@ void SetEdenPath(EdenPath eden_path, const Path& new_path) {
 #else
 
 /**
+ * Gets the path of the directory containing the executable of the current process
+ * (/proc/self/exe on Linux; the current directory where that can't be read).
+ */
+[[nodiscard]] std::filesystem::path GetExeDirectory();
+
+/**
  * Gets the path of the directory specified by the #HOME environment variable.
  * If $HOME is not defined, it will attempt to query the user database in passwd instead.
  *
