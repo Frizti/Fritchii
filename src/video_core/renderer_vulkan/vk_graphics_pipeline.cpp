@@ -349,6 +349,10 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 } // Anonymous namespace
 
+// Declared before the definition for -Werror=missing-declarations, which only gcc's -Wall turns on:
+// vk_rasterizer.cpp calls this across translation units and declares it there, not in a header.
+void NoteDrawReuseProbeFrame();
+
 void NoteDrawReuseProbeFrame() {
     if (DrawReuseProbe::Enabled()) [[unlikely]] {
         DrawReuseProbe::Get().Frame();
