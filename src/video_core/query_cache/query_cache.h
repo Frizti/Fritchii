@@ -24,6 +24,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -187,6 +188,9 @@ struct QueryCacheBase<Traits>::QueryCacheBaseImpl {
             streamers[i] = runtime.GetStreamerInterface(static_cast<QueryType>(i));
             if (streamers[i]) {
                 streamer_mask |= 1ULL << streamers[i]->GetId();
+                if (QueryCacheBase<Traits>::QueryBatchEnabled()) {
+                    streamers[i]->sync_batcher = owner;
+                }
             }
         }
     }
@@ -352,79 +356,36 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                 : !Settings::IsGPUFenceBehaviorBalanced() &&
                                       !Settings::IsGPUFenceBehaviorAccurate()) &&
                            is_fence;
+    const ReportRecord record{
+        .is_synced = is_synced,
+        .streamer = streamer,
+        .query_base = query,
+        .query_location = query_location,
+        .pointer = pointer,
+        .pointer_timestamp = pointer_timestamp,
+        .cpu_addr = cpu_addr,
+        .addr = addr,
+        .asid = gpu_memory->GetID(),
+        .counter_type = counter_type,
+    };
     // Counted for Nx2AsyncReportsSettled (SEM_FAST) and FlushQueryResults' own-report wait
     // (EXP30, zortos293/Lichii#559): completed on every way out of the operation, written or
     // discarded, and when the operation is dropped without running.
-    auto report = std::make_shared<Tegra::Nx2AsyncReport>(cpu_addr);
-    std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
-                                     pointer, pointer_timestamp, cpu_addr, addr,
-                                     asid = gpu_memory->GetID(), counter_type, report] {
-        struct Settle {
-            Tegra::Nx2AsyncReport& async_report;
-            ~Settle() {
-                async_report.Complete();
-            }
-        } const settle{*report};
-        if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
-            if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
-                LOG_INFO(HW_GPU,
-                         "DKB_QUERY discard n={} as={} gpu={:#x} device={:#x} type={} "
-                         "reason=invalidated flags={:#x}",
-                         trace, asid, addr, cpu_addr, static_cast<u32>(counter_type),
-                         static_cast<u32>(query_base->flags));
-            }
-            if (!is_synced) [[likely]] {
-                impl->pending_unregister.push_back(query_location);
-            }
-            return;
-        }
-        if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
-            if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
-                LOG_INFO(HW_GPU,
-                         "DKB_QUERY discard n={} as={} gpu={:#x} device={:#x} type={} "
-                         "reason=unsynchronized flags={:#x}",
-                         trace, asid, addr, cpu_addr, static_cast<u32>(counter_type),
-                         static_cast<u32>(query_base->flags));
-            }
-            LOG_ERROR(HW_GPU,
-                      "Query report value not synchronized. Consider increasing GPU accuracy.");
-            if (!is_synced) [[likely]] {
-                impl->pending_unregister.push_back(query_location);
-            }
-            return;
-        }
-        query_base->value += streamer->GetAmendValue();
-        streamer->SetAccumulationValue(query_base->value);
-        if (counter_type == QueryType::Payload) {
-            // EXP13=2: marked before the word is written (nx2.h).
-            Tegra::Nx2NoteLanded(cpu_addr, static_cast<u32>(query_base->value),
-                                 Tegra::Nx2Landing::QueryCompletion);
-        }
-        if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
-            u64 timestamp = impl->gpu.GetTicks();
-            std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
-            std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
-        } else {
-            u32 value = static_cast<u32>(query_base->value);
-            std::memcpy(pointer, &value, sizeof(value));
-        }
-        Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
-        Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::QueryCompletion, cpu_addr, addr,
-                                    pointer, static_cast<u32>(query_base->value));
-        if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
-            const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);
-            LOG_INFO(HW_GPU,
-                     "DKB_QUERY write n={} path=completion as={} gpu={:#x} device={:#x} type={} "
-                     "bytes={} value={:#x} flags={:#x}",
-                     trace, asid, addr, cpu_addr, static_cast<u32>(counter_type), wide ? 8 : 4,
-                     wide ? query_base->value : static_cast<u32>(query_base->value),
-                     static_cast<u32>(query_base->flags));
-        }
-        if (!is_synced) [[likely]] {
-            impl->pending_unregister.push_back(query_location);
-        }
-    });
+    const auto make_operation = [this, &record, cpu_addr] {
+        auto report = std::make_shared<Tegra::Nx2AsyncReport>(cpu_addr);
+        std::function<void()> operation([this, record, report] {
+            struct Settle {
+                Tegra::Nx2AsyncReport& async_report;
+                ~Settle() {
+                    async_report.Complete();
+                }
+            } const settle{*report};
+            RunReport(record);
+        });
+        return std::make_pair(std::move(report), std::move(operation));
+    };
     if (is_fence) {
+        auto [report, operation] = make_operation();
         report->Issue();
         VideoCore::g_signaling_query_report_fence = keep_fence_report;
         impl->rasterizer.SignalFence(std::move(operation));
@@ -455,8 +416,15 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             streamer->Free(new_query_id);
             return;
         }
-        report->Issue();
-        impl->rasterizer.SyncOperation(std::move(operation));
+        if (QueryBatchEnabled() && GpuSplit::OnBackThread()) {
+            // EDEN_NX2_QUERY_BATCH: a record in the open batch, issued as the report would be.
+            Tegra::Nx2IssueAsyncReport(cpu_addr);
+            OpenOpBatch().entries.push_back({record, nullptr});
+        } else {
+            auto [report, operation] = make_operation();
+            report->Issue();
+            impl->rasterizer.SyncOperation(std::move(operation));
+        }
     }
     if (is_synced) {
         streamer->Free(new_query_id);
@@ -477,6 +445,140 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         old_query->flags |= QueryFlagBits::IsRewritten;
         sub_container.insert_or_assign(base, query_location);
     }
+}
+
+template <typename Traits>
+void QueryCacheBase<Traits>::RunReport(const ReportRecord& record) {
+    const bool is_synced = record.is_synced;
+    auto* const streamer = record.streamer;
+    auto* const query_base = record.query_base;
+    const QueryLocation query_location = record.query_location;
+    u8* const pointer = record.pointer;
+    u8* const pointer_timestamp = record.pointer_timestamp;
+    const DAddr cpu_addr = record.cpu_addr;
+    const GPUVAddr addr = record.addr;
+    const size_t asid = record.asid;
+    const QueryType counter_type = record.counter_type;
+    if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+        if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
+            LOG_INFO(HW_GPU,
+                     "DKB_QUERY discard n={} as={} gpu={:#x} device={:#x} type={} "
+                     "reason=invalidated flags={:#x}",
+                     trace, asid, addr, cpu_addr, static_cast<u32>(counter_type),
+                     static_cast<u32>(query_base->flags));
+        }
+        if (!is_synced) [[likely]] {
+            impl->pending_unregister.push_back(query_location);
+        }
+        return;
+    }
+    if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
+        if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
+            LOG_INFO(HW_GPU,
+                     "DKB_QUERY discard n={} as={} gpu={:#x} device={:#x} type={} "
+                     "reason=unsynchronized flags={:#x}",
+                     trace, asid, addr, cpu_addr, static_cast<u32>(counter_type),
+                     static_cast<u32>(query_base->flags));
+        }
+        LOG_ERROR(HW_GPU,
+                  "Query report value not synchronized. Consider increasing GPU accuracy.");
+        if (!is_synced) [[likely]] {
+            impl->pending_unregister.push_back(query_location);
+        }
+        return;
+    }
+    query_base->value += streamer->GetAmendValue();
+    streamer->SetAccumulationValue(query_base->value);
+    if (counter_type == QueryType::Payload) {
+        // EXP13=2: marked before the word is written (nx2.h).
+        Tegra::Nx2NoteLanded(cpu_addr, static_cast<u32>(query_base->value),
+                             Tegra::Nx2Landing::QueryCompletion);
+    }
+    if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+        u64 timestamp = impl->gpu.GetTicks();
+        std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+        std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
+    } else {
+        u32 value = static_cast<u32>(query_base->value);
+        std::memcpy(pointer, &value, sizeof(value));
+    }
+    Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
+    Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::QueryCompletion, cpu_addr, addr,
+                                pointer, static_cast<u32>(query_base->value));
+    if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
+        const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);
+        LOG_INFO(HW_GPU,
+                 "DKB_QUERY write n={} path=completion as={} gpu={:#x} device={:#x} type={} "
+                 "bytes={} value={:#x} flags={:#x}",
+                 trace, asid, addr, cpu_addr, static_cast<u32>(counter_type), wide ? 8 : 4,
+                 wide ? query_base->value : static_cast<u32>(query_base->value),
+                 static_cast<u32>(query_base->flags));
+    }
+    if (!is_synced) [[likely]] {
+        impl->pending_unregister.push_back(query_location);
+    }
+}
+
+/// EDEN_NX2_QUERY_BATCH: report completions (with their async report's issue and settle) and
+/// counter resets, run in order by one sync operation.
+template <typename Traits>
+struct QueryCacheBase<Traits>::OpBatch {
+    struct Entry {
+        ReportRecord report;
+        StreamerInterface* reset; ///< Not null: a counter reset of this streamer
+    };
+    std::vector<Entry> entries;
+    size_t ran{};
+
+    ~OpBatch() {
+        // Dropped without running (or partly): settle the reports as their own operations did.
+        for (size_t i = ran; i < entries.size(); ++i) {
+            if (entries[i].reset == nullptr) {
+                Tegra::Nx2CompleteAsyncReport(entries[i].report.cpu_addr);
+            }
+        }
+    }
+};
+
+template <typename Traits>
+bool QueryCacheBase<Traits>::QueryBatchEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_QUERY_BATCH");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+template <typename Traits>
+auto QueryCacheBase<Traits>::OpenOpBatch() -> OpBatch& {
+    if (!open_batch) {
+        auto batch = std::make_shared<OpBatch>();
+        batch->entries.reserve(64);
+        // Queued first (this closes nothing: no batch is open), then opened.
+        impl->rasterizer.SyncOperation([this, batch] {
+            OpBatch& run = *batch;
+            for (; run.ran < run.entries.size(); ++run.ran) {
+                const auto& entry = run.entries[run.ran];
+                if (entry.reset != nullptr) {
+                    entry.reset->ClearAccumulation();
+                } else {
+                    RunReport(entry.report);
+                    Tegra::Nx2CompleteAsyncReport(entry.report.cpu_addr);
+                }
+            }
+        });
+        open_batch = std::move(batch);
+    }
+    return *open_batch;
+}
+
+template <typename Traits>
+bool QueryCacheBase<Traits>::QueueAccumulationReset(StreamerInterface* streamer) {
+    if (!QueryBatchEnabled() || !GpuSplit::OnBackThread()) {
+        return false;
+    }
+    OpenOpBatch().entries.push_back({ReportRecord{}, streamer});
+    return true;
 }
 
 template <typename Traits>

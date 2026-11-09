@@ -525,6 +525,18 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
     DispatchMethod(system, method, method_argument, is_last_call);
 }
 
+bool Maxwell3D::TryFastDrawBegin(u32 argument) {
+    // The conditions under which CallMethod reaches CallMethodFast for this method.
+    if (VideoCommon::Nx2Profile::Enabled() || !fast_maxwell3d || executing_macro != 0 ||
+        perf_verify) {
+        return false;
+    }
+    constexpr u32 method = MAXWELL3D_REG_INDEX(draw.begin);
+    ProcessDirtyRegisters(method, ProcessShadowRam(method, argument));
+    draw_manager.DrawBegin(*this);
+    return true;
+}
+
 void Maxwell3D::DispatchMethod(Core::System& system, u32 method, u32 method_argument,
                                bool is_last_call) {
     if (!fast_maxwell3d || executing_macro != 0 || method >= MacroRegistersStart ||

@@ -80,6 +80,11 @@ public:
     }
 
     void SyncOperation(std::function<void()>&& func) {
+        // EDEN_NX2_QUERY_BATCH: what the back queues next goes after the query cache's open
+        // batch of report completions and counter resets.
+        if (GpuSplit::OnBackThread()) {
+            query_cache.CloseOpBatch();
+        }
         // Not only the GPU thread queues these (query cache work runs elsewhere too), while
         // SignalFence moves the list into pending_operations: unguarded, the list was corrupted
         // and the fencing thread crashed walking it. Its own lock, held for no callbacks.
@@ -92,6 +97,11 @@ public:
 
     void SignalFence(std::function<void()>&& func) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
+        // EDEN_NX2_QUERY_BATCH: the open batch is complete before this fence takes the queued
+        // work (the fencing thread runs it only then).
+        if (GpuSplit::OnBackThread()) {
+            query_cache.CloseOpBatch();
+        }
         // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
         // at each command list end): read once, every decision of this fence uses one value.
         // EXP33 (zortos293/Lichii#337): a fence that writes a fence-flagged query report is never
@@ -146,6 +156,7 @@ public:
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
             uncommitted_operations.clear(); // moved-from: make it empty explicitly
+            uncommitted_operations.reserve(64);
         }
         pending_flushes.push_back(committed_flushes);
         if constexpr (can_async_check) {
@@ -347,7 +358,7 @@ private:
         }();
         struct Released {
             TFence fence;
-            std::deque<std::function<void()>> operations;
+            OperationList operations;
             u8 flushes;
             u32 query_pops; ///< Query cache entries: one per fence, folded ones included
         };
@@ -469,10 +480,11 @@ private:
         }
         if (!fence_thread_busy && !inline_running && GpuSplit::OnBackThread()) {
             inline_running = true;
-            std::deque<std::function<void()>> operations;
+            OperationList operations;
             {
                 std::scoped_lock ops_lock{uncommitted_guard};
                 operations.swap(uncommitted_operations);
+                uncommitted_operations.reserve(64);
             }
             lock.unlock();
             query_cache.PopAsyncFlushes();
@@ -501,6 +513,7 @@ private:
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
             uncommitted_operations.clear();
+            uncommitted_operations.reserve(64);
         }
         pending_flushes.push_back(0);
         pending_query_pops.push_back(1);
@@ -651,8 +664,11 @@ private:
     }
 
     std::queue<TFence> fences;
-    std::deque<std::function<void()>> uncommitted_operations;
-    std::deque<std::deque<std::function<void()>>> pending_operations;
+    /// A vector, not a deque: libstdc++'s deque allocates its map and a 512-byte block for the
+    /// first element, so every fence's list cost two allocations (port of #858's change).
+    using OperationList = std::vector<std::function<void()>>;
+    OperationList uncommitted_operations;
+    std::deque<OperationList> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     std::deque<u32> pending_query_pops; ///< Async check, per fence: query cache entries to pop
     bool fence_thread_busy{}; ///< Guarded by guard: the fencing thread releases fences it took

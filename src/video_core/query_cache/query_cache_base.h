@@ -7,6 +7,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -20,6 +21,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/query_cache/query_base.h"
+#include "video_core/query_cache/query_stream.h"
 #include "video_core/query_cache/types.h"
 
 namespace VideoCore {
@@ -38,10 +40,25 @@ struct LookupData {
 };
 
 template <typename Traits>
-class QueryCacheBase : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
+class QueryCacheBase : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo>,
+                       public QuerySyncBatcher {
     using RuntimeType = typename Traits::RuntimeType;
 
 public:
+    /// EDEN_NX2_QUERY_BATCH=1 (off by default until measured): the split's back queues its
+    /// report completions and counter resets (one each per draw in Ocarina of Time, ~65,000 a
+    /// second each) as records in one sync operation (OpBatch) instead of a std::function, a
+    /// shared Nx2AsyncReport, a lock and a work epoch bump each. The batch keeps their place: any
+    /// other sync operation or fence from the back closes it first (CloseOpBatch).
+    [[nodiscard]] static bool QueryBatchEnabled();
+
+    /// Ends the open batch: what comes next is queued after it. The split's back only.
+    void CloseOpBatch() noexcept {
+        open_batch.reset();
+    }
+
+    bool QueueAccumulationReset(StreamerInterface* streamer) override;
+
     /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
     VideoCommon::PageFilter page_filter;
 
@@ -200,6 +217,26 @@ protected:
     bool SemiFlushQueryDirty(QueryLocation location);
     void RequestGuestHostSync();
     void UnregisterPending();
+
+    /// What a report's completion needs (CounterReport's operation).
+    struct ReportRecord {
+        bool is_synced;
+        StreamerInterface* streamer;
+        QueryBase* query_base;
+        QueryLocation query_location;
+        u8* pointer;
+        u8* pointer_timestamp;
+        DAddr cpu_addr;
+        GPUVAddr addr;
+        size_t asid;
+        QueryType counter_type;
+    };
+    /// A report's completion once the host query is in (without the async report's settle).
+    void RunReport(const ReportRecord& record);
+
+    struct OpBatch;
+    OpBatch& OpenOpBatch();
+    std::shared_ptr<OpBatch> open_batch;
 
     ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>> cached_queries;
     std::mutex cache_mutex;

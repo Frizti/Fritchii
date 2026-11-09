@@ -202,11 +202,13 @@ public:
             PauseCounter();
         }
         AbandonCurrentQuery();
-        std::function<void()> func([this] {
-            amend_value = 0;
-            accumulation_value = 0;
-        });
-        rasterizer->SyncOperation(std::move(func));
+        if (sync_batcher == nullptr || !sync_batcher->QueueAccumulationReset(this)) {
+            std::function<void()> func([this] {
+                amend_value = 0;
+                accumulation_value = 0;
+            });
+            rasterizer->SyncOperation(std::move(func));
+        }
         accumulation_since_last_sync = false;
         first_accumulation_checkpoint = (std::min)(first_accumulation_checkpoint, num_slots_used);
         last_accumulation_checkpoint = (std::max)(last_accumulation_checkpoint, num_slots_used);
