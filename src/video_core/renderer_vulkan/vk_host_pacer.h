@@ -84,6 +84,9 @@ public:
 
     /// Time from `now` to the display's next refresh, or -1 while the refresh grid is unknown.
     [[nodiscard]] long long NsToNextRefresh(Clock::time_point now) const;
+    /// As NsToNextRefresh, also while pacing is off (frame generation): the grid follows every
+    /// shown frame either way. -1 until a frame was shown.
+    [[nodiscard]] long long NsToNextGridRefresh(Clock::time_point now) const;
 
     [[nodiscard]] std::chrono::nanoseconds RefreshPeriod() const {
         return std::chrono::nanoseconds{static_cast<s64>(refresh_ns)};

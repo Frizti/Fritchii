@@ -262,6 +262,15 @@ long long HostPacer::NsToNextRefresh(Clock::time_point now) const {
     return static_cast<long long>(refresh_ns - into);
 }
 
+long long HostPacer::NsToNextGridRefresh(Clock::time_point now) const {
+    if (!vblank) {
+        return -1;
+    }
+    const double since = static_cast<double>(Ns{now - *vblank}.count());
+    const double into = std::fmod(std::fmod(since, refresh_ns) + refresh_ns, refresh_ns);
+    return static_cast<long long>(refresh_ns - into);
+}
+
 void HostPacer::NoteSubmitted(u64 id, Clock::time_point submitted_at, bool was_held) {
     if (id == 0) {
         outstanding = 0;
