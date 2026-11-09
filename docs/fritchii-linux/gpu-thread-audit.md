@@ -76,6 +76,28 @@ Conclusion so far: the limit is the back thread's CPU time; the front's acquire 
 where they leave the back idle. No v5 zone profile exists yet, so the split of the back's time on
 v5 (with v5's image pool, async translation and the fast buffer binding switches) is unknown.
 
+### v5 profile (2026-11-08, build 49531e3b63, `EDEN_NX2_GPU_PROFILE=2`, 60 FPS mode, LSFG 3x)
+
+Game frame 18-21 ms (48-56 fps), ~80,000 draws/s. Shader preparation did not run (no recipe in
+`~/Downloads/bin/recipes`), so 0.57-1.0 s hitches remain in two windows.
+
+- Back: 917 ms/s CPU busy (~11 us per draw). method 113 ms (3.35 M/s; 2.05 M 3D register writes,
+  1.31 M same value), other 106, split wait 106-227 (idle for the front), uniform buffers 85
+  (165 k/s; cb upload 11, cb bind 7), compute 64, fence 56 (10 k/s), pipeline lookup 43, query
+  report 38 (69 k/s), update buffers 34, bind stage buffers 35, geometry buffers 22. Fine
+  counters: uniform rebinds ~250 k/s, streamed ~140 k/s, cached ~75 k/s.
+- Front: 662 ms/s busy. split drain 487 ms (7,467/s): fence release 253 ms (1,638/s), macro DMA
+  read 218 ms (2,875/s), macro DMA flush 13, list writers 5, acquire 3. macro 226 (1.2 M/s), push
+  198.
+
+Reading: the threads alternate. The front drains the back ~7,500 times a second; the back then
+idles 106-227 ms/s waiting for the next methods. That idle time bounds what removing front drains
+can give (~12-15%).
+
+Ranking: (1) fence release drains -> #805 semaphore view; (2) macro DMA read drains -> #805 back
+macros (`a442c38fe6`); (3) back uniform buffer handling (~100 ms/s); (4) same-value register
+writes (many are trigger methods: draw begin/end 0x585/0x586, report 0x6c3; not droppable).
+
 ## 5. Profiling plan
 
 One run per configuration, same save, same route:
