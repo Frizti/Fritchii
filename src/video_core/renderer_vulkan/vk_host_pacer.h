@@ -124,6 +124,9 @@ private:
     std::array<u32, 6> refreshes_shown{}; // 0 (same refresh), 1, 2, 3, 4, 5+
     u32 frames{}, held{}, missed{}, lost{}, caught_up{};
     double interval_sum_ms{}, interval_max_ms{}, hold_sum_ms{}, latency_sum_ms{};
+    /// Shown-frame intervals of the report window in 0.25 ms buckets (the last one: 64 ms and
+    /// longer), for its p50/p95/p99.
+    std::array<u32, 257> interval_buckets{};
 };
 
 } // namespace Vulkan

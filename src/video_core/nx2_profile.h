@@ -185,6 +185,7 @@ struct ThreadData {
     std::array<u64, static_cast<size_t>(FineCounter::Count)> fine_counters{}; ///< TEST
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
+    std::array<u64, static_cast<size_t>(Zone::Count)> max_ticks{}; ///< Longest call (inclusive)
     std::array<u64, 64> counters{}; ///< See Counter (static_assert below)
     std::array<u64, static_cast<size_t>(DmaWaitCause::Count)> dma_wait_causes{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
@@ -263,6 +264,7 @@ public:
         const auto index = static_cast<size_t>(zone);
         data.exclusive_ns[index] += elapsed - data.child_ns;
         ++data.count[index];
+        data.max_ticks[index] = (std::max)(data.max_ticks[index], elapsed);
         data.child_ns = parent_child_ns + elapsed;
         --data.depth;
     }
@@ -647,6 +649,28 @@ inline void Report(const char* thread_name = "GPU thread") {
                             static_cast<double>(window) / 1e6);
     }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
+    {
+        // The longest single calls of the window (zone and its nested zones), the zones whose
+        // worst case reached 1 ms: the hitches behind the per-second totals.
+        std::array<size_t, static_cast<size_t>(Zone::Count)> order{};
+        for (size_t i = 0; i < order.size(); ++i) {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.end(),
+                  [&](size_t a, size_t b) { return data.max_ticks[a] > data.max_ticks[b]; });
+        std::string worst;
+        for (size_t i = 0; i < order.size() && i < 10; ++i) {
+            const double ms = static_cast<double>(data.max_ticks[order[i]]) *
+                              static_cast<double>(window) / static_cast<double>(window_ticks) / 1e6;
+            if (ms < 1.0) {
+                break;
+            }
+            worst += fmt::format(" | {} {:.1f} ms", zone_names[order[i]], ms);
+        }
+        if (!worst.empty()) {
+            LOG_INFO(HW_GPU, "{} longest calls:{}", thread_name, worst);
+        }
+    }
     if (Fine()) {
         // TEST: the fine counters.
         std::string fine;

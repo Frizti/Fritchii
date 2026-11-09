@@ -305,6 +305,8 @@ void HostPacer::NoteShown(u64 id, Clock::time_point shown, bool was_lost) {
         const double interval = static_cast<double>(Ns{shown - *last_shown}.count());
         interval_sum_ms += interval / 1e6;
         interval_max_ms = (std::max)(interval_max_ms, interval / 1e6);
+        ++interval_buckets[(std::min)(static_cast<size_t>(interval / 250'000.0),
+                                      interval_buckets.size() - 1)];
         const auto count = std::clamp<s64>(std::llround(interval / refresh_ns), 0, 5);
         ++refreshes_shown[static_cast<size_t>(count)];
     }
@@ -362,6 +364,29 @@ void HostPacer::Report(Clock::time_point now) {
     for (const u32 count : refreshes_shown) {
         intervals += count;
     }
+    // Interval percentiles from the buckets: the upper edge of the bucket the rank falls in.
+    u64 bucketed = 0;
+    for (const u32 count : interval_buckets) {
+        bucketed += count;
+    }
+    const auto percentile = [&](double fraction) {
+        if (bucketed == 0) {
+            return 0.0;
+        }
+        const u64 rank = static_cast<u64>(fraction * static_cast<double>(bucketed - 1)) + 1;
+        u64 seen = 0;
+        for (size_t i = 0; i < interval_buckets.size(); ++i) {
+            seen += interval_buckets[i];
+            if (seen >= rank) {
+                return static_cast<double>(i + 1) * 0.25;
+            }
+        }
+        return static_cast<double>(interval_buckets.size()) * 0.25;
+    };
+    LOG_INFO(Render_Vulkan, "Host pacing frame time: p50 {:.2f} ms, p95 {:.2f} ms, p99 {:.2f} ms "
+                            "({} intervals)",
+             percentile(0.50), percentile(0.95), percentile(0.99), bucketed);
+    interval_buckets = {};
     LOG_INFO(Render_Vulkan,
              "Host pacing {}: {} frames at {:.3f} Hz; shown for 1/2/3/4/5+ refreshes: "
              "{}/{}/{}/{}/{} (same refresh {}); interval mean {:.2f} ms, max {:.2f}; held {} "
