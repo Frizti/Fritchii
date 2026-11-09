@@ -87,11 +87,12 @@ inline bool On(Opt opt) {
         };
         // FramesAhead is on: with Ocarina's CPU readbacks preflushed it is worth ~1 fps (48.3 ->
         // 49.5 on the Kokiri porch) and it waits for this frame too whenever the GPU falls behind.
+        // FrontSleep is on: the front spun through its waits for the back, ~600 ms/s of a core
+        // on a Ryzen 5 5500 + RX 6900 XT (RADV); sleeping cut that to ~70 ms/s, intro 52 -> 57 fps.
         const unsigned default_off = bit(Opt::CleanWords) |
                                      bit(Opt::IndexRebind) | bit(Opt::SubmitBudget) |
                                      bit(Opt::FenceFlush) | bit(Opt::FragmentBarrier) |
-                                     bit(Opt::FrontSleep) | bit(Opt::AsyncPipelines) |
-                                     bit(Opt::Bounds);
+                                     bit(Opt::AsyncPipelines) | bit(Opt::Bounds);
         unsigned mask = (default_off & ~names("EDEN_NX2_PERF_ON")) | names("EDEN_NX2_PERF_OFF");
         mask |= bit(Opt::SplitOverlap);
         if (const char* value = std::getenv("EDEN_NX2_PERF_FRAMES_AHEAD"); value && value[0] == '0') {
