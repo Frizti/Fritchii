@@ -37,6 +37,7 @@
 #undef False
 #undef None
 #undef True
+#undef Status
 
 // "Catch-all" handle for both Android and.. the rest of platforms
 struct VkSurfaceKHR_T;
