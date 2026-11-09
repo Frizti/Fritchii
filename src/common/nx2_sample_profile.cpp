@@ -360,6 +360,8 @@ void WriteModules(std::ofstream& file) {
 
 void SamplerMain() {
     const Config& config = GetConfig();
+    LOG_INFO(Common, "Sample profile: starts in {} s, then samples for {} s (keep the game running)",
+             config.delay_seconds, config.seconds);
     std::this_thread::sleep_for(std::chrono::seconds{config.delay_seconds});
 
     struct sigaction action{};
@@ -383,6 +385,8 @@ void SamplerMain() {
     Put(file, std::uint64_t{1'000'000'000}); // tick frequency: nanoseconds
     WriteModules(file);
 
+    LOG_INFO(Common, "Sample profile: started, {} s at {} Hz; the file is written to {} when it ends",
+             config.seconds, config.hz, path.string());
     const std::uint64_t period = 1'000'000'000ULL / (std::max)(config.hz, 1u);
     const std::uint64_t start = NowNs();
     const std::uint64_t end = start + static_cast<std::uint64_t>(config.seconds) * 1'000'000'000ULL;
