@@ -10,6 +10,9 @@
 #include <condition_variable>
 #include <list>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "common/assert.h"
@@ -18,6 +21,8 @@
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/gpu_dirty_memory_manager.h"
+#include "core/lichii_telemetry.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
 #include "core/hle/service/nvdrv/nvdata.h"
@@ -151,6 +156,12 @@ struct GPU::Impl {
         return current_sync_fence.load(std::memory_order_relaxed);
     }
 
+    /// Whether a CPU thread waits for a sync request (a flush) the GPU thread has not run yet.
+    [[nodiscard]] bool HasPendingSyncRequests() const {
+        return last_sync_fence.load(std::memory_order_acquire) !=
+               current_sync_fence.load(std::memory_order_acquire);
+    }
+
     /// Returns once the request of `fence` ran, or once the GPU threads stopped for good
     /// (NotifyShutdown): then it never runs.
     void WaitForSyncOperation(const u64 fence) {
@@ -278,6 +289,7 @@ struct GPU::Impl {
             return raster_area;
         }
         raster_area.preemtive = true;
+        Core::Telemetry::NoteCpuReadFlush();
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
         // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
         if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
@@ -285,13 +297,66 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
-        const u64 fence = RequestSyncOperation([this, raster_area]() {
+        // LICHII_ASYNC_READBACK=<n>: a page the guest CPU has read through a flush n times (data
+        // it reads every frame, like the exposure) is no longer waited for: the read sees guest
+        // memory as the previous flush left it (one frame old) and the flush runs on the GPU
+        // thread meanwhile, so the CPU and the GPU stop taking turns every frame.
+        static const u32 async_threshold = [] {
+            const char* value = std::getenv("LICHII_ASYNC_READBACK");
+            return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        }();
+        if (async_threshold != 0) {
+            bool hot = false;
+            {
+                std::scoped_lock lock{hot_read_mutex};
+                hot = ++hot_read_counts[raster_area.start_address] > async_threshold;
+            }
+            if (hot) {
+                const u64 page = raster_area.start_address;
+                const u64 page_size = raster_area.end_address - raster_area.start_address;
+                bool queue = false;
+                {
+                    std::scoped_lock lock{hot_read_mutex};
+                    queue = async_pending.insert(page).second;
+                }
+                if (queue) {
+                    (void)RequestSyncOperation([this, page, page_size]() {
+                        InvalidateGPUCache();
+                        renderer->ReadRasterizer()->FlushRegion(page, page_size);
+                        std::scoped_lock lock{hot_read_mutex};
+                        async_pending.erase(page);
+                    });
+                    gpu_thread.TickGPU(is_async);
+                }
+                // Not preemptive: the next read of the page traps again (and sees the flush).
+                raster_area.preemtive = false;
+                return raster_area;
+            }
+        }
+        const auto wait_start = std::chrono::steady_clock::now();
+        const u64 fence = RequestSyncOperation([this, raster_area, wait_start, addr]() {
             // Apply collected guest writes before downloading GPU data over guest memory.
+            const auto flush_start = std::chrono::steady_clock::now();
             InvalidateGPUCache();
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
+            const auto flush_end = std::chrono::steady_clock::now();
+            using us = std::chrono::microseconds;
+            Core::Telemetry::NoteCpuReadParts(
+                addr, raster_area.end_address - raster_area.start_address,
+                std::chrono::duration_cast<us>(flush_start - wait_start).count(),
+                std::chrono::duration_cast<us>(flush_end - flush_start).count());
         });
         gpu_thread.TickGPU(is_async);
         WaitForSyncOperation(fence);
+        const s64 waited_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - wait_start)
+                                  .count();
+        Core::Telemetry::NoteCpuReadWait(waited_us);
+        if (Core::Telemetry::Enabled()) {
+            if (const auto* thread = Kernel::GetCurrentThreadPointer(system.Kernel())) {
+                Core::Telemetry::NoteThreadReadWait(thread->GetThreadId(), waited_us);
+            }
+        }
         return raster_area;
     }
 
@@ -409,12 +474,16 @@ struct GPU::Impl {
     std::condition_variable sync_cv;
 
     std::list<std::function<void()>> sync_requests;
+    // LICHII_ASYNC_READBACK (OnCPURead): flush reads per page, and pages with a flush queued.
+    std::mutex hot_read_mutex;
+    std::unordered_map<u64, u32> hot_read_counts;
+    std::unordered_set<u64> async_pending;
     /// Set with each request queued, cleared under the lock once TickWork emptied the queue
     /// (EXP29 & 2 reads it without the lock).
     std::atomic<bool> has_sync_requests{};
     std::atomic<u64> current_sync_fence{};
     std::atomic<u64> present_ns{};
-    u64 last_sync_fence{};
+    std::atomic<u64> last_sync_fence{};
 
     VideoCommon::PendingMaps pending_maps;
     std::mutex sync_request_mutex;
@@ -504,6 +573,10 @@ u64 GPU::RunOnGpuThread(std::function<void()>&& action) {
 
 u64 GPU::CurrentSyncRequestFence() const {
     return impl->CurrentSyncRequestFence();
+}
+
+bool GPU::HasPendingSyncRequests() const {
+    return impl->HasPendingSyncRequests();
 }
 
 void GPU::WaitForSyncOperation(u64 fence) {

@@ -44,6 +44,7 @@ struct Frame {
     bool storage_capable{};
     u64 render_tick{};                               ///< Scheduler tick that renders the frame
     std::chrono::steady_clock::time_point queued_at; ///< When it reached the present queue
+    void* frame_gen_token{}; ///< DLSS Frame Generation: the frame's Streamline token, if any
 };
 
 class PresentManager {
