@@ -1324,6 +1324,21 @@ bool IsOtherIndexDraw(u32 method) {
     }
 }
 
+std::unordered_map<GPUVAddr, u64>& FrontReportSlots() {
+    static std::unordered_map<GPUVAddr, u64> slots;
+    return slots;
+}
+
+bool QueuedFrontReport(const VideoCommon::GpuSplit& split, GPUVAddr source, size_t bytes) {
+    const auto& slots = FrontReportSlots();
+    for (GPUVAddr slot = source & ~GPUVAddr{0xf}; slot < source + bytes; slot += 16) {
+        if (const auto it = slots.find(slot); it != slots.end() && !split.Ran(it->second)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // Anonymous namespace
 
 void Maxwell3D::FrontTrackIndexDraws(FrontState& fs, u32 method) {
@@ -1985,6 +2000,7 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
             // the host query completed.
             split.NoteAsyncWrite(*device, 16);
             split.NoteMemoryWrite(*device, 16, "3D report");
+            FrontReportSlots()[address & ~GPUVAddr{0xf}] = split.SentPosition();
         }
         return;
     }
@@ -2310,17 +2326,33 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
-    if (full_drain) {
-        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
-    } else {
-        split.WaitForMemoryWriters(VideoCommon::DrainSite::MacroDmaRead, source,
-                                   source + read_bytes);
+    bool fast = false;
+    if (!full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
+        !VideoCommon::QueryDma::TraceEnabled()) {
+        bool may_gpu_written = false;
+        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes;
+             page += 0x1000) {
+            const auto device = memory_manager.GpuToCpuAddress(page);
+            may_gpu_written |= !device || Tegra::Nx2MayBeGpuWritten(*device, 0x1000);
+        }
+        if (!may_gpu_written) {
+            (void)split.WaitForWriters();
+            fast = !QueuedFrontReport(split, source, read_bytes);
+        }
+    }
+    if (!fast) {
+        if (full_drain) {
+            split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+        } else {
+            split.WaitForMemoryWriters(VideoCommon::DrainSite::MacroDmaRead, source,
+                                       source + read_bytes);
+        }
     }
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
     // EDEN_NX2_QUERY_DMA_TRACE: reads of reports whose host query result is still pending.
-    if (VideoCommon::QueryDma::TraceEnabled()) {
+    if (!fast && VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(
             [this, macro, method, source, read_bytes] {
                 if (VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer, source,
@@ -2331,7 +2363,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             },
             VideoCommon::DrainSite::MacroDmaFlush);
     }
-    flush_if_dirty();
+    if (!fast) {
+        flush_if_dirty();
+    }
     std::vector<u32> diag_before;
     if (Tegra::Nx2CmdPageDiag::g_enabled) {
         diag_before.resize(words);
@@ -2340,11 +2374,13 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         flush_if_dirty();
     }
     // Write out the reports held in the query cache, or the read returns stale occlusion counts.
-    split.Run(
-        [this, source, read_bytes] {
-            VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
-        },
-        VideoCommon::DrainSite::MacroDmaFlush);
+    if (!fast) {
+        split.Run(
+            [this, source, read_bytes] {
+                VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
+            },
+            VideoCommon::DrainSite::MacroDmaFlush);
+    }
     u32 changed{};
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
