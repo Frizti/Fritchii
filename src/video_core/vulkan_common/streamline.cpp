@@ -852,7 +852,8 @@ void* TakeFrameGenToken() {
     return const_cast<sl::FrameToken*>(state.fg_tagged.exchange(nullptr, std::memory_order_acq_rel));
 }
 
-void FrameGenBeforePresent(void* token) {
+void FrameGenBeforePresent(void* token, u32 game_left, u32 game_top, u32 game_right,
+                           u32 game_bottom) {
     State& state = GetState();
     if (!IsFrameGenAvailable()) {
         return;
@@ -887,6 +888,21 @@ void FrameGenBeforePresent(void* token) {
     }
     const auto& frame = *static_cast<const sl::FrameToken*>(token);
     api.pcl_set_marker(sl::PCLMarker::eRenderSubmitEnd, frame);
+    // The game image's rectangle in the backbuffer, a few pixels in: frame generation runs inside
+    // it and copies the edges as they are. Scaled to fullscreen, the last row came out dark and
+    // generation smeared it into a black line while running (LICHII_DLSS_FG_INSET=n, default 4).
+    static const u32 inset = [] {
+        const char* const value = std::getenv("LICHII_DLSS_FG_INSET");
+        return value ? static_cast<u32>(std::atoi(value)) : 4u;
+    }();
+    if (game_right > game_left + 2 * inset && game_bottom > game_top + 2 * inset) {
+        const sl::Extent subrect{game_top + inset, game_left + inset,
+                                 game_right - game_left - 2 * inset,
+                                 game_bottom - game_top - 2 * inset};
+        sl::ResourceTag backbuffer{nullptr, sl::kBufferTypeBackbuffer,
+                                   sl::ResourceLifecycle::eValidUntilPresent, &subrect};
+        api.set_tag_for_frame(frame, sl::ViewportHandle{0u}, &backbuffer, 1, nullptr);
+    }
     api.pcl_set_marker(sl::PCLMarker::ePresentStart, frame);
     state.fg_present_begin = std::chrono::steady_clock::now();
 }

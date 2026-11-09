@@ -286,8 +286,13 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                                 : std::chrono::steady_clock::time_point{};
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
-                               render_window.GetFramebufferLayout(),
+    const auto frame_layout = render_window.GetFramebufferLayout();
+    // Where the game image lands in the frame (DLSS Frame Generation's backbuffer subrect).
+    frame->game_left = frame_layout.screen.left;
+    frame->game_top = frame_layout.screen.top;
+    frame->game_right = frame_layout.screen.right;
+    frame->game_bottom = frame_layout.screen.bottom;
+    blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers, frame_layout,
                                present_manager.SwapchainImageCount(),
                                swapchain.GetImageViewFormat());
 

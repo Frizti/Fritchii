@@ -867,7 +867,8 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     // Present
 #ifdef EGLANTINE_STREAMLINE
     void* const frame_gen_token = std::exchange(frame->frame_gen_token, nullptr);
-    Streamline::FrameGenBeforePresent(frame_gen_token);
+    Streamline::FrameGenBeforePresent(frame_gen_token, frame->game_left, frame->game_top,
+                                      frame->game_right, frame->game_bottom);
 #endif
     last_present_id = swapchain.Present(render_semaphore);
 #ifdef EGLANTINE_STREAMLINE
