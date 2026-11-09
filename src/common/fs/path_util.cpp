@@ -600,4 +600,19 @@ std::string_view GetPathWithoutTop(std::string_view path) {
     return path.substr((std::min)(name_bck_index, name_fwd_index) + 1);
 }
 
+#if !defined(_WIN32)
+fs::path GetExeDirectory() {
+#if defined(__linux__)
+    std::error_code error;
+    const auto exe = fs::read_symlink("/proc/self/exe", error);
+    if (!error && !exe.empty()) {
+        return exe.parent_path();
+    }
+#endif
+    std::error_code cwd_error;
+    const auto cwd = fs::current_path(cwd_error);
+    return cwd_error ? fs::path{} : cwd;
+}
+#endif
+
 } // namespace Common::FS

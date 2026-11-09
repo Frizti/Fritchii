@@ -283,10 +283,12 @@ void SetEdenPath(EdenPath eden_path, const Path& new_path) {
 }
 #endif
 
+/// Gets the path of the directory containing the executable of the current process.
+[[nodiscard]] std::filesystem::path GetExeDirectory();
+
 #ifdef _WIN32
 
 /**
- * Gets the path of the directory containing the executable of the current process.
  *
  * @returns The path of the directory containing the executable of the current process.
  */

@@ -79,6 +79,8 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 
+#pragma clang diagnostic ignored "-Wshadow"
+
 namespace Vulkan {
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;

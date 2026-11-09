@@ -98,6 +98,12 @@
 #include "../../android/app/src/main/jni/android_settings.h"
 #endif
 
+// X11's Xlib.h defines Status (as int), which collides with the pipeline cache enum on Linux.
+#ifdef Status
+#undef Status
+#endif
+#pragma clang diagnostic ignored "-Wshadow"
+
 namespace Vulkan {
 
 namespace {

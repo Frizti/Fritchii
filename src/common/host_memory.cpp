@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+
 #ifdef _WIN32
 
 #include <iterator>
@@ -82,6 +83,8 @@ namespace Common {
 [[maybe_unused]] constexpr int BackingAttempts = 5; // fastmem backing allocation tries (Windows)
 [[maybe_unused]] constexpr size_t HugePageSize = 0x200000;
 
+std::atomic<u64> g_committed_bytes{};  ///< Committed by HostMemory::Commit
+
 #ifdef _WIN32
 
 // Manually imported for MinGW compatibility
@@ -146,7 +149,6 @@ struct ReservedViews {
     size_t virtual_size{};
 };
 ReservedViews g_reserved_views;
-std::atomic<u64> g_committed_bytes{};  ///< Committed by HostMemory::Commit
 std::atomic<u64> g_net_commits{};      ///< Committed by ReservedPageHandler
 std::atomic<u64> g_first_net_offset{}; ///< Its first: backing offset, or virtual offset | 1 << 63
 
