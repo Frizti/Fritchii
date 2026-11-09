@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "common/nx2_gpu_write_listener.h"
 #include "video_core/nx2_frame_fence.h"
 
@@ -506,7 +508,8 @@ public:
     void Add(const void* owner, u64 device_address, u32 value, u32 operation) {
         std::scoped_lock lk{mutex};
         std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
-        waiters.push_back({owner, device_address, value, operation, false});
+        waiters.push_back({owner, device_address, value, operation, false,
+                           Timing() ? Clock::now() : Clock::time_point{}, {}});
         count.store(waiters.size(), std::memory_order_release);
     }
 
@@ -515,6 +518,17 @@ public:
             return;
         }
         std::scoped_lock lk{mutex};
+        if (Timing()) {
+            const auto now = Clock::now();
+            for (const Waiter& w : waiters) {
+                if (w.owner == owner && w.latched) {
+                    // Latched by a GPU write, now resumed: how long the front took to notice.
+                    resume_ns += static_cast<u64>((now - w.latched_at).count());
+                    ++resumed;
+                }
+            }
+            Report(now);
+        }
         std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
         count.store(waiters.size(), std::memory_order_release);
     }
@@ -535,22 +549,65 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        {
+            std::scoped_lock lk{mutex};
+            const bool timing = Timing();
+            const auto now = timing ? Clock::now() : Clock::time_point{};
+            for (auto& w : waiters) {
+                if (w.address == device_address && !w.latched && Matches(w, value)) {
+                    w.latched = true;
+                    if (timing) {
+                        w.latched_at = now;
+                        // From the suspension to the GPU write that meets it (the host GPU's
+                        // part).
+                        latch_ns += static_cast<u64>((now - w.added).count());
+                        ++latched;
+                    }
+                }
             }
         }
     }
 
 private:
+    using Clock = std::chrono::steady_clock;
     struct Waiter {
         const void* owner;
         u64 address;
         u32 value;
         u32 operation;
         bool latched;
+        Clock::time_point added;
+        Clock::time_point latched_at;
     };
+
+    /// With EDEN_NX2_GPU_PROFILE (read on first use, after main() applied nx2_switches.txt):
+    /// the suspensions below are timed.
+    static bool Timing() {
+        static const bool timing = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+        return timing;
+    }
+
+    /// Every 5 s (under `mutex`): suspensions a GPU write ended, and how long they took.
+    void Report(Clock::time_point now) {
+        if (now < next_report) {
+            return;
+        }
+        const bool first = next_report == Clock::time_point{};
+        next_report = now + std::chrono::seconds{5};
+        if (!first && (latched != 0 || resumed != 0)) {
+            LOG_INFO(HW_GPU,
+                     "Semaphore waits ended by a GPU write (5 s): {} latched, {:.0f} us from the "
+                     "suspension to the write; {} resumed, {:.0f} us from the write to the resume",
+                     latched, latched != 0 ? static_cast<double>(latch_ns) / 1e3 / latched : 0.0,
+                     resumed, resumed != 0 ? static_cast<double>(resume_ns) / 1e3 / resumed : 0.0);
+        }
+        latched = resumed = latch_ns = resume_ns = 0;
+    }
+    Clock::time_point next_report{};
+    u64 latched{};
+    u64 resumed{};
+    u64 latch_ns{};
+    u64 resume_ns{};
 
     static bool Matches(const Waiter& w, u32 current) {
         switch (w.operation) {

@@ -17,10 +17,32 @@
 
 namespace VideoCommon {
 
+class StreamerInterface;
+
+/// EDEN_NX2_QUERY_BATCH: queues a streamer's accumulation reset in the query cache's batch of
+/// sync operations instead of as an operation of its own (QueryCacheBase::OpBatch). False when
+/// it can't (not on the split's back), then the streamer queues it as before.
+class QuerySyncBatcher {
+public:
+    virtual bool QueueAccumulationReset(StreamerInterface* streamer) = 0;
+
+protected:
+    ~QuerySyncBatcher() = default;
+};
+
 class StreamerInterface {
 public:
     explicit StreamerInterface(size_t id_) : id{id_}, dependence_mask{}, dependent_mask{} {}
     virtual ~StreamerInterface() = default;
+
+    /// Set by the query cache with EDEN_NX2_QUERY_BATCH.
+    QuerySyncBatcher* sync_batcher{};
+
+    /// What ResetCounter's sync operation does (SamplesStreamer).
+    void ClearAccumulation() noexcept {
+        amend_value = 0;
+        accumulation_value = 0;
+    }
 
     virtual QueryBase* GetQuery(size_t id) = 0;
 

@@ -10,9 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <optional>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <thread>
 #include <vector>
@@ -59,6 +59,8 @@ enum class DrainSite : u32 {
     FenceWriters,   ///< EXP12: a fence release waits for the writers a semaphore read can't see
     QmdRead,        ///< EXP13=2: the front's QMD scheduler copy reads a QMD queued work writes
     ListCopies,     ///< Lists on GPU-written pages: the dispatches and copies before the last sync
+    BackRegister,   ///< A register a macro the back ran may have written (Maxwell3D)
+    BackCode,       ///< The macro code changes under the macros the back has yet to run
     Count,
 };
 
@@ -68,6 +70,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
     "macro dma dispatch", "fence writers", "qmd read", "list copy writers",
+    "back register", "back code",
 };
 
 /// EXP13=2: which queued writer set GpuSplit::QueuedGuestWriters' position (a wait cause).
@@ -365,6 +368,24 @@ public:
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload, effect);
     }
+    /// Defer, calling `func` with a copy of `words` (a std::span<const u32>).
+    template <typename Func>
+    void DeferWords(const Func& func, std::span<const u32> words,
+                    Effect effect = Effect::Unknown) {
+        static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        const size_t payload = function_words + 1 + (words.size() + 1) / 2;
+        u64* const entry = Reserve(2 + payload);
+        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[1] = reinterpret_cast<u64>(&CallWordsThunk<Func>);
+        std::memcpy(entry + 2, &func, sizeof(Func));
+        entry[2 + function_words] = words.size();
+        if (!words.empty()) {
+            entry[1 + payload] = 0; // Padding after an odd count
+            std::memcpy(entry + 3 + function_words, words.data(), words.size_bytes());
+        }
+        Commit(2 + payload, effect);
+    }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
@@ -392,6 +413,10 @@ public:
     void PublishBeforeWait();
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
+    /// The ring position after the entries sent so far, for WaitUntil.
+    [[nodiscard]] u64 Position() const {
+        return write_position;
+    }
 
     /// What sent compute or copy work that may write any memory (EXP10's log line).
     enum class WriterKind : u32 {
@@ -938,6 +963,13 @@ private:
     template <typename Func>
     static void CallThunk(const u64* payload) {
         (*reinterpret_cast<const Func*>(payload))();
+    }
+    template <typename Func>
+    static void CallWordsThunk(const u64* payload) {
+        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        (*reinterpret_cast<const Func*>(payload))(
+            std::span<const u32>{reinterpret_cast<const u32*>(payload + function_words + 1),
+                                 static_cast<size_t>(payload[function_words])});
     }
 
     /// Room for an entry of `words` at the write position (never across the ring's end).

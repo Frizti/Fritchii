@@ -44,3 +44,17 @@ EDEN_NX2_FENCE_BATCH=1
 # Warm-up builds skip our vulkan_pipelines file (only the driver's cache keeps them); =1 adds
 # them to it.
 #EDEN_NX2_WARM_APP_CACHE=1
+
+# GPU thread split offloads and trims (off by default; see the commits for measurements):
+# Macros that read memory run on the split's back (zortos293/Lichii#805 a442c38fe6).
+#EDEN_NX2_BACK_MACROS=1
+# Texture uploads fill their staging memory on a TexFill thread instead of the back thread.
+#EDEN_NX2_TEXTURE_FILL=1
+# A fence's empty second GPU submit is skipped (it re-sent all draw state for nothing).
+#EDEN_NX2_SKIP_EMPTY_SUBMITS=1
+# Fences skip the dirty-memory gather's locks when nothing was written.
+#EDEN_NX2_DIRTY_FAST=1
+# Query report completions and counter resets queued as one batch per fence.
+#EDEN_NX2_QUERY_BATCH=1
+# The instance loops' draw.begin writes skip CallMethod's layers.
+#EDEN_NX2_FAST_DRAW_BEGIN=1

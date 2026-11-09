@@ -18,6 +18,9 @@
 
 #include <fmt/format.h>
 
+#include <fstream>
+#include <atomic>
+#include "video_core/nx2_texture_fill.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
 #include "common/logging.h"
@@ -38,6 +41,94 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
+
+namespace {
+// EDEN_NX2_GPU_PROFILE: the Vulkan worker's own time (the GPU threads' zones don't cover it) and,
+// on Linux with an amdgpu card, the GPU's busy share (sysfs gpu_busy_percent), every 10 s.
+struct WorkerProfile {
+    std::atomic<u64> submit_ns{};
+    std::atomic<u64> submits{};
+    u64 busy_ns{};
+    u64 window_start_ns{};
+    u64 next_gpu_sample_ns{};
+    u64 gpu_busy_sum{};
+    u64 gpu_samples{};
+    int gpu_busy_fd_state{}; // 0 unknown, 1 found, 2 none
+    std::string gpu_busy_path;
+};
+WorkerProfile g_worker_profile;
+
+u64 WorkerNowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+void SampleGpuBusy(WorkerProfile& profile) {
+#ifdef __linux__
+    if (profile.gpu_busy_fd_state == 0) {
+        profile.gpu_busy_fd_state = 2;
+        for (int card = 0; card < 8; ++card) {
+            const std::string base = "/sys/class/drm/card" + std::to_string(card) + "/device/";
+            std::ifstream vendor{base + "vendor"};
+            std::string id;
+            if (vendor >> id && id == "0x1002" && std::ifstream{base + "gpu_busy_percent"}) {
+                profile.gpu_busy_path = base + "gpu_busy_percent";
+                profile.gpu_busy_fd_state = 1;
+                break;
+            }
+        }
+    }
+    if (profile.gpu_busy_fd_state != 1) {
+        return;
+    }
+    std::ifstream file{profile.gpu_busy_path};
+    u64 percent{};
+    if (file >> percent) {
+        profile.gpu_busy_sum += percent;
+        ++profile.gpu_samples;
+    }
+#else
+    (void)profile;
+#endif
+}
+
+void ReportWorker(WorkerProfile& profile, u64 now) {
+    if (now >= profile.next_gpu_sample_ns) {
+        profile.next_gpu_sample_ns = now + 100'000'000;
+        SampleGpuBusy(profile);
+    }
+    if (profile.window_start_ns == 0) {
+        profile.window_start_ns = now;
+        return;
+    }
+    const u64 window = now - profile.window_start_ns;
+    if (window < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(window) / 1e9;
+    const u64 submit_ns = profile.submit_ns.exchange(0, std::memory_order_relaxed);
+    const u64 submits = profile.submits.exchange(0, std::memory_order_relaxed);
+    std::string gpu = "n/a";
+    if (profile.gpu_samples != 0) {
+        gpu = fmt::format("{:.0f}%", static_cast<double>(profile.gpu_busy_sum) /
+                                         static_cast<double>(profile.gpu_samples));
+    }
+    LOG_INFO(Render_Vulkan,
+             "Vulkan worker per second: busy {:.1f} ms (vkQueueSubmit {:.1f} ms, {:.0f} submits, "
+             "{:.0f} us each) | GPU busy {} (amdgpu gpu_busy_percent, {} samples)",
+             static_cast<double>(profile.busy_ns) / 1e6 / seconds,
+             static_cast<double>(submit_ns) / 1e6 / seconds,
+             static_cast<double>(submits) / seconds,
+             submits != 0 ? static_cast<double>(submit_ns) / 1e3 / static_cast<double>(submits)
+                          : 0.0,
+             gpu, profile.gpu_samples);
+    profile.busy_ns = 0;
+    profile.gpu_busy_sum = 0;
+    profile.gpu_samples = 0;
+    profile.window_start_ns = now;
+}
+} // Anonymous namespace
 
 namespace {
 std::atomic<u64> g_profile_submits{};
@@ -577,11 +668,18 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             const bool has_submit = work->HasSubmit();
             Common::Nx2Timeline::Span timeline_span{has_submit ? "record commands + submit"
                                                                : "record commands"};
+            const bool profile = VideoCommon::Nx2Profile::Enabled();
+            const u64 work_begin = profile ? WorkerNowNs() : 0;
             work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {
                 AllocateWorkerCommandBuffer();
+            }
+            if (profile) {
+                const u64 work_end = WorkerNowNs();
+                g_worker_profile.busy_ns += work_end - work_begin;
+                ReportWorker(g_worker_profile, work_end);
             }
         }
 
@@ -824,7 +922,11 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     if (Common::Nx2Timeline::Active()) {
         Common::Nx2Timeline::Instant("submit", {"tick", signal_value});
     }
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+    // EDEN_NX2_TEXTURE_FILL: the staging fills of the uploads recorded so far, which the GPU
+    // reads once this goes out (nx2_texture_fill.h).
+    const u64 texture_fills =
+        VideoCommon::TextureFill::Enabled() ? VideoCommon::TextureFill::Get().Queued() : 0;
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, texture_fills,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -853,14 +955,24 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         if (on_submit) {
             on_submit();
         }
+        if (texture_fills != 0) {
+            VideoCommon::TextureFill::Get().WaitDone(texture_fills);
+        }
 
         std::scoped_lock lock{submit_mutex};
         // Lines up with DkbFrameTrace's begin stamp and the driver's queue packets.
         if (Common::Nx2Timeline::Active()) {
             Common::Nx2Timeline::Instant("vkQueueSubmit", {"tick", signal_value});
         }
-        switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+        const u64 submit_begin = VideoCommon::Nx2Profile::Enabled() ? WorkerNowNs() : 0;
+        const VkResult submit_result = master_semaphore->SubmitQueue(
+            cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value);
+        if (submit_begin != 0) {
+            g_worker_profile.submit_ns.fetch_add(WorkerNowNs() - submit_begin,
+                                                 std::memory_order_relaxed);
+            g_worker_profile.submits.fetch_add(1, std::memory_order_relaxed);
+        }
+        switch (const VkResult result = submit_result) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
@@ -891,6 +1003,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     });
     chunk->MarkSubmit();
     DispatchWork();
+    recorded_since_submit = false;
     return signal_value;
 }
 
