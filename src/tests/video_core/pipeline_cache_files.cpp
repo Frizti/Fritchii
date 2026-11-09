@@ -17,6 +17,9 @@
 
 namespace {
 
+// Not PipelineCacheMergeResult::Status: X11's Status macro (pulled in on Linux) breaks the name.
+using MergeStatus = decltype(VideoCommon::PipelineCacheMergeResult{}.status);
+
 constexpr std::array<char, 8> Magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
 constexpr std::array<char, 8> OtherMagic{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
 
@@ -52,10 +55,6 @@ std::string Header(u32 version) {
            std::string(reinterpret_cast<const char*>(&version), sizeof(version));
 }
 
-std::string Header(u32 version) {
-    return std::string(Magic.data(), Magic.size()) +
-           std::string(reinterpret_cast<const char*>(&version), sizeof(version));
-}
 
 // Merge tests use records of a key, a size and that many bytes.
 std::string Record(u32 key, std::string_view body) {
@@ -132,7 +131,7 @@ TEST_CASE("A newer cache's pipelines are appended once, its source untouched",
 
     std::optional<VideoCommon::PipelineKeySet> keys;
     const auto result = Merge(zortos, own, keys);
-    REQUIRE(result.status == VideoCommon::PipelineCacheMergeResult::Status::Merged);
+    REQUIRE(result.status == MergeStatus::Merged);
     CHECK(result.added_pipelines == 2);
     CHECK(result.added_records == 3);
     CHECK(result.known_pipelines == 1);
@@ -155,13 +154,12 @@ TEST_CASE("A cache is created from a newer one when there is none", "[pipeline_c
     WriteCache(zortos, Magic, 54, Record(7, "x") + Record(8, "y"));
     std::optional<VideoCommon::PipelineKeySet> keys;
     const auto result = Merge(zortos, own, keys);
-    REQUIRE(result.status == VideoCommon::PipelineCacheMergeResult::Status::Merged);
+    REQUIRE(result.status == MergeStatus::Merged);
     CHECK(result.added_pipelines == 2);
     CHECK(ReadAll(own) == Header(52) + Record(7, "x") + Record(8, "y"));
 }
 
 TEST_CASE("A broken or foreign cache is never merged", "[pipeline_cache_files]") {
-    using Status = VideoCommon::PipelineCacheMergeResult::Status;
     TempDir temp;
     const auto own = temp.path / "vulkan-frizti.fork-v52.bin";
     const auto zortos = temp.path / "vulkan.fork-v54.bin";
@@ -171,14 +169,14 @@ TEST_CASE("A broken or foreign cache is never merged", "[pipeline_cache_files]")
     // The last record is cut short: nothing at all is taken, not even the first new one.
     WriteCache(zortos, Magic, 54, Record(5, "new") + Record(6, "truncated").substr(0, 10));
     std::optional<VideoCommon::PipelineKeySet> keys;
-    CHECK(Merge(zortos, own, keys).status == Status::BadSource);
+    CHECK(Merge(zortos, own, keys).status == MergeStatus::BadSource);
     CHECK(ReadAll(own) == own_before);
 
     WriteCache(zortos, Magic, 53, Record(5, "new"));
-    CHECK(Merge(zortos, own, keys).status == Status::WrongHeader);
+    CHECK(Merge(zortos, own, keys).status == MergeStatus::WrongHeader);
     WriteCache(zortos, OtherMagic, 54, Record(5, "new"));
-    CHECK(Merge(zortos, own, keys).status == Status::WrongHeader);
-    CHECK(Merge(temp.path / "missing.bin", own, keys).status == Status::Missing);
+    CHECK(Merge(zortos, own, keys).status == MergeStatus::WrongHeader);
+    CHECK(Merge(temp.path / "missing.bin", own, keys).status == MergeStatus::Missing);
     CHECK(ReadAll(own) == own_before);
 
     // Our own cache does not parse: it is left for the loader as it is.
@@ -186,7 +184,7 @@ TEST_CASE("A broken or foreign cache is never merged", "[pipeline_cache_files]")
     WriteCache(own, Magic, 52, Record(1, "a").substr(0, 6));
     const std::string broken_own = ReadAll(own);
     std::optional<VideoCommon::PipelineKeySet> fresh;
-    CHECK(Merge(zortos, own, fresh).status == Status::BadDestination);
+    CHECK(Merge(zortos, own, fresh).status == MergeStatus::BadDestination);
     CHECK(ReadAll(own) == broken_own);
     CHECK_FALSE(std::filesystem::exists(temp.path / "vulkan-frizti.fork-v52.bin.merging"));
 }
