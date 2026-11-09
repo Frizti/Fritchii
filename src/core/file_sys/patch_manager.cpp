@@ -179,6 +179,20 @@ constexpr std::array BUILTIN_PATCHES{
     },
 };
 
+/// Opt-in patches apply while their environment variable is 1; Occlusion Off also with its
+/// setting (oot_occlusion_off).
+bool BuiltinPatchOptedIn(const BuiltinPatch& patch) {
+    if (patch.enable_env == nullptr) {
+        return true;
+    }
+    if (patch.records.data() == OCCLUSION_OFF_RECORDS.data() &&
+        Settings::values.oot_occlusion_off.GetValue()) {
+        return true;
+    }
+    const char* const value = std::getenv(patch.enable_env);
+    return value != nullptr && std::string_view{value} == "1";
+}
+
 enum class TitleVersionFormat : u8 {
     ThreeElements, ///< vX.Y.Z
     FourElements,  ///< vX.Y.Z.W
@@ -602,11 +616,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.title_id != title_id || patch.module != name) {
             continue;
         }
-        if (patch.enable_env != nullptr) {
-            const char* const value = std::getenv(patch.enable_env);
-            if (value == nullptr || std::string_view{value} != "1") {
-                continue;
-            }
+        if (!BuiltinPatchOptedIn(patch)) {
+            continue;
         }
         // disable_env=1 skips the patch, =0 applies it even when Add-Ons has it off (A/B runs).
         const char* const ab_value = patch.disable_env ? std::getenv(patch.disable_env) : nullptr;
@@ -1234,10 +1245,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id ||
-            (patch.enable_env != nullptr &&
-             std::string_view{std::getenv(patch.enable_env) ? std::getenv(patch.enable_env) : ""} !=
-                 "1")) {
+        if (patch.title_id != title_id || !BuiltinPatchOptedIn(patch)) {
             continue;
         }
         const auto patch_disabled =

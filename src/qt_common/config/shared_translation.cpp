@@ -319,6 +319,17 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Moves the game by each frame's real time instead of an average of recent frames, "
               "so Link no longer speeds up for a moment after a stutter. Small frame time "
               "changes show as small speed changes instead. Takes effect when the game starts."));
+    INSERT(Settings, nx2_fast_buffer_binding, tr("Switch 2: faster buffer binding"),
+           tr("Skips buffer checks and rebinds the GPU thread already knows are unneeded. Less "
+              "work per draw on the GPU thread. Turn off if objects draw wrong. Takes effect "
+              "after restarting the emulator."));
+    INSERT(Settings, nx2_async_pipelines, tr("Switch 2: build shaders off the GPU thread"),
+           tr("Builds new shaders on a worker thread so the GPU thread does not stall on them "
+              "(fewer hitches when new areas load). Takes effect after restarting the emulator."));
+    INSERT(Settings, oot_occlusion_off, tr("Ocarina of Time: Occlusion Off"),
+           tr("The game stops asking the GPU which objects are hidden, which removes many GPU "
+              "thread waits, but it draws hidden objects too. Can be faster or slower. Takes "
+              "effect when the game starts."));
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "
               "Takes effect after restarting the game."));

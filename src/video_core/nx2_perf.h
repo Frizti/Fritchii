@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "common/settings.h"
 
 // EXPERIMENT (not for nx2): GPU back-thread optimizations for Ocarina of Time.
 // split_overlap is quarantined. Frizti build: the options reviewed as exact rewrites are on by
@@ -93,7 +94,15 @@ inline bool On(Opt opt) {
                                      bit(Opt::IndexRebind) | bit(Opt::SubmitBudget) |
                                      bit(Opt::FenceFlush) | bit(Opt::FragmentBarrier) |
                                      bit(Opt::AsyncPipelines) | bit(Opt::Bounds);
-        unsigned mask = (default_off & ~names("EDEN_NX2_PERF_ON")) | names("EDEN_NX2_PERF_OFF");
+        unsigned settings_on = 0;
+        if (Settings::values.nx2_fast_buffer_binding.GetValue()) {
+            settings_on |= bit(Opt::CleanWords) | bit(Opt::Bounds) | bit(Opt::IndexRebind);
+        }
+        if (Settings::values.nx2_async_pipelines.GetValue()) {
+            settings_on |= bit(Opt::AsyncPipelines);
+        }
+        unsigned mask = (default_off & ~settings_on & ~names("EDEN_NX2_PERF_ON")) |
+                        names("EDEN_NX2_PERF_OFF");
         mask |= bit(Opt::SplitOverlap);
         if (const char* value = std::getenv("EDEN_NX2_PERF_FRAMES_AHEAD"); value && value[0] == '0') {
             mask |= bit(Opt::FramesAhead);
