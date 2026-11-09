@@ -734,6 +734,35 @@ void KeepOtherThreadsOffGpuCores(u64 gpu_mask, pid_t front, pid_t back) {
              gpu_mask);
 }
 
+/// The cores pinned to the GPU threads (BackgroundWorkCpuMask keeps background builds off them).
+std::atomic<u64> g_pinned_gpu_mask{};
+
+/// The CPUs below 64 the process may use (the main thread's affinity, which the exclusive GPU
+/// cores option takes the GPU cores out of as well).
+u64 ProcessCpuMask() {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) {
+        return 0;
+    }
+    u64 mask = 0;
+    for (int cpu = 0; cpu < 64; ++cpu) {
+        if (CPU_ISSET(cpu, &set)) {
+            mask |= u64{1} << cpu;
+        }
+    }
+    return mask;
+}
+
+/// Every CPU the process may use, taken before the exclusive GPU cores option narrows the other
+/// threads: a full-speed shader preparation (the game held, the GPU threads idle) gets all of them.
+std::atomic<u64> g_all_cpus_mask{};
+
+u64 AllCpusMask() {
+    const u64 all = g_all_cpus_mask.load(std::memory_order_relaxed);
+    return all != 0 ? all : ProcessCpuMask();
+}
+
 /// Sweeps once both GPU threads of a session are pinned (a new session has new threads).
 void NoteGpuThreadPinned(Common::PinnedRole role, u64 mask) {
     static std::mutex mutex;
@@ -748,6 +777,10 @@ void NoteGpuThreadPinned(Common::PinnedRole role, u64 mask) {
         back = tid;
         back_mask = mask;
     }
+    if (g_all_cpus_mask.load(std::memory_order_relaxed) == 0) {
+        g_all_cpus_mask.store(ProcessCpuMask(), std::memory_order_relaxed);
+    }
+    g_pinned_gpu_mask.store(front_mask | back_mask, std::memory_order_relaxed);
     if (front == 0 || back == 0 || (front == swept_front && back == swept_back) ||
         !ExclusiveGpuCores()) {
         return;
@@ -967,6 +1000,25 @@ u64 BackgroundWorkCpuMask() {
         }
     }
     return std::popcount(other_caches) >= 4 ? other_caches : rest;
+#elif defined(__linux__) && !defined(__ANDROID__)
+    // As on Windows: the CPUs the process may use without the GPU threads' cores, and without
+    // their L3 where the CPU has several and that leaves enough cores.
+    const u64 pinned = g_pinned_gpu_mask.load(std::memory_order_relaxed);
+    if (pinned == 0) {
+        return 0;
+    }
+    const u64 rest = AllCpusMask() & ~pinned;
+    if (rest == 0) {
+        return 0;
+    }
+    static const std::vector<Common::ThreadPinning::Cache> l3_caches = ReadPinningTopology().l3;
+    u64 other_caches = rest;
+    for (const auto& cache : l3_caches) {
+        if ((cache.mask & pinned) != 0) {
+            other_caches &= ~cache.mask;
+        }
+    }
+    return std::popcount(other_caches) >= 4 ? other_caches : rest;
 #else
     return 0;
 #endif
@@ -983,6 +1035,21 @@ void SetCurrentThreadCpuMask(u64 mask) {
         mask = process;
     }
     SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask));
+#elif defined(__linux__) && !defined(__ANDROID__)
+    if (mask == 0) {
+        mask = AllCpusMask();
+        if (mask == 0) {
+            return;
+        }
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int cpu = 0; cpu < 64; ++cpu) {
+        if (((mask >> cpu) & 1) != 0) {
+            CPU_SET(cpu, &set);
+        }
+    }
+    sched_setaffinity(0, sizeof(set), &set);
 #else
     static_cast<void>(mask);
 #endif

@@ -6538,11 +6538,11 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
             env_ptrs.push_back(&job.envs[index]);
         }
     }
-    // As the GPU thread's build: SPIR-V emission and the driver compile on the pipeline workers
-    // when the emission budget has room, otherwise the SPIR-V here.
+    // The SPIR-V is emitted here: this thread is off the GPU thread already. Deferring it to the
+    // pipeline workers (Nx2Perf async_pipelines) only added a hop and took emission budget the GPU
+    // thread's own builds need, so async_pipelines applies to GPU-thread builds only.
     std::shared_ptr<ShaderPools> emit_pools;
-    auto reservation = emission_budget.TryAcquire(
-        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::AsyncPipelines), job.native);
+    auto reservation = emission_budget.TryAcquire(false, job.native);
     if (reservation) {
         {
             std::scoped_lock lock{spare_pools_mutex};
