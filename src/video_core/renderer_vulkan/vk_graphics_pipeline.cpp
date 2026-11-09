@@ -349,6 +349,8 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 } // Anonymous namespace
 
+void NoteDrawReuseProbeFrame();
+
 void NoteDrawReuseProbeFrame() {
     if (DrawReuseProbe::Enabled()) [[unlikely]] {
         DrawReuseProbe::Get().Frame();

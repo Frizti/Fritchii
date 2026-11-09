@@ -69,6 +69,10 @@
 #include "../../android/app/src/main/jni/android_settings.h"
 #endif
 
+// Xlib.h (via the Vulkan XLIB platform headers) defines Status as int, which eats the
+// PipelineCacheMergeResult::Status member below. Nothing here uses the X11 type.
+#undef Status
+
 namespace Vulkan {
 
 namespace {
