@@ -179,6 +179,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 // Video Core //
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
+#include "video_core/present_stats.h"
 #include "video_core/shader_notify.h"
 
 #include <SDL3/SDL.h>
@@ -1135,8 +1136,8 @@ void MainWindow::InitializeWidgets() {
         tr("Current emulation speed. Values higher or lower than 100% "
            "indicate emulation is running faster or slower than a Switch."));
     game_fps_label = new QLabel();
-    game_fps_label->setToolTip(tr("How many frames per second the game is currently displaying. "
-                                  "This will vary from game to game and scene to scene."));
+    game_fps_label->setToolTip(tr("Game FPS, or presented FPS including frame generation with "
+                                  "the game's real FPS in parentheses."));
     emu_frametime_label = new QLabel();
     emu_frametime_label->setToolTip(
         tr("Time taken to emulate a Switch frame, not counting framelimiting or v-sync. For "
@@ -2306,6 +2307,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         game_list->hide();
         game_list_placeholder->hide();
     }
+    last_presented_frames = VideoCore::PresentedFrameCount();
+    presented_fps_clock.invalidate();
     status_bar_update_timer.start(500);
     renderer_status_button->setDisabled(true);
     refresh_button->setDisabled(true);
@@ -3388,6 +3391,8 @@ void MainWindow::OnMenuRecentFile() {
 void MainWindow::OnStartGame() {
     PreventOSSleep();
 
+    last_presented_frames = VideoCore::PresentedFrameCount();
+    presented_fps_clock.invalidate();
     QtCommon::emu_thread->SetRunning(true);
 
     UpdateMenuState();
@@ -5189,6 +5194,7 @@ void MainWindow::OnTasStateChanged() {
 void MainWindow::UpdateStatusBar() {
     if (QtCommon::emu_thread == nullptr || !QtCommon::system->IsPoweredOn()) {
         status_bar_update_timer.stop();
+        presented_fps_clock.invalidate();
         return;
     }
 
@@ -5250,6 +5256,28 @@ void MainWindow::UpdateStatusBar() {
     }
 
     QString fpsText = tr("Game: %1 FPS").arg(std::round(results.average_game_fps), 0, 'f', 0);
+    const u64 presented = VideoCore::PresentedFrameCount();
+    const qint64 elapsed_ns = presented_fps_clock.isValid() ? presented_fps_clock.nsecsElapsed() : 0;
+    const double shown_fps = elapsed_ns > 0
+                                 ? static_cast<double>(presented - last_presented_frames) *
+                                       1'000'000'000.0 / static_cast<double>(elapsed_ns)
+                                 : 0.0;
+    last_presented_frames = presented;
+    presented_fps_clock.start();
+    const bool generating = Settings::values.renderer_backend.GetValue() ==
+                                Settings::RendererBackend::Vulkan &&
+                            Settings::values.frame_gen.GetValue() &&
+                            shown_fps > results.average_game_fps * 1.2 + 1.0;
+    if (generating) {
+        const QString method = Settings::values.frame_gen_type.GetValue() ==
+                                       Settings::FrameGenType::Fsr3
+                                   ? QStringLiteral("FSR3")
+                                   : QStringLiteral("LSFG");
+        fpsText = tr("%1 FPS (%2 real + %3)")
+                      .arg(std::round(shown_fps), 0, 'f', 0)
+                      .arg(std::round(results.average_game_fps), 0, 'f', 0)
+                      .arg(method);
+    }
     if (!m_fpsSuffix.isEmpty())
         fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
 
