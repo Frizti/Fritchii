@@ -589,6 +589,14 @@ bool DriverCachesPipelines(const Device& device) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
     case VK_DRIVER_ID_AMD_PROPRIETARY:
         return true;
+    case VK_DRIVER_ID_MESA_RADV: {
+        // Mesa keeps compiled shaders in its on-disk cache (~/.cache/mesa_shader_cache_db) unless
+        // MESA_SHADER_CACHE_DISABLE turns it off. Without this the preparation was skipped on
+        // RADV, and new areas built their shaders in play (1.7-2 s freezes on an RX 6900 XT).
+        const char* const disabled = std::getenv("MESA_SHADER_CACHE_DISABLE");
+        return disabled == nullptr || (std::string_view{disabled} != "true" &&
+                                       std::string_view{disabled} != "1");
+    }
     default:
         return false;
     }
