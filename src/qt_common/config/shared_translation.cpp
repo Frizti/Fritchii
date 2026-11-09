@@ -315,6 +315,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, oot_30fps, tr("Ocarina of Time: 30 FPS mode (lower-end PCs)"),
            tr("Caps Ocarina of Time at 30 FPS. The game keeps its normal speed. Takes effect at "
               "once; the 60 FPS / 30 FPS button in the status bar switches it too."));
+    INSERT(Settings, oot_exact_frame_time, tr("Ocarina of Time: exact frame timing"),
+           tr("Moves the game by each frame's real time instead of an average of recent frames, "
+              "so Link no longer speeds up for a moment after a stutter. Small frame time "
+              "changes show as small speed changes instead. Takes effect when the game starts."));
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "
               "Takes effect after restarting the game."));

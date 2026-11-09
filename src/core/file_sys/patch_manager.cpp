@@ -96,6 +96,20 @@ constexpr std::array<u8, 120> DYNAMIC_FPS_ROUTINE{
     0x03, 0x09, 0x23, 0x1E, 0x40, 0x20, 0x23, 0x1E, 0x4D, 0x00, 0x00, 0x54,
     0x48, 0x40, 0x20, 0x1E, 0xC0, 0x03, 0x5F, 0xD6, 0x0A, 0xD7, 0x83, 0x3F,
 };
+// With oot_exact_frame_time: the same routine stepping by each frame's measured time (clamped to
+// 50 ms as before) instead of its running average, which moved 1/8 of the way per frame and so
+// made up a slow frame over the next ones. Instructions 13-17 (the average) become
+// mov x12, x11 and four nops; the length, the branch and the literal stay where they were.
+constexpr std::array<u8, 120> DYNAMIC_FPS_ROUTINE_EXACT = [] {
+    auto routine = DYNAMIC_FPS_ROUTINE;
+    constexpr std::array<u8, 20> exact{
+        0xEC, 0x03, 0x0B, 0xAA, // mov x12, x11
+        0x1F, 0x20, 0x03, 0xD5, 0x1F, 0x20, 0x03, 0xD5, 0x1F, 0x20, 0x03, 0xD5,
+        0x1F, 0x20, 0x03, 0xD5, // nop x4
+    };
+    std::copy(exact.begin(), exact.end(), routine.begin() + 13 * 4);
+    return routine;
+}();
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x6E6CC4, .bytes = DYNAMIC_FPS_CALL},
     BuiltinPatchRecord{.module_offset = 0x3C46200, .bytes = DYNAMIC_FPS_ROUTINE},
@@ -648,12 +662,20 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (!apply) {
             continue;
         }
+        const bool exact_frame_time = Settings::values.oot_exact_frame_time.GetValue();
         for (const BuiltinPatchRecord& record : patch.records) {
+            std::span<const u8> bytes = record.bytes;
+            if (exact_frame_time && bytes.data() == DYNAMIC_FPS_ROUTINE.data()) {
+                bytes = DYNAMIC_FPS_ROUTINE_EXACT;
+            }
             std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.module_offset,
-                        record.bytes.data(), record.bytes.size());
+                        bytes.data(), bytes.size());
         }
-        LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}", patch.name,
-                 patch.records.size(), name);
+        LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}{}", patch.name,
+                 patch.records.size(), name,
+                 exact_frame_time && &patch.records.front() == &DYNAMIC_FPS_RECORDS.front()
+                     ? " (exact frame timing)"
+                     : "");
     }
 
     if (out.size() < sizeof(Loader::NSOHeader)) {

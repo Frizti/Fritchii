@@ -653,6 +653,11 @@ struct Values {
     // timing follows real time (Dynamic FPS by Dark), so it keeps full speed. Asked once at the
     // first launch (oot_fps_asked).
     SwitchableSetting<bool> oot_30fps{linkage, false, "oot_30fps", Category::RendererAdvanced};
+    // Ocarina of Time: the Dynamic FPS patch steps the game by each frame's measured time instead
+    // of its running average, so a slow frame is not made up over the next ones (Link briefly
+    // running fast after a hitch). Read when the game starts.
+    SwitchableSetting<bool> oot_exact_frame_time{linkage, false, "oot_exact_frame_time",
+                                                 Category::RendererAdvanced};
     Setting<bool> oot_fps_asked{linkage, false, "oot_fps_asked", Category::RendererAdvanced};
     // Which revision of the Frizti tuned settings (common/frizti_settings.h) this config has had
     // applied once (MainWindow::MigrateFriztiSettings; config/frizti.ini keeps it too).
