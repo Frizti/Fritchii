@@ -130,6 +130,8 @@ add_library(video_core STATIC
     nx2_frame_fence.h
     nx2_list_verify.h
     nx2_profile.h
+    nx2_texture_fill.cpp
+    nx2_texture_fill.h
     nx2_qmd_prediction.cpp
     nx2_qmd_prediction.h
     nx2_perf.h

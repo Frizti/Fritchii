@@ -18,6 +18,7 @@
 
 #include <fmt/format.h>
 
+#include "video_core/nx2_texture_fill.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
 #include "common/logging.h"
@@ -824,7 +825,11 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     if (Common::Nx2Timeline::Active()) {
         Common::Nx2Timeline::Instant("submit", {"tick", signal_value});
     }
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+    // EDEN_NX2_TEXTURE_FILL: the staging fills of the uploads recorded so far, which the GPU
+    // reads once this goes out (nx2_texture_fill.h).
+    const u64 texture_fills =
+        VideoCommon::TextureFill::Enabled() ? VideoCommon::TextureFill::Get().Queued() : 0;
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, texture_fills,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -852,6 +857,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
 
         if (on_submit) {
             on_submit();
+        }
+        if (texture_fills != 0) {
+            VideoCommon::TextureFill::Get().WaitDone(texture_fills);
         }
 
         std::scoped_lock lock{submit_mutex};
