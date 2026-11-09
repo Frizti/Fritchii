@@ -610,6 +610,188 @@ Common::ThreadPinning::Topology ReadPinningTopology() {
 } // Anonymous namespace
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <cerrno>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <sys/syscall.h>
+#include "common/settings.h"
+
+namespace {
+std::string ReadSysfsLine(const std::string& path) {
+    std::ifstream file{path};
+    std::string line;
+    std::getline(file, line);
+    return line;
+}
+
+/// "0-3,8,10-11" as a mask of the logical processors below 64.
+u64 ParseCpuList(const std::string& list) {
+    u64 mask{};
+    std::size_t pos = 0;
+    while (pos < list.size()) {
+        const std::size_t end = std::min(list.find(',', pos), list.size());
+        const std::string part = list.substr(pos, end - pos);
+        const std::size_t dash = part.find('-');
+        const unsigned long first = std::strtoul(part.c_str(), nullptr, 10);
+        const unsigned long last =
+            dash == std::string::npos ? first : std::strtoul(part.c_str() + dash + 1, nullptr, 10);
+        for (unsigned long cpu = first; cpu <= last && cpu < 64; ++cpu) {
+            mask |= u64{1} << cpu;
+        }
+        pos = end + 1;
+    }
+    return mask;
+}
+
+/// The same layout ReadPinningTopology reads on Windows, from sysfs. Intel efficiency cores
+/// (/sys/devices/cpu_atom) rank below the others; every other core ranks the same.
+Common::ThreadPinning::Topology ReadPinningTopology() {
+    Common::ThreadPinning::Topology topology;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return topology;
+    }
+    const u64 atom = ParseCpuList(ReadSysfsLine("/sys/devices/cpu_atom/cpus"));
+    u64 seen{};
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        ++topology.logical_processors;
+        if (cpu >= 64) {
+            continue;
+        }
+        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+        u64 core = ParseCpuList(ReadSysfsLine(base + "/topology/thread_siblings_list"));
+        core = core == 0 ? u64{1} << cpu : core;
+        if ((seen & core) == 0) {
+            seen |= core;
+            const u8 efficiency_class = (atom & core) != 0 ? 0 : 1;
+            topology.cores.push_back({core, efficiency_class});
+        }
+        for (int index = 0;; ++index) {
+            const std::string cache = base + "/cache/index" + std::to_string(index);
+            const std::string level = ReadSysfsLine(cache + "/level");
+            if (level.empty()) {
+                break;
+            }
+            if (level != "3" || ReadSysfsLine(cache + "/type") == "Instruction") {
+                continue;
+            }
+            const u64 shared = ParseCpuList(ReadSysfsLine(cache + "/shared_cpu_list"));
+            const bool known = std::any_of(topology.l3.begin(), topology.l3.end(),
+                                           [&](const auto& l3) { return l3.mask == shared; });
+            if (shared != 0 && !known) {
+                // sysfs gives the size as "32768K".
+                const u64 size = std::strtoull(ReadSysfsLine(cache + "/size").c_str(), nullptr, 10);
+                topology.l3.push_back({shared, size * 1024});
+            }
+        }
+    }
+    return topology;
+}
+
+/// EDEN_GPU_PIN_EXCLUSIVE=1 or the nx2_exclusive_gpu_cores setting (after zortos293/Lichii#913):
+/// take the GPU threads' cores out of every other thread's affinity, so no other emulator thread
+/// shares a core (its SMT sibling) with them. Threads created later inherit their creator's
+/// affinity; a thread left with no CPU keeps its mask.
+bool ExclusiveGpuCores() {
+    if (const char* value = std::getenv("EDEN_GPU_PIN_EXCLUSIVE")) {
+        return value[0] != '\0' && value[0] != '0';
+    }
+    return Settings::values.nx2_exclusive_gpu_cores.GetValue();
+}
+
+void KeepOtherThreadsOffGpuCores(u64 gpu_mask, pid_t front, pid_t back) {
+    std::size_t moved = 0;
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task", error)) {
+        const pid_t tid =
+            static_cast<pid_t>(std::strtol(entry.path().filename().c_str(), nullptr, 10));
+        if (tid <= 0 || tid == front || tid == back) {
+            continue;
+        }
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(tid, sizeof(set), &set) != 0) {
+            continue;
+        }
+        bool changed = false;
+        for (int cpu = 0; cpu < 64; ++cpu) {
+            if (((gpu_mask >> cpu) & 1) != 0 && CPU_ISSET(cpu, &set)) {
+                CPU_CLR(cpu, &set);
+                changed = true;
+            }
+        }
+        if (changed && CPU_COUNT(&set) > 0 && sched_setaffinity(tid, sizeof(set), &set) == 0) {
+            ++moved;
+        }
+    }
+    LOG_INFO(Common, "Thread pinning: moved {} other threads off the GPU cores {:#x}", moved,
+             gpu_mask);
+}
+
+/// The cores pinned to the GPU threads (BackgroundWorkCpuMask keeps background builds off them).
+std::atomic<u64> g_pinned_gpu_mask{};
+
+/// The CPUs below 64 the process may use (the main thread's affinity, which the exclusive GPU
+/// cores option takes the GPU cores out of as well).
+u64 ProcessCpuMask() {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(getpid(), sizeof(set), &set) != 0) {
+        return 0;
+    }
+    u64 mask = 0;
+    for (int cpu = 0; cpu < 64; ++cpu) {
+        if (CPU_ISSET(cpu, &set)) {
+            mask |= u64{1} << cpu;
+        }
+    }
+    return mask;
+}
+
+/// Every CPU the process may use, taken before the exclusive GPU cores option narrows the other
+/// threads: a full-speed shader preparation (the game held, the GPU threads idle) gets all of them.
+std::atomic<u64> g_all_cpus_mask{};
+
+u64 AllCpusMask() {
+    const u64 all = g_all_cpus_mask.load(std::memory_order_relaxed);
+    return all != 0 ? all : ProcessCpuMask();
+}
+
+/// Sweeps once both GPU threads of a session are pinned (a new session has new threads).
+void NoteGpuThreadPinned(Common::PinnedRole role, u64 mask) {
+    static std::mutex mutex;
+    static pid_t front{}, back{}, swept_front{}, swept_back{};
+    static u64 front_mask{}, back_mask{};
+    std::scoped_lock lock{mutex};
+    const pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+    if (role == Common::PinnedRole::GpuFront) {
+        front = tid;
+        front_mask = mask;
+    } else {
+        back = tid;
+        back_mask = mask;
+    }
+    if (g_all_cpus_mask.load(std::memory_order_relaxed) == 0) {
+        g_all_cpus_mask.store(ProcessCpuMask(), std::memory_order_relaxed);
+    }
+    g_pinned_gpu_mask.store(front_mask | back_mask, std::memory_order_relaxed);
+    if (front == 0 || back == 0 || (front == swept_front && back == swept_back) ||
+        !ExclusiveGpuCores()) {
+        return;
+    }
+    swept_front = front;
+    swept_back = back;
+    KeepOtherThreadsOffGpuCores(front_mask | back_mask, front, back);
+}
+} // Anonymous namespace
+#endif
+
 namespace Common {
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
@@ -718,7 +900,7 @@ void SetCurrentThreadToPerformanceCores() {
 }
 
 void PinCurrentThread(PinnedRole role, int guest_core) {
-#ifdef _WIN32
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
     // Off with EDEN_NX2_PIN_THREADS=0, forced with 1, otherwise on with enough performance cores
     // (ThreadPinning::MakePlan): the split's back did about 8% more draws a second at Lake Hylia
     // (Ryzen 7 7800X3D), its worst window 29 -> 54 fps, once no SMT sibling shared its core.
@@ -763,6 +945,7 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
     }
     }
     if (mask != 0) {
+#ifdef _WIN32
         GROUP_AFFINITY affinity{};
         affinity.Mask = static_cast<KAFFINITY>(mask);
         affinity.Group = 0;
@@ -771,9 +954,24 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
         } else if (role != PinnedRole::GuestCore) {
             pinned_gpu_mask.fetch_or(mask, std::memory_order_relaxed);
         }
+#else
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (int cpu = 0; cpu < 64; ++cpu) {
+            if ((mask >> cpu) & 1) {
+                CPU_SET(cpu, &set);
+            }
+        }
+        if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+            LOG_WARNING(Common, "Could not pin thread: {}", std::strerror(errno));
+        } else if (role != PinnedRole::GuestCore) {
+            NoteGpuThreadPinned(role, mask);
+        }
+#endif
     }
 #else
     (void)role;
+    (void)guest_core;
 #endif
 }
 
@@ -802,6 +1000,25 @@ u64 BackgroundWorkCpuMask() {
         }
     }
     return std::popcount(other_caches) >= 4 ? other_caches : rest;
+#elif defined(__linux__) && !defined(__ANDROID__)
+    // As on Windows: the CPUs the process may use without the GPU threads' cores, and without
+    // their L3 where the CPU has several and that leaves enough cores.
+    const u64 pinned = g_pinned_gpu_mask.load(std::memory_order_relaxed);
+    if (pinned == 0) {
+        return 0;
+    }
+    const u64 rest = AllCpusMask() & ~pinned;
+    if (rest == 0) {
+        return 0;
+    }
+    static const std::vector<Common::ThreadPinning::Cache> l3_caches = ReadPinningTopology().l3;
+    u64 other_caches = rest;
+    for (const auto& cache : l3_caches) {
+        if ((cache.mask & pinned) != 0) {
+            other_caches &= ~cache.mask;
+        }
+    }
+    return std::popcount(other_caches) >= 4 ? other_caches : rest;
 #else
     return 0;
 #endif
@@ -818,6 +1035,21 @@ void SetCurrentThreadCpuMask(u64 mask) {
         mask = process;
     }
     SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask));
+#elif defined(__linux__) && !defined(__ANDROID__)
+    if (mask == 0) {
+        mask = AllCpusMask();
+        if (mask == 0) {
+            return;
+        }
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int cpu = 0; cpu < 64; ++cpu) {
+        if (((mask >> cpu) & 1) != 0) {
+            CPU_SET(cpu, &set);
+        }
+    }
+    sched_setaffinity(0, sizeof(set), &set);
 #else
     static_cast<void>(mask);
 #endif

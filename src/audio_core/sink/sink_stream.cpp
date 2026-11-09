@@ -17,6 +17,7 @@
 #include "audio_core/sink/sink_stream.h"
 #include "common/common_types.h"
 #include "common/fixed_point.h"
+#include "common/nx2_movie_clock.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -90,11 +91,24 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     }
 }
 
+/// Blocks a sysmix stream may queue: enough for the host's largest callback plus one block.
+/// A host that asks for more than the queue holds (PipeWire's default 1024 frames against three
+/// 240-frame blocks) gets silence for the rest of every callback. The sample ring must hold the
+/// queued blocks and the one playing, at the device's channel count.
+u32 SinkStream::SysmixQueueLimit() const {
+    constexpr u64 MinimumBlocks = 3;
+    const u64 ring_blocks = SampleRingCapacity / (u64{TargetSampleCount} * device_channels) - 1;
+    const u64 request = largest_request_frames.load(std::memory_order_relaxed);
+    const u64 blocks = (request + TargetSampleCount - 1) / TargetSampleCount + 1;
+    return static_cast<u32>(std::clamp<u64>(blocks, MinimumBlocks, (std::min<u64>)(ring_blocks, 64)));
+}
+
 bool SinkStream::TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples) {
     if (type != StreamType::Sysmix || !IsReady() || buffer.frames != TargetSampleCount ||
         buffer.frames_played != 0 || buffer.consumed || system_channels != 2 ||
         (device_channels != 2 && device_channels != 6) ||
-        samples.size() != TargetSampleCount * system_channels || queued_buffers.load() >= 3) {
+        samples.size() != TargetSampleCount * system_channels ||
+        queued_buffers.load() >= SysmixQueueLimit()) {
         return false;
     }
     AppendBuffer(buffer, samples);
@@ -207,6 +221,12 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
         return;
     }
 
+    if (type == StreamType::Sysmix && num_frames > largest_request_frames.load()) {
+        largest_request_frames.store(num_frames);
+        LOG_INFO(Audio, "sysmix {}: host asks for {} frames per callback, queue limit {} blocks",
+                 name, num_frames, SysmixQueueLimit());
+    }
+
     while (frames_written < num_frames) {
         if (playing_buffer.consumed || playing_buffer.frames == 0) {
             std::unique_lock lk{release_mutex};
@@ -242,6 +262,13 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     }
 
     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+
+    if (type == StreamType::Render && Common::Nx2MovieClock::Enabled()) {
+        auto& clock = Common::Nx2MovieClock::Get();
+        const size_t index = !name.empty() && name.back() == '1' ? 1 : 0;
+        Common::Nx2MovieClock::Add(clock.sink_frames[index], num_frames);
+        Common::Nx2MovieClock::Add(clock.sink_padded[index], num_frames - actual_frames_written);
+    }
 
     // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
     if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr;

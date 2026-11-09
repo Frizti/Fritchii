@@ -140,6 +140,8 @@ private:
     };
     bool present_wait_enabled{};
     HostPacer pacer;
+    /// With frame generation on: when the last frame went to the swapchain (present thread only).
+    std::chrono::steady_clock::time_point last_frame_gen_present{};
     u64 last_present_id{};
     std::mutex present_wait_mutex; ///< Held while waiting on a swapchain; recreation takes it
     std::mutex wait_queue_mutex;

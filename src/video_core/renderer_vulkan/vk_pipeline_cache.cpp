@@ -98,6 +98,10 @@
 #include "../../android/app/src/main/jni/android_settings.h"
 #endif
 
+// Xlib.h (via the Vulkan XLIB platform headers) defines Status as int, which eats the
+// PipelineCacheMergeResult::Status member below. Nothing here uses the X11 type.
+#undef Status
+
 namespace Vulkan {
 
 namespace {
@@ -585,6 +589,14 @@ bool DriverCachesPipelines(const Device& device) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
     case VK_DRIVER_ID_AMD_PROPRIETARY:
         return true;
+    case VK_DRIVER_ID_MESA_RADV: {
+        // Mesa keeps compiled shaders in its on-disk cache (~/.cache/mesa_shader_cache_db) unless
+        // MESA_SHADER_CACHE_DISABLE turns it off. Without this the preparation was skipped on
+        // RADV, and new areas built their shaders in play (1.7-2 s freezes on an RX 6900 XT).
+        const char* const disabled = std::getenv("MESA_SHADER_CACHE_DISABLE");
+        return disabled == nullptr || (std::string_view{disabled} != "true" &&
+                                       std::string_view{disabled} != "1");
+    }
     default:
         return false;
     }
@@ -2863,7 +2875,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 }
                 bool build = !background_stop.load(std::memory_order_relaxed);
                 if (build) {
-                    std::scoped_lock lock{background_mutex};
+                    std::scoped_lock claim_lock{background_mutex};
                     build = !background_claimed.contains(key);
                 }
                 if (stream_ && build) {
@@ -2880,7 +2892,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                     pipeline = CreateCachedGraphicsPipeline(key, records_, nullptr);
                 }
                 ticket_.Done();
-                std::unique_lock lock{background_mutex};
+                std::unique_lock ready_lock{background_mutex};
                 if (pipeline && !background_claimed.contains(key)) {
                     background_ready.emplace(key, std::move(pipeline));
                 }
@@ -2909,7 +2921,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                         QueueVulkanPipelineCacheSave(true);
                     }
                 }
-                lock.unlock();
+                ready_lock.unlock();
                 // A pipeline dropped here was never bound, so no GPU work can still use it.
                 pipeline.reset();
             });
@@ -3190,11 +3202,11 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
     size_t file_entries = 0;
     bool read_ok = false;
     // Read the whole file here (its own reader: the disk cache loader deletes files it rejects).
-    struct Entry {
+    struct WarmEntry {
         ComputePipelineCacheKey key;
         FileEnvironment env;
     };
-    auto entries = std::make_shared<std::vector<Entry>>();
+    auto entries = std::make_shared<std::vector<WarmEntry>>();
     try {
         std::ifstream file(warm_file, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
@@ -3228,7 +3240,7 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
                             file_entries + 1, path);
                 break;
             }
-            Entry entry;
+            WarmEntry entry;
             entry.env.Deserialize(file);
             if (entry.env.ShaderStage() != Shader::Stage::Compute) {
                 LOG_WARNING(Render_Vulkan, "Nx2Perf compute_warm: non-compute entry in {}", path);
@@ -3282,7 +3294,7 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
                 std::call_once(progress->running_marker, [this, &warm_file, &title_file] {
                     WriteRunningMarker(warm_file, title_file, device);
                 });
-                Entry& entry = (*entries)[index];
+                WarmEntry& entry = (*entries)[index];
                 entry.env.SetGuessMissing(&guess);
                 bool ok = false;
                 try {
@@ -3953,13 +3965,13 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     .read(reinterpret_cast<char*>(ids.data()), count * sizeof(u32));
                 const bool compute = kind == 1;
                 ComputePipelineCacheKey compute_key{};
-                GraphicsPipelineCacheKey graphics_key{};
+                GraphicsPipelineCacheKey record_key{};
                 if (compute) {
                     in.read(reinterpret_cast<char*>(&compute_key), sizeof(compute_key));
                 } else {
-                    in.read(reinterpret_cast<char*>(&graphics_key), sizeof(graphics_key));
-                    RecordedKeyForThisDevice(graphics_key);
-                    const auto& key_state = graphics_key.state;
+                    in.read(reinterpret_cast<char*>(&record_key), sizeof(record_key));
+                    RecordedKeyForThisDevice(record_key);
+                    const auto& key_state = record_key.state;
                     const bool other_device =
                         (key_state.extended_dynamic_state != 0) !=
                             dynamic_features.has_extended_dynamic_state ||
@@ -4008,7 +4020,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                             }
                         }
                         skipped = true;
-                    } else if (!keeping && disk_keys && disk_keys->contains(graphics_key.Hash())) {
+                    } else if (!keeping && disk_keys && disk_keys->contains(record_key.Hash())) {
                         ++state.known;
                         skipped = true;
                     }
@@ -4052,7 +4064,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         TranslationRecord kept;
                         kept.keep_infos = true;
                         const auto pipeline{CreateGraphicsPipeline(
-                            pools, graphics_key, MakeSpan(env_ptrs), nullptr, false, nullptr,
+                            pools, record_key, MakeSpan(env_ptrs), nullptr, false, nullptr,
                             nullptr, false, keeping ? &kept : nullptr)};
                         ok = pipeline && !pipeline->Failed();
                         // A pipeline drawn through the task/mesh compute fallback is not kept:
@@ -4062,7 +4074,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         if (ok && keeping && kept.complete && !kept.mesh_emulated) {
                             writer.Keep(index, 0,
                                         kept.libraries ? PrecompiledKept::FlagLibraries : u8{0},
-                                        graphics_key.Hash(), env_ids, kept.infos, kept.spirv);
+                                        record_key.Hash(), env_ids, kept.infos, kept.spirv);
                         }
                     }
                 }
@@ -4419,7 +4431,7 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
         }
         const u64 key_offset = offset + 4 + count * sizeof(u32);
         ComputePipelineCacheKey compute_key{};
-        GraphicsPipelineCacheKey graphics_key{};
+        GraphicsPipelineCacheKey record_key{};
         if (compute) {
             if (!index.ReadPrecompiled(key_offset,
                                        std::span(reinterpret_cast<u8*>(&compute_key),
@@ -4431,12 +4443,12 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
             }
         } else {
             if (!index.ReadPrecompiled(key_offset,
-                                       std::span(reinterpret_cast<u8*>(&graphics_key),
-                                                 sizeof(graphics_key)))) {
+                                       std::span(reinterpret_cast<u8*>(&record_key),
+                                                 sizeof(record_key)))) {
                 return "its precompiled record (unreadable)";
             }
-            RecordedKeyForThisDevice(graphics_key);
-            if (graphics_key.Hash() != record.key_hash) {
+            RecordedKeyForThisDevice(record_key);
+            if (record_key.Hash() != record.key_hash) {
                 return "the key (as this device and EDEN_NX2_CANONICAL_KEYS key it)";
             }
         }
@@ -4477,7 +4489,7 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
                 translated.translate_only = true;
                 translated.keep_infos = true;
                 [[maybe_unused]] const auto none =
-                    CreateGraphicsPipeline(pools, graphics_key, MakeSpan(env_ptrs), nullptr, false,
+                    CreateGraphicsPipeline(pools, record_key, MakeSpan(env_ptrs), nullptr, false,
                                            nullptr, nullptr, false, &translated);
                 if (!translated.complete) {
                     return "the pipeline (its translation failed)";
@@ -6084,13 +6096,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                         use_libraries ? &stage_hashes[stage] : nullptr);
                 }
             }
-            auto pools = std::move(job->pools);
+            auto job_pools = std::move(job->pools);
             job.reset();
-            pools->ReleaseContents();
+            job_pools->ReleaseContents();
             {
                 std::scoped_lock lock{spare_pools_mutex};
                 if (spare_pools.size() < 4) {
-                    spare_pools.push_back(std::move(pools));
+                    spare_pools.push_back(std::move(job_pools));
                 }
             }
             AddRuntimeSpirvTime(1, begin);
@@ -6526,11 +6538,11 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
             env_ptrs.push_back(&job.envs[index]);
         }
     }
-    // As the GPU thread's build: SPIR-V emission and the driver compile on the pipeline workers
-    // when the emission budget has room, otherwise the SPIR-V here.
+    // The SPIR-V is emitted here: this thread is off the GPU thread already. Deferring it to the
+    // pipeline workers (Nx2Perf async_pipelines) only added a hop and took emission budget the GPU
+    // thread's own builds need, so async_pipelines applies to GPU-thread builds only.
     std::shared_ptr<ShaderPools> emit_pools;
-    auto reservation = emission_budget.TryAcquire(
-        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::AsyncPipelines), job.native);
+    auto reservation = emission_budget.TryAcquire(false, job.native);
     if (reservation) {
         {
             std::scoped_lock lock{spare_pools_mutex};

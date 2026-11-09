@@ -146,8 +146,9 @@ bool ApplyTheme() {
 }
 
 bool HidesSetting(const std::string& label) {
-    // No frame generation in Fritchii (real frames only), and its options are dev tools.
-    return Enabled() && label.starts_with("frame_gen");
+    // Upstream Fritchii hides frame generation (real frames only). This Linux build keeps it for
+    // LSFG and FSR 3 on CPUs that can't hold 60; only the optical flow dump is a dev tool.
+    return Enabled() && label == "frame_gen_dump_flow";
 }
 
 QIcon Icon(const QString& name, int px) {

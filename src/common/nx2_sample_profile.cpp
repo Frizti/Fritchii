@@ -21,6 +21,26 @@
 
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#elif defined(__linux__) && !defined(__ANDROID__)
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <thread>
+
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <ctime>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#include "common/fs/path_util.h"
+#include "common/logging.h"
 #endif
 
 namespace Common::Nx2SampleProfile {
@@ -241,6 +261,192 @@ void SamplerMain() {
 
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+
+// Record kinds of the sample file (tools/nx2/sample_report.py parses it), as on Windows.
+constexpr std::uint8_t KindSample = 1;
+constexpr std::uint8_t KindThread = 2;
+constexpr std::uint8_t KindModule = 3;
+constexpr std::uint8_t KindEnd = 0xff;
+constexpr size_t MaxThreads = 32;
+// SIGPROF: what sampling profilers use; handlers are installed with SA_RESTART.
+constexpr int SampleSignal = SIGPROF;
+
+struct SampledThread {
+    pid_t tid{};
+    std::string name;
+};
+
+std::mutex threads_mutex;
+std::array<SampledThread, MaxThreads> sampled_threads;
+std::atomic<size_t> num_threads{};
+
+// One sample in flight: the sampler names the thread it signals, the handler of that thread (and
+// only that one: a late signal of an earlier request finds another target) stores its PC.
+std::atomic<pid_t> g_target{0};
+std::atomic<std::uint64_t> g_pc{0};
+std::atomic<bool> g_done{false};
+
+pid_t CurrentTid() {
+    return static_cast<pid_t>(syscall(SYS_gettid));
+}
+
+/// Async-signal-safe: reads the interrupted PC from the signal context and stores it.
+void SampleHandler(int, siginfo_t*, void* raw_context) {
+    const int saved_errno = errno;
+    if (g_target.load(std::memory_order_acquire) == CurrentTid()) {
+        const auto* context = static_cast<const ucontext_t*>(raw_context);
+#if defined(__x86_64__)
+        const auto pc = static_cast<std::uint64_t>(context->uc_mcontext.gregs[REG_RIP]);
+#elif defined(__aarch64__)
+        const auto pc = static_cast<std::uint64_t>(context->uc_mcontext.pc);
+#else
+        const std::uint64_t pc = 0;
+        (void)context;
+#endif
+        g_pc.store(pc, std::memory_order_relaxed);
+        g_done.store(true, std::memory_order_release);
+    }
+    errno = saved_errno;
+}
+
+template <typename T>
+void Put(std::ofstream& file, T value) {
+    file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+void PutString(std::ofstream& file, std::string_view text) {
+    Put(file, static_cast<std::uint16_t>(text.size()));
+    file.write(text.data(), static_cast<std::streamsize>(text.size()));
+}
+
+std::uint64_t NowNs() {
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ULL +
+           static_cast<std::uint64_t>(now.tv_nsec);
+}
+
+/// Each mapped file as one module: from its lowest mapping (where file offset 0 is loaded, the
+/// address ELF virtual addresses count from) to its highest end.
+void WriteModules(std::ofstream& file) {
+    std::ifstream maps{"/proc/self/maps"};
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> modules;
+    std::string line;
+    while (std::getline(maps, line)) {
+        std::istringstream fields{line};
+        std::string range, perms, offset, device, inode, path;
+        fields >> range >> perms >> offset >> device >> inode;
+        std::getline(fields >> std::ws, path);
+        if (path.empty() || path.front() != '/') {
+            continue;
+        }
+        const size_t dash = range.find('-');
+        const std::uint64_t begin = std::stoull(range.substr(0, dash), nullptr, 16);
+        const std::uint64_t end = std::stoull(range.substr(dash + 1), nullptr, 16);
+        auto [it, inserted] = modules.try_emplace(path, begin, end);
+        if (!inserted) {
+            it->second.first = (std::min)(it->second.first, begin);
+            it->second.second = (std::max)(it->second.second, end);
+        }
+    }
+    for (const auto& [path, range] : modules) {
+        Put(file, KindModule);
+        Put(file, range.first);
+        Put(file, static_cast<std::uint32_t>(range.second - range.first));
+        PutString(file, path);
+    }
+}
+
+void SamplerMain() {
+    const Config& config = GetConfig();
+    LOG_INFO(Common, "Sample profile: starts in {} s, then samples for {} s (keep the game running)",
+             config.delay_seconds, config.seconds);
+    std::this_thread::sleep_for(std::chrono::seconds{config.delay_seconds});
+
+    struct sigaction action{};
+    action.sa_sigaction = SampleHandler;
+    action.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SampleSignal, &action, nullptr) != 0) {
+        LOG_ERROR(Common, "Sample profile: can't install the SIGPROF handler");
+        return;
+    }
+    const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) /
+                      ("nx2_samples_" + std::to_string(getpid()) + ".bin");
+    std::ofstream file{path, std::ios::binary | std::ios::trunc};
+    if (!file) {
+        LOG_ERROR(Common, "Sample profile: can't open {}", path.string());
+        return;
+    }
+    file.write("NX2SMPL1", 8);
+    Put(file, std::uint32_t{1});
+    Put(file, static_cast<std::uint32_t>(config.hz));
+    Put(file, std::uint64_t{1'000'000'000}); // tick frequency: nanoseconds
+    WriteModules(file);
+
+    LOG_INFO(Common, "Sample profile: started, {} s at {} Hz; the file is written to {} when it ends",
+             config.seconds, config.hz, path.string());
+    const std::uint64_t period = 1'000'000'000ULL / (std::max)(config.hz, 1u);
+    const std::uint64_t start = NowNs();
+    const std::uint64_t end = start + static_cast<std::uint64_t>(config.seconds) * 1'000'000'000ULL;
+    const pid_t process = getpid();
+    size_t threads_written = 0;
+    std::uint64_t samples = 0;
+    std::uint64_t next = start;
+    for (std::uint64_t now = start; now < end; now = NowNs()) {
+        const size_t count = num_threads.load(std::memory_order_acquire);
+        for (; threads_written < count; ++threads_written) {
+            Put(file, KindThread);
+            Put(file, static_cast<std::uint8_t>(threads_written));
+            PutString(file, sampled_threads[threads_written].name);
+        }
+        for (size_t index = 0; index < count; ++index) {
+            const pid_t tid = sampled_threads[index].tid;
+            g_done.store(false, std::memory_order_relaxed);
+            g_target.store(tid, std::memory_order_release);
+            if (syscall(SYS_tgkill, process, tid, SampleSignal) != 0) {
+                continue;
+            }
+            // The handler runs as soon as the thread is scheduled; a thread that doesn't get
+            // there within 2 ms is skipped this round.
+            const std::uint64_t give_up = NowNs() + 2'000'000;
+            while (!g_done.load(std::memory_order_acquire) && NowNs() < give_up) {
+            }
+            g_target.store(0, std::memory_order_release);
+            if (!g_done.load(std::memory_order_acquire)) {
+                continue;
+            }
+            const std::uint64_t pc = g_pc.load(std::memory_order_relaxed);
+            if (pc == 0) {
+                continue;
+            }
+            Put(file, KindSample);
+            Put(file, static_cast<std::uint8_t>(index));
+            Put(file, static_cast<std::uint8_t>(1));
+            Put(file, static_cast<std::uint8_t>(0));
+            Put(file, now);
+            Put(file, pc);
+            ++samples;
+        }
+        next += period;
+        const std::uint64_t after = NowNs();
+        if (next > after) {
+            const timespec wait{static_cast<time_t>((next - after) / 1'000'000'000ULL),
+                                static_cast<long>((next - after) % 1'000'000'000ULL)};
+            nanosleep(&wait, nullptr);
+        } else {
+            next = after;
+        }
+    }
+    Put(file, KindEnd);
+    file.close();
+    LOG_INFO(Common, "Sample profile: {} samples of {} threads at {} Hz written to {}", samples,
+             threads_written, config.hz, path.string());
+}
+
+#endif
+
 } // namespace
 
 bool Requested() {
@@ -266,6 +472,18 @@ void OnThreadNamed(const char* name) {
             return;
         }
         sampled_threads[index] = {handle, name};
+        num_threads.store(index + 1, std::memory_order_release);
+    }
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread{SamplerMain}.detach(); });
+#elif defined(__linux__) && !defined(__ANDROID__)
+    {
+        std::scoped_lock lock{threads_mutex};
+        const size_t index = num_threads.load(std::memory_order_relaxed);
+        if (index == MaxThreads) {
+            return;
+        }
+        sampled_threads[index] = {CurrentTid(), name};
         num_threads.store(index + 1, std::memory_order_release);
     }
     static std::once_flag started;

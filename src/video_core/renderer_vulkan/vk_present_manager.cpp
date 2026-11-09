@@ -368,6 +368,31 @@ void PresentManager::PresentThread(std::stop_token token) {
             Common::Nx2Timeline::Span timeline_span{"present: wait for frame"};
             frame_cv.wait(lock, token, [this] { return !present_queue.empty(); });
         }
+        if (!token.stop_requested() && Settings::values.frame_gen.GetValue()) {
+            // Frame generation queues its frames and the real one back to back. A compositor
+            // (gamescope on SteamOS) shows only the newest image of each refresh, so frames
+            // reaching it within one refresh were never seen: 90-150 of 600 per 10 s on an
+            // RX 6900 XT. Hand them over one per refresh, on the refresh grid the shown frames
+            // give: spacing each a refresh after the previous one drifted, skipping a refresh and
+            // then putting two in the next (still 70-90 of 600, and a 90 ms queue). Before the
+            // grid is known, about a refresh apart. Only this thread pops the queue, so the frame
+            // stays at its front while the lock is released.
+            const auto period = pacer.RefreshPeriod();
+            const auto now = std::chrono::steady_clock::now();
+            auto earliest = last_frame_gen_present + period * 15 / 16;
+            if (const long long to_next = pacer.NsToNextGridRefresh(now); to_next >= 0) {
+                const auto next_refresh = now + std::chrono::nanoseconds{to_next};
+                earliest = last_frame_gen_present >= next_refresh - period
+                               ? next_refresh + std::chrono::milliseconds{1}
+                               : now;
+            }
+            if (now < earliest) {
+                lock.unlock();
+                std::this_thread::sleep_until(earliest);
+                lock.lock();
+            }
+            last_frame_gen_present = std::chrono::steady_clock::now();
+        }
         if (!token.stop_requested()) {
             bool held = false;
             if (present_wait_enabled) {

@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "common/settings.h"
 
 // EXPERIMENT (not for nx2): GPU back-thread optimizations for Ocarina of Time.
 // split_overlap is quarantined. Frizti build: the options reviewed as exact rewrites are on by
@@ -64,7 +65,7 @@ inline bool Enabled() {
 
 inline bool On(Opt opt) {
     static const unsigned off = [] {
-        const auto bit = [](Opt opt) { return 1U << static_cast<unsigned>(opt); };
+        const auto bit = [](Opt option) { return 1U << static_cast<unsigned>(option); };
         const auto names = [](const char* variable) {
             unsigned bits = 0;
             std::string_view list = std::getenv(variable) ? std::getenv(variable) : "";
@@ -87,12 +88,21 @@ inline bool On(Opt opt) {
         };
         // FramesAhead is on: with Ocarina's CPU readbacks preflushed it is worth ~1 fps (48.3 ->
         // 49.5 on the Kokiri porch) and it waits for this frame too whenever the GPU falls behind.
+        // FrontSleep is on: the front spun through its waits for the back, ~600 ms/s of a core
+        // on a Ryzen 5 5500 + RX 6900 XT (RADV); sleeping cut that to ~70 ms/s, intro 52 -> 57 fps.
         const unsigned default_off = bit(Opt::CleanWords) |
                                      bit(Opt::IndexRebind) | bit(Opt::SubmitBudget) |
                                      bit(Opt::FenceFlush) | bit(Opt::FragmentBarrier) |
-                                     bit(Opt::FrontSleep) | bit(Opt::AsyncPipelines) |
-                                     bit(Opt::Bounds);
-        unsigned mask = (default_off & ~names("EDEN_NX2_PERF_ON")) | names("EDEN_NX2_PERF_OFF");
+                                     bit(Opt::AsyncPipelines) | bit(Opt::Bounds);
+        unsigned settings_on = 0;
+        if (Settings::values.nx2_fast_buffer_binding.GetValue()) {
+            settings_on |= bit(Opt::CleanWords) | bit(Opt::Bounds) | bit(Opt::IndexRebind);
+        }
+        if (Settings::values.nx2_async_pipelines.GetValue()) {
+            settings_on |= bit(Opt::AsyncPipelines);
+        }
+        unsigned mask = (default_off & ~settings_on & ~names("EDEN_NX2_PERF_ON")) |
+                        names("EDEN_NX2_PERF_OFF");
         mask |= bit(Opt::SplitOverlap);
         if (const char* value = std::getenv("EDEN_NX2_PERF_FRAMES_AHEAD"); value && value[0] == '0') {
             mask |= bit(Opt::FramesAhead);

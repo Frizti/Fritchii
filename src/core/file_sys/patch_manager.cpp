@@ -96,6 +96,20 @@ constexpr std::array<u8, 120> DYNAMIC_FPS_ROUTINE{
     0x03, 0x09, 0x23, 0x1E, 0x40, 0x20, 0x23, 0x1E, 0x4D, 0x00, 0x00, 0x54,
     0x48, 0x40, 0x20, 0x1E, 0xC0, 0x03, 0x5F, 0xD6, 0x0A, 0xD7, 0x83, 0x3F,
 };
+// With oot_exact_frame_time: the same routine stepping by each frame's measured time (clamped to
+// 50 ms as before) instead of its running average, which moved 1/8 of the way per frame and so
+// made up a slow frame over the next ones. Instructions 13-17 (the average) become
+// mov x12, x11 and four nops; the length, the branch and the literal stay where they were.
+constexpr std::array<u8, 120> DYNAMIC_FPS_ROUTINE_EXACT = [] {
+    auto routine = DYNAMIC_FPS_ROUTINE;
+    constexpr std::array<u8, 20> exact{
+        0xEC, 0x03, 0x0B, 0xAA, // mov x12, x11
+        0x1F, 0x20, 0x03, 0xD5, 0x1F, 0x20, 0x03, 0xD5, 0x1F, 0x20, 0x03, 0xD5,
+        0x1F, 0x20, 0x03, 0xD5, // nop x4
+    };
+    std::copy(exact.begin(), exact.end(), routine.begin() + 13 * 4);
+    return routine;
+}();
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x6E6CC4, .bytes = DYNAMIC_FPS_CALL},
     BuiltinPatchRecord{.module_offset = 0x3C46200, .bytes = DYNAMIC_FPS_ROUTINE},
@@ -164,6 +178,20 @@ constexpr std::array BUILTIN_PATCHES{
         .enable_env = "EDEN_NX2_OOT_POLL_BACKOFF",
     },
 };
+
+/// Opt-in patches apply while their environment variable is 1; Occlusion Off also with its
+/// setting (oot_occlusion_off).
+bool BuiltinPatchOptedIn(const BuiltinPatch& patch) {
+    if (patch.enable_env == nullptr) {
+        return true;
+    }
+    if (patch.records.data() == OCCLUSION_OFF_RECORDS.data() &&
+        Settings::values.oot_occlusion_off.GetValue()) {
+        return true;
+    }
+    const char* const value = std::getenv(patch.enable_env);
+    return value != nullptr && std::string_view{value} == "1";
+}
 
 enum class TitleVersionFormat : u8 {
     ThreeElements, ///< vX.Y.Z
@@ -588,11 +616,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.title_id != title_id || patch.module != name) {
             continue;
         }
-        if (patch.enable_env != nullptr) {
-            const char* const value = std::getenv(patch.enable_env);
-            if (value == nullptr || std::string_view{value} != "1") {
-                continue;
-            }
+        if (!BuiltinPatchOptedIn(patch)) {
+            continue;
         }
         // disable_env=1 skips the patch, =0 applies it even when Add-Ons has it off (A/B runs).
         const char* const ab_value = patch.disable_env ? std::getenv(patch.disable_env) : nullptr;
@@ -648,12 +673,20 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (!apply) {
             continue;
         }
+        const bool exact_frame_time = Settings::values.oot_exact_frame_time.GetValue();
         for (const BuiltinPatchRecord& record : patch.records) {
+            std::span<const u8> bytes = record.bytes;
+            if (exact_frame_time && bytes.data() == DYNAMIC_FPS_ROUTINE.data()) {
+                bytes = DYNAMIC_FPS_ROUTINE_EXACT;
+            }
             std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.module_offset,
-                        record.bytes.data(), record.bytes.size());
+                        bytes.data(), bytes.size());
         }
-        LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}", patch.name,
-                 patch.records.size(), name);
+        LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}{}", patch.name,
+                 patch.records.size(), name,
+                 exact_frame_time && &patch.records.front() == &DYNAMIC_FPS_RECORDS.front()
+                     ? " (exact frame timing)"
+                     : "");
     }
 
     if (out.size() < sizeof(Loader::NSOHeader)) {
@@ -1212,10 +1245,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id ||
-            (patch.enable_env != nullptr &&
-             std::string_view{std::getenv(patch.enable_env) ? std::getenv(patch.enable_env) : ""} !=
-                 "1")) {
+        if (patch.title_id != title_id || !BuiltinPatchOptedIn(patch)) {
             continue;
         }
         const auto patch_disabled =

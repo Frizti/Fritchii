@@ -345,6 +345,16 @@ fs::path GetAppDataRoamingDirectory() {
 
 #else
 
+fs::path GetExeDirectory() {
+    std::error_code error;
+#ifdef __linux__
+    if (const fs::path exe = fs::read_symlink("/proc/self/exe", error); !error) {
+        return exe.parent_path();
+    }
+#endif
+    return fs::current_path(error);
+}
+
 fs::path GetHomeDirectory() {
     const char* home_env_var = getenv("HOME");
 
