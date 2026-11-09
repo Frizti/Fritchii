@@ -161,6 +161,22 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{true}; ///< Collect what only the debug statistics lines use
+    struct TransientTarget {
+        ImageId id;
+        u64 allocation_tick;
+        u64 check_tick;
+        u32 survived;
+    };
+    std::deque<TransientTarget> transient_targets;
+    u64 transient_evictions{};
+    u64 logged_transient_evictions{};
+    [[nodiscard]] static u64 RtEvictPressureFrames() {
+        static const u64 frames = [] {
+            const char* value = std::getenv("EDEN_NX2_RT_EVICT_PRESSURE");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : u64{8};
+        }();
+        return frames;
+    }
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
