@@ -309,7 +309,9 @@ int main(int argc, char* argv[]) {
         qputenv("DISPLAY", ":0");
     }
 
-    if (GraphicsBackend::GetForceX11() && qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
+    // A desktop session often exports QT_QPA_PLATFORM itself (e.g. "wayland;xcb"); an explicit
+    // in-app "Use X11" choice has to win over that, so only an xcb-first list is left alone.
+    if (GraphicsBackend::GetForceX11() && !qgetenv("QT_QPA_PLATFORM").startsWith("xcb"))
         qputenv("QT_QPA_PLATFORM", "xcb");
 
     // Fix the Wayland appId. This needs to match the name of the .desktop file without the .desktop
