@@ -466,6 +466,8 @@ std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 std::atomic<std::chrono::nanoseconds::rep> hold_time_total_ns{};
 } // Anonymous namespace
 
+void NoteDrawReuseProbeFrame(); // vk_rasterizer.cpp calls this via its own forward declaration
+
 void NoteDrawReuseProbeFrame() {
     if (DrawReuseProbe::Enabled()) [[unlikely]] {
         DrawReuseProbe::Get().Frame();
