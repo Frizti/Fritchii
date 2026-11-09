@@ -326,6 +326,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, nx2_async_pipelines, tr("Switch 2: build shaders off the GPU thread"),
            tr("Builds new shaders on a worker thread so the GPU thread does not stall on them "
               "(fewer hitches when new areas load). Takes effect after restarting the emulator."));
+    INSERT(Settings, nx2_exclusive_gpu_cores, tr("Switch 2: GPU threads get their cores to themselves (Linux)"),
+           tr("Moves every other emulator thread off the two CPU cores the GPU threads are pinned "
+              "to, so nothing shares those cores with them. The GPU threads run faster, everything "
+              "else shares the remaining cores. Try it on CPUs with 6 cores or more. Takes effect "
+              "when the game starts."));
     INSERT(Settings, oot_occlusion_off, tr("Ocarina of Time: Occlusion Off"),
            tr("The game stops asking the GPU which objects are hidden, which removes many GPU "
               "thread waits, but it draws hidden objects too. Can be faster or slower. Takes "

@@ -665,6 +665,10 @@ struct Values {
                                                     Category::RendererAdvanced};
     SwitchableSetting<bool> nx2_async_pipelines{linkage, true, "nx2_async_pipelines",
                                                 Category::RendererAdvanced};
+    // Linux, with thread pinning: no other emulator thread runs on the GPU threads' cores (as
+    // EDEN_GPU_PIN_EXCLUSIVE=1). Read when the GPU threads start.
+    SwitchableSetting<bool> nx2_exclusive_gpu_cores{linkage, false, "nx2_exclusive_gpu_cores",
+                                                    Category::RendererAdvanced};
     // Ocarina of Time: the built-in Occlusion Off patch (as EDEN_NX2_OCCLUSION_OFF=1). Read when
     // the game starts.
     SwitchableSetting<bool> oot_occlusion_off{linkage, false, "oot_occlusion_off",

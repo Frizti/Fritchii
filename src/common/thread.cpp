@@ -611,7 +611,12 @@ Common::ThreadPinning::Topology ReadPinningTopology() {
 #endif
 
 #if defined(__linux__) && !defined(__ANDROID__)
+#include <cerrno>
+#include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <sys/syscall.h>
+#include "common/settings.h"
 
 namespace {
 std::string ReadSysfsLine(const std::string& path) {
@@ -687,6 +692,69 @@ Common::ThreadPinning::Topology ReadPinningTopology() {
         }
     }
     return topology;
+}
+
+/// EDEN_GPU_PIN_EXCLUSIVE=1 or the nx2_exclusive_gpu_cores setting (after zortos293/Lichii#913):
+/// take the GPU threads' cores out of every other thread's affinity, so no other emulator thread
+/// shares a core (its SMT sibling) with them. Threads created later inherit their creator's
+/// affinity; a thread left with no CPU keeps its mask.
+bool ExclusiveGpuCores() {
+    if (const char* value = std::getenv("EDEN_GPU_PIN_EXCLUSIVE")) {
+        return value[0] != '\0' && value[0] != '0';
+    }
+    return Settings::values.nx2_exclusive_gpu_cores.GetValue();
+}
+
+void KeepOtherThreadsOffGpuCores(u64 gpu_mask, pid_t front, pid_t back) {
+    std::size_t moved = 0;
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task", error)) {
+        const pid_t tid =
+            static_cast<pid_t>(std::strtol(entry.path().filename().c_str(), nullptr, 10));
+        if (tid <= 0 || tid == front || tid == back) {
+            continue;
+        }
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(tid, sizeof(set), &set) != 0) {
+            continue;
+        }
+        bool changed = false;
+        for (int cpu = 0; cpu < 64; ++cpu) {
+            if (((gpu_mask >> cpu) & 1) != 0 && CPU_ISSET(cpu, &set)) {
+                CPU_CLR(cpu, &set);
+                changed = true;
+            }
+        }
+        if (changed && CPU_COUNT(&set) > 0 && sched_setaffinity(tid, sizeof(set), &set) == 0) {
+            ++moved;
+        }
+    }
+    LOG_INFO(Common, "Thread pinning: moved {} other threads off the GPU cores {:#x}", moved,
+             gpu_mask);
+}
+
+/// Sweeps once both GPU threads of a session are pinned (a new session has new threads).
+void NoteGpuThreadPinned(Common::PinnedRole role, u64 mask) {
+    static std::mutex mutex;
+    static pid_t front{}, back{}, swept_front{}, swept_back{};
+    static u64 front_mask{}, back_mask{};
+    std::scoped_lock lock{mutex};
+    const pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+    if (role == Common::PinnedRole::GpuFront) {
+        front = tid;
+        front_mask = mask;
+    } else {
+        back = tid;
+        back_mask = mask;
+    }
+    if (front == 0 || back == 0 || (front == swept_front && back == swept_back) ||
+        !ExclusiveGpuCores()) {
+        return;
+    }
+    swept_front = front;
+    swept_back = back;
+    KeepOtherThreadsOffGpuCores(front_mask | back_mask, front, back);
 }
 } // Anonymous namespace
 #endif
@@ -863,6 +931,8 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
         }
         if (sched_setaffinity(0, sizeof(set), &set) != 0) {
             LOG_WARNING(Common, "Could not pin thread: {}", std::strerror(errno));
+        } else if (role != PinnedRole::GuestCore) {
+            NoteGpuThreadPinned(role, mask);
         }
 #endif
     }
