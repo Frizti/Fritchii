@@ -249,7 +249,7 @@ private:
     void UpdateStencilOp(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs);
-    void UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs);
+    void UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs, const GraphicsPipeline* pipeline);
     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
@@ -334,6 +334,8 @@ private:
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    /// Fragment output components the dynamic color write mask was last recorded with
+    u32 last_color_output_mask{};
     VideoCommon::OotNetwork::BypassState oot_network_bypass;
     u32 mesh_emulation_groups{};             ///< mesh workgroups of the emulated draw
     u32 mesh_emulation_vertices_per_group{}; ///< 0 unless the draw is an emulated mesh draw
