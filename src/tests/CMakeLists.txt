@@ -141,6 +141,13 @@ endif()
 
 add_test(NAME tests COMMAND tests)
 
+add_executable(mod_manager_tests
+    frontend_common/mod_manager.cpp
+    ../frontend_common/data_manager.cpp
+    ../frontend_common/mod_manager.cpp)
+target_link_libraries(mod_manager_tests PRIVATE common Catch2::Catch2WithMain)
+add_test(NAME mod_manager_tests COMMAND mod_manager_tests)
+
 add_executable(update_checker_tests
     common/update_checker.cpp
     ../frontend_common/update_checker.cpp)
