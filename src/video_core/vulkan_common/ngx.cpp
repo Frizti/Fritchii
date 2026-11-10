@@ -3,23 +3,101 @@
 
 #include <cstdlib>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <nvsdk_ngx_helpers_vk.h>
+
+#include "common/scm_rev.h"
 
 namespace Vulkan::Ngx {
 namespace {
 constexpr const char* PROJECT_ID = "8d3e2f9a-6b41-4c7e-9a52-1f0c3b7d5e64";
+constexpr std::string_view UNVERSIONED_RUNTIME = "libnvidia-ngx-dlss.so";
+constexpr std::string_view VERSIONED_PREFIX = "libnvidia-ngx-dlss.so.";
 enum class Phase { Disabled, Prepared, Attached };
 struct Runtime {
     Phase phase{};
     VkDevice device{};
     std::wstring path;
     std::wstring cache;
+    std::string engine_version;
     const wchar_t* search_path{};
     NVSDK_NGX_FeatureCommonInfo info{};
     NVSDK_NGX_Result result{};
 };
 Runtime runtime;
+
+// NGX PathListInfo is a list of directories. NVIDIA's driver/NGX Core loads the
+// unversioned feature library name libnvidia-ngx-dlss.so from those directories
+// (see the DLSS SDK guide). A versioned SDK file such as
+// libnvidia-ngx-dlss.so.310.9.16 is accepted by staging a symlink to that
+// unversioned name in the writable cache directory, so the source folder can
+// stay read-only and no user-created symlink is required.
+std::filesystem::path FindRuntimeFile(const std::filesystem::path& dir) {
+    std::error_code error;
+    if (dir.empty()) {
+        return {};
+    }
+    const auto unversioned = dir / UNVERSIONED_RUNTIME;
+    if (std::filesystem::is_regular_file(unversioned, error)) {
+        return unversioned;
+    }
+    if (!std::filesystem::is_directory(dir, error)) {
+        return {};
+    }
+    std::filesystem::path found;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             dir, std::filesystem::directory_options::skip_permission_denied, error)) {
+        std::error_code file_error;
+        const auto name = entry.path().filename().string();
+        if (name.starts_with(VERSIONED_PREFIX) && name.size() > VERSIONED_PREFIX.size() &&
+            entry.is_regular_file(file_error)) {
+            if (found.empty() || name > found.filename().string()) {
+                found = entry.path();
+            }
+        }
+    }
+    return found;
+}
+
+std::filesystem::path SearchDirectory(const std::filesystem::path& source,
+                                      const std::filesystem::path& file,
+                                      const std::filesystem::path& cache) {
+    if (file.filename() == UNVERSIONED_RUNTIME) {
+        return source;
+    }
+    std::error_code error;
+    const auto link = cache / UNVERSIONED_RUNTIME;
+    const auto status = std::filesystem::symlink_status(link, error);
+    if (status.type() == std::filesystem::file_type::symlink) {
+        std::filesystem::remove(link, error);
+        if (error) {
+            return {};
+        }
+    } else if (status.type() != std::filesystem::file_type::not_found) {
+        return {};
+    }
+    std::filesystem::create_symlink(std::filesystem::absolute(file), link, error);
+    if (error) {
+        return {};
+    }
+    return cache;
+}
+
+void SetEngineVersion() {
+    if (!runtime.engine_version.empty()) {
+        return;
+    }
+    const std::string_view name = Common::g_build_name;
+    const std::string_view version = Common::g_build_version;
+    if (name.empty() || version.empty()) {
+        runtime.engine_version = "Fritchii-v5.6";
+        return;
+    }
+    runtime.engine_version = version.front() == 'v' || version.front() == 'V'
+                                 ? std::string(name) + "-" + std::string(version)
+                                 : std::string(name) + "-v" + std::string(version);
+}
 
 NVSDK_NGX_FeatureDiscoveryInfo Discovery() {
     NVSDK_NGX_FeatureDiscoveryInfo discovery{};
@@ -28,7 +106,7 @@ NVSDK_NGX_FeatureDiscoveryInfo Discovery() {
     discovery.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
     discovery.Identifier.v.ProjectDesc.ProjectId = PROJECT_ID;
     discovery.Identifier.v.ProjectDesc.EngineType = NVSDK_NGX_ENGINE_TYPE_CUSTOM;
-    discovery.Identifier.v.ProjectDesc.EngineVersion = "Fritchii-v4";
+    discovery.Identifier.v.ProjectDesc.EngineVersion = runtime.engine_version.c_str();
     discovery.ApplicationDataPath = runtime.cache.c_str();
     discovery.FeatureInfo = &runtime.info;
     return discovery;
@@ -95,11 +173,15 @@ NVSDK_NGX_Resource_VK Resource(const NvidiaDlssImage& image, VkExtent2D extent, 
 bool Prepare(const std::filesystem::path& path, const std::filesystem::path& cache) {
     if (runtime.phase == Phase::Attached) return true;
     runtime.phase = Phase::Disabled;
+    const auto file = FindRuntimeFile(path);
+    if (file.empty()) return false;
     std::error_code error;
-    if (path.empty() || !std::filesystem::is_regular_file(path / "libnvidia-ngx-dlss.so", error)) return false;
     std::filesystem::create_directories(cache, error);
     if (error) return false;
-    runtime.path = std::filesystem::absolute(path).wstring();
+    const auto search = SearchDirectory(path, file, cache);
+    if (search.empty()) return false;
+    SetEngineVersion();
+    runtime.path = std::filesystem::absolute(search).wstring();
     runtime.cache = std::filesystem::absolute(cache).wstring();
     runtime.search_path = runtime.path.c_str();
     runtime.info = {};
@@ -135,8 +217,9 @@ bool Initialize(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
                 PFN_vkGetInstanceProcAddr get_instance, PFN_vkGetDeviceProcAddr get_device) {
     if (!WantsDevice()) return false;
     runtime.result = NVSDK_NGX_VULKAN_Init_with_ProjectID(
-        PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "Fritchii-v4", runtime.cache.c_str(),
-        instance, physical, device, get_instance, get_device, &runtime.info);
+        PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, runtime.engine_version.c_str(),
+        runtime.cache.c_str(), instance, physical, device, get_instance, get_device,
+        &runtime.info);
     if (NVSDK_NGX_FAILED(runtime.result)) {
         runtime.phase = Phase::Disabled;
         return false;

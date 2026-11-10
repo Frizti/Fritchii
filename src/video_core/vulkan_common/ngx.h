@@ -23,7 +23,6 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
                   u32 graphics_family, vk::DeviceDispatch& dispatch);
 void Stop();
 u32 LastResult();
-std::filesystem::path RuntimeDirectory();
 
 // Evaluate runs only on the recording worker. Reconfiguration and destruction require GPU idle.
 class Feature {
