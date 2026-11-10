@@ -1378,10 +1378,20 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (!passes) {
         return false;
     }
-    if (passes->spatial_only && (native_key == passes->prepass || native_key == passes->output)) {
+    // EDEN_NX2_DLSS_PREPASS_KEY=<hex>: another program that starts the chain as the captured
+    // prepass does (a game update can change the prepass and keep the output pass: then the
+    // chain never starts, the output pass runs natively and the replacement never applies).
+    static const u64 extra_prepass = [] {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_PREPASS_KEY");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
+    }();
+    const bool prepass = native_key == passes->prepass ||
+                         (passes->prepass_alt != 0 && native_key == passes->prepass_alt) ||
+                         (extra_prepass != 0 && native_key == extra_prepass);
+    if (passes->spatial_only && (prepass || native_key == passes->output)) {
         TraceDlssContract(native_key, false);
     }
-    if (native_key == passes->prepass) {
+    if (prepass) {
         dlss_chain.spatial_only = passes->spatial_only;
         CaptureFireEmblemJitter();
         dlss_chain.active = true;
@@ -1403,8 +1413,7 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
         return replacement && FinishDlssEvaluation();
     }
     return dlss_chain.failure != VideoCore::GameDlssReason::None &&
-           native_key != passes->prepass &&
-           dlss_chain.programs.contains(native_key);
+           !prepass && dlss_chain.programs.contains(native_key);
 }
 
 // The game's own DLSS network (its translated programs) is shown once every pass of an
