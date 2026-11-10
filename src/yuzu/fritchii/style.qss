@@ -89,7 +89,7 @@ QTabWidget::pane { border: none; }
 QTabBar::tab {
     background: transparent;
     color: #9a9aa8;
-    padding: 8px 14px;
+    padding: 6px 10px;
     border: none;
     border-bottom: 2px solid transparent;
 }
@@ -214,3 +214,27 @@ QToolButton#FritchiiTile {
     font-size: 13px;
 }
 QToolButton#FritchiiTile:hover { background: #1b1b1f; color: #ececf1; }
+
+/* Compact layout for Controls settings */
+QWidget#ConfigureInput QPushButton, QWidget#ConfigureInputPlayer QPushButton {
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+}
+QWidget#ConfigureInput QGroupBox, QWidget#ConfigureInputPlayer QGroupBox {
+    margin-top: 14px;
+    padding: 8px 6px 6px 6px;
+    border-radius: 8px;
+    font-size: 11px;
+}
+QWidget#ConfigureInput QGroupBox::title, QWidget#ConfigureInputPlayer QGroupBox::title {
+    font-size: 11px;
+}
+QWidget#ConfigureInput QLabel, QWidget#ConfigureInputPlayer QLabel {
+    font-size: 11px;
+}
+QWidget#ConfigureInput QComboBox, QWidget#ConfigureInputPlayer QComboBox {
+    padding: 2px 6px;
+    font-size: 11px;
+    border-radius: 6px;
+}

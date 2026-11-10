@@ -118,7 +118,7 @@
           <item>
            <widget class="QComboBox" name="comboDevices">
             <property name="minimumContentsLength">
-             <number>60</number>
+             <number>20</number>
             </property>
            </widget>
           </item>

@@ -227,9 +227,26 @@ void PlayerControlPreview::UpdateInput() {
 
 void PlayerControlPreview::paintEvent(QPaintEvent* event) {
     QFrame::paintEvent(event);
+    if (rect().width() <= 0 || rect().height() <= 0) {
+        return;
+    }
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
-    const QPointF center = rect().center();
+
+    // Approximate bounding box of the controller preview drawings (~460x340 px)
+    constexpr qreal base_width = 460.0;
+    constexpr qreal base_height = 340.0;
+
+    const qreal scale_x = static_cast<qreal>(rect().width()) / base_width;
+    const qreal scale_y = static_cast<qreal>(rect().height()) / base_height;
+    const qreal scale = std::min(scale_x, scale_y);
+
+    p.save();
+    p.translate(rect().center());
+    if (scale < 1.0) {
+        p.scale(scale, scale);
+    }
+    const QPointF center(0, 0);
 
     switch (controller_type) {
     case Core::HID::NpadStyleIndex::Handheld:
@@ -252,6 +269,8 @@ void PlayerControlPreview::paintEvent(QPaintEvent* event) {
         DrawProController(p, center);
         break;
     }
+
+    p.restore();
 }
 
 void PlayerControlPreview::DrawLeftController(QPainter& p, const QPointF center) {
