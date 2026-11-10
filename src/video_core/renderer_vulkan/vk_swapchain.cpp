@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <limits>
 #include <vector>
 
@@ -18,12 +19,15 @@
 #include "common/settings_enums.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/present_stats.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "vulkan/vulkan_core.h"
 
 namespace Vulkan {
+
+static std::atomic<u64> presented_frames{};
 
 namespace {
 
@@ -271,6 +275,9 @@ u64 Swapchain::Present(VkSemaphore render_semaphore) {
         LOG_CRITICAL(Render_Vulkan, "Failed to present with error {}", string_VkResult(result));
         break;
     }
+    if (queued) {
+        presented_frames.fetch_add(1, std::memory_order_relaxed);
+    }
     ++frame_index;
     if (frame_index >= image_count) {
         frame_index = 0;
@@ -400,3 +407,7 @@ bool Swapchain::NeedsPresentModeUpdate() const {
 }
 
 } // namespace Vulkan
+
+u64 VideoCore::PresentedFrameCount() {
+    return Vulkan::presented_frames.load(std::memory_order_relaxed);
+}

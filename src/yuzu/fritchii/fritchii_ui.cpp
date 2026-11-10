@@ -153,9 +153,8 @@ bool ApplyTheme() {
     return true;
 }
 
-bool HidesSetting(const std::string& label) {
-    // No frame generation in Fritchii (real frames only), and its options are dev tools.
-    return Enabled() && label.starts_with("frame_gen");
+bool HidesSetting(const std::string&) {
+    return false;
 }
 
 QIcon Icon(const QString& name, int px) {
