@@ -90,13 +90,16 @@ void SetEngineVersion() {
     }
     const std::string_view name = Common::g_build_name;
     const std::string_view version = Common::g_build_version;
-    if (name.empty() || version.empty()) {
-        runtime.engine_version = "Fritchii-v5.6";
+    // Use the real build strings when they are present. A bare "Fritchii" is the
+    // fallback so this never embeds a stale version number.
+    const std::string engine_name = name.empty() ? "Fritchii" : std::string(name);
+    if (version.empty()) {
+        runtime.engine_version = engine_name;
         return;
     }
     runtime.engine_version = version.front() == 'v' || version.front() == 'V'
-                                 ? std::string(name) + "-" + std::string(version)
-                                 : std::string(name) + "-v" + std::string(version);
+                                 ? engine_name + "-" + std::string(version)
+                                 : engine_name + "-v" + std::string(version);
 }
 
 NVSDK_NGX_FeatureDiscoveryInfo Discovery() {
