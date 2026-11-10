@@ -736,22 +736,22 @@ Aggressive mode may impact performance of other applications such as recording s
     <message>
         <location filename="../../src/qt_common/config/shared_translation.cpp" line="198"/>
         <source>GPU Readback Before NCE Invalidation</source>
-        <translation type="unfinished"/>
+        <translation>本机代码执行（NCE）失效前 GPU 回读</translation>
     </message>
     <message>
         <location filename="../../src/qt_common/config/shared_translation.cpp" line="199"/>
         <source>Flushes GPU buffer data back to guest memory before NCE invalidates the whole guest page, preserving it while the CPU store proceeds.</source>
-        <translation type="unfinished"/>
+        <translation>在本机代码执行（NCE）使整个客户机页面失效之前，将 GPU 缓冲区数据写回客户机内存，以便在 CPU 写入进行期间保留这些数据。</translation>
     </message>
     <message>
         <location filename="../../src/qt_common/config/shared_translation.cpp" line="202"/>
         <source>Patch Runtime NROs for NCE</source>
-        <translation type="unfinished"/>
+        <translation>为本机代码执行（NCE）修补运行时 NRO</translation>
     </message>
     <message>
         <location filename="../../src/qt_common/config/shared_translation.cpp" line="203"/>
         <source>Applies NCE code patches to runtime-loaded NRO modules.This is required for some games to run correctly.</source>
-        <translation type="unfinished"/>
+        <translation>对运行时加载的 NRO 模块应用本机代码执行（NCE）代码补丁。某些游戏需要此项才能正常运行。</translation>
     </message>
     <message>
         <location filename="../../src/qt_common/config/shared_translation.cpp" line="205"/>
@@ -854,7 +854,11 @@ Immediate is the fastest option, but can introduce some issues.
 Balanced offers better compatibility and may fix issues in some games.
 Accurate further improves compatibility at the cost of some performance.
 Default follows the GPU Mode setting.</source>
-        <translation type="unfinished"/>
+        <translation>控制 GPU 围栏同步行为。
+“即时”速度最快，但可能会引发一些问题。
+“平衡”兼容性更好，可能会修复某些游戏中的问题。
+“高精度”能进一步提高兼容性，但会牺牲一些性能。
+默认跟随 GPU 模式设置。</translation>
     </message>
     <message>
         <location filename="../../src/qt_common/config/shared_translation.cpp" line="238"/>
