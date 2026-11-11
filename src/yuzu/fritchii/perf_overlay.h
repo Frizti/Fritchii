@@ -21,8 +21,9 @@ namespace FritchiiUi {
 /// Fritchii's performance overlay (View > Performance Overlay): a Graphite panel with the frame
 /// rate in big type, the frame time and the lowest recent frame rate, and a violet line of the
 /// last minute and a half against the target (60, or 30 with OoT at 30 FPS), plus Fritchii's RAM
-/// and VRAM with what is left of each (Windows). Freezes and loading screens break the line instead of pulling
-/// it to zero. Drag it anywhere; right-click hides it.
+/// and VRAM with what is left of each (Windows), and with DLSS Frame Generation the frames shown
+/// against the real ones. Freezes and loading screens break the line instead of pulling it to zero.
+/// Drag it anywhere; right-click hides it.
 class PerfOverlay : public QWidget {
     Q_OBJECT
 public:
@@ -46,6 +47,10 @@ private:
     double ram_free_gb = -1;  ///< RAM the PC has free
     double vram_used_gb = -1; ///< Fritchii's video memory on its GPU (-1: unknown)
     double vram_left_gb = -1; ///< What Windows still lets Fritchii use there (budget - used)
+    bool frame_gen = false;    ///< DLSS Frame Generation is available this session
+    bool frame_gen_on = false; ///< It is adding frames now
+    double frame_gen_real = 0;
+    double frame_gen_shown = 0;
     QPoint offset{24, 80};
     QPoint drag_start;
 };

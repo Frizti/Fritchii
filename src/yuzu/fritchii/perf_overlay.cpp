@@ -15,6 +15,10 @@
 #include "common/settings.h"
 #include "core/perf_stats.h"
 #include "yuzu/main_window.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#include "video_core/vulkan_common/streamline_frame_gen.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -34,6 +38,8 @@ constexpr int Width = 272;
 constexpr int Height = 210;
 constexpr int RamRowTop = 66;
 constexpr int VramRowTop = RamRowTop + 26;
+constexpr int FrameGenRowTop = VramRowTop + 26;
+constexpr int FrameGenRowHeight = 26;
 constexpr int Pad = 18;
 constexpr int GraphHeight = 54;
 
@@ -151,6 +157,16 @@ void PerfOverlay::OnStats(const Core::PerfStatsResults& results) {
         vram_left_gb = -1;
     }
 #endif
+#ifdef EGLANTINE_STREAMLINE
+    frame_gen = Vulkan::Streamline::FrameGenAvailable();
+    if (frame_gen) {
+        const auto rates = Vulkan::Streamline::FrameGenRecentRates();
+        frame_gen_on = rates.generating;
+        frame_gen_real = rates.real_fps;
+        frame_gen_shown = rates.shown_fps;
+    }
+    setFixedSize(Width, frame_gen ? Height + FrameGenRowHeight : Height);
+#endif
     update();
 }
 
@@ -222,8 +238,29 @@ void PerfOverlay::paintEvent(QPaintEvent*) {
     memory_row(RamRowTop, ram_used_gb, tr("RAM"), ram_free_gb, 2.0);
     memory_row(VramRowTop, vram_used_gb, tr("VRAM"), vram_left_gb, 1.0);
 
+    // DLSS Frame Generation: frames on screen, then the real ones. Violet while it adds frames,
+    // muted while it is paused (menus, movies, loading).
+    if (frame_gen) {
+        const QString shown_text = QString::number(std::lround(frame_gen_shown));
+        painter.setFont(value);
+        painter.setPen(Text);
+        painter.drawText(QRect(Pad, FrameGenRowTop, 120, 22), Qt::AlignLeft | Qt::AlignVCenter,
+                         shown_text);
+        const int shown_width = QFontMetrics(value).horizontalAdvance(shown_text);
+        painter.setFont(label);
+        painter.setPen(Muted);
+        painter.drawText(QRect(Pad + shown_width + 6, FrameGenRowTop, 60, 22),
+                         Qt::AlignLeft | Qt::AlignVCenter, tr("shown"));
+        const long real = std::lround(frame_gen_real);
+        painter.setPen(frame_gen_on ? Accent : Muted);
+        painter.drawText(QRect(right - 140, FrameGenRowTop, 140, 22),
+                         Qt::AlignRight | Qt::AlignVCenter,
+                         frame_gen_on ? tr("%1 real (DLSS FG)").arg(real)
+                                      : tr("%1 real (FG paused)").arg(real));
+    }
+
     // The line: the last samples against the target frame rate.
-    const QRectF graph(Pad, Height - Pad - GraphHeight, Width - 2 * Pad, GraphHeight);
+    const QRectF graph(Pad, height() - Pad - GraphHeight, Width - 2 * Pad, GraphHeight);
     const double target = Settings::values.oot_30fps.GetValue() ? 30.0 : 60.0;
     double top = target * 1.25;
     for (const double sample : fps_samples) {

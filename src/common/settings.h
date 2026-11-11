@@ -417,6 +417,10 @@ struct Values {
                                                    Specialization::Default,
                                                    true,
                                                    true};
+    // NVIDIA DLSS Frame Generation (DLSS-G with Reflex and PCL, through Streamline). Only with
+    // nvidia_dlss on; unrelated to the frame_gen* settings, which Fritchii keeps off.
+    Setting<bool> nvidia_dlss_frame_gen{linkage, false, "nvidia_dlss_frame_gen",
+                                        Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",

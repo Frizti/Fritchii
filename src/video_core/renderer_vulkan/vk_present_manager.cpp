@@ -22,6 +22,9 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 
 namespace Vulkan {
 
@@ -168,9 +171,19 @@ PresentManager::PresentManager(const vk::Instance& instance_,
         free_queue.push_back(&frame);
     }
 
-    present_wait_enabled = use_present_thread && device.IsKhrPresentWaitSupported();
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS Frame Generation presents through Streamline's own swapchain and paces the frames
+    // itself: present ids from here mean nothing there.
+    const bool frame_gen_paces = Streamline::FrameGenAvailable();
+#else
+    constexpr bool frame_gen_paces = false;
+#endif
+    present_wait_enabled =
+        use_present_thread && device.IsKhrPresentWaitSupported() && !frame_gen_paces;
     LOG_INFO(Render_Vulkan, "Host pacing: present wait {}",
-             present_wait_enabled ? "supported" : "unavailable, frames are not paced");
+             frame_gen_paces        ? "off, NVIDIA DLSS Frame Generation paces the frames"
+             : present_wait_enabled ? "supported"
+                                    : "unavailable, frames are not paced");
     if (present_wait_enabled) {
         present_wait_thread =
             std::jthread([this](std::stop_token token) { PresentWaitThread(token); });
@@ -190,6 +203,9 @@ PresentManager::~PresentManager() {
         present_wait_thread.request_stop();
         present_wait_thread.join();
     }
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::FrameGenSuspend();
+#endif
 }
 
 Frame* PresentManager::GetRenderFrame() {
@@ -207,6 +223,9 @@ Frame* PresentManager::GetRenderFrame() {
     // Wait for the presentation to be finished so all frame resources are free
     frame->present_done.Wait();
     frame->present_done.Reset();
+#ifdef EGLANTINE_STREAMLINE
+    frame->frame_gen = false;
+#endif
 
     return frame;
 }
@@ -572,6 +591,9 @@ void PresentManager::DrainShown() {
 }
 
 void PresentManager::RecreateSwapchain(Frame* frame) {
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::FrameGenSuspend();
+#endif
     // Nothing may wait on the old swapchain while it is replaced: its queued ids count as lost.
     std::unique_lock wl{present_wait_mutex, std::defer_lock};
     if (present_wait_enabled) {
@@ -817,7 +839,24 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
+#ifdef EGLANTINE_STREAMLINE
+    if (frame->frame_gen) {
+        Streamline::FrameGenBeforePresent({
+            .frame = frame->frame_gen_frame,
+            .guest_rect = frame->guest_rect,
+            .frame_extent = {frame->width, frame->height},
+            .swapchain_extent = extent,
+            .swapchain_format = swapchain.GetImageFormat(),
+            .swapchain_images = static_cast<u32>(swapchain.GetImageCount()),
+        });
+    }
+#endif
     last_present_id = swapchain.Present(render_semaphore);
+#ifdef EGLANTINE_STREAMLINE
+    if (frame->frame_gen) {
+        Streamline::FrameGenAfterPresent(frame->frame_gen_frame.index);
+    }
+#endif
 }
 
 } // namespace Vulkan

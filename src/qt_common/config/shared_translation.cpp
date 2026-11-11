@@ -170,6 +170,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Automatic picks the mode from the game's own resolution. Native (DLAA) keeps the "
               "game's resolution and only smooths it. Other modes apply when they fit the game's "
               "resolution, otherwise Automatic is used. Changes apply while playing."));
+    INSERT(Settings, nvidia_dlss_frame_gen, tr("NVIDIA DLSS Frame Generation"),
+           tr("Generates frames between the game's own with NVIDIA DLSS Frame Generation.\nNeeds "
+              "\"Use NVIDIA DLSS\" on, a GeForce RTX 40 series or newer GPU, and Hardware-"
+              "accelerated GPU scheduling on in Windows' graphics settings.\nVSync is not "
+              "available with it: Lichii presents without VSync while it runs.\nTakes effect when "
+              "a game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));

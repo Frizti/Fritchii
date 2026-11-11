@@ -185,6 +185,10 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#include "video_core/vulkan_common/streamline_frame_gen.h"
+#endif
 
 #include <SDL3/SDL.h>
 
@@ -5362,8 +5366,21 @@ void MainWindow::UpdateStatusBar() {
     }
 
     QString fpsText = tr("Game: %1 FPS").arg(std::round(results.average_game_fps), 0, 'f', 0);
-    if (!m_fpsSuffix.isEmpty())
-        fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
+    QString fpsSuffix = m_fpsSuffix;
+#ifdef EGLANTINE_STREAMLINE
+    if (Vulkan::Streamline::FrameGenAvailable()) {
+        const auto rates = Vulkan::Streamline::FrameGenRecentRates();
+        fpsText = tr("Game: %1 FPS real / %2 shown")
+                      .arg(std::round(rates.real_fps), 0, 'f', 0)
+                      .arg(std::round(rates.shown_fps), 0, 'f', 0);
+        QString frameGen = rates.generating ? tr("DLSS FG") : tr("DLSS FG paused");
+        if (!fpsSuffix.isEmpty())
+            frameGen = frameGen % QStringLiteral(", ") % fpsSuffix;
+        fpsSuffix = frameGen;
+    }
+#endif
+    if (!fpsSuffix.isEmpty())
+        fpsText = fpsText % QStringLiteral(" (%1)").arg(fpsSuffix);
 
     game_fps_label->setText(fpsText);
 

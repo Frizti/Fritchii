@@ -45,6 +45,7 @@
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/streamline.h"
+#include "video_core/vulkan_common/streamline_frame_gen.h"
 #endif
 #ifdef __ANDROID__
 #include <jni.h>
@@ -153,7 +154,7 @@ try
     , memory_allocator(device)
     , state_tracker()
     , scheduler(device, state_tracker)
-    , swapchain(*surface,
+    , swapchain(PresentationSurface(),
                 device,
                 scheduler,
                render_window.GetFramebufferLayout().width,
@@ -216,6 +217,13 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     SCOPE_EXIT {
         render_window.OnFrameDisplayed();
     };
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS Frame Generation: this guest frame ends here, presented or not.
+    Streamline::FrameGenBeginFrame();
+    SCOPE_EXIT {
+        Streamline::FrameGenNextFrame();
+    };
+#endif
 
     RenderAppletCaptureLayer(framebuffers);
 
@@ -256,6 +264,18 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         scheduler.MarkFrameEnd(++trace_frame);
     }
     frame->render_tick = scheduler.Flush(*frame->render_ready);
+#ifdef EGLANTINE_STREAMLINE
+    {
+        const Streamline::FrameGenFrame ended = Streamline::FrameGenEndFrame();
+        const Common::Rectangle<u32>& screen = render_window.GetFramebufferLayout().screen;
+        frame->frame_gen = Streamline::FrameGenAvailable();
+        frame->frame_gen_frame = ended;
+        frame->guest_rect = VkRect2D{
+            .offset = {static_cast<s32>(screen.left), static_cast<s32>(screen.top)},
+            .extent = {screen.GetWidth(), screen.GetHeight()},
+        };
+    }
+#endif
 
     const auto presenting = trace ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
@@ -289,6 +309,27 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         }
         trace_last_frame = entered;
     }
+}
+
+VkSurfaceKHR RendererVulkan::PresentationSurface() {
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS-G looks the window up by the swapchain's surface: replace the surface made before the
+    // device with one made through Streamline, for the same window. Present support stays valid,
+    // as it belongs to the window and the queue family.
+    const auto& window_info = render_window.GetWindowInfo();
+    if (Streamline::FrameGenAvailable()) {
+        const VkSurfaceKHR registered =
+            window_info.type == Core::Frontend::WindowSystemType::Windows
+                ? Streamline::CreateFrameGenSurface(*instance, window_info.render_surface)
+                : VK_NULL_HANDLE;
+        if (registered) {
+            surface = vk::SurfaceKHR(registered, *instance, instance.Dispatch());
+        } else {
+            Streamline::DisableFrameGen("Streamline could not make the window's surface");
+        }
+    }
+#endif
+    return *surface;
 }
 
 void RendererVulkan::Report() const {
