@@ -24,10 +24,12 @@
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/stb.h"
+#include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/frontend/framebuffer_layout.h"
+#include "core/file_sys/patch_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "hid_core/hid_core.h"
@@ -474,6 +476,24 @@ json SetSwitch(ToolState&, const json& params) {
     return {{"name", name}, {"previous", previous}, {"value", value->load()}};
 }
 
+// Ocarina of Time's high refresh rate mode, switched live for tests without saving the setting
+// (the Ctrl+U hotkey saves it into the player's config). Also returns main's code address, for
+// read_memory of Dark's routine (main + 0x3C46200), our cave (main + 0x3C46E00), the frame step's
+// call (main + 0x6E6CC4) and the ripple hook (main + 0x475F8).
+json OotHighRefresh(ToolState& state, const json& params) {
+    Kernel::KProcess* const process = state.system.ApplicationProcess();
+    json result = {{"patched", Settings::OotHighRefreshPatched()},
+                   {"main", HexAddress(process ? process->GetOotMainCodeAddress() : 0)}};
+    if (params.contains("on")) {
+        const auto outcome =
+            FileSys::SwitchOotHighRefreshLive(state.system, params.at("on").get<bool>());
+        result["outcome"] = static_cast<int>(outcome);
+        result["switched"] = outcome == FileSys::OotHighRefreshSwitch::Switched;
+        result["patched"] = Settings::OotHighRefreshPatched();
+    }
+    return result;
+}
+
 // Lifts or restores the speed limit (test scripts boot through the logos and menus unlimited).
 json SpeedLimit(ToolState&, const json& params) {
     auto& setting = Settings::values.use_speed_limit;
@@ -497,6 +517,23 @@ json ReadMemory(ToolState& state, const json& params) {
     json result = {{"address", HexAddress(address)}, {"size", size}};
     result.update(FormatMemory(bytes, as));
     return result;
+}
+
+// Test tool (2026-11-10): writes `hex` bytes at `address` (at most 4 KiB) and invalidates the
+// instruction cache there, e.g. to plant another mod's code in Ocarina's cave and check the high
+// refresh switch leaves it alone. No stall: only for memory no guest thread runs or reads now.
+json WriteMemory(ToolState& state, const json& params) {
+    const u64 address = AddressParam(params, "address");
+    const std::vector<u8> bytes = ParseHexBytes(params.at("hex").get<std::string>());
+    if (bytes.empty() || bytes.size() > 4096) {
+        throw std::runtime_error{"hex must hold 1 to 4096 bytes"};
+    }
+    Kernel::KProcess& process = Application(state);
+    if (!process.GetMemory().WriteBlock(address, bytes.data(), bytes.size())) {
+        throw std::runtime_error{fmt::format("guest address {:#x} is not mapped", address)};
+    }
+    Core::InvalidateInstructionCacheRange(&process, address, bytes.size());
+    return {{"address", HexAddress(address)}, {"size", bytes.size()}};
 }
 
 json SearchMemory(ToolState& state, const json& params) {
@@ -922,7 +959,9 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"pgo_dump", handler(PgoDump)},
         {"switch", handler(SetSwitch)},
         {"speed_limit", handler(SpeedLimit)},
+        {"oot_high_refresh", handler(OotHighRefresh)},
         {"read_memory", handler(ReadMemory)},
+        {"write_memory", handler(WriteMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},
         {"input", waiting(Input)},

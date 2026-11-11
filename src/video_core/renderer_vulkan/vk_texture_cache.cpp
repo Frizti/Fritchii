@@ -27,6 +27,7 @@
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
 
+#include "video_core/fsr.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
@@ -38,6 +39,7 @@
 #include "video_core/renderer_vulkan/framebuffer_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -1921,7 +1923,7 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             .frame_time_ms = frame_time_ms,
             .reset = reset,
             .sharpen = sharpen,
-            .sharpness = 1.0f - stops / 2.0f,
+            .sharpness = FSR::RcasSharpnessFromStops(stops),
         });
     } catch (const vk::Exception& exception) {
         LOG_ERROR(Render_Vulkan, "FSR 3.1 evaluation unavailable ({}); using the temporal stand-in",
@@ -2023,7 +2025,10 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .barrier_aspect = ImageAspectMask(view.format),
         };
     };
-    const VkExtent2D extent = dst_framebuffer->RenderArea();
+    const bool native_resolution =
+        Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
+    const VkExtent2D extent = native_resolution ? VkExtent2D{render_size[0], render_size[1]}
+                                                : dst_framebuffer->RenderArea();
     bool upscaled{};
     try {
         upscaled = dlss_upscaler->Upscale({
@@ -2049,7 +2054,8 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         return false;
     }
     DrawUpscaledOutput(dst_framebuffer, dlss_upscaler->OutputView(), dlss_upscaler->OutputImage(),
-                       dlss_upscaler->PointSampler());
+                       native_resolution ? dlss_upscaler->LinearSampler()
+                                         : dlss_upscaler->PointSampler());
     static bool logged{};
     if (!logged) {
         logged = true;
@@ -2869,6 +2875,14 @@ void TextureCacheRuntime::LogMemoryStatistics() const {
     Vulkan::LogMemoryStatistics(device);
 }
 
+void TextureCacheRuntime::LogMemoryTrace() {
+    LOG_INFO(Render_Vulkan, "Memory trace: staging upload {} MiB, download {} MiB, device {} MiB",
+             staging_buffer_pool.CachedBytes(MemoryUsage::Upload) >> 20,
+             staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20,
+             staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20);
+    Vulkan::LogMemoryTrace(device);
+}
+
 bool TextureCacheRuntime::UseOpaqueAstcFormat() const {
     // EDEN_NX2_ASTC_BC1=0 keeps every re-compressed ASTC image in BC3.
     static const bool enabled = [] {
@@ -2954,7 +2968,11 @@ void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u6
     });
     image_pool_bytes += bytes;
     ++image_pool_given;
-    TrimImagePool(ImagePoolMaxBytes);
+    TrimImagePool(ImagePoolCap());
+}
+
+u64 TextureCacheRuntime::ImagePoolCap() {
+    return VideoCore::Nx2Debug::Experiment(42) >= 2 ? ImagePoolMaxBytesDedicated : ImagePoolMaxBytes;
 }
 
 void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
@@ -3150,10 +3168,15 @@ void Image::ReleaseToPool() {
         if (!key.valid || !image || image.IsUnbacked()) {
             return;
         }
-        // Dedicated allocations (block 0) and memory placed in host memory over budget are
-        // freed as before.
+        // Memory placed in host memory over budget is freed as before. Dedicated allocations
+        // (block 0) too with EXP42=1; EXP42=2 pools them as well (2026-11-10: in the Stalchild
+        // fight 2,295 images a 600 frames asked the pool and only 309 were ever given back, the
+        // big render targets such as a 1280x720 one remade up to 282 times being dedicated).
+        // The image keeps its own allocation either way.
         const vk::Image::MemoryBlock block = image.GetMemoryBlock();
-        if (block.block == 0 || block.size < MinPooledBytes || !image.IsDeviceLocal()) {
+        const bool dedicated = block.block == 0;
+        if ((dedicated && VideoCore::Nx2Debug::Experiment(42) < 2) || block.size < MinPooledBytes ||
+            !image.IsDeviceLocal()) {
             return;
         }
         if (ENABLE_MSAA_RESOLVE_CONSUME) {
@@ -4694,6 +4717,15 @@ void CustomBorderColorBudget::Release() noexcept {
     held = 0;
 }
 
+f32 TextureCacheRuntime::OcarinaFsrLodBias() {
+    if (!ocarina_fsr_lod_bias) {
+        const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+        ocarina_fsr_lod_bias =
+            ocarina ? VideoCommon::OcarinaFsrLodBias(ResolveOcarinaUpscaler(device)) : 0.0f;
+    }
+    return *ocarina_fsr_lod_bias;
+}
+
 Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& tsc) {
     const auto& device = runtime.device;
     device_ptr = &device;
@@ -4753,6 +4785,16 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
             max_lod = 0.25f;
         }
     }
+    // Ocarina with FSR: FSR renders below the output size, so textures would pick the render
+    // size's mips; the bias keeps the output's detail (VideoCommon::OcarinaFsrLodBias).
+    f32 lod_bias = tsc.LodBias();
+    ocarina_fsr_failed = &runtime.ocarina_fsr_failed;
+    if (const f32 fsr_lod_bias = runtime.OcarinaFsrLodBias();
+        fsr_lod_bias != 0.0f && tsc.mipmap_filter != TextureMipmapFilter::None) {
+        const f32 biased = std::clamp(lod_bias + fsr_lod_bias, -15.0f, 15.0f);
+        added_lod_bias = biased - lod_bias;
+        lod_bias = biased;
+    }
     base_ci = VkSamplerCreateInfo{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
@@ -4763,7 +4805,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
         .addressModeU = wrap_u,
         .addressModeV = wrap_v,
         .addressModeW = wrap_p,
-        .mipLodBias = tsc.LodBias(),
+        .mipLodBias = lod_bias,
         .anisotropyEnable = static_cast<VkBool32>(max_anisotropy > 1.0f),
         .maxAnisotropy = max_anisotropy,
         .compareEnable = static_cast<VkBool32>(tsc.depth_compare_enabled),
@@ -4788,6 +4830,16 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
     // Vulkan leaves it undefined and AMD returns the 0/1 compare result (Ocarina forest fog
     // composite read alpha 0 -> black screen). Use a variant without comparison.
     key.drop_compare = has_depth_comparison && !is_depth;
+    // The FSR bias is for the game's textures. Images the GPU wrote (render targets: bloom and
+    // blur chains, reflections, fog) keep the game's own bias, or they'd read a mip too sharp.
+    // So does every image in handheld mode (the console mode can change in-session), and after
+    // the upscaler failed this session (the game's pass runs again).
+    if (added_lod_bias != 0.0f) {
+        const Image* const image = image_view.BackingImage();
+        key.drop_lod_bias = !VideoCommon::KeepOcarinaFsrLodBias(
+            Settings::IsDockedMode(), *ocarina_fsr_failed,
+            image != nullptr && True(image->flags & ImageFlagBits::GpuModified));
+    }
     if (needs_swizzle_mapping && !key.drop_custom_border && !image_view.HasIdentitySwizzle()) {
         const VkComponentMapping& mapping = image_view.Swizzle();
         key.swizzle = {mapping.r, mapping.g, mapping.b, mapping.a};
@@ -4851,6 +4903,9 @@ VkSampler Sampler::Emplace(VariantKey key) {
     }
 
     VkSamplerCreateInfo create_info = base_ci;
+    if (key.drop_lod_bias) {
+        create_info.mipLodBias -= added_lod_bias;
+    }
     if (key.drop_compare) {
         create_info.compareEnable = VK_FALSE;
     }

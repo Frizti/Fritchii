@@ -68,6 +68,7 @@ add_library(video_core STATIC
     render_trace.h
     fsr.cpp
     fsr.h
+    fsr4_support.h
     game_dlss_status.cpp
     game_dlss_status.h
     host1x/codecs/decoder.cpp
@@ -134,6 +135,7 @@ add_library(video_core STATIC
     nx2_qmd_prediction.h
     nx2_perf.h
     nx2_download_trace.h
+    nx2_async_readback.h
     pending_maps.h
     present.h
     pte_kind.h
@@ -206,6 +208,11 @@ add_library(video_core STATIC
     renderer_vulkan/vk_compute_pass.h
     renderer_vulkan/vk_fsr3_upscaler.cpp
     renderer_vulkan/vk_fsr3_upscaler.h
+    renderer_vulkan/vk_fsr4_upscaler.cpp
+    renderer_vulkan/vk_fsr4_upscaler.h
+    vulkan_common/ffx_files.h
+    vulkan_common/ffx_runtime.cpp
+    vulkan_common/ffx_runtime.h
     renderer_vulkan/vk_dlss_network_probe.cpp
     renderer_vulkan/vk_dlss_network_probe.h
     renderer_vulkan/vk_ocarina_camera_motion.cpp
@@ -247,6 +254,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_rasterizer.cpp
     renderer_vulkan/vk_rasterizer.h
     renderer_vulkan/submission_policy.h
+    renderer_vulkan/upload_batch.h
     renderer_vulkan/vk_render_pass_cache.cpp
     renderer_vulkan/vk_render_pass_cache.h
     renderer_vulkan/vk_resource_pool.cpp
@@ -296,6 +304,7 @@ add_library(video_core STATIC
     shader_cache.h
     shader_environment.cpp
     shader_environment.h
+    evicted_pointer_slots.h
     shader_handle_program.h
     shader_notify.cpp
     shader_notify.h
@@ -315,6 +324,7 @@ add_library(video_core STATIC
     texture_cache/decode_bc.cpp
     texture_cache/decode_bc.h
     texture_cache/descriptor_table.h
+    texture_cache/host_memory_limit.h
     texture_cache/formatter.cpp
     texture_cache/formatter.h
     texture_cache/format_lookup_table.cpp
@@ -431,6 +441,31 @@ if (ENABLE_RESHADE)
     target_compile_definitions(video_core PUBLIC HAS_RESHADE)
 endif()
 
+# "Preparing shaders" is stamped with a hash of what decides the driver's compiled pipelines (the
+# shader recompiler, pipeline creation, the precompile step), not the release version
+# (CMakeModules/Nx2ShaderStamp.cmake): releases that change no shader skip the step.
+file(GLOB_RECURSE NX2_SHADER_STAMP_INPUTS CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/src/shader_recompiler/*.cpp"
+    "${PROJECT_SOURCE_DIR}/src/shader_recompiler/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/renderer_vulkan/fixed_pipeline_state.*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/renderer_vulkan/vk_graphics_pipeline.*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/renderer_vulkan/vk_compute_pipeline.*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/nx2_precompile.*")
+string(REPLACE ";" "\n" NX2_SHADER_STAMP_LIST "${NX2_SHADER_STAMP_INPUTS}")
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/nx2_shader_stamp_inputs.txt"
+     CONTENT "${NX2_SHADER_STAMP_LIST}\n")
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/nx2_shader_stamp.h"
+    COMMAND ${CMAKE_COMMAND} "-DINPUT_LIST=${CMAKE_CURRENT_BINARY_DIR}/nx2_shader_stamp_inputs.txt"
+            "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/nx2_shader_stamp.h"
+            -P "${PROJECT_SOURCE_DIR}/CMakeModules/Nx2ShaderStamp.cmake"
+    DEPENDS ${NX2_SHADER_STAMP_INPUTS} "${PROJECT_SOURCE_DIR}/CMakeModules/Nx2ShaderStamp.cmake"
+            "${CMAKE_CURRENT_BINARY_DIR}/nx2_shader_stamp_inputs.txt"
+    COMMENT "Hashing the shader translator for the Preparing shaders stamp"
+    VERBATIM)
+target_sources(video_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/nx2_shader_stamp.h")
+target_include_directories(video_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
 if (ENABLE_OPENGL)
     target_sources(video_core PRIVATE
         renderer_opengl/present/filters.cpp
@@ -513,6 +548,12 @@ target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
 
 add_dependencies(video_core host_shaders)
 target_include_directories(video_core PRIVATE ${HOST_SHADERS_INCLUDE})
+# AMD's FFX API headers (MIT), for calling AMD's FSR 4 runtime (vk_fsr4_upscaler.cpp).
+target_include_directories(video_core PRIVATE ${CMAKE_SOURCE_DIR}/externals/ffx-api)
+if (WIN32)
+    # Checks AMD's downloaded FSR 4 runtime (vulkan_common/ffx_runtime.cpp).
+    target_link_libraries(video_core PRIVATE bcrypt wintrust crypt32)
+endif()
 
 target_link_libraries(video_core PRIVATE sirit::sirit)
 

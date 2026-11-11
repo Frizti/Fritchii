@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <limits>
@@ -140,6 +141,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 gc_deletes{};
     u64 gc_costly_deletes{};
     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
+    u64 gc_downloads_deferred{}; ///< EXP57: downloads left for a later frame (one wait a frame)
+    u64 gc_waited_frame{~0ULL};  ///< EXP57: the frame of the collector's last download wait
     u64 async_decodes_queued{};
     u64 images_created{};
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
@@ -161,6 +164,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{true}; ///< Collect what only the debug statistics lines use
+    /// EDEN_NX2_MEM_TRACE: when the last memory trace lines were logged.
+    std::chrono::steady_clock::time_point mem_trace_time{};
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
@@ -724,7 +729,19 @@ private:
     std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
     ::Common::unordered_set<ImageId> cold_watch_set;
     u64 cold_deleted{};       ///< Since the last report
+    /// Images made since the last cold sweep report, per (format, width), with their heights
+    /// (fable52_answer_13 section 6: in the Stalchild fight new render target sizes one pixel
+    /// apart, 528x513 to 528x527, kept making images). Logged with the cold sweep line.
+    struct MadeShapes {
+        u64 made{};
+        std::vector<u32> heights; ///< Distinct, at most 64 kept
+    };
+    std::map<std::pair<u32, u32>, MadeShapes> made_shapes;
+    void NoteMadeShape(const ImageInfo& info);
     u64 cold_kept_guarded{};  ///< Dropped from the watch: GPU-written and guarded
+    u64 cold_superseded{};    ///< EXP58: guarded but superseded and old, deleted
+    /// EXP58: whether a newer render target of another shape covers this image's memory.
+    [[nodiscard]] bool ColdSuperseded(ImageId image_id, const ImageBase& image);
     u64 cold_kept_read{};     ///< Dropped from the watch: GPU-written and read later or by the CPU
 
     [[nodiscard]] static bool RelocationShaped(const ImageInfo& info) noexcept {

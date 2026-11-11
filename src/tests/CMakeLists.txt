@@ -7,6 +7,7 @@
 add_executable(tests
     video_core/vulkan_overlay_filter.cpp
     video_core/unswizzle_workers.cpp
+    video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
     video_core/gpu_timestamp.cpp
     core/nx2_streamplay.cpp
@@ -16,6 +17,8 @@ add_executable(tests
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
     audio_core/nx2_sysmix.cpp
+    audio_core/nx2_input_service.cpp
+    audio_core/audio_in.cpp
     audio_core/sysmix_sink.cpp
     audio_core/sysmix_test_context.h
     video_core/ampere_starfox_test10.cpp
@@ -23,6 +26,7 @@ add_executable(tests
     video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
     audio_core/batch_decoder.cpp
+    audio_core/microphone.cpp
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
@@ -39,6 +43,8 @@ add_executable(tests
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
     core/nup_validation.cpp
+    core/nx_archive.cpp
+    frontend_common/nx_archive.cpp
     input_common/calibration_lifetime.cpp
     input_common/tas_input.cpp
     video_core/ampere_logged_numeric.cpp
@@ -57,6 +63,7 @@ add_executable(tests
     video_core/unbacked_fallback.cpp
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp
+    video_core/dlss_mode.cpp
     video_core/ampere_fast_fusion.cpp
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
@@ -96,6 +103,7 @@ add_executable(tests
     video_core/ampere_tennis_i2f.cpp
     video_core/ampere_tennis_tessellation.cpp
     video_core/pipeline_cache_files.cpp
+    video_core/evicted_pointer_slots.cpp
     video_core/shader_object_pool.cpp
     video_core/storage_binding_capacity.cpp
     video_core/native_indirect_reset.cpp
@@ -108,15 +116,19 @@ add_executable(tests
     video_core/spirv_builtin_capabilities.cpp
     video_core/spirv_nan_safe_min_max.cpp
     video_core/virtual_range_cache.cpp
+    video_core/ocarina_upscale.cpp
+    video_core/fsr4_support.cpp
     common/bit_field.cpp
     common/bit_util.cpp
     common/cityhash.cpp
     common/container_hash.cpp
+    common/data_directories.cpp
     common/event.cpp
     common/fibers.cpp
     common/frizti_settings.cpp
     common/game_presets.cpp
     common/host_memory.cpp
+    common/multi_level_page_table.cpp
     common/page_table.cpp
     common/param_package.cpp
     common/range_map.cpp
@@ -179,7 +191,15 @@ if (TARGET dynarmic::dynarmic)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
 
+target_compile_definitions(tests PRIVATE
+    LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures")
+
 add_test(NAME tests COMMAND tests)
+
+add_executable(profile_migration_tests
+    common/profile_migration.cpp)
+target_link_libraries(profile_migration_tests PRIVATE common Catch2::Catch2WithMain)
+add_test(NAME profile_migration_tests COMMAND profile_migration_tests)
 
 if (WIN32 AND ARCHITECTURE_x86_64)
     add_executable(event_wait_probe ../../tools/nx2/event_wait_probe.cpp)
@@ -193,6 +213,15 @@ add_executable(update_checker_tests
     ../frontend_common/update_installer.cpp)
 target_link_libraries(update_checker_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME update_checker_tests COMMAND update_checker_tests)
+
+if (NOT ANDROID)
+    add_executable(profile_import_tests
+        frontend_common/profile_import.cpp
+        ../frontend_common/profile_import.cpp)
+    target_link_libraries(profile_import_tests PRIVATE common SimpleIni::SimpleIni
+        Catch2::Catch2WithMain ${PLATFORM_LIBRARIES})
+    add_test(NAME profile_import_tests COMMAND profile_import_tests)
+endif()
 
 # needed for vma
 if (NOT MSVC)

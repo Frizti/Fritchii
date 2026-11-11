@@ -3,6 +3,8 @@
 #include "yuzu/fritchii/fritchii_ui.h"
 
 #include <cstdlib>
+#include <algorithm>
+#include <array>
 #include <map>
 #include <string>
 #include <string_view>
@@ -11,24 +13,36 @@
 #include <QActionGroup>
 #include <QApplication>
 #include <QBuffer>
+#include <QDateTime>
+#include <QDesktopServices>
+#include <QDir>
 #include <QFile>
 #include <QFont>
 #include <QFontDatabase>
 #include <QIcon>
 #include <QImageReader>
+#include <QLocale>
 #include <QMainWindow>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QProcess>
 #include <QPalette>
 #include <QPixmap>
 #include <QProxyStyle>
 #include <QPushButton>
+#include <QUrl>
 #include <QScrollArea>
 #include <QStyleFactory>
 #include <QTimer>
 
 #include "common/frame_gen_stats.h"
+#include "common/fs/fs_paths.h"
+#include "common/fs/path_util.h"
+#include "frontend_common/profile_import.h"
+#include "yuzu/fritchii/saves_window.h"
+#include "yuzu/user_data_migration.h"
+#include "common/logging.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -261,6 +275,24 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     ui.menu_Help->insertAction(first_help, delete_cache);
     ui.menu_Help->insertSeparator(first_help);
     ui.menu_Help->insertAction(first_help, whats_new);
+    auto* discord = new QAction(Icon(QStringLiteral("community"), 16), tr("Fritchii &Discord"), &window);
+    QObject::connect(discord, &QAction::triggered, &window, [] { OpenDiscord(); });
+    auto* donate = new QAction(Icon(QStringLiteral("heart"), 16), tr("D&onate"), &window);
+    QObject::connect(donate, &QAction::triggered, &window, [] { OpenDonate(); });
+    ui.menu_Help->insertAction(first_help, discord);
+    ui.menu_Help->insertAction(first_help, donate);
+    // v5.8.1: copy a profile again after the first launch's automatic import (a player whose
+    // newest saves were in Lichii 150+'s folder got the older eden copy).
+    auto* copy_data = new QAction(tr("&Copy Data from Eden or Lichii..."), &window);
+    QObject::connect(copy_data, &QAction::triggered, &window, [&window] { CopyDataFromOldFolder(window); });
+    ui.menu_Help->insertAction(first_help, copy_data);
+    // v5.8.3: export, import and copy saves between Fritchii, Eden and Lichii.
+    auto* saves = new QAction(tr("Sa&ves..."), &window);
+    QObject::connect(saves, &QAction::triggered, &window, [&window] {
+        ShowSavesWindow(&window,
+                        [] { return QtCommon::system && QtCommon::system->IsPoweredOn(); });
+    });
+    ui.menu_Help->insertAction(copy_data, saves);
 
     // Plain names.
     ui.menu_recent_files->setTitle(tr("Open &Recent"));
@@ -543,6 +575,185 @@ QProgressBar::chunk {
   background-color: #a78bfa;
   border-radius: 3px;
 })";
+}
+
+namespace {
+constexpr int KeptSettingsBackups = 10;
+constexpr const char* BackupFolderFormat = "yyyy-MM-dd HHmmss";
+
+QString ConfigDirPath() {
+    return QString::fromStdString(Common::FS::PathToUTF8String(
+        Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir)));
+}
+
+bool CopyDirFiles(const QString& from, const QString& to) {
+    const QDir source(from);
+    if (!source.exists()) {
+        return true;
+    }
+    if (!QDir().mkpath(to)) {
+        return false;
+    }
+    bool ok = true;
+    for (const QString& name : source.entryList(QDir::Files)) {
+        QFile::remove(QDir(to).filePath(name));
+        ok &= QFile::copy(source.filePath(name), QDir(to).filePath(name));
+    }
+    return ok;
+}
+} // namespace
+
+QString BackupSettings() {
+    const QDir config(ConfigDirPath());
+    const QString folder =
+        config.filePath(QStringLiteral("backups/") +
+                        QDateTime::currentDateTime().toString(QString::fromLatin1(BackupFolderFormat)));
+    if (!QDir().mkpath(folder)) {
+        LOG_WARNING(Frontend, "Settings backup: cannot create {}", folder.toStdString());
+        return {};
+    }
+    bool ok = true;
+    for (const QString name : {QStringLiteral("qt-config.ini"), QStringLiteral("frizti.ini")}) {
+        if (config.exists(name)) {
+            ok &= QFile::copy(config.filePath(name), QDir(folder).filePath(name));
+        }
+    }
+    ok &= CopyDirFiles(config.filePath(QStringLiteral("custom")),
+                       QDir(folder).filePath(QStringLiteral("custom")));
+    LOG_INFO(Frontend, "Settings backup {}: {}", folder.toStdString(), ok ? "saved" : "incomplete");
+    // Keep the newest few.
+    const auto backups = SettingsBackups();
+    for (size_t i = KeptSettingsBackups; i < backups.size(); ++i) {
+        QDir(backups[i].first).removeRecursively();
+    }
+    return ok ? folder : QString{};
+}
+
+std::vector<std::pair<QString, QString>> SettingsBackups() {
+    const QDir root(QDir(ConfigDirPath()).filePath(QStringLiteral("backups")));
+    std::vector<std::pair<QString, QString>> backups;
+    // Folder names sort by time.
+    const QStringList names = root.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name | QDir::Reversed);
+    for (const QString& name : names) {
+        const QDateTime when =
+            QDateTime::fromString(name, QString::fromLatin1(BackupFolderFormat));
+        if (!when.isValid() || !QFile::exists(QDir(root.filePath(name)).filePath(QStringLiteral("qt-config.ini")))) {
+            continue;
+        }
+        backups.emplace_back(root.filePath(name),
+                             QLocale().toString(when, QStringLiteral("d MMM yyyy, HH:mm")));
+    }
+    return backups;
+}
+
+bool RestoreSettingsFiles(const QString& backup) {
+    const QDir config(ConfigDirPath());
+    const QDir from(backup);
+    if (!from.exists(QStringLiteral("qt-config.ini"))) {
+        return false;
+    }
+    bool ok = true;
+    for (const QString name : {QStringLiteral("qt-config.ini"), QStringLiteral("frizti.ini")}) {
+        if (from.exists(name)) {
+            QFile::remove(config.filePath(name));
+            ok &= QFile::copy(from.filePath(name), config.filePath(name));
+        }
+    }
+    QDir(config.filePath(QStringLiteral("custom"))).removeRecursively();
+    ok &= CopyDirFiles(from.filePath(QStringLiteral("custom")),
+                       config.filePath(QStringLiteral("custom")));
+    LOG_INFO(Frontend, "Settings restored from {}: {}", backup.toStdString(), ok ? "done" : "incomplete");
+    return ok;
+}
+
+QString& PendingSettingsRestore() {
+    static QString pending;
+    return pending;
+}
+
+void OpenDiscord() {
+    QDesktopServices::openUrl(QUrl(QString::fromLatin1(DiscordInvite)));
+}
+
+void CopyDataFromOldFolder(QMainWindow& window) {
+    namespace fs = std::filesystem;
+    using namespace Common::FS;
+    if (IsPortableMode()) {
+        QMessageBox::information(&window, QStringLiteral("Fritchii"),
+                                 QObject::tr("This Fritchii keeps its data in the user folder next to "
+                                    "lichii.exe."));
+        return;
+    }
+    const bool any = std::ranges::any_of(
+        std::array{LegacyEdenDir, LichiiDir, YuzuDir, SuyuDir, SudachiDir, CitronDir},
+        [](EmuPath path) { return fs::is_directory(GetLegacyPath(path)); });
+    if (!any) {
+        QMessageBox::information(&window, QStringLiteral("Fritchii"),
+                                 QObject::tr("No eden or lichii folder was found in %APPDATA%."));
+        return;
+    }
+    // The same dialog as the first launch (v5.8.2): which folder, and saves / settings / mods.
+    const auto choice = UserDataMigrator::AskImport(&window, true);
+    if (!choice) {
+        return;
+    }
+    try {
+        FrontendCommon::RequestProfileImport(choice->Serialize());
+    } catch (const std::exception& error) {
+        QMessageBox::warning(&window, QStringLiteral("Fritchii"), QString::fromUtf8(error.what()));
+        return;
+    }
+    // The copy runs when Fritchii starts, before anything reads the settings.
+    QObject::connect(qApp, &QCoreApplication::aboutToQuit, qApp, [] {
+        QProcess::startDetached(QCoreApplication::applicationFilePath(), {});
+    });
+    window.close();
+}
+
+void OpenDonate() {
+    QDesktopServices::openUrl(QUrl(QString::fromLatin1(DonateLink)));
+}
+
+namespace {
+QString OcarinaGameConfigPath() {
+    return QDir(ConfigDirPath()).filePath(QStringLiteral("custom/0400486024DEC000.ini"));
+}
+} // namespace
+
+QStringList OcarinaGameOverrides() {
+    QFile file(OcarinaGameConfigPath());
+    QStringList names;
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return names;
+    }
+    const QString suffix = QStringLiteral("\\use_global=false");
+    while (!file.atEnd()) {
+        const QString line = QString::fromUtf8(file.readLine()).trimmed();
+        // The memory layout is Fritchii's own while a Switch 2 game runs (12 GB, core.cpp), and
+        // saving Game Settings during play could store it as OoT's: never the player's choice,
+        // so it doesn't count (players read the banner as "my settings changed", 2026-11-11).
+        if (line.endsWith(suffix) && !line.contains(QStringLiteral("memory_layout_mode"))) {
+            names << line.chopped(suffix.size());
+        }
+    }
+    return names;
+}
+
+bool ClearOcarinaGameOverrides() {
+    QFile file(OcarinaGameConfigPath());
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    QByteArray text = file.readAll();
+    file.close();
+    text.replace("\\use_global=false", "\\use_global=true");
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return false;
+    }
+    const bool ok = file.write(text) == text.size();
+    LOG_INFO(Frontend, "Ocarina of Time's game-specific settings back on the global ones: {}",
+             ok ? "done" : "failed");
+    return ok;
 }
 
 } // namespace FritchiiUi
