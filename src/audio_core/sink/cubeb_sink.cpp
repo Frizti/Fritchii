@@ -236,10 +236,13 @@ CubebSink::CubebSink(std::string_view target_device_name) {
     }
 
     if (target_device_name != auto_device_name && !target_device_name.empty()) {
-        cubeb_device_collection collection;
-        if (cubeb_enumerate_devices(ctx, CUBEB_DEVICE_TYPE_OUTPUT, &collection) != CUBEB_OK) {
-            LOG_WARNING(Audio_Sink, "Audio output device enumeration not supported");
-        } else {
+        // The same sink type serves output and input, so resolve the name in both lists.
+        const auto find_device = [&](cubeb_device_type type, cubeb_devid& out) {
+            cubeb_device_collection collection;
+            if (cubeb_enumerate_devices(ctx, type, &collection) != CUBEB_OK) {
+                LOG_WARNING(Audio_Sink, "Audio device enumeration not supported");
+                return;
+            }
             const auto collection_end{collection.device + collection.count};
             const auto device{
                 std::find_if(collection.device, collection_end, [&](const cubeb_device_info& info) {
@@ -247,10 +250,12 @@ CubebSink::CubebSink(std::string_view target_device_name) {
                            target_device_name == std::string(info.friendly_name);
                 })};
             if (device != collection_end) {
-                output_device = device->devid;
+                out = device->devid;
             }
             cubeb_device_collection_destroy(ctx, &collection);
-        }
+        };
+        find_device(CUBEB_DEVICE_TYPE_OUTPUT, output_device);
+        find_device(CUBEB_DEVICE_TYPE_INPUT, input_device);
     }
 
     cubeb_get_max_channel_count(ctx, &device_channels);
