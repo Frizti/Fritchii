@@ -50,6 +50,7 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(DlssFrameGen, false);
 SWITCHABLE(OotRefreshCap, false);
 SWITCHABLE(OotMovieUpscale, false);
 SWITCHABLE(AspectRatio, true);
