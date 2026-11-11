@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <nvsdk_ngx_helpers.h>
 #include <nvsdk_ngx_helpers_vk.h>
 
 #include "common/scm_rev.h"
@@ -141,13 +142,26 @@ struct Configuration {
     u32 preset;
     bool operator==(const Configuration&) const = default;
 };
-Configuration Config(const NvidiaDlssInputs& in) {
-    const float ratio = static_cast<float>(in.render_size.width) / static_cast<float>(in.upscale_size.width);
-    const auto quality = ratio >= 0.99f ? NVSDK_NGX_PerfQuality_Value_DLAA
-                       : ratio >= 0.65f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
-                       : ratio >= 0.57f ? NVSDK_NGX_PerfQuality_Value_Balanced
-                       : ratio >= 0.49f ? NVSDK_NGX_PerfQuality_Value_MaxPerf
-                                        : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+NVSDK_NGX_PerfQuality_Value PerfQualityFor(Settings::NvidiaDlssQuality mode) {
+    using Quality = Settings::NvidiaDlssQuality;
+    switch (mode) {
+    case Quality::Native:
+        return NVSDK_NGX_PerfQuality_Value_DLAA;
+    case Quality::Balanced:
+        return NVSDK_NGX_PerfQuality_Value_Balanced;
+    case Quality::Performance:
+        return NVSDK_NGX_PerfQuality_Value_MaxPerf;
+    case Quality::UltraPerformance:
+        return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+    case Quality::Quality:
+    case Quality::Automatic:
+    default:
+        return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    }
+}
+
+Configuration Config(const NvidiaDlssInputs& in, Settings::NvidiaDlssQuality mode) {
+    const auto quality = PerfQualityFor(mode);
     int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
     if (in.depth_inverted) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     if (in.hdr && EnvEnabled("EDEN_NX2_DLSS_HDR")) flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
@@ -191,6 +205,28 @@ bool Prepare(const std::filesystem::path& path, const std::filesystem::path& cac
     runtime.info.PathListInfo = {&runtime.search_path, 1};
     runtime.phase = Phase::Prepared;
     return true;
+}
+
+std::optional<VideoCommon::DlssMode::Range> OptimalRange(Settings::NvidiaDlssQuality mode,
+                                                         VkExtent2D output) {
+    if (!IsDlssAvailable() || mode == Settings::NvidiaDlssQuality::Automatic) return std::nullopt;
+    // The optimal-settings callback lives in the capability parameters, not in allocated ones.
+    NVSDK_NGX_Parameter* parameters{};
+    if (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_GetCapabilityParameters(&parameters)) || !parameters) {
+        return std::nullopt;
+    }
+    u32 optimal_width{}, optimal_height{}, max_width{}, max_height{}, min_width{}, min_height{};
+    float sharpness{};
+    const NVSDK_NGX_Result result = NGX_DLSS_GET_OPTIMAL_SETTINGS(
+        parameters, output.width, output.height, PerfQualityFor(mode), &optimal_width,
+        &optimal_height, &max_width, &max_height, &min_width, &min_height, &sharpness);
+    NVSDK_NGX_VULKAN_DestroyParameters(parameters);
+    // A mode the runtime doesn't offer reports a zero size.
+    if (NVSDK_NGX_FAILED(result) || !optimal_width || !optimal_height || !max_width ||
+        !max_height) {
+        return std::nullopt;
+    }
+    return VideoCommon::DlssMode::Range{{min_width, min_height}, {max_width, max_height}};
 }
 
 bool WantsDevice() { return runtime.phase == Phase::Prepared; }
@@ -265,16 +301,17 @@ struct Feature::State {
 Feature::Feature() : state{std::make_unique<State>()} {}
 Feature::~Feature() { state->Release(); }
 u32 Feature::LastResult() const { return static_cast<u32>(state->result); }
-bool Feature::NeedsRecreate(const NvidiaDlssInputs& inputs) const {
-    return !state->config || *state->config != Config(inputs);
+bool Feature::NeedsRecreate(const NvidiaDlssInputs& inputs,
+                            Settings::NvidiaDlssQuality mode) const {
+    return !state->config || *state->config != Config(inputs, mode);
 }
 
 bool Feature::Evaluate(VkCommandBuffer command, const NvidiaDlssInputs& in,
-                       const NvidiaDlssImage& output) {
+                       Settings::NvidiaDlssQuality mode, const NvidiaDlssImage& output) {
     if (!IsDlssAvailable() || !in.render_size.width || !in.render_size.height ||
         !in.upscale_size.width || !in.upscale_size.height) return false;
-    const Configuration config = Config(in);
-    const bool recreate = NeedsRecreate(in);
+    const Configuration config = Config(in, mode);
+    const bool recreate = NeedsRecreate(in, mode);
     if (recreate) {
         state->Release();
         state->result = NVSDK_NGX_VULKAN_AllocateParameters(&state->parameters);

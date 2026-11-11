@@ -25,6 +25,12 @@ std::vector<std::filesystem::path> RuntimeDirectories() {
     if (!data.empty()) {
         dirs.emplace_back(data / "ngx");
     }
+    // Builds before Fritchii v5.8 used the eden data folder. Read the library from there too, so
+    // a player who put it there doesn't have to move it. Nothing is copied or written there.
+    const auto legacy = Common::FS::GetLegacyPath(Common::FS::EmuPath::LegacyEdenDir);
+    if (!legacy.empty() && legacy != data) {
+        dirs.emplace_back(legacy / "ngx");
+    }
     return dirs;
 }
 
