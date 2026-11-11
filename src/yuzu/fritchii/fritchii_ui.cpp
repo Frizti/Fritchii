@@ -49,6 +49,9 @@
 #include "qt_common/config/shared_translation.h"
 #include "qt_common/qt_common.h"
 #include "ui_main.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "yuzu/configuration/nvidia_dlss_panel.h"
+#endif
 #ifdef HAS_RESHADE
 #include "video_core/post_processing/fx_preset.h"
 #endif
@@ -426,6 +429,20 @@ QPushButton* MakeFrameGenButton(QWidget* parent, GraphicsHooks hooks) {
             if (CurrentDlssMode() == DlssMode::Off) {
                 SetDlssMode(DlssMode::To1440); // frame generation runs on DLSS's output
             }
+#ifdef EGLANTINE_STREAMLINE
+            // NVIDIA's files for DLSS and its frame generation, fetched now when missing (the
+            // usual licence dialog first); without them it stays off.
+            if (NvidiaDlssPanel::FrameGenFilesMissing()) {
+                NvidiaDlssPanel panel(button->window());
+                panel.hide();
+                if (!panel.Download()) {
+                    Settings::SetSessionOverride("LICHII_DLSS_FG", nullptr);
+                    Common::FrameGenStats::user_enabled.store(false, std::memory_order_relaxed);
+                    update();
+                    return;
+                }
+            }
+#endif
             OfferRestart(button->window(), hooks, QObject::tr("DLSS Frame Generation"));
         }
         update();
