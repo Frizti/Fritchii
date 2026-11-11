@@ -19,11 +19,17 @@ public:
 
     void Refresh();
 
+    /// Fetches NVIDIA's missing files from the Streamline release, with DLSS Frame Generation's
+    /// when it is asked for (LICHII_DLSS_FG). True when nothing is missing afterwards.
+    bool Download();
+
+    /// Whether DLSS, or DLSS Frame Generation with Reflex, still lacks one of NVIDIA's files.
+    [[nodiscard]] static bool FrameGenFilesMissing();
+
 protected:
     void showEvent(QShowEvent* event) override;
 
 private:
-    void Download();
 
     QLabel* icon_label;
     QLabel* status_label;
