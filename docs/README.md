@@ -11,6 +11,7 @@ This contains documentation created by developers, build instructions, guideline
 - **[Cross Compiling](./CrossCompile.md)**
 - **[Development Guidelines](./Development.md)**
 - **[Dependencies](./Deps.md)**
+- **[Installing on NixOS](./nixos-install.md)**
 - **[Debug Guidelines](./Debug.md)**
   - **[RenderDoc](./Debug.md#renderdoc)**
 - **[CPM - CMake Package Manager](./CPMUtil.md)**

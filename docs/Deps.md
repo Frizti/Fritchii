@@ -231,7 +231,27 @@ Yes, `nlohmann-json` is just named `json-c++`. Why?
 <details>
 <summary>NixOS</summary>
 
-A convenience script is provided on the root of this project [shell.nix](../shell.nix). Run the usual `nix-shell`.
+The root of this project has both a [shell.nix](../shell.nix) (run `nix-shell`) and a [flake.nix](../flake.nix).
+
+With the flake, for a development shell:
+
+```sh
+nix develop
+cmake -S . -B build -G Ninja -DENABLE_WERROR=OFF
+cmake --build build --parallel $(nproc)
+./build/bin/lichii
+```
+
+Or build (and optionally run) the packaged emulator:
+
+```sh
+nix build .#lichii
+nix run .#lichii
+```
+
+See **[Installing on NixOS](./nixos-install.md)** for installing it into a system
+or home profile, the desktop entry, the flake outputs and how to refresh the CPM
+source cache hash.
 
 If you're going for a pure build (i.e no downloaded deps), use `-DYUZU_USE_CPM=ON -DCPMUTIL_FORCE_SYSTEM=ON`.
 
