@@ -274,6 +274,8 @@ set_target_properties(yuzu PROPERTIES OUTPUT_NAME "lichii")
 add_custom_command(TARGET yuzu POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu>/nx2_switches.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+        "${PROJECT_SOURCE_DIR}/dist/recipes" "$<TARGET_FILE_DIR:yuzu>/recipes"
     VERBATIM)
 
 if (YUZU_CRASH_DUMPS)
