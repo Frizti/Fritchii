@@ -64,9 +64,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("This option increases CPU emulation thread use from 1 to the maximum of 4.\n"
               "This is mainly a debug option and shouldn't be disabled."));
     INSERT(Settings, memory_layout_mode, tr("Memory Layout"),
-           tr("Increases the amount of emulated RAM.\nDoesn't affect performance/stability but may "
-              "allow HD texture "
-              "mods to load."));
+           tr("Switch 2 games always use 12 GB while they run, whatever this says: it only "
+              "applies to Switch 1 games.\nIncreases the amount of emulated RAM. Doesn't affect "
+              "performance/stability but may allow HD texture mods to load."));
     INSERT(Settings, use_speed_limit, QString(), QString());
     INSERT(Settings, current_speed_mode, QString(), QString());
     INSERT(Settings, speed_limit, tr("Limit Speed Percent"),
@@ -782,7 +782,8 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(MemoryLayout, Memory_6Gb, tr("6GB DRAM (Unsafe)")),
                               PAIR(MemoryLayout, Memory_8Gb, tr("8GB DRAM")),
                               PAIR(MemoryLayout, Memory_10Gb, tr("10GB DRAM (Unsafe)")),
-                              PAIR(MemoryLayout, Memory_12Gb, tr("12GB DRAM (Unsafe)")),
+                              // Switch 2 games use it on their own while they run (core.cpp): not "unsafe" for them.
+                              PAIR(MemoryLayout, Memory_12Gb, tr("12GB DRAM (Switch 2)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::ConsoleMode>::Index(),
                           {
