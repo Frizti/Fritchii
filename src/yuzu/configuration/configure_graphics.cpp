@@ -231,11 +231,18 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             continue;
         }
 #endif
-#ifndef EGLANTINE_STREAMLINE
-        // Only builds with NVIDIA Streamline (Windows) can use it.
+#ifndef EGLANTINE_NVIDIA_DLSS
+        // Only builds with an NVIDIA DLSS backend can use it.
         if (setting->Id() == Settings::values.nvidia_dlss.Id() ||
             setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
-            setting->Id() == Settings::values.nvidia_dlss_preset.Id()) {
+            setting->Id() == Settings::values.nvidia_dlss_preset.Id() ||
+            setting->Id() == Settings::values.nvidia_dlss_frame_gen.Id()) {
+            continue;
+        }
+#endif
+#ifndef EGLANTINE_NGX
+        // DLSS Frame Generation runs on the native NGX backend only.
+        if (setting->Id() == Settings::values.nvidia_dlss_frame_gen.Id()) {
             continue;
         }
 #endif
@@ -259,8 +266,16 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             continue;
         }
 
+#if defined(EGLANTINE_NVIDIA_DLSS) && !defined(EGLANTINE_STREAMLINE)
+        // The native NGX backend (Linux) has no download panel; its checkbox still shows and hides
+        // the quality and preset controls.
+        if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
+            nvidia_dlss_checkbox = widget->checkbox;
+        }
+#endif
         if (nvidia_dlss_checkbox && (setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
-                                     setting->Id() == Settings::values.nvidia_dlss_preset.Id())) {
+                                     setting->Id() == Settings::values.nvidia_dlss_preset.Id() ||
+                                     setting->Id() == Settings::values.nvidia_dlss_frame_gen.Id())) {
             widget->setVisible(nvidia_dlss_checkbox->isChecked());
             connect(nvidia_dlss_checkbox, &QCheckBox::toggled, widget, &QWidget::setVisible);
         }

@@ -42,9 +42,9 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#ifdef EGLANTINE_STREAMLINE
+#ifdef EGLANTINE_NVIDIA_DLSS
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
-#include "video_core/vulkan_common/streamline.h"
+#include "video_core/vulkan_common/nvidia_dlss.h"
 #endif
 #ifdef __ANDROID__
 #include <jni.h>
@@ -135,8 +135,8 @@ try
     , gpu(gpu_)
     , library(OpenLibrary(context.get()))
     , dld()
-#ifdef EGLANTINE_STREAMLINE
-    , streamline_started(Streamline::Start())
+#ifdef EGLANTINE_NVIDIA_DLSS
+    , streamline_started(NvidiaDlss::Start())
 #endif
     // Create raw Vulkan instance first
     , instance(CreateInstance(*library,
@@ -188,6 +188,11 @@ try
     , frame_gen(memory_allocator, scheduler)
 #endif
 {
+#ifdef EGLANTINE_NGX
+    if (Ngx::FrameGenMultiplier() > 1) {
+        ngx_frame_gen.emplace(device, memory_allocator, scheduler);
+    }
+#endif
 
     if (Settings::values.renderer_force_max_clock.GetValue() && device.ShouldBoostClocks()) {
         turbo_mode.emplace(instance, dld);
@@ -249,6 +254,29 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         frame_gen.GenerateInto(device, generated, generation);
         generated->render_tick = scheduler.Flush(*generated->render_ready);
         present_manager.Present(generated);
+    }
+#endif
+
+#ifdef EGLANTINE_NGX
+    if (ngx_frame_gen) {
+        // DLSS Frame Generation: the generated frames go out ahead of the rendered one and the
+        // present thread spaces them out (PresentManager::PaceGeneratedFrame).
+        const auto& layout = render_window.GetFramebufferLayout();
+        const u32 generations =
+            ngx_frame_gen->BeginFrame(frame, swapchain.GetImageViewFormat(), layout.screen);
+        for (u32 index = 1; index <= generations; ++index) {
+            Frame* generated = present_manager.GetRenderFrame();
+            blit_swapchain.PrepareFrame(device, generated, layout);
+            ngx_frame_gen->GenerateInto(generated, index);
+            generated->dlssg_slot = index;
+            generated->dlssg_count = generations + 1;
+            generated->render_tick = scheduler.Flush(*generated->render_ready);
+            present_manager.Present(generated);
+        }
+        if (generations != 0) {
+            frame->dlssg_slot = generations + 1;
+            frame->dlssg_count = generations + 1;
+        }
     }
 #endif
 
@@ -414,9 +442,9 @@ void RendererVulkan::RenderAppletCaptureLayer(
                             CaptureFormat);
 }
 
-#ifdef EGLANTINE_STREAMLINE
+#ifdef EGLANTINE_NVIDIA_DLSS
 VideoCore::DlssStatus RendererVulkan::GetDlssStatus() const {
-    return StreamlineDlssUpscaler::Status();
+    return NvidiaDlssUpscaler::Status();
 }
 #endif
 
