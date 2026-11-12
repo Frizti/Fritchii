@@ -248,6 +248,36 @@ int main(int argc, char* argv[]) {
     // also reads these variables, for this process only (nothing system-wide changes). A value
     // already set (the player's, or nx2_switches.txt) wins.
     if (FritchiiUi::Enabled()) {
+        // A stable path under ~/.cache/fritchii, not the shared ~/.cache/nvidia/GLCache that
+        // other OpenGL/Vulkan apps, Steam's shadercachemanager, and the driver's default
+        // cleanup can evict mid-run (a 180 MiB cache went to 0 MiB during preparation while
+        // SKIP_CLEANUP and a 10 GiB size were already set). Already-set values (the player's,
+        // or nx2_switches.txt) win. A launcher (e.g. an AppImage AppRun) may also set them
+        // before the binary starts, which is the safest place.
+#if defined(__linux__) && !defined(__ANDROID__)
+        if (!qEnvironmentVariableIsSet("__GL_SHADER_DISK_CACHE_PATH")) {
+            std::filesystem::path folder;
+            if (const char* const xdg = std::getenv("XDG_CACHE_HOME");
+                xdg != nullptr && xdg[0] != '\0') {
+                folder = std::filesystem::path{xdg} / "fritchii" / "nvidia-glcache";
+            } else if (const char* const home = std::getenv("HOME"); home != nullptr) {
+                folder = std::filesystem::path{home} / ".cache" / "fritchii" / "nvidia-glcache";
+            }
+            if (!folder.empty()) {
+                std::error_code ec;
+                std::filesystem::create_directories(folder, ec);
+                qputenv("__GL_SHADER_DISK_CACHE_PATH", QByteArray::fromStdString(folder.string()));
+            }
+        }
+        if (!qEnvironmentVariableIsSet("__GL_SHADER_DISK_CACHE")) {
+            qputenv("__GL_SHADER_DISK_CACHE", "1");
+        }
+        // Stable name so a new AppImage path or a remount under /tmp/.mount_* does not
+        // open a fresh hash and drop the previous one. Already-set values win.
+        if (!qEnvironmentVariableIsSet("__GL_SHADER_DISK_CACHE_APP_NAME")) {
+            qputenv("__GL_SHADER_DISK_CACHE_APP_NAME", "fritchii");
+        }
+#endif
         if (!qEnvironmentVariableIsSet("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP")) {
             qputenv("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1");
         }
