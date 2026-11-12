@@ -249,7 +249,9 @@ nix build .#lichii
 nix run .#lichii
 ```
 
-The flake fetches CPM dependencies in a fixed-output derivation (`packages.<system>.cpmCache`) because Nix builds have no network. When nixpkgs or `cpmfile.json` changes, rebuild it with a placeholder hash (`lib.fakeHash`) and copy the hash Nix reports.
+See **[Installing on NixOS](./nixos-install.md)** for installing it into a system
+or home profile, the desktop entry, the flake outputs and how to refresh the CPM
+source cache hash.
 
 If you're going for a pure build (i.e no downloaded deps), use `-DYUZU_USE_CPM=ON -DCPMUTIL_FORCE_SYSTEM=ON`.
 
