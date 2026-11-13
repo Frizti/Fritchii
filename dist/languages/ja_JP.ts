@@ -5867,7 +5867,7 @@ Drag points to change position, or double-click table cells to edit values.</sou
     </message>
     <message>
         <location filename="../../src/yuzu/data_dialog.ui" line="48"/>
-        <source>Deleting ANY data is IRREVERSABLE!</source>
+        <source>Deleting ANY data is IRREVERSIBLE!</source>
         <translation>データの削除は、いかなる場合も元に戻せません！</translation>
     </message>
     <message>
@@ -5915,7 +5915,7 @@ Drag points to change position, or double-click table cells to edit values.</sou
     </message>
     <message>
         <location filename="../../src/yuzu/data_widget.ui" line="106"/>
-        <source>Delete all data in this directory. THIS IS 100% IRREVERSABLE!</source>
+        <source>Delete all data in this directory. THIS IS 100% IRREVERSIBLE!</source>
         <translation>このディレクトリ内のすべてのデータを削除します。この操作は完全に元に戻せません！</translation>
     </message>
     <message>

@@ -103,7 +103,7 @@ min-height: 45px;
         </size>
        </property>
        <property name="toolTip">
-        <string>Delete all data in this directory. THIS IS 100% IRREVERSABLE!</string>
+        <string>Delete all data in this directory. THIS IS 100% IRREVERSIBLE!</string>
        </property>
        <property name="styleSheet">
         <string notr="true">QPushButton {

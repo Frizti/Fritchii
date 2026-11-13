@@ -45,7 +45,7 @@
      <item>
       <widget class="QLabel" name="label">
        <property name="text">
-        <string>Deleting ANY data is IRREVERSABLE!</string>
+        <string>Deleting ANY data is IRREVERSIBLE!</string>
        </property>
       </widget>
      </item>

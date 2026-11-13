@@ -1392,7 +1392,7 @@ void Java_org_yuzu_yuzu_1emu_NativeLibrary_initializeEmptyUserDirectory(JNIEnv* 
 }
 
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_playTimeManagerInit(JNIEnv* env, jobject obj) {
-    // for some reason the full user directory isnt initialized in Android, so we need to create it
+    // for some reason the full user directory isn't initialized in Android, so we need to create it
     const auto play_time_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::PlayTimeDir);
     if (!Common::FS::IsDir(play_time_dir) && !Common::FS::CreateDir(play_time_dir))
         LOG_WARNING(Frontend, "Failed to create play time directory");
