@@ -255,7 +255,7 @@ Test Condition Code and Set Predicate.
 - **DFMA_cr**: `0100 1011 0111 ----`
 - **DFMA_imm**: `0011 011- 0111 ----`
 
-FP64 Fused Mutiply Add.
+FP64 Fused Multiply Add.
 
 # DMNMX
 - **DMNMX_reg**: `0101 1100 0101 0---`
@@ -390,7 +390,7 @@ FP16 Add.
 - **HFMA2_imm**: `0111 0--- 0--- ----`
 - **HFMA2_32I**: `0010 100- ---- ----`
 
-FP16 Fused Mutiply Add.
+FP16 Fused Multiply Add.
 
 # HMUL2
 - **HMUL2_reg**: `0101 1101 0000 1---`
