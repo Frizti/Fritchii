@@ -5782,7 +5782,7 @@ Arrasta os pontos para mudar a posição, ou dá duplo-clique nas células da ta
     </message>
     <message>
         <location filename="../../src/yuzu/data_dialog.ui" line="48"/>
-        <source>Deleting ANY data is IRREVERSABLE!</source>
+        <source>Deleting ANY data is IRREVERSIBLE!</source>
         <translation type="unfinished"/>
     </message>
     <message>
@@ -5830,7 +5830,7 @@ Arrasta os pontos para mudar a posição, ou dá duplo-clique nas células da ta
     </message>
     <message>
         <location filename="../../src/yuzu/data_widget.ui" line="106"/>
-        <source>Delete all data in this directory. THIS IS 100% IRREVERSABLE!</source>
+        <source>Delete all data in this directory. THIS IS 100% IRREVERSIBLE!</source>
         <translation type="unfinished"/>
     </message>
     <message>

@@ -5851,7 +5851,7 @@ Trascina i punti per cambiare posizione, oppure clicca due volte la cella in tab
     </message>
     <message>
         <location filename="../../src/yuzu/data_dialog.ui" line="48"/>
-        <source>Deleting ANY data is IRREVERSABLE!</source>
+        <source>Deleting ANY data is IRREVERSIBLE!</source>
         <translation>La cancellazione di qualsiasi dato è IRREVERSIBILE!</translation>
     </message>
     <message>
@@ -5899,7 +5899,7 @@ Trascina i punti per cambiare posizione, oppure clicca due volte la cella in tab
     </message>
     <message>
         <location filename="../../src/yuzu/data_widget.ui" line="106"/>
-        <source>Delete all data in this directory. THIS IS 100% IRREVERSABLE!</source>
+        <source>Delete all data in this directory. THIS IS 100% IRREVERSIBLE!</source>
         <translation>Cancella tutti i dati in questa cartella. L&apos;OPERAZIONE È COMPLETAMENTE IRREVERSIBILE!</translation>
     </message>
     <message>

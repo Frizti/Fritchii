@@ -228,7 +228,7 @@ void EmuWindow_SDL3::OnEvent(SDL_Event& event) {
     // Notice how we skip the "update title" aspect on most events
     // this is because some WMs do NOT like changing titles while resizing
     // so let's just... not do that, thanks :)
-    // Afterall we don't really expect the user to pay attention to the titlebar
+    // After all we don't really expect the user to pay attention to the titlebar
     // while they're moving a lot of shit around...
     switch (event.type) {
     case SDL_EVENT_WINDOW_RESIZED:

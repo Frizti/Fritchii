@@ -631,7 +631,7 @@ void PollThreadPolicies() {
 
 #ifdef ARCHITECTURE_x86_64
 // On Linux and UNIX systems, a futex would nominally be used to cover the costs
-// the idea is that it's intuitivelly cheaper to use a direct instruction as opposed to a full futex call
+// the idea is that it's intuitively cheaper to use a direct instruction as opposed to a full futex call
 // the underlying libc++ implementation uses pthread_cond_timedwait which MAY invoke a futex
 // Let's pretend the OS is too expensive to jump into, and avoid ANY context switches
 // this should *IN THEORY* lower CPU usage while just waiting for stuff effectively

@@ -22,7 +22,7 @@ namespace fs = std::filesystem;
 // because of their security policy.
 // I don't know what kind of drugs the Windows developers have been on since NT started.
 
-// Microsoft still has not implemented any of this in their std::filesystem implemenation,
+// Microsoft still has not implemented any of this in their std::filesystem implementation,
 // which ALSO means that it DOES NOT FOLLOW ANY DIRECTORY JUNCTIONS... AT ALL.
 // Nor does any of their command line utilities or APIs. So you're quite literally
 // on your own.
