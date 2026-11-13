@@ -3,7 +3,7 @@
 > [!WARNING]
 > This guide is intended for developers ONLY. If you're looking for configuring the emulator itself, read **[the user handbook](./user/README.md)**.
 
-Settings on the emulator are very important, toggles and such can be used to guard and/or add branches to paths where some games may crash while others won't, and viceversa.
+Settings on the emulator are very important, toggles and such can be used to guard and/or add branches to paths where some games may crash while others won't, and vice versa.
 
 However, this process can be tedious for those unfamiliar; this document serves as an outline/documentation for the settings subsystem.
 
