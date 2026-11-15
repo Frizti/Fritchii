@@ -1341,11 +1341,9 @@ size_t BackgroundPipelineLimit(size_t built_at_boot) {
     constexpr u64 PipelineBytes = u64{460} << 10;
     const u64 ram = Common::GetMemInfo().TotalPhysicalMemory;
     const size_t by_ram = static_cast<size_t>(ram / 16 / PipelineBytes);
-    const size_t evict_above = EvictAbovePipelines();
-    const size_t by_eviction = evict_above > built_at_boot ? evict_above - built_at_boot : 0;
-    constexpr size_t MinPipelines = 500;
     constexpr size_t MaxPipelines = 6000;
-    return std::clamp<size_t>((std::min)(by_ram, by_eviction), MinPipelines, MaxPipelines);
+    return VideoCommon::GraphicsBackgroundBudget((std::min)(by_ram, MaxPipelines),
+                                                 EvictAbovePipelines(), built_at_boot);
 }
 
 // EXPERIMENT EDEN_NX2_EXP5 (live, read by each background build): background pipeline builds
@@ -2746,7 +2744,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                       const VideoCore::DiskResourceLoadCallback& callback) {
     // Read here, after nx2_switches.txt, and kept for the draws' lookups.
     canonical_keys = CanonicalKeys();
-    static_cast<void>(EvictAbovePipelines()); // Chosen and logged at boot
+    const size_t graphics_budget = EvictAbovePipelines();
     visual_workaround_title = title_id;
     if (title_id == 0) {
         return;
@@ -3121,12 +3119,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
         }
     }};
-    const auto queue_graphics{[&](const GraphicsPipelineCacheKey& key, DiskRecords records) {
-        const u64 hash = key.Hash();
-        disk_pipelines.insert(hash);
-        if (!PreloadAllPipelines() &&
-            (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
-                                    : !used_pipelines.contains(hash))) {
+    const auto queue_graphics{[&](const GraphicsPipelineCacheKey& key, DiskRecords records,
+                                  bool build_at_boot) {
+        disk_pipelines.insert(key.Hash());
+        if (!build_at_boot) {
             ++skipped_pipelines;
             if (BackgroundPipelinesEnabled()) {
                 deferred_graphics.emplace_back(key, std::move(records));
@@ -3160,11 +3156,37 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         boot_stream = std::make_shared<RecordStream>(record_file, 2 * num_pipeline_workers + 8,
                                                      false);
     }
-    for (auto& [key, records] : graphics_records) {
+    const bool preload_all = PreloadAllPipelines();
+    const bool has_used_list = !used_pipelines.empty();
+    const size_t no_history_limit = (std::min)(graphics_budget, MaxPipelinesWithoutUsedList);
+    std::vector<bool> selected(graphics_records.size());
+    if (!preload_all && has_used_list && graphics_budget != 0) {
+        // Rank only compatible, deduplicated records, after the loader has transferred ages to
+        // rekeyed records. Keep file order for the subsequent background-build queue.
+        std::vector<VideoCommon::GraphicsBootCandidate> candidates;
+        candidates.reserve((std::min)(graphics_records.size(), used_pipelines.size()));
+        for (size_t i = 0; i < graphics_records.size(); ++i) {
+            const auto used = used_pipelines.find(graphics_records[i].first.Hash());
+            if (used != used_pipelines.end()) {
+                candidates.push_back({i, used->second});
+            }
+        }
+        for (const auto& candidate :
+             VideoCommon::SelectGraphicsBootCandidates(candidates, graphics_budget)) {
+            selected[candidate.record_index] = true;
+        }
+    }
+    for (size_t i = 0; i < graphics_records.size(); ++i) {
+        auto& [key, records] = graphics_records[i];
+        const bool build_at_boot =
+            preload_all || (has_used_list ? selected[i] : i < no_history_limit);
         std::ranges::reverse(records.envs);
         std::ranges::reverse(records.refs);
-        queue_graphics(key, std::move(records));
+        queue_graphics(key, std::move(records), build_at_boot);
     }
+    LOG_INFO(Render_Vulkan,
+             "Prebuild: {} of {} cached graphics pipelines queued at boot (budget {}, preload all {})",
+             queued_graphics, graphics_records.size(), graphics_budget, preload_all);
     graphics_records.clear();
     graphics_record_index.clear();
     for (auto& [key, candidates] : compute_envs) {
@@ -3194,7 +3216,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                  "(canonical) key",
                  canonical_rekeyed);
     }
-    if (PreloadAllPipelines() && queued_graphics > 10000) {
+    if (preload_all && queued_graphics > 10000) {
         LOG_WARNING(Render_Vulkan,
                     "EDEN_NX2_PRELOAD_ALL_PIPELINES: building and keeping all {} cached graphics "
                     "pipelines holds ~{} GB of driver memory all session",
@@ -5853,7 +5875,7 @@ PipelineCache::MemoryOwnerCounts PipelineCache::MemoryOwners() {
     MemoryOwnerCounts counts{};
     counts.graphics_entries = graphics_cache.size();
     for (const auto& [key, pipeline] : graphics_cache) {
-        if (pipeline != nullptr && pipeline->IsBuilt()) {
+        if (pipeline != nullptr && pipeline->IsBuilt() && !pipeline->Failed()) {
             ++counts.graphics_built;
         }
     }
@@ -5925,11 +5947,15 @@ void PipelineCache::EvictUnusedPipelines() {
     // again on the GPU thread when it reaches that content. Past the budget (~0.9 GB of driver
     // memory) they go like the rest, so a large cache can't hold their memory all session.
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
+    size_t built = 0;
     size_t kept_prebuilt = 0;
     std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
     for (const auto& [key, pipeline] : graphics_cache) {
-        if (pipeline == nullptr || pipeline.get() == current_pipeline || !pipeline->IsBuilt() ||
-            pipeline->LastUse() >= cutoff) {
+        if (pipeline == nullptr || !pipeline->IsBuilt() || pipeline->Failed()) {
+            continue;
+        }
+        ++built;
+        if (pipeline.get() == current_pipeline || pipeline->LastUse() >= cutoff) {
             continue;
         }
         if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
@@ -5938,8 +5964,8 @@ void PipelineCache::EvictUnusedPipelines() {
         }
         candidates.emplace_back(pipeline->LastUse(), key);
     }
-    const size_t evicted = VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(),
-                                                                 candidates.size(), evict_above);
+    const size_t evicted =
+        VideoCommon::GraphicsPipelinesToEvict(built, candidates.size(), evict_above);
     if (evicted == 0) {
         return;
     }
@@ -5960,8 +5986,9 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->ClearTransitions();
         }
     }
-    LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+    LOG_INFO(Render_Vulkan,
+             "Evicted {} graphics pipelines unused for {} frames, {} left ({} built)", evicted,
+             EvictAfterFrames, graphics_cache.size(), built - evicted);
 }
 
 void PipelineCache::EvictUnusedComputePipelines(int mode) {
