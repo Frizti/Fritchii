@@ -40,6 +40,11 @@
 #include <objc/message.h>
 #endif
 
+#ifdef __linux__
+#include <cstdlib>
+#include <sys/prctl.h>
+#endif
+
 #ifdef _WIN32
 #include <QApplication>
 #include <QSettings>
@@ -279,6 +284,18 @@ void Init(QWidget* root) {
     LOG_INFO(Frontend, "Host RAM: {:.2f} GiB",
              Common::GetMemInfo().TotalPhysicalMemory / f64{1_GiB});
     LOG_INFO(Frontend, "Host Swap: {:.2f} GiB", Common::GetMemInfo().TotalSwapMemory / f64{1_GiB});
+#ifdef __linux__
+    // The Linux counterpart of the Windows timer resolution below: a sleep may end up to the
+    // thread's timer slack late (50 us by default), and the GPU, Vulkan and present threads sleep
+    // 50-250 us at a time. Threads started from here on inherit 1 us. FRITCHII_TIMER_SLACK=0 keeps
+    // the default. From viktorsparda/FritchiiLinux.
+    if (const char* slack = std::getenv("FRITCHII_TIMER_SLACK");
+        slack == nullptr || slack[0] != '0') {
+        if (prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL) == 0) {
+            LOG_INFO(Frontend, "Host timer slack: 1 us");
+        }
+    }
+#endif
 #ifdef _WIN32
     LOG_INFO(Frontend, "Host Timer Resolution: {:.4f} ms",
              std::chrono::duration_cast<std::chrono::duration<f64, std::milli>>(
