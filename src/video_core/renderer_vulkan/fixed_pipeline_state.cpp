@@ -112,10 +112,42 @@ size_t UsedColorTargets(const std::array<u8, Maxwell::NumRenderTargets>& color_f
     return used;
 }
 
+using BlendingAttachment = FixedPipelineState::BlendingAttachment;
+
+/// Bits of BlendingAttachment::raw. The attachment is read and written through raw only: GCC's
+/// strict aliasing dropped the colour mask written through the BitField members of a local
+/// attachment before it was copied (black blended draws on Linux, Frizti/Fritchii #52).
+constexpr u32 AttachmentMaskBits = decltype(BlendingAttachment::mask_r)::FormatValue(1) |
+                                   decltype(BlendingAttachment::mask_g)::FormatValue(1) |
+                                   decltype(BlendingAttachment::mask_b)::FormatValue(1) |
+                                   decltype(BlendingAttachment::mask_a)::FormatValue(1);
+constexpr u32 AttachmentEnableBit = decltype(BlendingAttachment::enable)::FormatValue(1);
+static_assert(AttachmentMaskBits == 0xF);
+
 /// An attachment below the last colour target as CanonicalizeNative keeps it: without blending,
 /// only the colour write mask.
-u32 CanonicalAttachmentRaw(const FixedPipelineState::BlendingAttachment& attachment) {
-    return attachment.enable ? attachment.raw : (attachment.raw & 0xF);
+u32 CanonicalAttachmentRaw(const BlendingAttachment& attachment) {
+    const u32 raw = attachment.raw;
+    return (raw & AttachmentEnableBit) != 0 ? raw : (raw & AttachmentMaskBits);
+}
+
+/// The blending half of BlendingAttachment::raw, enable bit included.
+u32 PackedBlending(Maxwell::Blend::Equation color_op, Maxwell::Blend::Equation alpha_op,
+                   Maxwell::Blend::Factor color_source, Maxwell::Blend::Factor color_dest,
+                   Maxwell::Blend::Factor alpha_source, Maxwell::Blend::Factor alpha_dest) {
+    using FPS = FixedPipelineState;
+    return decltype(BlendingAttachment::equation_rgb)::FormatValue(
+               FPS::PackBlendEquation(color_op)) |
+           decltype(BlendingAttachment::equation_a)::FormatValue(FPS::PackBlendEquation(alpha_op)) |
+           decltype(BlendingAttachment::factor_source_rgb)::FormatValue(
+               FPS::PackBlendFactor(color_source)) |
+           decltype(BlendingAttachment::factor_dest_rgb)::FormatValue(
+               FPS::PackBlendFactor(color_dest)) |
+           decltype(BlendingAttachment::factor_source_a)::FormatValue(
+               FPS::PackBlendFactor(alpha_source)) |
+           decltype(BlendingAttachment::factor_dest_a)::FormatValue(
+               FPS::PackBlendFactor(alpha_dest)) |
+           AttachmentEnableBit;
 }
 } // Anonymous namespace
 
@@ -289,12 +321,8 @@ FixedPipelineState::BlendingAttachment FixedPipelineState::BlendingFor(const Max
                                                                       size_t index) const {
     BlendingAttachment attachment{};
     attachment.Refresh(regs, index);
-    if (color_write_enable_dynamic && attachment.mask_r == 0 && attachment.mask_g == 0 &&
-        attachment.mask_b == 0 && attachment.mask_a == 0) {
-        attachment.mask_r.Assign(1);
-        attachment.mask_g.Assign(1);
-        attachment.mask_b.Assign(1);
-        attachment.mask_a.Assign(1);
+    if (color_write_enable_dynamic && (attachment.raw & AttachmentMaskBits) == 0) {
+        attachment.raw |= AttachmentMaskBits;
     }
     return attachment;
 }
@@ -349,45 +377,39 @@ Maxwell::PrimitiveTopology FixedPipelineState::KeyTopology(Maxwell::PrimitiveTop
 void FixedPipelineState::BlendingAttachment::Refresh(const Maxwell& regs, size_t index) {
     const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : index];
 
-    raw = 0;
-    mask_r.Assign(mask.R);
-    mask_g.Assign(mask.G);
-    mask_b.Assign(mask.B);
-    mask_a.Assign(mask.A);
+    // Built in a plain u32 and stored through raw once (see AttachmentMaskBits): the same bits the
+    // BitField members describe, without writing through them.
+    const u32 value =
+        decltype(mask_r)::FormatValue(mask.R) | decltype(mask_g)::FormatValue(mask.G) |
+        decltype(mask_b)::FormatValue(mask.B) | decltype(mask_a)::FormatValue(mask.A);
 
     // TODO: C++20 Use templated lambda to deduplicate code
     if (!regs.blend.enable[index]) {
+        raw = value;
         return;
     }
 
-    const auto setup_blend = [&]<typename T>(const T& src) {
-        equation_rgb.Assign(PackBlendEquation(src.color_op));
-        equation_a.Assign(PackBlendEquation(src.alpha_op));
-        factor_source_rgb.Assign(PackBlendFactor(src.color_source));
-        factor_dest_rgb.Assign(PackBlendFactor(src.color_dest));
-        factor_source_a.Assign(PackBlendFactor(src.alpha_source));
-        factor_dest_a.Assign(PackBlendFactor(src.alpha_dest));
-        enable.Assign(1);
+    const auto setup_blend = []<typename T>(const T& src) {
+        return PackedBlending(src.color_op, src.alpha_op, src.color_source, src.color_dest,
+                              src.alpha_source, src.alpha_dest);
     };
 
     if (!regs.blend_per_target_enabled) {
         // Temporary workaround for games that use iterated blending
         // even when dynamic blending is off so overrides work with EDS = 0 as well
         if (regs.iterated_blend.enable && Settings::values.use_squashed_iterated_blend) {
-            equation_rgb.Assign(PackBlendEquation(Maxwell::Blend::Equation::Add_GL));
-            equation_a.Assign(PackBlendEquation(Maxwell::Blend::Equation::Add_GL));
-            factor_source_rgb.Assign(PackBlendFactor(Maxwell::Blend::Factor::One_GL));
-            factor_dest_rgb.Assign(PackBlendFactor(Maxwell::Blend::Factor::One_GL));
-            factor_source_a.Assign(
-                PackBlendFactor(Maxwell::Blend::Factor::OneMinusSourceColor_GL));
-            factor_dest_a.Assign(PackBlendFactor(Maxwell::Blend::Factor::Zero_GL));
-            enable.Assign(1);
+            raw = value | PackedBlending(Maxwell::Blend::Equation::Add_GL,
+                                         Maxwell::Blend::Equation::Add_GL,
+                                         Maxwell::Blend::Factor::One_GL,
+                                         Maxwell::Blend::Factor::One_GL,
+                                         Maxwell::Blend::Factor::OneMinusSourceColor_GL,
+                                         Maxwell::Blend::Factor::Zero_GL);
             return;
         }
-        setup_blend(regs.blend);
+        raw = value | setup_blend(regs.blend);
         return;
     }
-    setup_blend(regs.blend_per_target[index]);
+    raw = value | setup_blend(regs.blend_per_target[index]);
 }
 
 void FixedPipelineState::DynamicState::Refresh(const Maxwell& regs) {
