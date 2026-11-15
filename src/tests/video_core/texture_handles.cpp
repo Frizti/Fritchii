@@ -12,6 +12,7 @@
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
+#include "shader_recompiler/info_serialize.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/shader_handle_program.h"
 
@@ -484,6 +485,26 @@ TEST_CASE("Handle tables are read for every element at once", "[video_core][text
         CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 0, element) ==
               0x100 + element);
     }
+}
+
+TEST_CASE("Kept shader metadata preserves a texture array capped to one element",
+          "[video_core][texture_handles]") {
+    Shader::Info info{};
+    auto& descriptor = info.texture_descriptors.emplace_back();
+    descriptor.count = 1;
+    descriptor.is_descriptor_array = true;
+    descriptor.handle_program = 0;
+    info.handle_programs.push_back({static_cast<u32>(Shader::HandleOp::Index)});
+
+    std::vector<u8> bytes;
+    Shader::SerializeInfo(info, bytes);
+    std::span<const u8> input{bytes};
+    Shader::Info restored{};
+    REQUIRE(Shader::DeserializeInfo(input, restored));
+    REQUIRE(input.empty());
+    REQUIRE(restored.texture_descriptors.size() == 1);
+    CHECK(restored.texture_descriptors.front() == descriptor);
+    CHECK(restored.handle_programs == info.handle_programs);
 }
 
 TEST_CASE("Handle tables read storage buffers past binding 31 from their own base",
