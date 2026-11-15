@@ -23,6 +23,7 @@
 
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/buffer_cache/deleted_buffer_bindings.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/nx2_bytes_equal.h"
 #include "video_core/nx2_debug_control.h"
@@ -4268,35 +4269,9 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     read_trapped_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(),
                                  slot_buffers[buffer_id].SizeBytes());
     cpu_read_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(), slot_buffers[buffer_id].SizeBytes());
-    bool dirty_index{false};
-    boost::container::small_vector<u64, NUM_VERTEX_BUFFERS> dirty_vertex_buffers;
-    const auto scalar_replace = [buffer_id](Binding& binding) {
-        if (binding.buffer_id == buffer_id) {
-            binding.buffer_id = BufferId{};
-        }
-    };
-    const auto replace = [scalar_replace](std::span<Binding> bindings) {
-        std::ranges::for_each(bindings, scalar_replace);
-    };
-
-    if (channel_state->index_buffer.buffer_id == buffer_id) {
-        channel_state->index_buffer.buffer_id = BufferId{};
-        dirty_index = true;
-    }
-
-    for (u32 index = 0; index < channel_state->vertex_buffers.size(); index++) {
-        auto& binding = channel_state->vertex_buffers[index];
-        if (binding.buffer_id == buffer_id) {
-            binding.buffer_id = BufferId{};
-            UpdateVertexBufferSlot(index, binding);
-            dirty_vertex_buffers.push_back(index);
-        }
-    }
-    std::ranges::for_each(channel_state->uniform_buffers, replace);
-    std::ranges::for_each(channel_state->storage_buffers, replace);
-    replace(channel_state->transform_feedback_buffers);
-    replace(channel_state->compute_uniform_buffers);
-    replace(channel_state->compute_storage_buffers);
+    InvalidateDeletedBufferBindings<HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS>(
+        *channel_state, channel_storage, active_channel_ids, buffer_id,
+        [this](u32 index, const Binding& binding) { UpdateVertexBufferSlot(index, binding); });
 
     // Adapted from the pre-refresh branch: merged buffers invalidate segment references too.
     InvalidateMultiRangeSegments(std::span{graphics_segments}, buffer_id);
@@ -4316,24 +4291,6 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
         delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
 
     slot_buffers.erase(buffer_id);
-
-    if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
-        channel_state->dirty_uniform_buffers.fill(~u32{0});
-        channel_state->uniform_buffer_binding_sizes.fill({});
-    }
-
-    auto& flags = maxwell3d->dirty.flags;
-    if (dirty_index) {
-        flags[Dirty::IndexBuffer] = true;
-    }
-
-    if (dirty_vertex_buffers.size() > 0) {
-        flags[Dirty::VertexBuffers] = true;
-        for (auto index : dirty_vertex_buffers) {
-            flags[Dirty::VertexBuffer0 + index] = true;
-        }
-    }
-    channel_state->has_deleted_buffers = true;
 }
 
 template <class P>
