@@ -27,6 +27,36 @@ TEST_CASE("Graphics pipelines are evicted only past the limit", "[video_core][pi
     }
 }
 
+TEST_CASE("Prebuild retains recent graphics pipelines within the boot budget",
+          "[video_core][pipeline_cache]") {
+    std::array candidates{
+        GraphicsBootCandidate{0, 2},
+        GraphicsBootCandidate{2, 0},
+        GraphicsBootCandidate{3, 1},
+        GraphicsBootCandidate{4, 0},
+    };
+    CHECK(SelectGraphicsBootCandidates(candidates, 0).empty());
+    CHECK(SelectGraphicsBootCandidates(candidates, 4).size() == 4);
+
+    const auto selected = SelectGraphicsBootCandidates(candidates, 2);
+    REQUIRE(selected.size() == 2);
+    CHECK(selected[0].record_index == 2);
+    CHECK(selected[1].record_index == 4);
+
+    const auto tied = SelectGraphicsBootCandidates(candidates, 1);
+    REQUIRE(tied.size() == 1);
+    CHECK(tied[0].record_index == 2);
+}
+
+TEST_CASE("Background graphics builds fit the budget remaining after boot",
+          "[video_core][pipeline_cache]") {
+    CHECK(GraphicsBackgroundBudget(6000, 2268, 0) == 2268);
+    CHECK(GraphicsBackgroundBudget(6000, 2268, 2000) == 268);
+    CHECK(GraphicsBackgroundBudget(6000, 2268, 2268) == 0);
+    CHECK(GraphicsBackgroundBudget(6000, 2268, 8771) == 0);
+    CHECK(GraphicsBackgroundBudget(500, 2268, 0) == 500);
+}
+
 TEST_CASE("Vertex attribute mask follows the header's input map", "[video_core][pipeline_cache]") {
     std::array<std::array<bool, 4>, 32> inputs{};
     CHECK(VertexAttributeMask(inputs) == 0);

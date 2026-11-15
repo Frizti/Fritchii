@@ -1200,8 +1200,16 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
         if (blacklist) {
             has_blacklisted = false;
         }
+        const ImageViewInOut* previous{};
         for (ImageViewInOut& view : views) {
-            view.id = VisitImageView(view.index, compute);
+            // An element repeating the one before (a handle table holding one shadow map in
+            // many elements, say) is the same view: visiting it again only prepares it again.
+            // Not once this pass has deleted image views (scaling an image down below does):
+            // that view may have gone with them.
+            view.id = previous != nullptr && previous->index == view.index && !has_deleted_images
+                          ? previous->id
+                          : VisitImageView(view.index, compute);
+            previous = &view;
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view = slot_image_views[view.id];
@@ -4965,6 +4973,7 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
     image.flags &= ~ImageFlagBits::GpuModified;
     image.flags |= ImageFlagBits::CpuModified;
     image.last_write_frame = ~u64{0};
+    image.write_streak = 0;
     image.relocation_guard_noted = 0;
     // A new target to the asynchronous shaders' skip rule too: its draws wait until it was
     // cleared at this address in two render frames (ClassifyDrawTargets).
@@ -5093,7 +5102,9 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
-    image.last_write_frame = RenderFrame();
+    const u64 render_frame = RenderFrame();
+    image.write_streak = NextWriteStreak(image.last_write_frame, image.write_streak, render_frame);
+    image.last_write_frame = render_frame;
     if (!clearing_render_targets) {
         image.drawn_since_clear = true;
     }
@@ -5730,9 +5741,18 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
             image ? ClassifyClearedTarget(image->last_clear_frame, image->previous_clear_frame,
                                           render_frame)
                   : DrawTargetClass::FirstTime;
+        // A target never cleared but drawn in every recent frame is per-frame too.
+        const DrawTargetClass redrawn_kind =
+            kind == DrawTargetClass::Persistent && image &&
+                    IsRedrawnTarget(image->last_write_frame, image->write_streak, render_frame)
+                ? DrawTargetClass::Recurring
+                : kind;
+        result.kind_if_redrawn = (std::max)(result.kind_if_redrawn, redrawn_kind);
         if (kind > result.kind) {
+            const DrawTargetClass kind_if_redrawn = result.kind_if_redrawn;
             result = DrawTargets{
                 .kind = kind,
+                .kind_if_redrawn = kind_if_redrawn,
                 .gpu_addr = gpu_addr,
                 .width = image ? image->info.size.width : info.size.width,
                 .height = image ? image->info.size.height : info.size.height,
@@ -5758,6 +5778,7 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
     if (!any_target) {
         // No colour or depth target: what the draw does stays in storage it writes.
         result.kind = DrawTargetClass::Persistent;
+        result.kind_if_redrawn = DrawTargetClass::Persistent;
     }
     return result;
 }

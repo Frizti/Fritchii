@@ -79,6 +79,7 @@ add_executable(tests
     video_core/spirv_fragment_shuffle.cpp
     video_core/mesh_fallback.cpp
     video_core/multi_range_refresh.cpp
+    video_core/deleted_buffer_bindings.cpp
     video_core/command_fetch_order.cpp
     video_core/async_report_wait.cpp
     video_core/command_snapshot_suspensions.cpp
@@ -183,7 +184,7 @@ add_executable(tests
 
 create_target_directory_groups(tests)
 
-target_link_libraries(tests PRIVATE common core audio_core input_common video_core)
+target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 if (TARGET dynarmic::dynarmic)

@@ -419,24 +419,22 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const auto& qmd{kepler_compute.launch_description};
     const auto& cbufs{qmd.const_buffer_config};
     const bool via_header_index{qmd.linked_tsc != 0};
+    const auto cbuf_address{[&](u32 cbuf) -> GPUVAddr {
+        return cbuf < cbufs.size() && ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0
+                   ? cbufs[cbuf].Address()
+                   : GPUVAddr{};
+    }};
+    // EDEN_NX2_HANDLE_ALIGN=0 reads the words at the unaligned address (A/B).
+    static const bool align_storage{[] {
+        const char* const value{std::getenv("EDEN_NX2_HANDLE_ALIGN")};
+        return value == nullptr || *value != '0';
+    }()};
+    const u64 storage_alignment{align_storage ? device.GetStorageBufferAlignment() : 1};
     const auto read_handle{[&](const auto& desc, u32 index) {
         if (desc.handle_program != ~0U) {
-            // Read by the shader from a storage buffer: computed for this dispatch.
-            // EDEN_NX2_HANDLE_ALIGN=0 reads the words at the unaligned address (A/B).
-            static const bool align_storage{[] {
-                const char* const value{std::getenv("EDEN_NX2_HANDLE_ALIGN")};
-                return value == nullptr || *value != '0';
-            }()};
             return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                   info, desc.handle_program, gpu_memory,
-                                   [&](u32 cbuf) -> GPUVAddr {
-                                       return cbuf < cbufs.size() &&
-                                                      ((qmd.const_buffer_enable_mask >> cbuf) &
-                                                       1) != 0
-                                                  ? cbufs[cbuf].Address()
-                                                  : GPUVAddr{};
-                                   },
-                                   align_storage ? device.GetStorageBufferAlignment() : 1),
+                                   info, desc.handle_program, gpu_memory, cbuf_address,
+                                   storage_alignment, index),
                                via_header_index);
         }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
@@ -475,7 +473,35 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
     // EDEN_NX2_EXP21 (default 1; 0 = off): no texture for a handle that is a buffer address.
     const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
+    u32 texture{};
     for (const auto& desc : info.texture_descriptors) {
+        if (desc.count > 1 && desc.handle_program != ~0U) {
+            // A table of handles the shader indexes, read in one go; elements repeating a
+            // sampler share its lookup.
+            const size_t first{views.size()};
+            u32 last_sampler_index{~0U};
+            VideoCommon::SamplerId sampler{};
+            VideoCommon::EvaluateTextureHandles(
+                info, desc.handle_program, gpu_memory, cbuf_address,
+                storage_alignment, desc.count, [&](u32, u32 raw) {
+                    const auto handle{TexturePair(raw, via_header_index)};
+                    views.push_back({handle.first});
+                    if (handle.second != last_sampler_index) {
+                        sampler = texture_cache.GetSamplerId(handle.second, true);
+                        last_sampler_index = handle.second;
+                    }
+                    samplers.push_back(sampler);
+                });
+            if (VideoCommon::HandleTableNotes::Wanted()) {
+                std::vector<u32> tics(desc.count);
+                for (u32 index = 0; index < desc.count; ++index) {
+                    tics[index] = views[first + index].index;
+                }
+                VideoCommon::HandleTableNotes::Note(shader_hash, texture, tics);
+            }
+            ++texture;
+            continue;
+        }
         for (u32 index = 0; index < desc.count; ++index) {
             const auto handle{null_pointer_handles &&
                                       VideoCommon::HandleIsStoragePointer(info, desc, index)
@@ -486,6 +512,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
             samplers.push_back(sampler);
         }
+        ++texture;
     }
     for (const auto& desc : info.image_descriptors) {
         add_image(desc, desc.is_written);

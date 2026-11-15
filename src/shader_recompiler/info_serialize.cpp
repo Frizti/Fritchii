@@ -14,12 +14,12 @@ namespace {
 // there too: this size check fails the build until it is (update the size with it).
 // Bump Magic in vk_precompiled_kept.cpp when this layout changes.
 #if defined(_MSC_VER) && defined(_WIN64)
-static_assert(sizeof(Info) == 6960,
+static_assert(sizeof(Info) == 7008,
               "Shader::Info changed: list the new fields in VisitInfo, then update this size");
-// The descriptors are held in vectors, so a field they grow does not change sizeof(Info).
+// Check individual descriptors as well as the aggregate that holds them.
 static_assert(sizeof(ConstantBufferDescriptor) == 8 && sizeof(StorageBufferDescriptor) == 80 &&
                   sizeof(TextureBufferDescriptor) == 40 && sizeof(ImageBufferDescriptor) == 28 &&
-                  sizeof(TextureDescriptor) == 44 && sizeof(ImageDescriptor) == 36,
+                  sizeof(TextureDescriptor) == 48 && sizeof(ImageDescriptor) == 36,
               "A Shader::Info descriptor changed: list the new fields in its Visit function below, "
               "then update these sizes and Magic (vk_precompiled_kept.cpp)");
 static_assert(sizeof(StorageWriteExtent) == 60,
@@ -230,6 +230,7 @@ void VisitTexture(Io& io, D& d) {
     io(d.count);
     io(d.size_shift);
     io(d.handle_program);
+    io(d.is_descriptor_array);
 }
 template <typename Io, typename D>
 void VisitImage(Io& io, D& d) {

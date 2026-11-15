@@ -92,6 +92,34 @@ constexpr u64 RECURRING_CLEAR_WINDOW = 4;
     return DrawTargetClass::Recurring;
 }
 
+/// Consecutive render frames a target must have been drawn into, this one included, to count as
+/// redrawn every frame although the game never fully clears it (a scene colour target that the
+/// sky or terrain covers instead of a clear). EDEN_NX2_ASYNC_REDRAWN, see ClassifyDrawTargets.
+constexpr u32 REDRAWN_WRITE_FRAMES = 8;
+
+/// The run of consecutive render frames with a write after one in render_frame, from the frame
+/// of the image's previous write (~0 = none or discarded) and the run up to it. Several writes in
+/// one frame count once; a frame without a write starts the run again.
+[[nodiscard]] constexpr u32 NextWriteStreak(u64 last_write_frame, u32 streak,
+                                            u64 render_frame) noexcept {
+    constexpr u64 Never = ~u64{0};
+    if (last_write_frame == render_frame) {
+        return streak == 0 ? 1 : streak;
+    }
+    if (last_write_frame != Never && last_write_frame + 1 == render_frame && streak != 0) {
+        return streak + 1;
+    }
+    return 1;
+}
+
+/// Whether a target not cleared in this render frame is still one the game draws every frame:
+/// already written in this one and in each of the REDRAWN_WRITE_FRAMES - 1 before. A layer the
+/// game renders once, or now and then, never is.
+[[nodiscard]] constexpr bool IsRedrawnTarget(u64 last_write_frame, u32 streak,
+                                             u64 render_frame) noexcept {
+    return last_write_frame == render_frame && streak >= REDRAWN_WRITE_FRAMES;
+}
+
 enum class RelaxedOptions : u32 {
     Size = 1 << 0,
     Format = 1 << 1,

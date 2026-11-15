@@ -87,6 +87,9 @@ using TextureCacheGPUMap = ::Common::unordered_map<u64, std::vector<ImageId>, Co
 /// first of the draw's least safe class; address 0 for a draw without targets).
 struct DrawTargets {
     DrawTargetClass kind{DrawTargetClass::Recurring};
+    /// kind, with targets drawn in every recent frame but never cleared counted as recurring
+    /// (IsRedrawnTarget).
+    DrawTargetClass kind_if_redrawn{DrawTargetClass::Recurring};
     GPUVAddr gpu_addr{};
     u32 width{};
     u32 height{};

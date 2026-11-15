@@ -23,6 +23,32 @@ constexpr size_t GraphicsPipelinesToEvict(size_t cached, size_t stale, size_t li
     return (std::min)(stale, cached - limit);
 }
 
+struct GraphicsBootCandidate {
+    size_t record_index;
+    u8 sessions_since_use;
+};
+
+/// Select recently used records first, with disk order as a tie-breaker.
+inline std::span<GraphicsBootCandidate> SelectGraphicsBootCandidates(
+    std::span<GraphicsBootCandidate> candidates, size_t limit) {
+    if (candidates.size() <= limit) {
+        return candidates;
+    }
+    const auto selected_end = candidates.begin() + limit;
+    std::ranges::partial_sort(candidates, selected_end, [](const auto& lhs, const auto& rhs) {
+        if (lhs.sessions_since_use != rhs.sessions_since_use) {
+            return lhs.sessions_since_use < rhs.sessions_since_use;
+        }
+        return lhs.record_index < rhs.record_index;
+    });
+    return candidates.first(limit);
+}
+
+constexpr size_t GraphicsBackgroundBudget(size_t ram_limit, size_t eviction_limit,
+                                         size_t queued_at_boot) {
+    return (std::min)(ram_limit, eviction_limit - (std::min)(eviction_limit, queued_at_boot));
+}
+
 /// Attribute mask of a native vertex program, two bits per attribute as in
 /// FixedPipelineState::attribute_types.
 /// @param input_generic Components of each generic attribute in the program header's input map.
