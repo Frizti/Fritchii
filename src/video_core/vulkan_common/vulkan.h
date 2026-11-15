@@ -36,6 +36,14 @@
 #undef False
 #undef None
 #undef True
+#ifndef _WIN32
+// Xlib's Status, Bool and Success (pulled in by vulkan_xlib.h) clash with names in our own code
+// (enum class Status in pipeline_cache_files.h, Loader::ResultStatus::Success, ...): undefined
+// here once for every file that includes this header.
+#undef Bool
+#undef Status
+#undef Success
+#endif
 
 // "Catch-all" handle for both Android and.. the rest of platforms
 struct VkSurfaceKHR_T;
