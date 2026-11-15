@@ -997,27 +997,24 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+        const auto cbuf_address{[&cbufs](u32 cbuf) -> GPUVAddr {
+            return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address : GPUVAddr{};
+        }};
+        // EDEN_NX2_HANDLE_ALIGN=0 reads the words at the unaligned address (A/B).
+        static const bool align_storage{[] {
+            const char* const value{std::getenv("EDEN_NX2_HANDLE_ALIGN")};
+            return value == nullptr || *value != '0';
+        }()};
+        const u64 storage_alignment{device.GetStorageBufferAlignment()};
+        const u64 handle_alignment{align_storage ? storage_alignment : 1};
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
-                const auto evaluate{[&](u64 storage_alignment) {
+                const auto evaluate{[&](u64 alignment) {
                     return VideoCommon::EvaluateTextureHandle(
-                        info, desc.handle_program, *gpu_memory,
-                        [&](u32 cbuf) -> GPUVAddr {
-                            return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
-                                                                              : GPUVAddr{};
-                        },
-                        storage_alignment);
+                        info, desc.handle_program, *gpu_memory, cbuf_address, alignment, index);
                 }};
-                // The program's storage offsets are relative to the buffer address aligned down
-                // to the host storage alignment (StorageOffset). EDEN_NX2_HANDLE_ALIGN=0 reads
-                // the words at the unaligned address instead (A/B).
-                static const bool align_storage{[] {
-                    const char* const value{std::getenv("EDEN_NX2_HANDLE_ALIGN")};
-                    return value == nullptr || *value != '0';
-                }()};
-                const u64 storage_alignment{device.GetStorageBufferAlignment()};
-                const u32 raw{evaluate(align_storage ? storage_alignment : 1)};
+                const u32 raw{evaluate(handle_alignment)};
                 if (raw == 0) {
                     ++zero_texture_handles;
                     static std::set<std::pair<u64, u32>> logged;
@@ -1075,11 +1072,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         // EDEN_NX2_EXP21 (default 1; 0 = off): no texture for a handle that is a buffer address.
         const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
         for (const auto& desc : info.texture_descriptors) {
-            for (u32 index = 0; index < desc.count; ++index) {
-                const auto handle{null_pointer_handles &&
-                                          VideoCommon::HandleIsStoragePointer(info, desc, index)
-                                      ? VideoCommon::NULL_TEXTURE_HANDLE
-                                      : read_handle(desc, index)};
+            u32 last_sampler_index{~0U};
+            VideoCommon::SamplerId last_sampler{};
+            const auto add_texture = [&](u32 index, const std::pair<u32, u32>& handle) {
                 // EDEN_NX2_HANDLE_TRACE=<shader hash>: each new handle of that shader's textures.
                 static const u64 trace_hash{[] {
                     const char* const value{std::getenv("EDEN_NX2_HANDLE_TRACE")};
@@ -1116,10 +1111,35 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 if (texture_memo_on) {
                     sampler_handles.push_back(handle.second);
                 } else {
-                    VideoCommon::SamplerId sampler{
-                        texture_cache.GetSamplerId(handle.second, false)};
-                    samplers.push_back(sampler);
+                    if (handle.second != last_sampler_index || !last_sampler) {
+                        last_sampler = texture_cache.GetSamplerId(handle.second, false);
+                        last_sampler_index = handle.second;
+                    }
+                    samplers.push_back(last_sampler);
                 }
+            };
+            if (desc.count > 1 && desc.handle_program != ~0U) {
+                const size_t first{views.size()};
+                VideoCommon::EvaluateTextureHandles(
+                    info, desc.handle_program, *gpu_memory, cbuf_address, handle_alignment,
+                    desc.count, [&](u32 index, u32 raw) {
+                        add_texture(index, TexturePair(raw, via_header_index));
+                    });
+                if (VideoCommon::HandleTableNotes::Wanted()) {
+                    std::vector<u32> tics(desc.count);
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        tics[index] = views[first + index].index;
+                    }
+                    const u32 slot = static_cast<u32>(&desc - info.texture_descriptors.data());
+                    VideoCommon::HandleTableNotes::Note(key.unique_hashes[stage + 1], slot, tics);
+                }
+                continue;
+            }
+            for (u32 index = 0; index < desc.count; ++index) {
+                add_texture(index, null_pointer_handles &&
+                                           VideoCommon::HandleIsStoragePointer(info, desc, index)
+                                       ? VideoCommon::NULL_TEXTURE_HANDLE
+                                       : read_handle(desc, index));
             }
         }
         if constexpr (Spec::has_images) {
