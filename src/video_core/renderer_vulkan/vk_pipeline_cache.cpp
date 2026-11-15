@@ -744,6 +744,35 @@ bool AppCacheBesideDriver(const Device& device) {
     return AmdAppCache(device) || IntelDriverCache(device);
 }
 
+#ifndef _WIN32
+/// A Mesa environment switch set to a true value, read the way Mesa reads its own (1, true, t,
+/// yes, y, any case).
+bool MesaEnvFlagSet(const char* name) {
+    const char* const value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+    std::string lower{value};
+    for (char& c : lower) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return lower == "1" || lower == "true" || lower == "t" || lower == "yes" || lower == "y";
+}
+
+/// Mesa's drivers (RADV on AMD, ANV on Intel, NVK on NVIDIA) keep built shaders in Mesa's disk
+/// cache (~/.cache/mesa_shader_cache), unless the player turned it off.
+bool MesaCachesPipelines() {
+    if (MesaEnvFlagSet("MESA_SHADER_CACHE_DISABLE") || MesaEnvFlagSet("MESA_GLSL_CACHE_DISABLE")) {
+        return false;
+    }
+    const char* const debug = std::getenv("RADV_DEBUG");
+    const std::string flags = "," + std::string{debug != nullptr ? debug : ""} + ",";
+    return flags.find(",nocache,") == std::string::npos;
+}
+#endif
+
 bool DriverCachesPipelines(const Device& device) {
     switch (device.GetDriverID()) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
@@ -751,10 +780,40 @@ bool DriverCachesPipelines(const Device& device) {
         return true;
     case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
         return IntelDriverCache(device);
+#ifndef _WIN32
+    case VK_DRIVER_ID_MESA_RADV:
+    case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
+    case VK_DRIVER_ID_MESA_NVK:
+        return MesaCachesPipelines();
+#endif
     default:
         return false;
     }
 }
+
+#ifndef _WIN32
+/// Mesa's shader cache is keyed by its build (pipelineCacheUUID), so a Mesa update, even one that
+/// keeps the version number of a git build, leaves the prepared pipelines behind: the stamp names
+/// it so the preparation runs again. Empty on other drivers.
+std::string MesaCacheIdentity(const Device& device) {
+    switch (device.GetDriverID()) {
+    case VK_DRIVER_ID_MESA_RADV:
+    case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
+    case VK_DRIVER_ID_MESA_NVK: {
+        const auto properties = device.GetPhysical().GetProperties();
+        std::string identity =
+            fmt::format(" mesa:{:04x}:{:04x}:", properties.vendorID, properties.deviceID);
+        for (const u8 byte : properties.pipelineCacheUUID) {
+            identity += fmt::format("{:02x}", byte);
+        }
+        return identity;
+    }
+    default:
+        break;
+    }
+    return {};
+}
+#endif
 } // Anonymous namespace
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
@@ -4480,9 +4539,15 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // recompiler, pipeline creation and the precompile step (CMakeModules/Nx2ShaderStamp.cmake).
     const auto stamp_path =
         base_dir / fmt::format("precompiled_prepared.fork-v{}.txt", CACHE_VERSION);
+#ifdef _WIN32
     const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}\n", file_size, modified,
                                           device.GetDriverVersion(), NX2_SHADER_STAMP,
                                           device.GetModelName());
+#else
+    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}\n", file_size, modified,
+                                          device.GetDriverVersion(), NX2_SHADER_STAMP,
+                                          device.GetModelName(), MesaCacheIdentity(device));
+#endif
     // EDEN_NX2_PRECOMPILED_FAST: the preparation keeps each pipeline's infos and SPIR-V too
     // (vk_precompiled_kept.h), for this release, its settings and GPU. Whether this build
     // translates them the same is checked on a sample at boot (CheckKeptSample), not stamped.
@@ -4669,6 +4734,10 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         std::atomic<size_t> built{};
         std::atomic<size_t> fast{};      ///< built in under FastBuild: most likely a driver cache hit
         std::atomic<size_t> failed{};
+#ifndef _WIN32
+        std::atomic<size_t> failure_logs{}; ///< Failure reasons logged (the first 16)
+        std::atomic<size_t> exceptions{};   ///< Of failed, records that threw
+#endif
         std::atomic<size_t> other_device{};
         /// Of other_device, per dynamic state the record and this device disagree on (recorded
         /// dynamic / this device dynamic): EDS, EDS2, EDS2 logic op, EDS3 blend, EDS3 enables,
@@ -4701,8 +4770,20 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const auto begin = std::chrono::steady_clock::now();
     // Threads() workers beside the game; at full speed (the frontend holds the game for the
     // preparation) one per host thread, at normal priority.
+#ifdef __linux__
+    // On Linux a host with 16 GB or less keeps the Threads() count at full speed too: every
+    // builder holds its own translator and driver compiler memory, and one per host thread pushed
+    // a 16 GB machine into swap (lkotlarenko, RX 7600 + 16 GB).
+    const u64 total_ram = Common::GetMemInfo().TotalPhysicalMemory;
+    const bool small_host = total_ram != 0 && total_ram < (u64{20} << 30);
+    const size_t full_threads = CapLegacyAmdBuildThreads(
+        device, small_host ? threads
+                           : std::max<size_t>(threads,
+                                              std::max(1U, std::thread::hardware_concurrency())));
+#else
     const size_t full_threads = CapLegacyAmdBuildThreads(
         device, std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency())));
+#endif
     // On Intel it does not build beside the game: there its compiles took the CPU from the game
     // (owner, Arc B580 + 6 cores: lag spikes with the preparation running in play, none with
     // EDEN_NX2_PRECOMPILE=0). Like the warm-up, it builds then only while emulation is paused or
@@ -4712,7 +4793,15 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         const char* value = std::getenv("EDEN_NX2_PRECOMPILE_WHILE_PLAYING");
         return value != nullptr && value[0] == '1';
     }();
+#ifdef _WIN32
     const bool hold_beside_game = IntelDriverCache(device) && !while_playing;
+#else
+    // Intel's Mesa driver (ANV) is held the same way until a Linux player shows it doesn't need it.
+    const bool hold_beside_game =
+        (IntelDriverCache(device) ||
+         device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) &&
+        !while_playing;
+#endif
     const auto allowed_threads = [&](bool full) -> size_t {
         if (full) {
             return full_threads;
@@ -4871,9 +4960,23 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     const std::span<const u32> env_ids{ids.data(), count};
                     if (compute) {
                         ComputeKeep kept;
+#ifdef _WIN32
                         ok = CreateComputePipeline(pools, compute_key, envs.front(), nullptr,
                                                    false, true, keeping ? &kept : nullptr)
                                  .pipeline != nullptr;
+#else
+                        {
+                            const auto entry =
+                                CreateComputePipeline(pools, compute_key, envs.front(), nullptr,
+                                                      false, true, keeping ? &kept : nullptr);
+                            ok = entry.pipeline != nullptr;
+                            if (!ok && state.failure_logs.fetch_add(1) < 16) {
+                                LOG_WARNING(Render_Vulkan,
+                                            "Precompiled compute record {} failed: {}", index,
+                                            entry.failure);
+                            }
+                        }
+#endif
                         if (ok && keeping && !kept.spirv.empty()) {
                             std::array<std::vector<u8>, 5> infos;
                             std::array<std::vector<u32>, 5> spirv;
@@ -4918,7 +5021,15 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     }
                 }
             } catch (const std::exception& e) {
+#ifdef _WIN32
                 LOG_DEBUG(Render_Vulkan, "Precompiled pipeline {} failed: {}", index, e.what());
+#else
+                ++state.exceptions;
+                if (state.failure_logs.fetch_add(1) < 16) {
+                    LOG_WARNING(Render_Vulkan, "Precompiled pipeline {} failed: {}", index,
+                                e.what());
+                }
+#endif
             }
             if (!skipped) {
                 ++(ok ? state.built : state.failed);
@@ -4959,6 +5070,14 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
              state.known.load() + state.other_device.load(), state.known.load(),
              state.other_device.load(), total - reached, seconds);
     LogDriverCacheFolder(device, "after the preparation");
+#ifndef _WIN32
+    if (state.failed.load() != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled failures: {} in all, {} of the records threw (the first 16 "
+                 "reasons are logged above)",
+                 state.failed.load(), state.exceptions.load());
+    }
+#endif
     if (state.other_device.load() != 0) {
         // Which dynamic states made records "for another device" (recorded on a GPU that has
         // them dynamic and this one static, or the reverse): AMD players skipped most of the

@@ -266,6 +266,12 @@ int main(int argc, char* argv[]) {
         if (!qEnvironmentVariableIsSet("__GL_SHADER_DISK_CACHE_SIZE")) {
             qputenv("__GL_SHADER_DISK_CACHE_SIZE", "10737418240"); // 10 GiB
         }
+#ifdef __linux__
+        // Mesa's drivers (RADV, ANV, NVK) keep them in Mesa's disk cache, 1 GiB by default.
+        if (!qEnvironmentVariableIsSet("MESA_SHADER_CACHE_MAX_SIZE")) {
+            qputenv("MESA_SHADER_CACHE_MAX_SIZE", "10G");
+        }
+#endif
     }
     bool has_broken_vulkan = false;
     bool is_child = false;
