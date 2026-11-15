@@ -132,6 +132,8 @@ struct ImageBase {
     /// Render target relocation guard (EXP43): the frame the GPU last wrote the image (~0 =
     /// never, or contents discarded), and the guard reasons this image already reported.
     u64 last_write_frame = ~u64{0};
+    /// Consecutive render frames with a write, up to last_write_frame (NextWriteStreak).
+    u32 write_streak = 0;
     u8 relocation_guard_noted = 0;
 
     /// Asynchronous shaders' skip rule (EDEN_NX2_ASYNC_DISCARD=2, ClassifyClearedTarget): the

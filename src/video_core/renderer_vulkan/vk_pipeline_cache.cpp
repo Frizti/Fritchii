@@ -6124,6 +6124,43 @@ int AsyncDiscardMode() {
     return mode;
 }
 
+namespace {
+/// EDEN_NX2_ASYNC_DISCARD=2 also skips depth-tested colour draws into targets the game draws
+/// every frame without clearing them (a scene the sky covers instead of a clear), not only into
+/// cleared ones: those waited for every new pipeline, a stall per new object or effect (Ocarina of
+/// Time in Hyrule Field, the first hit on an enemy). EDEN_NX2_ASYNC_REDRAWN=0 waits for them again.
+bool RedrawnTargetsRecur() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_REDRAWN");
+        const bool on = value == nullptr || value[0] != '0';
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_REDRAWN={}: depth-tested draws into targets drawn "
+                                "every frame without a clear {}",
+                 on ? 1 : 0, on ? "skip unbuilt pipelines" : "wait for them");
+        return on;
+    }();
+    return enabled;
+}
+
+/// Depth test on (a bound depth buffer alone doesn't test) and at least one colour target
+/// written: a depth-only pass, or a draw without depth testing (UI, a layer drawn once), waits.
+bool IsDepthTestedColorDraw(const Maxwell& regs) noexcept {
+    if (regs.zeta_enable == 0 || regs.depth_test_enable == 0) {
+        return false;
+    }
+    const u32 count =
+        (std::min)(static_cast<u32>(regs.rt_control.count), static_cast<u32>(Maxwell::NumRenderTargets));
+    for (u32 i = 0; i < count; ++i) {
+        const u32 rt_index = regs.rt_control.Map(i);
+        if (rt_index < Maxwell::NumRenderTargets &&
+            regs.rt[rt_index].format != Tegra::RenderTargetFormat::NONE &&
+            regs.color_mask[regs.color_mask_common ? 0 : rt_index].raw != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+} // Anonymous namespace
+
 bool PipelineCache::DrawMayBeSkipped() const {
     // Native draws whose pipeline is still building are skipped instead of waited for (the
     // object is missing for a frame or more rather than the game freezing while the driver
@@ -6149,7 +6186,9 @@ bool PipelineCache::DrawMayBeSkipped() const {
     // rule drops for good); it runs per missing pipeline, not per draw.
     const VideoCommon::DrawTargets targets = texture_cache.ClassifyDrawTargets();
     const bool recurring =
-        mode != 2 || !native || targets.kind == VideoCommon::DrawTargetClass::Recurring;
+        mode != 2 || !native || targets.kind == VideoCommon::DrawTargetClass::Recurring ||
+        (RedrawnTargetsRecur() && IsDepthTestedColorDraw(maxwell3d->regs) &&
+         targets.kind_if_redrawn == VideoCommon::DrawTargetClass::Recurring);
     const bool skip = CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
                                             draw_state.draw_element_count,
                                             draw_state.draw_element_count, mode != 0, recurring);
