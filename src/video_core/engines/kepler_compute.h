@@ -73,6 +73,11 @@ extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
 
 class KeplerCompute final : public EngineInterface {
 public:
+    static constexpr EngineTypes StaticEngineType = EngineTypes::KeplerCompute;
+    [[nodiscard]] EngineTypes GetEngineType() const noexcept override {
+        return StaticEngineType;
+    }
+
     explicit KeplerCompute(MemoryManager& memory_manager);
     ~KeplerCompute();
 

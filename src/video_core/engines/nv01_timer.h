@@ -25,6 +25,11 @@ class MemoryManager;
 namespace Tegra::Engines {
 class Nv01Timer final : public EngineInterface {
 public:
+    static constexpr EngineTypes StaticEngineType = EngineTypes::Nv01Timer;
+    [[nodiscard]] EngineTypes GetEngineType() const noexcept override {
+        return StaticEngineType;
+    }
+
     explicit Nv01Timer(MemoryManager& memory_manager) noexcept {}
     ~Nv01Timer() noexcept override {}
 

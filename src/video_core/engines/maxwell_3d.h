@@ -69,6 +69,11 @@ namespace Tegra::Engines {
 
 class Maxwell3D final : public EngineInterface {
 public:
+    static constexpr EngineTypes StaticEngineType = EngineTypes::Maxwell3D;
+    [[nodiscard]] EngineTypes GetEngineType() const noexcept override {
+        return StaticEngineType;
+    }
+
     explicit Maxwell3D(MemoryManager& memory_manager);
     ~Maxwell3D();
 

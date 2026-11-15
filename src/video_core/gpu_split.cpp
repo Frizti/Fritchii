@@ -2078,7 +2078,7 @@ void GpuSplit::MacroWords(Tegra::Engines::EngineInterface* engine, u32 method, c
     // Not for the 3D engine: the memory stage applies a Multi entry to its 3D copy as a
     // multi-method and ignores the Direct bit (memstage_shadow.cpp, Kind::Multi), while the
     // back calls every word as a Direct write. A 3D engine's words go one MacroWrite each.
-    if (dynamic_cast<const Tegra::Engines::Maxwell3D*>(engine) != nullptr) [[unlikely]] {
+    if (Tegra::Engines::EngineCast<Tegra::Engines::Maxwell3D>(engine) != nullptr) [[unlikely]] {
         ASSERT_MSG(false, "GpuSplit::MacroWords is not for the 3D engine");
         for (u32 i = 0; i < amount; ++i) {
             MacroWrite(engine, method, words[i], effect);
@@ -3847,7 +3847,7 @@ void GpuSplit::VerifyCbWords(const u64* words, u32 count, u64 front_address) {
             done += static_cast<u32>(Execute(words + done, count - done));
         }
     };
-    auto* const maxwell3d = dynamic_cast<Maxwell3D*>(back_engine);
+    auto* const maxwell3d = Tegra::Engines::EngineCast<Maxwell3D>(back_engine);
     if (maxwell3d == nullptr) {
         CbBump(cb_back.apply_skipped);
         run_block();

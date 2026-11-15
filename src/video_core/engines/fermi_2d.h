@@ -39,6 +39,11 @@ class SoftwareBlitEngine;
 
 class Fermi2D final : public EngineInterface {
 public:
+    static constexpr EngineTypes StaticEngineType = EngineTypes::Fermi2D;
+    [[nodiscard]] EngineTypes GetEngineType() const noexcept override {
+        return StaticEngineType;
+    }
+
     explicit Fermi2D(MemoryManager& memory_manager_);
     ~Fermi2D() override;
 

@@ -38,6 +38,11 @@ namespace Tegra::Engines {
 
 class KeplerMemory final : public EngineInterface {
 public:
+    static constexpr EngineTypes StaticEngineType = EngineTypes::KeplerMemory;
+    [[nodiscard]] EngineTypes GetEngineType() const noexcept override {
+        return StaticEngineType;
+    }
+
     explicit KeplerMemory(MemoryManager& memory_manager);
     ~KeplerMemory() override;
 

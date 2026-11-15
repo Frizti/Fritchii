@@ -104,6 +104,11 @@ public:
 
 class MaxwellDMA final : public EngineInterface {
 public:
+    static constexpr EngineTypes StaticEngineType = EngineTypes::MaxwellDMA;
+    [[nodiscard]] EngineTypes GetEngineType() const noexcept override {
+        return StaticEngineType;
+    }
+
     struct PackedGPUVAddr {
         u32 upper;
         u32 lower;

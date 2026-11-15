@@ -970,10 +970,10 @@ EngineKind KindOf(const Tegra::Engines::EngineInterface* engine) noexcept {
     g_kind_engine = engine;
     if (engine == nullptr) {
         g_kind = EngineKind::None;
-    } else if (const auto* maxwell3d = dynamic_cast<const Maxwell3D*>(engine)) {
+    } else if (const auto* maxwell3d = Tegra::Engines::EngineCast<Maxwell3D>(engine)) {
         g_kind = EngineKind::Maxwell3D;
         g_engine3d = maxwell3d;
-    } else if (dynamic_cast<const Tegra::Engines::KeplerCompute*>(engine) != nullptr) {
+    } else if (Tegra::Engines::EngineCast<Tegra::Engines::KeplerCompute>(engine) != nullptr) {
         g_kind = EngineKind::Compute;
     } else {
         g_kind = EngineKind::Other;

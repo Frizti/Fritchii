@@ -1056,16 +1056,16 @@ Copy* FindCopy(State& s, Maxwell3D* back) {
 }
 
 EngineType TypeOf(Tegra::Engines::EngineInterface* engine) {
-    if (dynamic_cast<Tegra::Engines::KeplerCompute*>(engine) != nullptr) {
+    if (Tegra::Engines::EngineCast<Tegra::Engines::KeplerCompute>(engine) != nullptr) {
         return EngineType::KeplerCompute;
     }
-    if (dynamic_cast<Tegra::Engines::KeplerMemory*>(engine) != nullptr) {
+    if (Tegra::Engines::EngineCast<Tegra::Engines::KeplerMemory>(engine) != nullptr) {
         return EngineType::KeplerMemory;
     }
-    if (dynamic_cast<Tegra::Engines::MaxwellDMA*>(engine) != nullptr) {
+    if (Tegra::Engines::EngineCast<Tegra::Engines::MaxwellDMA>(engine) != nullptr) {
         return EngineType::MaxwellDMA;
     }
-    if (dynamic_cast<Tegra::Engines::Fermi2D*>(engine) != nullptr) {
+    if (Tegra::Engines::EngineCast<Tegra::Engines::Fermi2D>(engine) != nullptr) {
         return EngineType::Fermi2D;
     }
     return EngineType::Other;
@@ -3101,7 +3101,7 @@ size_t Process(State& s, u64 position, bool executed) {
         auto* const engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
         s.engine = engine;
         s.engine_copy = nullptr;
-        if (auto* const maxwell3d = dynamic_cast<Maxwell3D*>(engine)) {
+        if (auto* const maxwell3d = Tegra::Engines::EngineCast<Maxwell3D>(engine)) {
             s.engine_copy = FindCopy(s, maxwell3d);
         } else {
             s.engine_type = TypeOf(engine);
@@ -3838,7 +3838,7 @@ void StageStart(s32 channel) {
     // The engine the back runs now: entries before the next engine entry are its.
     if (Tegra::Engines::EngineInterface* const engine = Access::BackEngine()) {
         s.engine = engine;
-        if (auto* const maxwell3d = dynamic_cast<Maxwell3D*>(engine)) {
+        if (auto* const maxwell3d = Tegra::Engines::EngineCast<Maxwell3D>(engine)) {
             s.engine_copy = FindCopy(s, maxwell3d);
         } else {
             s.engine_type = TypeOf(engine);
@@ -3875,7 +3875,7 @@ bool StageExtendsRun(u64 position) {
     case Kind::Wrap:
         return true;
     case Kind::Engine:
-        return dynamic_cast<Maxwell3D*>(
+        return Tegra::Engines::EngineCast<Maxwell3D>(
                    reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1])) == nullptr;
     case Kind::Call:
         switch (StageTagOf(head)) {

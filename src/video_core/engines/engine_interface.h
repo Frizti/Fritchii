@@ -7,6 +7,7 @@
 
 #include <bitset>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 #include "common/common_types.h"
@@ -24,11 +25,18 @@ enum class EngineTypes : u32 {
     Fermi2D,
     MaxwellDMA,
     KeplerMemory,
+    /// GetEngineType of an engine class that is none of the above (a test probe).
+    Other,
 };
 
 class EngineInterface {
 public:
     virtual ~EngineInterface() = default;
+
+    /// The engine's class, for EngineCast (builds without RTTI have no dynamic_cast).
+    [[nodiscard]] virtual EngineTypes GetEngineType() const noexcept {
+        return EngineTypes::Other;
+    }
 
     /// Write the value to the register identified by method.
     virtual void CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) = 0;
@@ -90,5 +98,23 @@ protected:
         method_sink.clear();
     }
 };
+
+/// dynamic_cast<T*>(engine) without RTTI: every engine class is final and derives from
+/// EngineInterface directly, so the class tag decides it exactly (nullptr stays nullptr).
+template <typename T>
+[[nodiscard]] T* EngineCast(EngineInterface* engine) noexcept {
+    static_assert(std::is_final_v<T>, "EngineCast matches the exact class only");
+    return engine != nullptr && engine->GetEngineType() == T::StaticEngineType
+               ? static_cast<T*>(engine)
+               : nullptr;
+}
+
+template <typename T>
+[[nodiscard]] const T* EngineCast(const EngineInterface* engine) noexcept {
+    static_assert(std::is_final_v<T>, "EngineCast matches the exact class only");
+    return engine != nullptr && engine->GetEngineType() == T::StaticEngineType
+               ? static_cast<const T*>(engine)
+               : nullptr;
+}
 
 } // namespace Tegra::Engines
