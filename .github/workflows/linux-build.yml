@@ -1,0 +1,210 @@
+# SPDX-FileCopyrightText: Copyright 2026 Fritchii contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Linux x86-64 build of Fritchii: clang, Qt 6.8.3, Ubuntu 24.04 (glibc 2.39), no PGO. Packs the
+# AppImage and a tar.gz with tools/appimage/package.sh and uploads them as a workflow artifact
+# only: it never publishes a release. Runs on request, or on a push to the linux-ci branch.
+name: linux-build
+
+'on':
+  workflow_dispatch:
+    inputs:
+      werror:
+        description: Build with -Werror (OFF collects every error in one run)
+        type: choice
+        options: ['OFF', 'ON']
+        default: 'OFF'
+      recipes_version:
+        description: Fritchii release whose Windows zip gives the shader recipes (default dist/frizti_version.txt)
+        type: string
+        default: ''
+  push:
+    branches:
+    - linux-ci
+    paths:
+    - src/**
+    - '!src/tests/**'
+    - CMakeLists.txt
+    - CMakeModules/**
+    - externals/**
+    - dist/**
+    - tools/appimage/**
+    - .patch/**
+    - cpmfile.json
+    - .github/workflows/linux-build.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: '23'
+  QT_VERSION: 6.8.3
+  BUILD_PLATFORM: linux-x86_64
+
+jobs:
+  build:
+    name: Linux x86-64 (clang)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPILERCHECK: content
+    steps:
+    - name: Check out source
+      uses: actions/checkout@v5
+
+    - name: Install Linux dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          autoconf pipx g++ gcc git glslang-tools libglu1-mesa-dev \
+          libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
+          mesa-common-dev nasm ninja-build pkg-config zlib1g-dev \
+          libavfilter-dev libavcodec-dev libswscale-dev libva-dev libvdpau-dev \
+          spirv-tools spirv-headers libusb-1.0-0-dev \
+          libboost-dev libboost-fiber-dev libboost-context-dev \
+          libopus-dev libasound2-dev ccache unzip \
+          libfribidi0 libcom-err2 libgpg-error0 libopengl0 \
+          libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+          libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+        # The project needs CMake 3.31; Ubuntu 24.04 packages 3.28.
+        pipx install cmake==3.31.6
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: ${{ env.QT_VERSION }}
+        host: linux
+        target: desktop
+        arch: linux_gcc_64
+        modules: qtcharts
+        cache: true
+
+    - name: Install clang
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
+          sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+        echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$LLVM_VERSION main" |
+          sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends "clang-$LLVM_VERSION" "lld-$LLVM_VERSION"
+        # OpenSSL's bundled build calls plain "clang".
+        echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
+        "clang-$LLVM_VERSION" --version
+
+    - name: Restore CPM downloads
+      id: cpm-cache
+      uses: actions/cache/restore@v5
+      with:
+        path: .cache/cpm
+        key: cpm-${{ env.BUILD_PLATFORM }}-v1-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+        restore-keys: |
+          cpm-${{ env.BUILD_PLATFORM }}-v1-
+
+    - name: Restore compiler objects
+      id: compiler-cache
+      uses: actions/cache/restore@v5
+      with:
+        path: .ccache
+        key: objects-${{ env.BUILD_PLATFORM }}-llvm${{ env.LLVM_VERSION }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          objects-${{ env.BUILD_PLATFORM }}-llvm${{ env.LLVM_VERSION }}-
+
+    # Configure once: a second configure cannot find the bundled OpenSSL.
+    - name: Configure
+      shell: bash
+      run: |
+        set -euo pipefail
+        cmake -S . -B build/release -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_TESTING=OFF \
+          -DYUZU_TESTS=OFF \
+          -DYUZU_USE_BUNDLED_QT=OFF \
+          "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
+          -DYUZU_USE_BUNDLED_SDL3=ON \
+          -DVulkanHeaders_FORCE_BUNDLED=ON \
+          -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+          -DENABLE_UPDATE_CHECKER=ON \
+          -DFRITCHII_APPIMAGE=ON \
+          "-DENABLE_WERROR=${{ inputs.werror || 'OFF' }}" \
+          -DLICHII_BUILD_PLATFORM=${{ env.BUILD_PLATFORM }} \
+          -DUSE_DISCORD_PRESENCE=OFF \
+          "-DCMAKE_C_COMPILER=clang-$LLVM_VERSION" \
+          "-DCMAKE_CXX_COMPILER=clang++-$LLVM_VERSION" \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          "-DCMAKE_EXE_LINKER_FLAGS=-B/usr/lib/llvm-$LLVM_VERSION/bin -fuse-ld=lld" \
+          2>&1 | tee configure.log
+
+    - name: Save CPM downloads
+      if: steps.cpm-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: .cache/cpm
+        key: ${{ steps.cpm-cache.outputs.cache-primary-key }}
+
+    # -k 0: one run lists every compile error, not just the first.
+    - name: Build
+      shell: bash
+      run: |
+        set -euo pipefail
+        ccache --zero-stats
+        cmake --build build/release --target yuzu --parallel "$(nproc)" -- -k 0 2>&1 | tee build.log
+        ccache --show-stats
+
+    - name: Save compiler objects
+      if: always() && steps.compiler-cache.outcome == 'success'
+      uses: actions/cache/save@v5
+      with:
+        path: .ccache
+        key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: fritchii-${{ env.BUILD_PLATFORM }}-logs-${{ github.sha }}
+        path: |
+          configure.log
+          build.log
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Package AppImage and tar.gz
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RECIPES_VERSION: ${{ inputs.recipes_version }}
+      run: |
+        set -euo pipefail
+        mkdir -p dist-out
+        BUILD_DIR="$PWD/build/release" OUT_DIR="$PWD/dist-out" TOOLS_DIR="$RUNNER_TEMP/appimage-tools" \
+          tools/appimage/package.sh
+        # The Vulkan loader must be the host's (zortos293/Lichii #1854): fail if it got in.
+        for package in dist-out/*.tar.gz; do
+          if tar -tzf "$package" | grep '/libvulkan\.so'; then
+            echo "::error::$package bundles the Vulkan loader"
+            exit 1
+          fi
+        done
+
+    - name: Upload packages
+      uses: actions/upload-artifact@v7
+      with:
+        name: fritchii-${{ env.BUILD_PLATFORM }}-${{ github.sha }}
+        path: |
+          dist-out/*.AppImage
+          dist-out/*.tar.gz
+        if-no-files-found: error
+        compression-level: 0
+        retention-days: 7
