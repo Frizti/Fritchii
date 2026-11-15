@@ -2230,8 +2230,15 @@ private:
         default:
             break;
         }
+#ifdef _WIN32
         const long long display =
             VideoCommon::Nx2Perf::g_display_refresh_ns.load(std::memory_order_relaxed);
+#else
+        // The pacer's measured period, else the rate the frontend reports for the window's
+        // display: without the pacer (vsync Immediate, no present wait) "Display" fell back to
+        // 60 Hz on Linux.
+        const long long display = VideoCommon::Nx2Perf::DisplayRefreshNsOrReported();
+#endif
         long long ns = hz != 0 ? 1'000'000'000LL / hz : display;
         if (display > 0) {
             ns = (std::max)(ns, display);

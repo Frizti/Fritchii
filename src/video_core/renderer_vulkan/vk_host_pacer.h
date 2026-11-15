@@ -18,7 +18,8 @@ struct DisplayRefresh {
     std::string display; ///< Which display and source, for the log
 };
 
-/// The refresh period of the display a window is on (Windows; nullopt elsewhere or on failure).
+/// The refresh period of the display a window is on (Windows; elsewhere the rate the frontend
+/// reports or FRITCHII_HOST_REFRESH_HZ; nullopt when unknown or on failure).
 /// Keeps the display's rate between queries so the display configuration is only read again
 /// when the window moves to another display, its mode changes, or every 30 s.
 class DisplayRefreshQuery {
@@ -103,6 +104,9 @@ private:
     u32 shown_wait_misses{}; ///< In a row
     double refresh_ns{1e9 / 60.0};
     bool refresh_known{};
+#ifndef _WIN32
+    unsigned display_generation{}; ///< Nx2Perf::g_display_generation at the last query
+#endif
     Clock::time_point next_refresh_query{};
     DisplayRefreshQuery refresh_query;
     std::string refresh_display;

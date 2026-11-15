@@ -174,6 +174,21 @@ std::optional<DisplayRefresh> DisplayRefreshQuery::Query([[maybe_unused]] void* 
         mode.dmDisplayFrequency > 1) {
         return DisplayRefresh{1e9 / mode.dmDisplayFrequency, "primary, display settings"};
     }
+#else
+    // No compositor timing query here: the frontend reports the window's display
+    // (Nx2Perf::PublishDisplay), or the player sets FRITCHII_HOST_REFRESH_HZ.
+    const double forced = VideoCommon::Nx2Perf::ForcedRefreshHz();
+    const double hz =
+        forced > 0.0 ? forced
+                     : VideoCommon::Nx2Perf::g_display_refresh_hz.load(std::memory_order_relaxed);
+    if (hz > 20.0 && hz < 1000.0) {
+        if (forced > 0.0) {
+            return DisplayRefresh{1e9 / hz, "FRITCHII_HOST_REFRESH_HZ"};
+        }
+        const std::string name = VideoCommon::Nx2Perf::DisplayName();
+        return DisplayRefresh{1e9 / hz, name.empty() ? std::string{"window display"}
+                                                     : name + ", window display"};
+    }
 #endif
     return std::nullopt;
 }
@@ -190,7 +205,15 @@ void HostPacer::NoteQueued(Clock::time_point queued) {
 }
 
 void HostPacer::Refresh(Clock::time_point now, bool allowed, void* native_window) {
+#ifdef _WIN32
     if (now >= next_refresh_query) {
+#else
+    // A display or mode change the frontend saw is read at once, not up to 2 s later.
+    const unsigned generation =
+        VideoCommon::Nx2Perf::g_display_generation.load(std::memory_order_acquire);
+    if (now >= next_refresh_query || generation != display_generation) {
+        display_generation = generation;
+#endif
         next_refresh_query = now + std::chrono::seconds{2};
         if (const auto refresh = refresh_query.Query(native_window);
             refresh && refresh->period_ns > 2e6 && refresh->period_ns < 50e6) {

@@ -62,6 +62,9 @@
 #include "input_common/main.h"
 #include "qt_common/qt_common.h"
 #include "video_core/gpu.h"
+#ifndef _WIN32
+#include "video_core/nx2_perf.h"
+#endif
 #include "video_core/renderer_base.h"
 #include "yuzu/bootmanager.h"
 #include "yuzu/main_window.h"
@@ -195,7 +198,38 @@ void GRenderWindow::OnFramebufferSizeChanged() {
     const u32 width = this->width() * pixel_ratio;
     const u32 height = this->height() * pixel_ratio;
     UpdateCurrentFramebufferLayout(width, height);
+#ifndef _WIN32
+    PublishDisplayRefresh();
+#endif
 }
+
+#ifndef _WIN32
+void GRenderWindow::PublishDisplayRefresh() {
+    const QScreen* const current = screen();
+    if (current == nullptr) {
+        return;
+    }
+    const std::string name = current->name().toStdString();
+    const std::string platform = QGuiApplication::platformName().toStdString();
+    const double hz = current->refreshRate();
+    if (VideoCommon::Nx2Perf::PublishDisplay(hz, name + ", " + platform)) {
+        LOG_INFO(Frontend, "Display: {} at {:.3f} Hz (platform {}){}", name, hz, platform,
+                 hz > 20.0 && hz < 1000.0 ? "" : ", rate not usable for host pacing");
+    }
+}
+
+void GRenderWindow::FollowScreen(QScreen* new_screen) {
+    if (refresh_rate_connection) {
+        disconnect(refresh_rate_connection);
+    }
+    if (new_screen != nullptr) {
+        // A mode change on the same display (144 -> 60 Hz in the desktop's settings).
+        refresh_rate_connection = connect(new_screen, &QScreen::refreshRateChanged, this,
+                                          [this](qreal) { PublishDisplayRefresh(); });
+    }
+    OnFramebufferSizeChanged();
+}
+#endif
 
 void GRenderWindow::BackupGeometry() {
     geometry = QWidget::saveGeometry();
@@ -948,6 +982,21 @@ void GRenderWindow::showEvent(QShowEvent* event) {
     // windowHandle() is not initialized until the Window is shown, so we connect it here.
     connect(windowHandle(), &QWindow::screenChanged, this, &GRenderWindow::OnFramebufferSizeChanged,
             Qt::UniqueConnection);
+#ifndef _WIN32
+    // The host frame pacer follows the refresh rate of the display showing the game. The
+    // top-level window is the one a compositor moves between displays. Connected once.
+    if (!screen_follow_connected) {
+        screen_follow_connected = true;
+        QWindow* const top = window() != nullptr ? window()->windowHandle() : nullptr;
+        for (QWindow* const handle : {top, windowHandle()}) {
+            if (handle != nullptr) {
+                connect(handle, &QWindow::screenChanged, this,
+                        [this](QScreen* new_screen) { FollowScreen(new_screen); });
+            }
+        }
+    }
+    FollowScreen(screen());
+#endif
 }
 
 bool GRenderWindow::eventFilter(QObject* object, QEvent* event) {
