@@ -158,11 +158,15 @@ for plugin in imageformats/libqsvg.so iconengines/libqsvgicon.so; do
 done
 
 # The tar.gz is the same AppDir, for players who can't run AppImages (no FUSE, sandboxes).
-tar_dir="$(dirname "$BUILD_DIR")/fritchii"
-rm -rf "$tar_dir"
+# Its own folder: next to BUILD_DIR there may be a source checkout named fritchii (WSL builds,
+# 2026-11-16: the old "$(dirname "$BUILD_DIR")/fritchii" deleted it).
+tar_root="$(dirname "$BUILD_DIR")/fritchii-package"
+tar_dir="$tar_root/fritchii"
+rm -rf "$tar_root"
+mkdir -p "$tar_root"
 cp -a "$appdir" "$tar_dir"
 ln -s "usr/bin/$exe" "$tar_dir/$exe"
-tar -czf "$OUT_DIR/$name.tar.gz" -C "$(dirname "$tar_dir")" fritchii
+tar -czf "$OUT_DIR/$name.tar.gz" -C "$tar_root" fritchii
 
 # The host's Vulkan loader and C++ runtime must be the ones used (see above).
 if tar -tzf "$OUT_DIR/$name.tar.gz" | grep -E '/(libvulkan|libstdc\+\+|libgcc_s)\.so'; then
