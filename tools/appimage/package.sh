@@ -107,9 +107,15 @@ for plugin in libqwayland.so libqwayland-egl.so libqwayland-generic.so; do
 done
 EXTRA_PLATFORM_PLUGINS=$(IFS=';'; echo "${platforms[*]}")
 export EXTRA_PLATFORM_PLUGINS
+# The Fritchii UI's icons are SVG (src/yuzu/fritchii/icons): Qt loads them through the svg
+# imageformat/iconengine plugins, which linuxdeploy only deploys with the svg module named.
+# Without them every icon button is blank (Linux test 1, 2026-11-16).
+extra_modules=(svg)
 if compgen -G "$QT_ROOT_DIR/lib/libQt6WaylandCompositor.so*" > /dev/null; then
-    export EXTRA_QT_MODULES=waylandcompositor
+    extra_modules+=(waylandcompositor)
 fi
+EXTRA_QT_MODULES=$(IFS=';'; echo "${extra_modules[*]}")
+export EXTRA_QT_MODULES
 
 export PATH="$TOOLS_DIR:$PATH"
 export APPIMAGE_EXTRACT_AND_RUN=1
@@ -146,6 +152,10 @@ linuxdeploy-x86_64.AppImage --appdir "$appdir" \
 
 test -s "$LDAI_OUTPUT"
 test -f "$appdir/usr/bin/qt.conf"
+for plugin in imageformats/libqsvg.so iconengines/libqsvgicon.so; do
+    test -f "$appdir/usr/plugins/$plugin" ||
+        { echo "::error::No $plugin in the AppDir: the UI icons would be blank"; exit 1; }
+done
 
 # The tar.gz is the same AppDir, for players who can't run AppImages (no FUSE, sandboxes).
 tar_dir="$(dirname "$BUILD_DIR")/fritchii"
