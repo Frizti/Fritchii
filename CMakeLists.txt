@@ -48,6 +48,12 @@ endif()
 # qt stuff
 option(ENABLE_QT "Enable the Qt frontend" ON)
 option(ENABLE_UPDATE_CHECKER "Enable update checker (for Qt and Android)" OFF)
+# Set by the Linux AppImage packaging only: the updater then offers the release's AppImage and
+# replaces the running one in place. Other Linux builds are offered no update.
+option(FRITCHII_APPIMAGE "Linux AppImage build: the updater installs AppImage releases" OFF)
+if (FRITCHII_APPIMAGE)
+    add_compile_definitions(FRITCHII_APPIMAGE)
+endif()
 set(LICHII_BUILD_TAG "" CACHE STRING "Published build-N release tag; empty for local builds")
 set(LICHII_BUILD_PLATFORM "" CACHE STRING "Release asset platform and variant, such as linux-x86_64-pgo")
 cmake_dependent_option(YUZU_USE_QT_MULTIMEDIA "Use QtMultimedia for Camera"  OFF "NOT YUZU_USE_BUNDLED_QT" OFF)

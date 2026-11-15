@@ -35,6 +35,9 @@ private:
 #ifdef _WIN32
     void InstallInPlace();
 #endif
+#ifdef FRITCHII_APPIMAGE
+    void InstallAppImage();
+#endif
     bool DownloadTo(const QString& filename);
 
     Ui::UpdateDialog* ui;
@@ -53,6 +56,9 @@ void PrepareLaunch();
 
 // Whether this build can replace its own files: a Fritchii build on Windows run as lichii.exe.
 bool CanInstallInPlace();
+
+// Whether this build can replace the AppImage it was started from (FRITCHII_APPIMAGE builds).
+bool CanReplaceAppImage();
 
 // At startup: finish or undo a swap that was interrupted, and remove the staging folder. Returns
 // true when Fritchii restarted to run the restored files.

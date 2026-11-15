@@ -51,8 +51,9 @@ std::optional<u32> ParseNumber(std::string_view text) {
 }
 
 CheckResult CheckFritchii([[maybe_unused]] const FritchiiVersion& current) {
-#ifndef _WIN32
-    // Fritchii only publishes Windows packages.
+#if !defined(_WIN32) && !defined(FRITCHII_APPIMAGE)
+    // Fritchii publishes a Windows zip and a Linux AppImage. Only builds that can install one of
+    // them look: never offer the Windows zip to a Linux tar.gz or distro build.
     return {};
 #else
     auto source = DefaultSource();
@@ -215,7 +216,11 @@ std::optional<FritchiiVersion> ParseFritchiiTag(std::string_view tag) {
 }
 
 std::string FritchiiAssetName(const FritchiiVersion& version) {
+#ifdef FRITCHII_APPIMAGE
+    return fmt::format("Fritchii-v{}-Linux-x86_64.AppImage", version.ToString());
+#else
     return fmt::format("Fritchii-v{}-Windows-x64.zip", version.ToString());
+#endif
 }
 
 Source DefaultSource() {

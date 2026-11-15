@@ -66,8 +66,9 @@ std::optional<FritchiiVersion> RunningVersion();
 // "fritchii-v4", "fritchii-v4.1", or the older "frizti-v3".
 std::optional<FritchiiVersion> ParseFritchiiTag(std::string_view tag);
 
-// "Fritchii-v4-Windows-x64.zip". Releases from before the rename named it differently and are
-// never installed.
+// "Fritchii-v4-Windows-x64.zip", or "Fritchii-v6-Linux-x86_64.AppImage" in an AppImage build
+// (FRITCHII_APPIMAGE). Releases from before the rename named it differently and are never
+// installed.
 std::string FritchiiAssetName(const FritchiiVersion& version);
 
 // Where Fritchii releases are listed and downloaded from.
@@ -85,7 +86,8 @@ Source DefaultSource();
 // Plain HTTP is accepted only for a loopback host.
 std::optional<Source> ParseSourceOverride(std::string_view url);
 
-// The Windows package of a Fritchii release, when its URL belongs to `source`.
+// This platform's package of a Fritchii release (FritchiiAssetName), when its URL belongs to
+// `source`.
 std::optional<Common::Net::Asset> SelectFritchiiAsset(const Common::Net::Release& release,
                                                       const Source& source);
 

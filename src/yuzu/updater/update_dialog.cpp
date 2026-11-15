@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#ifdef FRITCHII_APPIMAGE
+#include <cstdlib>
+#endif
 #include <filesystem>
 #include <utility>
 #include <QTimer>
@@ -105,6 +108,14 @@ QProcessEnvironment& LaunchEnvironment() {
     return environment;
 }
 
+#ifdef FRITCHII_APPIMAGE
+// The file the AppImage runtime started this process from; empty outside an AppImage.
+fs::path AppImagePath() {
+    const char* const path = std::getenv("APPIMAGE");
+    return path != nullptr ? fs::path{path} : fs::path{};
+}
+#endif
+
 } // namespace
 
 UpdateDialog::UpdateDialog(const Common::Net::Release& release,
@@ -160,7 +171,7 @@ UpdateDialog::UpdateDialog(const Common::Net::Release& release,
             return;
         }
         install->setText(tr("Install"));
-        ui->label_2->setText(Updater::CanInstallInPlace()
+        ui->label_2->setText(Updater::CanInstallInPlace() || Updater::CanReplaceAppImage()
                                  ? tr("Fritchii will download the update, install it and restart. "
                                       "Your settings, saves and keys are not changed.")
                                  : tr("Would you like to download this update?"));
@@ -213,6 +224,12 @@ UpdateDialog::~UpdateDialog() {
 }
 
 void UpdateDialog::Download() {
+#ifdef FRITCHII_APPIMAGE
+    if (m_fritchii && Updater::CanReplaceAppImage()) {
+        InstallAppImage();
+        return;
+    }
+#endif
 #ifdef _WIN32
     if (m_fritchii && Updater::CanInstallInPlace()) {
         if (UpdateInstaller::IsWritable(InstallDir())) {
@@ -360,6 +377,51 @@ void UpdateDialog::InstallInPlace() {
                    .arg(ErrorText(ec)));
         return;
     }
+}
+#endif
+
+#ifdef FRITCHII_APPIMAGE
+void UpdateDialog::InstallAppImage() {
+    const auto appimage = AppImagePath();
+    auto staged = appimage;
+    staged += ".new";
+    auto previous = appimage;
+    previous += ".old";
+    // DownloadTo checks the published sha256 before it keeps the file.
+    if (!DownloadTo(QString::fromStdString(PathText(staged)))) {
+        return;
+    }
+
+    std::error_code ec;
+    const auto permissions = fs::status(appimage, ec).permissions();
+    if (!ec) {
+        fs::permissions(staged, permissions | fs::perms::owner_exec, ec);
+    }
+    if (!ec) {
+        // The running process keeps its copy open, so the file can be replaced underneath it.
+        std::error_code link_ec;
+        fs::remove(previous, link_ec);
+        fs::create_hard_link(appimage, previous, link_ec);
+        if (link_ec) {
+            LOG_WARNING(Frontend, "Could not keep the previous AppImage: {}", link_ec.message());
+        }
+        fs::rename(staged, appimage, ec);
+    }
+    if (ec) {
+        LOG_ERROR(Frontend, "Could not replace {}: {}", PathText(appimage), ec.message());
+        std::error_code remove_ec;
+        fs::remove(staged, remove_ec);
+        Notify(parentWidget(), QMessageBox::Critical, tr("Failed to install the update"),
+               tr("Could not replace the AppImage (%1). Fritchii was not changed.")
+                   .arg(ErrorText(ec)));
+        return;
+    }
+
+    LOG_INFO(Frontend, "Installed {} over {}", m_release.tag, PathText(appimage));
+    Updater::Restart(parentWidget(),
+                     tr("%1 is installed.\n\nThe previous version is kept next to it as %2.")
+                         .arg(QString::fromStdString(m_release.title),
+                              QString::fromStdString(PathText(previous.filename()))));
 }
 #endif
 
@@ -538,6 +600,17 @@ bool CanInstallInPlace() {
 #endif
 }
 
+bool CanReplaceAppImage() {
+#if defined(FRITCHII_APPIMAGE) && defined(ENABLE_UPDATE_CHECKER)
+    const auto appimage = AppImagePath();
+    std::error_code ec;
+    return UpdateChecker::RunningVersion().has_value() && !appimage.empty() &&
+           fs::is_regular_file(appimage, ec) && UpdateInstaller::IsWritable(appimage.parent_path());
+#else
+    return false;
+#endif
+}
+
 bool FinishPendingSwap(QWidget* window) {
     if (!CanInstallInPlace()) {
         return false;
@@ -652,8 +725,13 @@ void RollBack(QWidget* window) {
 }
 
 bool Restart(QWidget* window, const QString& note) {
+#ifdef FRITCHII_APPIMAGE
+    // The AppImage just replaced (Qt's applicationDirPath() is inside the old one's mount).
+    const auto exe = AppImagePath();
+#else
     // The install folder from startup: Qt's applicationDirPath() now names update-old.
     const auto exe = InstallDir() / ExeName;
+#endif
     const auto program = QString::fromStdWString(exe.wstring());
     std::error_code ec;
     if (UpdateInstaller::IsUpdaterFolder(exe.parent_path()) || !fs::is_regular_file(exe, ec)) {
