@@ -688,6 +688,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
+    // A skipped frame still runs draws whose shaders store to memory or that capture transform
+    // feedback: the game reads what they write (Mario Tennis Fever panicked in its menu).
+    const bool targets_repeat = pipeline && frameskip_active && FrameskipTargetsRepeat();
+    if (pipeline && frame_draws_skipped && targets_repeat && !pipeline->WritesMemory() &&
+        maxwell3d->regs.transform_feedback_enabled == 0) {
+        submitted = true;
+        ++frameskip_dropped_draws;
+        return;
+    }
     if (!pipeline) {
         report_failure("no pipeline");
         TraceRenderState(is_indexed, "no-pipeline", nullptr);
@@ -1726,6 +1735,10 @@ void RasterizerVulkan::CollectIndirectTrace() {
 }
 
 void RasterizerVulkan::DrawTexture() {
+    if (frameskip_active && FrameskipTargetsRepeat() && frame_draws_skipped) {
+        ++frameskip_dropped_draws;
+        return;
+    }
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -1780,6 +1793,9 @@ void RasterizerVulkan::DrawTexture() {
 
 void RasterizerVulkan::Clear(u32 layer_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
+    if (frameskip_active && FrameskipTargetsRepeat() && frame_clears_skipped) {
+        return;
+    }
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         const auto& regs = maxwell3d->regs;
         LOG_INFO(HW_GPU, "after upscale: clear rt0 {:#x} {}x{} fmt {:#x} surface {:#x} colour {} {} {} {}",
@@ -3530,6 +3546,56 @@ void RasterizerVulkan::TickFrame() {
         trace_sample_frame = trace_frame < 4 || trace_rate.Ready(now);
     }
     ComputePipeline::TickUpscalerTrace();
+    // Read again each frame: on Android one process runs every game launched.
+    const u32 frameskip_interval =
+        std::min<u32>(Settings::PerTitleEnv("EDEN_NX2_FRAMESKIP"), 4);
+    if (frameskip_interval != std::exchange(frameskip_logged_interval, frameskip_interval)) {
+        LOG_WARNING(Render_Vulkan, "Frameskip: drawing one frame in {}",
+                    std::max<u32>(frameskip_interval, 1));
+    }
+    static const auto frameskip_parts = [] {
+        const char* value = std::getenv("EDEN_NX2_FRAMESKIP_PARTS");
+        const std::string_view parts = value != nullptr ? value : "draws,clears,present";
+        const std::array<bool, 3> skipped{parts.find("draws") != std::string_view::npos,
+                                          parts.find("clears") != std::string_view::npos,
+                                          parts.find("present") != std::string_view::npos};
+        LOG_WARNING(Render_Vulkan, "Frameskip parts: draws {} clears {} present {}", skipped[0],
+                    skipped[1], skipped[2]);
+        return skipped;
+    }();
+    const u32 frameskip_auto_fps = Settings::PerTitleEnv("EDEN_NX2_FRAMESKIP_AUTO");
+    const auto frame_end = std::chrono::steady_clock::now();
+    const auto frame_time = frame_end - std::exchange(frameskip_last_tick, frame_end);
+    bool dropped = false;
+    if (frameskip_interval > 1) {
+        dropped = render_trace_frame % frameskip_interval != 0;
+    } else if (frameskip_auto_fps != 0) {
+        // A drawn frame that took 20 % longer than the target rate lets the next one go undrawn
+        // (with 5 %, timing noise alone dropped one frame in ten of a game holding 60 fps).
+        // A frame that follows a dropped one is timed from that frame's early end and looks
+        // late: timing it made every other frame dropped (Pokopia on a PC holding 60 fps showed
+        // 28), so only a frame timed from a drawn one counts.
+        const std::chrono::nanoseconds late{1'200'000'000LL / frameskip_auto_fps};
+        dropped = !frameskip_previous_dropped && !frameskip_timed_from_dropped &&
+                  frame_time > late;
+    }
+    frameskip_timed_from_dropped = frameskip_previous_dropped;
+    frameskip_previous_dropped = dropped;
+    frameskip_active = frameskip_interval > 1 || frameskip_auto_fps != 0;
+    if (render_trace_frame % 600 == 0) {
+        std::erase_if(frameskip_targets, [this](const auto& target) {
+            return target.second.frame + 600 < render_trace_frame;
+        });
+    }
+    frameskip_dropped_frames += dropped ? 1 : 0;
+    frame_draws_skipped = dropped && frameskip_parts[0];
+    frame_clears_skipped = dropped && frameskip_parts[1];
+    frame_present_skipped = dropped && frameskip_parts[2];
+    if ((frameskip_interval > 1 || frameskip_auto_fps != 0) && render_trace_frame % 600 == 0) {
+        LOG_INFO(Render_Vulkan, "Frameskip: {} frames and {} draws dropped over the last 600",
+                 std::exchange(frameskip_dropped_frames, 0),
+                 std::exchange(frameskip_dropped_draws, 0));
+    }
     draw_counter = 0;
     pending_native_work = false;
     pipeline_cache.TickFrame();
@@ -3546,6 +3612,39 @@ void RasterizerVulkan::TickFrame() {
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.TickFrame();
     }
+}
+
+bool RasterizerVulkan::FrameskipTargetsRepeat() {
+    const auto& regs = maxwell3d->regs;
+    const auto key = [](u64 address, u32 width, u32 height, u32 format) {
+        return address ^ (u64{width} << 40) ^ (u64{height} << 52) ^ (u64{format} << 32);
+    };
+    bool repeat = true;
+    const auto note = [&](u64 target) {
+        const auto [it, inserted] =
+            frameskip_targets.try_emplace(target, FrameskipTarget{render_trace_frame, false});
+        if (!inserted && it->second.frame != render_trace_frame) {
+            it->second.drawn_frame_before = it->second.frame + 1 == render_trace_frame;
+            it->second.frame = render_trace_frame;
+        }
+        repeat = repeat && it->second.drawn_frame_before;
+    };
+    bool any = false;
+    for (u32 index = 0; index < regs.rt_control.count && index < Maxwell::NumRenderTargets;
+         ++index) {
+        const auto& rt = regs.rt[regs.rt_control.Map(index)];
+        if (rt.Address() == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
+            continue;
+        }
+        any = true;
+        note(key(rt.Address(), rt.width, rt.height, static_cast<u32>(rt.format)));
+    }
+    if (regs.zeta_enable && regs.zeta.Address() != 0) {
+        any = true;
+        note(key(regs.zeta.Address(), regs.zeta_size.width, regs.zeta_size.height,
+                 0x8000'0000U | static_cast<u32>(regs.zeta.format)));
+    }
+    return any && repeat;
 }
 
 bool RasterizerVulkan::AccelerateConditionalRendering() {

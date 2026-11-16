@@ -7,6 +7,8 @@
 #pragma once
 
 #include <array>
+#include <unordered_map>
+#include <chrono>
 #include <optional>
 #include <string_view>
 
@@ -146,6 +148,11 @@ public:
     void TiledCacheBarrier() override;
     void FlushCommands() override;
     void TickFrame() override;
+
+    /// True while EDEN_NX2_FRAMESKIP drops the current frame's present.
+    [[nodiscard]] bool FramePresentSkipped() const noexcept {
+        return frame_present_skipped;
+    }
     bool AccelerateConditionalRendering() override;
     bool HasDrawTransformFeedback() override;
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
@@ -344,6 +351,33 @@ private:
         std::array<f32, 280 * 12> bones{};
     } oot_actor, oot_previous_actor;
     u64 render_trace_frame = 0;
+    /// EDEN_NX2_FRAMESKIP=<n> (2 to 4): one frame in n is drawn, the others only run their
+    /// compute work, copies and queries.
+    /// EDEN_NX2_FRAMESKIP_PARTS picks what a dropped frame skips: any of draws, clears and
+    /// present, comma separated (all three by default).
+    bool frame_draws_skipped{};
+    bool frame_clears_skipped{};
+    bool frame_present_skipped{};
+    u64 frameskip_dropped_draws = 0;
+    u32 frameskip_logged_interval = 0;
+    /// EDEN_NX2_FRAMESKIP_AUTO=<fps>: drop a frame only after one that missed that rate, timed
+    /// from a drawn frame, so at most one frame in three.
+    std::chrono::steady_clock::time_point frameskip_last_tick{};
+    bool frameskip_previous_dropped{};
+    bool frameskip_timed_from_dropped{};
+    u64 frameskip_dropped_frames = 0;
+    /// Frame each render target (address, size and format) was last drawn to. A dropped frame
+    /// only drops work on targets drawn the frame before: a target drawn once (a texture the
+    /// game renders when it loads it) is always drawn.
+    struct FrameskipTarget {
+        u64 frame;
+        bool drawn_frame_before;
+    };
+    std::unordered_map<u64, FrameskipTarget> frameskip_targets;
+    bool frameskip_active{};
+    /// Records the bound render targets as drawn this frame; true when all of them were drawn
+    /// the frame before too.
+    bool FrameskipTargetsRepeat();
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;
     bool pending_native_work{};
