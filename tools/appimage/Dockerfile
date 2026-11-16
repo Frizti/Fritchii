@@ -13,7 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         autoconf automake binutils ca-certificates curl file g++ gcc gettext git gnupg \
         glslang-tools libtool make nasm ninja-build patch perl pkg-config python3 python3-venv \
-        unzip xz-utils zip \
+        unzip xz-utils zip zsync \
         libasound2-dev libavcodec-dev libavfilter-dev libboost-context-dev libboost-dev \
         libboost-fiber-dev libegl1 libgl-dev libglu1-mesa-dev libopus-dev libpulse-dev \
         libswscale-dev libudev-dev libusb-1.0-0-dev libva-dev libvdpau-dev mesa-common-dev \

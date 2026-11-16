@@ -17,6 +17,11 @@
 #                    git (they aren't GPL): they ship in the Windows zip only. A private repository
 #                    needs RECIPES_ZIP, or gh with GH_TOKEN set.
 #   ALLOW_NO_RECIPES=1  package without recipes instead of failing (no shader preparation)
+#   UPDATE_INFORMATION  AppImage update information (default: the .zsync of the latest Frizti/Fritchii
+#                    release), read by AppImageUpdate, Gear Lever and AppImageLauncher; empty = none.
+#                    Fritchii's own updater ignores it (it takes Fritchii-v<N>-Linux-x86_64.AppImage).
+#
+# Next to each package goes a <file>.sha256 (sha256sum format), and next to the AppImage its .zsync.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -127,6 +132,14 @@ export LDAI_VERSION="v$VERSION-$(git rev-parse --short=7 HEAD 2> /dev/null || ec
 export LDAI_OUTPUT="$OUT_DIR/$name.AppImage"
 export OUTPUT="$LDAI_OUTPUT"
 export ARCH=x86_64
+# The .zsync is published beside the AppImage on every release; "latest" makes update tools follow
+# the newest release.
+UPDATE_INFORMATION=${UPDATE_INFORMATION-gh-releases-zsync|Frizti|Fritchii|latest|Fritchii-v*-Linux-x86_64.AppImage.zsync}
+if [ -n "$UPDATE_INFORMATION" ]; then
+    export UPDATE_INFORMATION LDAI_UPDATE_INFORMATION="$UPDATE_INFORMATION"
+else
+    unset UPDATE_INFORMATION LDAI_UPDATE_INFORMATION
+fi
 
 strip "$BUILD_DIR/bin/$exe"
 
@@ -152,6 +165,14 @@ linuxdeploy-x86_64.AppImage --appdir "$appdir" \
 
 test -s "$LDAI_OUTPUT"
 test -f "$appdir/usr/bin/qt.conf"
+# appimagetool writes the .zsync itself when it finds zsyncmake; otherwise make it here.
+if [ -n "${UPDATE_INFORMATION:-}" ] && [ ! -s "$LDAI_OUTPUT.zsync" ]; then
+    if command -v zsyncmake > /dev/null; then
+        zsyncmake -u "$(basename "$LDAI_OUTPUT")" -o "$LDAI_OUTPUT.zsync" "$LDAI_OUTPUT"
+    else
+        echo "::warning::No zsyncmake (apt package zsync): no .zsync, update tools can't update this AppImage"
+    fi
+fi
 for plugin in imageformats/libqsvg.so iconengines/libqsvgicon.so; do
     test -f "$appdir/usr/plugins/$plugin" ||
         { echo "::error::No $plugin in the AppDir: the UI icons would be blank"; exit 1; }
@@ -173,4 +194,8 @@ if tar -tzf "$OUT_DIR/$name.tar.gz" | grep -E '/(libvulkan|libstdc\+\+|libgcc_s)
     echo "::error::The package bundles the Vulkan loader or the C++ runtime"
     exit 1
 fi
-ls -la "$LDAI_OUTPUT" "$OUT_DIR/$name.tar.gz"
+# Checksums for players who check by hand: "sha256sum -c <file>.sha256" in the download folder.
+for package in "$LDAI_OUTPUT" "$OUT_DIR/$name.tar.gz"; do
+    (cd "$(dirname "$package")" && sha256sum "$(basename "$package")" > "$(basename "$package").sha256")
+done
+ls -la "$LDAI_OUTPUT"* "$OUT_DIR/$name.tar.gz"*

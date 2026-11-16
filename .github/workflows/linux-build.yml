@@ -70,7 +70,7 @@ jobs:
           libavfilter-dev libavcodec-dev libswscale-dev libva-dev libvdpau-dev \
           spirv-tools spirv-headers libusb-1.0-0-dev \
           libboost-dev libboost-fiber-dev libboost-context-dev \
-          libopus-dev libasound2-dev ccache unzip \
+          libopus-dev libasound2-dev ccache unzip zsync \
           libfribidi0 libcom-err2 libgpg-error0 libopengl0 \
           libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
           libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
@@ -205,6 +205,8 @@ jobs:
         path: |
           dist-out/*.AppImage
           dist-out/*.tar.gz
+          dist-out/*.zsync
+          dist-out/*.sha256
         if-no-files-found: error
         compression-level: 0
         retention-days: 7
