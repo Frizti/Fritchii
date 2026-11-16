@@ -5160,7 +5160,7 @@ void MainWindow::OnEmulatorUpdateAvailable() {
             QMessageBox::information(this, tr("Check for Updates"),
                                      tr("You have the latest version (%1 %2).")
                                          .arg(QString::fromLatin1(Common::g_build_name),
-                                              QString::fromLatin1(Common::g_build_version)));
+                                              QString::fromLatin1(Common::g_build_label)));
         }
         return;
     }
@@ -5264,7 +5264,7 @@ void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view
     static const std::string build_id = std::string{Common::g_build_id};
     static const std::string yuzu_title =
         fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_version}, std::string{Common::g_compiler_id});
+                    std::string{Common::g_build_label}, std::string{Common::g_compiler_id});
 
     const auto override_title =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
