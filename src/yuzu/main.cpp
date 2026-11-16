@@ -7,6 +7,8 @@
 #include <map>
 #include <string>
 
+#include "common/scm_rev.h"
+
 #include <QApplication>
 #include <QMessageBox>
 #include <cstdlib>
@@ -258,8 +260,9 @@ int main(int argc, char* argv[]) {
     // Fritchii: NVIDIA's driver shader cache must hold OoT's ~120,000 prepared pipelines. Its size
     // is a Control Panel setting newer drivers no longer show ("Shader Cache Size"); the driver
     // also reads these variables, for this process only (nothing system-wide changes). A value
-    // already set (the player's, or nx2_switches.txt) wins.
-    if (FritchiiUi::Enabled()) {
+    // already set (the player's, or nx2_switches.txt) wins. Every Fritchii build, the classic UI
+    // (FRITCHII_CLASSIC_UI=1) included: the cache is about the game, not the interface.
+    if (std::string_view{Common::g_build_name} == "Fritchii") {
         if (!qEnvironmentVariableIsSet("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP")) {
             qputenv("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1");
         }
