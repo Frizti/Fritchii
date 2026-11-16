@@ -397,11 +397,16 @@ void NvidiaDlssPanel::Refresh() {
     const Streamline::DlssFiles files = Streamline::FindDlssFiles();
     const bool has_driver = !files.interposer.empty();
     const bool has_model = !files.model.empty();
+    const std::string needed_driver = Streamline::NeededDriverVersion();
     QString status;
     if (!has_driver) {
         status = Tr("<b>Needs NVIDIA's own driver.</b> DLSS on Linux runs through the "
                     "proprietary NVIDIA driver, and libnvidia-ngx.so.1 was not found. Nouveau and "
                     "NVK can't run it. Games use AMD FSR 3.1.");
+    } else if (!needed_driver.empty()) {
+        status = Tr("<b>Needs NVIDIA driver %1 or newer.</b> Update the driver. Until then, "
+                    "games use AMD FSR 3.1.")
+                     .arg(QString::fromStdString(needed_driver));
     } else if (has_model) {
         status =
             Tr("<b>Ready.</b> Found %1 and %2.<br>DLSS and the settings below apply only "
@@ -414,7 +419,7 @@ void NvidiaDlssPanel::Refresh() {
                     "AMD FSR 3.1.")
                      .arg(QString::fromLatin1(Streamline::LINUX_DLSS_FILE));
     }
-    const bool ready = has_driver && has_model;
+    const bool ready = has_driver && has_model && needed_driver.empty();
     icon_label->setText(ready ? QStringLiteral("<span style=\"color:#2ea043\">&#10004;</span>")
                               : QStringLiteral("<span style=\"color:#d29922\">&#9888;</span>"));
     status_label->setText(status);

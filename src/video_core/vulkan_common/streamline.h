@@ -75,4 +75,10 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
 /// Shuts Streamline down; call before the device is destroyed.
 void Stop();
 
+#ifndef _WIN32
+/// Linux: the NVIDIA driver version DLSS asked for ("580.65") when it last failed to start in
+/// this run because the driver is too old; empty otherwise.
+[[nodiscard]] std::string NeededDriverVersion();
+#endif
+
 } // namespace Vulkan::Streamline

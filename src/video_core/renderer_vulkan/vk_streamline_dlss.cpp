@@ -848,6 +848,11 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 api_result = api.evaluate_feature(
                     *cmdbuf, static_cast<const Streamline::NgxHandle*>(ngx_feature), params,
                     nullptr);
+                // The resources above are locals of this recording: leave no pointer to them in
+                // the shared NGX parameter block.
+                for (const char* const name : {"Color", "Output", "Depth", "MotionVectors"}) {
+                    params->SetVoidPointer(name, nullptr);
+                }
                 return Streamline::NgxSucceeded(api_result);
             },
             [&] {

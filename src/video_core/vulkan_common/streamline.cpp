@@ -529,6 +529,15 @@ State& GetState() {
     return state;
 }
 
+// The driver version NGX last asked for (render thread writes, the settings panel reads).
+std::mutex needed_driver_mutex;
+std::string needed_driver;
+
+void SetNeededDriver(std::string version) {
+    std::scoped_lock lock{needed_driver_mutex};
+    needed_driver = std::move(version);
+}
+
 int LogLevel() {
     const char* const value = std::getenv("EDEN_NX2_DLSS_LOG");
     return value ? std::atoi(value) : 0;
@@ -932,6 +941,9 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
             LOG_WARNING(Render_Vulkan,
                         "NVIDIA DLSS needs NVIDIA driver {}.{} or newer; using FSR 3.1",
                         driver_major, driver_minor);
+            if (driver_major != 0) {
+                SetNeededDriver(fmt::format("{}.{}", driver_major, driver_minor));
+            }
         } else {
             LOG_WARNING(Render_Vulkan,
                         "NVIDIA DLSS is not available on this GPU or driver; using FSR 3.1");
@@ -940,6 +952,7 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
         return false;
     }
     state.attached = true;
+    SetNeededDriver({});
     LOG_INFO(Render_Vulkan, "NVIDIA DLSS is available through the NVIDIA driver's NGX");
     return true;
 }
@@ -947,6 +960,11 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
 bool IsDlssAvailable() {
     const State& state = GetState();
     return state.started && state.attached;
+}
+
+std::string NeededDriverVersion() {
+    std::scoped_lock lock{needed_driver_mutex};
+    return needed_driver;
 }
 
 void Stop() {
