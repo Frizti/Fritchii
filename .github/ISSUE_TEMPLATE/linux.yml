@@ -1,0 +1,92 @@
+name: Linux problem
+description: Fritchii on Linux won't start, crashes, looks wrong or runs slow
+title: "[Linux] "
+labels: ["Linux"]
+body:
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and found no duplicate
+          required: true
+        - label: I'm using the latest Fritchii release
+          required: true
+        - label: My game is legally dumped from my own console
+          required: true
+
+  - type: input
+    id: build
+    attributes:
+      label: Fritchii version
+      description: Help > About, or the file name you downloaded
+      placeholder: "Fritchii-v6.0-Linux-x86_64.AppImage"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package
+      options:
+        - AppImage
+        - tar.gz
+        - Built it myself
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distro and version
+      placeholder: "Ubuntu 24.04 / Fedora 41 / Arch / SteamOS 3.7 / Bazzite"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: session
+    attributes:
+      label: Session
+      options:
+        - Wayland
+        - X11
+        - Steam Deck Game Mode (gamescope)
+        - Other gamescope session
+        - Don't know
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: "Not sure? Run vulkaninfo --summary and copy deviceName and driverInfo"
+      placeholder: "RTX 3070, NVIDIA 580.95 / RX 6700 XT, Mesa 25.2 / Steam Deck"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: windows
+    attributes:
+      label: Same on Windows?
+      options:
+        - Not tested
+        - No, only on Linux
+        - Yes, Windows too
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: What happened?
+      placeholder: "1. Started the AppImage from a terminal\n2. Opened OoT\n3. ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log
+      description: "Attach ~/.local/share/fritchii/log/eden_log.txt, or paste what the terminal printed"
+      render: text
