@@ -68,6 +68,12 @@ mkdir -p "$appdir/usr/bin/recipes" "$appdir/usr/share/licenses/fritchii"
 # Like the Windows release (stage_release): no nx2_switches.txt beside the executable, the
 # settings are code defaults; the additional terms go with the program.
 cp LICENSES/Fritchii-Additional-Terms.txt "$appdir/usr/share/licenses/fritchii/"
+# Test packages only: TEST_SWITCHES names a NAME=VALUE file that goes next to the exe as
+# nx2_switches.txt (the Windows test packages ship one too). Releases leave it unset.
+if [ -n "${TEST_SWITCHES:-}" ]; then
+    cp "$TEST_SWITCHES" "$appdir/usr/bin/nx2_switches.txt"
+    echo "Test switches: $(grep -c = "$TEST_SWITCHES") from $TEST_SWITCHES"
+fi
 
 if [ -z "${RECIPES_ZIP:-}" ]; then
     RECIPES_ZIP="$TOOLS_DIR/Fritchii-v$RECIPES_VERSION-Windows-x64.zip"
