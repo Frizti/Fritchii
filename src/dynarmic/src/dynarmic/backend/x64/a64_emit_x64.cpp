@@ -37,6 +37,7 @@
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/backend/x64/nzcv_util.h"
 #include "dynarmic/backend/x64/perf_map.h"
+#include "dynarmic/backend/x64/shared_code.h"
 #include "dynarmic/backend/x64/stack_layout.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 #include "dynarmic/frontend/A64/a64_types.h"
@@ -179,6 +180,22 @@ int A64EmitX64::StateRefsMode() {
     return mode;
 }
 
+int A64EmitX64::SharedMode() {
+    static const int mode = [] {
+        const int value = EnvSwitch("FRITCHII_JIT_SHARED");
+        if (value < 0 || value > 2) {
+            LOG_WARNING(Core_ARM, "FRITCHII_JIT_SHARED={} is outside 0..2, using 0", value);
+            return 0;
+        }
+        if (value != 0) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_SHARED={}: one code cache for every guest core of a process{}", value,
+                     value == 2 ? ", with checks (must-be-0 counters)" : "");
+        }
+        return value;
+    }();
+    return mode;
+}
+
 StateRefConfig A64EmitX64::StateRefSetup(const A64::UserConfig& conf, const void* jit) {
     StateRefConfig refs;
     refs.mode = StateRefsMode();
@@ -195,6 +212,7 @@ StateRefConfig A64EmitX64::StateRefSetup(const A64::UserConfig& conf, const void
         set(CoreRef::MonitorAddress, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
         set(CoreRef::MonitorValue, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
     }
+    set(CoreRef::CntpctLast, u64(reinterpret_cast<uintptr_t>(conf.inline_cntpct_last)));
     // Conf, FastDispatchTable, IndirectSlots and IndirectCounters: the emitter's constructor.
     return refs;
 }
@@ -563,6 +581,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         const StateRefConfig& refs = code.StateRefs();
         AddStateRefScanRange(reinterpret_cast<const void*>(refs.values[size_t(CoreRef::MonitorAddress)]), sizeof(u64), "own monitor address");
         AddStateRefScanRange(reinterpret_cast<const void*>(refs.values[size_t(CoreRef::MonitorValue)]), 16, "own monitor value");
+        AddStateRefScanRange(conf.inline_cntpct_last, conf.inline_cntpct_last ? sizeof(u64) : 0, "inline cntpct last read");
         AddStateRefScanRange(this, sizeof(*this), "emitter");
         AddStateRefScanRange(fast_dispatch_table.get(), fast_dispatch_table_size * sizeof(FastDispatchEntry), "fast dispatch table");
         AddStateRefScanRange(indirect_slots.get(), indirect_slots ? indirect_slot_capacity * sizeof(FastDispatchEntry) : 0, "indirect slots");
@@ -797,15 +816,21 @@ finish_this_inst:
     ::Common::Log::FmtCrashMessage(__FILE__, __LINE__, __func__,
                                    "JIT emit of block {:#x} (core {}) threw: {}; indirect sites {}",
                                    A64::LocationDescriptor{block.Location()}.PC(), conf.processor_id,
-                                   error.what(), indirect_slots_used);
+                                   error.what(), indirect_slots_used.load(std::memory_order_relaxed));
     std::abort();
 }
 
 void A64EmitX64::ClearCache() {
     EmitX64::ClearCache();
     block_ranges.ClearCache();
-    ClearFastDispatchTable();
-    ClearIndirectSlots(true);
+    if (shared_code) {
+        // Fritchii (FRITCHII_JIT_SHARED): the tables and slots are per core (and this emitter's
+        // are one core's); each core empties its own when it sees the clear.
+        indirect_slots_used.store(0, std::memory_order_relaxed);
+    } else {
+        ClearFastDispatchTable();
+        ClearIndirectSlots(true);
+    }
     fastmem_patch_info.clear();
     link_stubs.clear();
     halt_stubs.clear();
@@ -817,6 +842,11 @@ std::optional<IR::LocationDescriptor> A64EmitX64::ChainCandidate() const {
         return std::nullopt;
     }
     return chain_target;
+}
+
+CodePtr A64EmitX64::UnlinkedJumpTarget(const IR::LocationDescriptor& target_desc) {
+    const auto stub = link_stubs.find(target_desc.Value());
+    return stub != link_stubs.end() ? stub->second : nullptr;
 }
 
 CodePtr A64EmitX64::LinkStub(const IR::LocationDescriptor& target) {
@@ -860,6 +890,9 @@ void A64EmitX64::EmitFritchiiLink(const IR::LocationDescriptor& target, IR::Loca
             const CodePtr halt_stub = HaltStub(target);
             code.cmp(dword[code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
             code.jne(halt_stub);
+        }
+        if (shared_code) {
+            AlignPatchField(1, 4);  // Fritchii (FRITCHII_JIT_SHARED): the jump's rel32
         }
         AddPatchLocation(target, EmitX64::PatchKind::Jmp);
         EmitPatchJmp(target, next_bb ? next_bb->entrypoint : nullptr);
@@ -908,23 +941,27 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
         InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
     }
     indirect_bulk_invalidation = false;
-    ClearIndirectSlots(false);
+    if (!shared_code) {
+        ClearIndirectSlots(false);  // FRITCHII_JIT_SHARED: each core empties its own
+    }
 }
 
 A64EmitX64::FastDispatchEntry* A64EmitX64::AllocateIndirectSlot() {
-    if (!indirect_slots || indirect_slots_used >= indirect_slot_capacity) {
+    const size_t used = indirect_slots_used.load(std::memory_order_relaxed);
+    if (!indirect_slots || used >= indirect_slot_capacity) {
         return nullptr;
     }
-    return &indirect_slots[indirect_slots_used++];
+    indirect_slots_used.store(used + 1, std::memory_order_relaxed);
+    return &indirect_slots[used];
 }
 
 void A64EmitX64::ClearIndirectSlots(bool release) {
     if (!indirect_slots) {
         return;
     }
-    std::fill_n(indirect_slots.get(), indirect_slots_used, FastDispatchEntry{});
+    std::fill_n(indirect_slots.get(), indirect_slots_used.load(std::memory_order_relaxed), FastDispatchEntry{});
     if (release) {
-        indirect_slots_used = 0;
+        indirect_slots_used.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -940,21 +977,28 @@ void A64EmitX64::EmitCalculateLocationDescriptor() {
 }
 
 void A64EmitX64::LogIndirectCounters() {
+    LogIndirectCounters(indirect_counters.data(), indirect_log, conf.processor_id);
+}
+
+void A64EmitX64::LogIndirectCounters(const u64* counters, IndirectLog& log, unsigned core) {
+    std::array<u64, IndirectCounterCount> now_counters;
+    std::copy_n(counters, size_t(IndirectCounterCount), now_counters.begin());
+    const size_t sites = indirect_slots_used.load(std::memory_order_relaxed);
     const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count();
-    if (indirect_log_ns == 0) {
-        indirect_log_ns = now;
-        indirect_counters_logged = indirect_counters;
+    if (log.log_ns == 0) {
+        log.log_ns = now;
+        log.logged = now_counters;
         return;
     }
-    if (now - indirect_log_ns < 10'000'000'000LL) {
+    if (now - log.log_ns < 10'000'000'000LL) {
         return;
     }
-    const double seconds = double(now - indirect_log_ns) / 1e9;
+    const double seconds = double(now - log.log_ns) / 1e9;
     std::array<u64, IndirectCounterCount> d{};
     for (size_t i = 0; i < IndirectCounterCount; ++i) {
-        d[i] = indirect_counters[i] - indirect_counters_logged[i];
+        d[i] = now_counters[i] - log.logged[i];
     }
     const auto share = [](u64 part, u64 whole) {
         return whole == 0 ? 0.0 : 100.0 * double(part) / double(whole);
@@ -964,19 +1008,19 @@ void A64EmitX64::LogIndirectCounters() {
                  "JIT indirect sites (FRITCHII_JIT_INDIRECT_CACHE=1) core {} {:.1f} s: indirect "
                  "branches {:.0f}/s, same target as the site's last {:.1f}%; returns {:.0f}/s, same "
                  "target as the site's last {:.1f}%, return buffer hits {:.1f}%; sites {}",
-                 conf.processor_id, seconds, double(d[IndirectRuns]) / seconds,
+                 core, seconds, double(d[IndirectRuns]) / seconds,
                  share(d[IndirectSameTarget], d[IndirectRuns]), double(d[ReturnRuns]) / seconds,
                  share(d[ReturnSameTarget], d[ReturnRuns]), share(d[ReturnRsbHits], d[ReturnRuns]),
-                 indirect_slots_used);
+                 sites);
     } else {
         LOG_INFO(Core_ARM,
                  "JIT indirect sites (FRITCHII_JIT_INDIRECT_CACHE={}) core {} {:.1f} s: slot misses "
                  "{:.0f}/s; sites {}",
-                 indirect_cache_mode, conf.processor_id, seconds, double(d[SlotMisses]) / seconds,
-                 indirect_slots_used);
+                 indirect_cache_mode, core, seconds, double(d[SlotMisses]) / seconds,
+                 sites);
     }
-    indirect_log_ns = now;
-    indirect_counters_logged = indirect_counters;
+    log.log_ns = now;
+    log.logged = now_counters;
 }
 
 void A64EmitX64::ClearFastDispatchTable() {
@@ -1568,7 +1612,8 @@ void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
         if (conf.inline_cntpct_last != nullptr) {
             // The host callback's polling pause: two reads within spin_ticks pause twice.
             Xbyak::Label no_pause;
-            code.mov(tmp, reinterpret_cast<u64>(conf.inline_cntpct_last));
+            // Fritchii (FRITCHII_JIT_STATE_REFS): per core (the callbacks object's field).
+            code.MovCoreRef(tmp, CoreRef::CntpctLast, reinterpret_cast<u64>(conf.inline_cntpct_last));
             code.mov(rax, rdx);
             code.sub(rax, qword[tmp]);
             code.cmp(rax, static_cast<u32>(conf.inline_cntpct_spin_ticks & 0x7fffffff));
@@ -1915,7 +1960,9 @@ void A64EmitX64::EmitPatchJmp(const IR::LocationDescriptor& target_desc, CodePtr
     const CodePtr patch_location = code.getCurr();
     if (compact_links) {
         // Fritchii (FRITCHII_JIT_CHAIN): one 5-byte slot; falls through when the block follows.
-        if (target_code_ptr == static_cast<const u8*>(patch_location) + 5) {
+        // FRITCHII_JIT_SHARED: always a jump (jmp +0 for the block behind), as a nop cannot be
+        // turned into a jump by one atomic store while another core runs it.
+        if (target_code_ptr == static_cast<const u8*>(patch_location) + 5 && !shared_code) {
             code.nop(5);
         } else if (target_code_ptr) {
             code.jmp(target_code_ptr, code.T_NEAR);
@@ -1942,12 +1989,25 @@ void A64EmitX64::EmitPatchMovRcx(CodePtr target_code_ptr) {
         target_code_ptr = code.GetReturnFromRunCodeAddress();
     }
     const CodePtr patch_location = code.getCurr();
+    if (shared_code) {
+        // Fritchii (FRITCHII_JIT_SHARED): always the 10-byte form (Xbyak picks a shorter one for
+        // small values), so the immediate is the one field a patch rewrites.
+        code.db(0x48);
+        code.db(0xB9);
+        code.dq(u64(target_code_ptr));
+        return;
+    }
     code.mov(code.rcx, u64(target_code_ptr));
     code.EnsurePatchLocationSize(patch_location, 10);
 }
 
 void A64EmitX64::Unpatch(const IR::LocationDescriptor& location) {
     EmitX64::Unpatch(location);
+    if (shared_code) {
+        // Fritchii (FRITCHII_JIT_SHARED): the dispatch tables and slots belong to the cores, which
+        // drop the block at their next entry (SharedCode's removal log).
+        return;
+    }
     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
         code.DisableWriting();
         if (fast_dispatch_table_lookup_in != nullptr) {

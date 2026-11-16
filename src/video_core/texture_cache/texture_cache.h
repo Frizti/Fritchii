@@ -37,6 +37,7 @@
 #include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
+#include "video_core/small_card.h"
 #include "video_core/texture_cache/host_memory_limit.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
@@ -219,8 +220,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                   True(image.flags & ImageFlagBits::CostlyLoad)) ||
                  (!high_priority_mode && must_download));
     };
+    const bool covered_on = VideoCore::Nx2Debug::SwitchValue(
+                                VideoCore::Nx2Debug::g_covered_retire,
+                                "FRITCHII_COVERED_RETIRE") > 0;
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &CanEvict, skip_kept, out_of_memory](ImageId image_id) {
+                          &CanEvict, skip_kept, out_of_memory, covered_on](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -240,6 +244,20 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             if (!CanEvict(image, must_download)) {
                 return false;
             }
+        }
+        // FRITCHII_COVERED_RETIRE: newer GPU writes cover every byte of it, so a download would
+        // only put bytes in guest memory that those images' own downloads replace. Checked again
+        // only after a newer image came to overlap it.
+        if (must_download && covered_on &&
+            image.covered_overlap_frame > image.covered_check_frame &&
+            CoveredByNewerWrites(image_id, image)) {
+            must_download = false;
+            ++covered_stats.collect_deleted;
+            covered_stats.deleted_bytes += ImageMemoryBytes(image);
+            if (covered_swept.size() >= 65536) {
+                covered_swept.clear();
+            }
+            covered_swept[image.gpu_addr] = frame_tick;
         }
         // EXP121 (live, 0 = off): record the download and delete the image at a later frame end,
         // when the GPU has written it out (LandCollectDownloads), instead of waiting here. An
@@ -427,6 +445,7 @@ bool TextureCache<P>::QueueCollectDownload(ImageId image_id) {
             .cache_modification = modification_tick,
             .staging_bytes = staging_bytes,
             .memory_bytes = memory_bytes,
+            .cpu_modified = True(image.flags & ImageFlagBits::CpuModified),
         });
         image.flags |= ImageFlagBits::CollectPending;
         collect_download_staging += staging_bytes;
@@ -482,15 +501,54 @@ void TextureCache<P>::LandCollectDownloads() {
             // Written again by the GPU or the CPU, or downloaded by a guest read.
             bool written = !IsDownloadable(image) ||
                            image.modification_tick != entry.image_modification;
+            // A CPU write since it was queued (WriteMemory marks it CpuModified; nothing drops
+            // the entry there): landing would put the GPU's older bytes over the CPU's.
+            if (!written && !entry.cpu_modified && True(image.flags & ImageFlagBits::CpuModified)) {
+                written = true;
+                ++collect_stats.dropped_cpu;
+            }
+            bool overlap_written = false;
+            bool landed_under = false;
             if (!written && runtime.IsFree(entry.tick)) {
                 // An overlapping image the GPU wrote since holds newer bytes for this memory.
+                // FRITCHII_COLLECT_LAND_UNDER: unless it is still GPU-only. Its bytes are not in
+                // guest memory, its own download lands over ours later, and one that lands first
+                // drops ours (DropCollectDownloadsIn), so landing ours is what the waiting path
+                // does. Dropped, the image stayed and the next pass queued it again.
+                const bool land_under = VideoCore::Nx2Debug::SwitchValue(
+                                            VideoCore::Nx2Debug::g_collect_land_under,
+                                            "FRITCHII_COLLECT_LAND_UNDER") > 0;
                 const ImageId self = entry.image_id;
                 const u64 since = entry.cache_modification;
                 ForEachImageInRegion(image.cpu_addr, image.guest_size_bytes,
                                      [&](ImageId other_id, ImageBase& other) {
-                                         written |= other_id != self &&
-                                                    other.modification_tick > since;
+                                         if (other_id == self || other.modification_tick <= since) {
+                                             return;
+                                         }
+                                         if (land_under &&
+                                             True(other.flags & ImageFlagBits::GpuModified)) {
+                                             landed_under = true;
+                                             return;
+                                         }
+                                         overlap_written = true;
                                      });
+            }
+            if (overlap_written) {
+                // FRITCHII_COVERED_RETIRE: newer GPU writes cover all of it, so nothing of it is
+                // left to land: deleted now instead of kept for the next pass to queue again.
+                if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_covered_retire,
+                                                     "FRITCHII_COVERED_RETIRE") > 0 &&
+                    CoveredByNewerWrites(entry.image_id, image)) {
+                    const ImageId image_id = entry.image_id;
+                    DropCollectDownload(i);
+                    ++collect_stats.dropped_written;
+                    ++collect_stats.dropped_under;
+                    ++covered_stats.landing_deleted;
+                    RetireCovered(image_id, image);
+                    continue;
+                }
+                written = true;
+                ++collect_stats.dropped_under;
             }
             if (written) {
                 DropCollectDownload(i);
@@ -521,6 +579,7 @@ void TextureCache<P>::LandCollectDownloads() {
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
             ++collect_stats.landed;
+            collect_stats.landed_under += landed_under ? 1 : 0;
             collect_stats.land_frames += frame_tick - entry.frame;
             unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
             const ImageId image_id = entry.image_id;
@@ -675,6 +734,21 @@ bool TextureCache<P>::IsAllStale(DAddr addr, size_t size) const {
 }
 
 template <class P>
+u64 TextureCache<P>::UncountedDeviceBytes() const {
+    // The same subtractions TickFrame makes from the driver's usage.
+    u64 bytes = std::accumulate(sentenced_image_bytes.begin(), sentenced_image_bytes.end(),
+                                gpu_sentenced_bytes) +
+                collect_download_memory;
+    if constexpr (requires { runtime.PendingImageFreeBytes(); }) {
+        bytes += runtime.PendingImageFreeBytes();
+    }
+    if constexpr (requires { runtime.PooledImageBytes(); }) {
+        bytes += runtime.PooledImageBytes();
+    }
+    return bytes;
+}
+
+template <class P>
 void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // Past what a frame needs, more device memory only keeps the textures of earlier scenes
     // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
@@ -693,6 +767,11 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
         // a 24 ms texture stall every ~3 s. Keep 2.5 GiB of the budget for everything else instead.
         if (budget >= 10_GiB) {
             max_critical = (std::max)(max_critical, budget - 2560_MiB);
+        } else if (budget > 2_GiB && VideoCore::SmallCard::On(VideoCore::SmallCard::Fit)) {
+            // FRITCHII_SMALL_CARD (part Fit): the budget check in TickFrame subtracts everything
+            // the usage leaves out, so its result needs no fixed cap; the cap only kept textures
+            // from the room the uncounted image pool and in-flight frees then took.
+            max_critical = (std::max)(max_critical, budget - SmallCardMargin(budget));
         } else if (budget > 4_GiB &&
                    VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_critical_fit,
                                                     "FRITCHII_VRAM_CRITICAL_FIT") != 0) {
@@ -781,7 +860,19 @@ void TextureCache<P>::TickFrame() {
                     const u32 events = runtime.MemoryPressureEvents();
                     if (events != seen_pressure_events) {
                         seen_pressure_events = events;
-                        pressure_margin = (std::min)(pressure_margin + 512_MiB, 3_GiB);
+                        // FRITCHII_SMALL_CARD (part Fit): at most 1/8 of the budget. An RTX
+                        // 2080 (budget ~7 GiB) loading Castle Town had ~60 refused images in
+                        // 0.5 s: the margin climbed to 3 GiB, critical fell to ~3.6 GiB and the
+                        // collector evicted and downloaded the scene it was drawing (read-backs
+                        // of 50-120 ms for seconds). Fit already keeps the uncounted memory out.
+                        u64 pressure_cap = 3_GiB;
+                        if (VideoCore::SmallCard::On(VideoCore::SmallCard::Fit)) {
+                            if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+                                pressure_cap = (std::max)(runtime.GetDeviceMemoryBudget() / 8,
+                                                          u64{512_MiB});
+                            }
+                        }
+                        pressure_margin = (std::min)(pressure_margin + 512_MiB, pressure_cap);
                         pressure_quiet_frames = 0;
                         budget_check_frames = 0; // thresholds are recomputed below
                         LOG_WARNING(HW_GPU, "Out of device memory: keeping {} MiB more free",
@@ -809,8 +900,29 @@ void TextureCache<P>::TickFrame() {
                                            ? slack
                                            : slack_margin - (std::min)(slack_margin - slack, 16_MiB);
                     }
-                    critical_memory =
-                        budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
+                    // FRITCHII_SMALL_CARD (part Fit): what the usage leaves out (the image pool,
+                    // deleted images still in flight, collector downloads) is memory the driver
+                    // counts. Kept out of the thresholds, the cache filled to critical and those
+                    // went on top: up to ~1.2 GiB past the 1/8 margin at the market (pool 1 GiB),
+                    // over the budget of an 8 GB card at 1440p and of every 6 GB card. Reserved
+                    // like the slack: at once when it grows, 16 MiB a check when it shrinks.
+                    // The margin then only covers growth between checks and the budget
+                    // shrinking: 1/16 of the budget, at most 512 MiB.
+                    u64 critical_margin = margin;
+                    if (VideoCore::SmallCard::On(VideoCore::SmallCard::Fit)) {
+                        const u64 held = UncountedDeviceBytes();
+                        held_margin = held >= held_margin
+                                          ? held
+                                          : held_margin - (std::min)(held_margin - held, 16_MiB);
+                        critical_margin = SmallCardMargin(budget) + held_margin;
+                        pressure_margin = (std::min)(
+                            pressure_margin, (std::max)(budget / 8, u64{512_MiB}));
+                    } else {
+                        held_margin = 0;
+                    }
+                    critical_memory = budget - (std::min)(critical_margin + pressure_margin +
+                                                              slack_margin,
+                                                          budget / 2);
                     // Ported fix: the device's budget is not all the room there is.
                     // Windows charges device memory to the system's commit limit, so the cache
                     // may also hold no more than the device memory in use plus the commit still
@@ -844,8 +956,12 @@ void TextureCache<P>::TickFrame() {
                                  expected_memory >> 20, critical_memory >> 20,
                                  minimum_memory >> 20);
                         LOG_INFO(HW_GPU,
-                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
-                                 margin >> 20, pressure_margin >> 20, slack_margin >> 20);
+                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack {} "
+                                 "MiB, uncounted {} MiB (small card profile {})",
+                                 (critical_margin - held_margin) >> 20, pressure_margin >> 20,
+                                 slack_margin >> 20, held_margin >> 20,
+                                 VideoCore::SmallCard::On(VideoCore::SmallCard::Fit) ? "on"
+                                                                                     : "off");
                         if (commit_room) {
                             LOG_INFO(HW_GPU, "Host memory: {} MiB of commit left, {}",
                                      *commit_room >> 20,
@@ -1048,12 +1164,14 @@ void TextureCache<P>::TickFrame() {
                      "Texture cache last 600 frames: collector downloads {} waited, {} queued, "
                      "{} landed ({:.1f} frames after), dropped {} used again / {} written again "
                      "/ {} deleted, fell back {} cap / {} out of memory, {} mismatches, {} queued "
-                     "now ({} MiB staging)",
+                     "now ({} MiB staging); written again: {} by a newer overlap, {} by the CPU; "
+                     "{} landed under a GPU-only overlap (FRITCHII_COLLECT_LAND_UNDER)",
                      s.waits, s.made, s.landed,
                      s.landed != 0 ? static_cast<double>(s.land_frames) / s.landed : 0.0,
                      s.dropped_used, s.dropped_written, s.dropped_deleted, s.fallback_cap,
                      s.fallback_oom, s.mismatches, collect_downloads.size(),
-                     collect_download_staging >> 20);
+                     collect_download_staging >> 20, s.dropped_under, s.dropped_cpu,
+                     s.landed_under);
         }
         s = {};
     }
@@ -1292,6 +1410,70 @@ bool TextureCache<P>::ColdSuperseded(ImageId image_id, const ImageBase& image) {
 }
 
 template <class P>
+bool TextureCache<P>::CoveredByNewerWrites(ImageId image_id, ImageBase& image) {
+    // FRITCHII_COVERED_RETIRE. Newer: written by the GPU after this image's last write
+    // (modification_tick is one counter for the whole cache) and touched no earlier than this
+    // image last was, so nothing read this image after those writes landed over it. Such
+    // images together reach every byte: the memory holds none of this image's contents any
+    // more, on the console as here, and a read of it (a CPU read flushes the GPU-written
+    // images there) gets the newer bytes either way.
+    const auto start = std::chrono::steady_clock::now();
+    image.covered_check_frame = frame_tick;
+    ++covered_stats.checked;
+    if (image.guest_size_bytes == 0 || True(image.flags & ImageFlagBits::Sparse)) {
+        return false;
+    }
+    const DAddr begin = image.cpu_addr;
+    const DAddr end = begin + image.guest_size_bytes;
+    const u64 touched = lru_cache.Tick(image.lru_index);
+    const u64 written = image.modification_tick;
+    covered_ranges.clear();
+    ForEachImageInRegion(begin, image.guest_size_bytes, [&](ImageId other_id, Image& other) {
+        if (other_id == image_id || False(other.flags & ImageFlagBits::Registered) ||
+            True(other.flags & ImageFlagBits::Sparse) || other.modification_tick <= written ||
+            lru_cache.Tick(other.lru_index) < touched) {
+            return;
+        }
+        const DAddr other_begin = (std::max)(static_cast<DAddr>(other.cpu_addr), begin);
+        const DAddr other_end =
+            (std::min)(static_cast<DAddr>(other.cpu_addr + other.guest_size_bytes), end);
+        if (other_begin < other_end) {
+            covered_ranges.emplace_back(other_begin, other_end);
+        }
+    });
+    std::ranges::sort(covered_ranges);
+    DAddr reach = begin;
+    for (const auto& [range_begin, range_end] : covered_ranges) {
+        if (range_begin > reach) {
+            break;
+        }
+        reach = (std::max)(reach, range_end);
+        if (reach >= end) {
+            break;
+        }
+    }
+    covered_stats.check_ns += NsSince(start);
+    return reach >= end;
+}
+
+template <class P>
+void TextureCache<P>::RetireCovered(ImageId image_id, Image& image) {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::ColdSweep};
+    covered_stats.deleted_bytes += ImageMemoryBytes(image);
+    if (covered_swept.size() >= 65536) {
+        covered_swept.clear(); // the oldest are the least likely to be read again
+    }
+    covered_swept[image.gpu_addr] = frame_tick;
+    // As the collector deletes a bad overlap: no download.
+    MarkStale(image); // before UntrackImage (see MarkStale)
+    if (True(image.flags & ImageFlagBits::Tracked)) {
+        UntrackImage(image, image_id);
+    }
+    UnregisterImage(image_id);
+    DeleteImage(image_id);
+}
+
+template <class P>
 void TextureCache<P>::SweepSuperseded() {
     // FRITCHII_SWEEP_SUPERSEDED=N (live, frames, 0 = off; 1 = 60): a GPU-written image untouched
     // for N frames whose memory a newer image of another shape (touched since) also covers: the
@@ -1416,6 +1598,18 @@ void TextureCache<P>::SweepColdImages() {
                        render_targets.color_buffer_ids.end();
         });
     };
+    // FRITCHII_COVERED_RETIRE=N: a watched GPU-written image untouched for N frames whose memory
+    // newer GPU writes cover whole goes now, guarded or not (the guards keep contents a later
+    // frame may read; covered ones have none left). Checked once per new overlap, under caps of
+    // their own: the pot room makes ~30 targets a frame.
+    const int covered_value = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_covered_retire, "FRITCHII_COVERED_RETIRE");
+    const u64 covered_frames = covered_value > 0 ? static_cast<u64>(covered_value) : 0;
+    constexpr u32 MaxCoveredChecks = 64;
+    constexpr u32 MaxCoveredDeletes = 64;
+    u32 covered_checks = 0;
+    u32 covered_deleted = 0;
+    bool covered_capped = false;
     u32 deleted = 0;
     size_t index = 0;
     while (index < cold_watch.size()) {
@@ -1435,6 +1629,33 @@ void TextureCache<P>::SweepColdImages() {
             True(image.flags & excluded)) {
             drop();
             continue;
+        }
+        if (covered_frames != 0 && True(image.flags & ImageFlagBits::GpuModified) &&
+            False(image.flags & ImageFlagBits::CollectPending) &&
+            image.covered_overlap_frame > image.covered_check_frame &&
+            frame_tick - lru_cache.Tick(image.lru_index) >= covered_frames) {
+            if (covered_checks >= MaxCoveredChecks || covered_deleted >= MaxCoveredDeletes) {
+                covered_capped = true; // looked at in a later frame
+            } else {
+                ++covered_checks;
+                if (CoveredByNewerWrites(image_id, image)) {
+                    if (queued(image_id, uncommitted_downloads) ||
+                        std::ranges::any_of(committed_downloads, [&](const auto& downloads) {
+                            return queued(image_id, downloads);
+                        }) ||
+                        bound(image)) {
+                        ++covered_stats.busy;
+                        image.covered_check_frame = image.covered_overlap_frame - 1; // again
+                        ++index;
+                        continue;
+                    }
+                    ++covered_deleted;
+                    ++covered_stats.sweep_deleted;
+                    RetireCovered(image_id, image);
+                    drop();
+                    continue;
+                }
+            }
         }
         if (False(image.flags & ImageFlagBits::BadOverlap)) {
             // The newest image of a chain has one overlap; the next drift makes it bad.
@@ -1513,7 +1734,11 @@ void TextureCache<P>::SweepColdImages() {
             continue;
         }
         if (deleted >= MaxPerFrame) {
-            break;
+            if (covered_frames == 0) {
+                break;
+            }
+            ++index; // FRITCHII_COVERED_RETIRE: the rest still get their coverage checks
+            continue;
         }
         // As the collector deletes an image it does not download.
         MarkStale(image); // before UntrackImage (see MarkStale)
@@ -1528,6 +1753,25 @@ void TextureCache<P>::SweepColdImages() {
     }
     cold_deleted += deleted;
     cold_cap_frames += deleted >= MaxPerFrame ? 1 : 0;
+    covered_stats.capped_frames += covered_capped ? 1 : 0;
+    if (frame_tick % 600 == 0) {
+        auto& c = covered_stats;
+        if (covered_frames != 0 || c.checked != 0) {
+            LOG_INFO(HW_GPU,
+                     "Covered retire (FRITCHII_COVERED_RETIRE={}) last 600 frames: {} checked "
+                     "({:.2f} ms), deleted {} by the cold sweep, {} by the collector without a "
+                     "download, {} queued downloads dropped as covered ({} MiB in all); {} kept "
+                     "as busy, caps reached in {} frames; {} sampled again where one was "
+                     "deleted (must stay near 0)",
+                     covered_frames, c.checked, static_cast<double>(c.check_ns) / 1e6,
+                     c.sweep_deleted, c.collect_deleted, c.landing_deleted,
+                     c.deleted_bytes >> 20, c.busy, c.capped_frames, c.sampled_after);
+        }
+        c = {};
+        if (covered_frames == 0) {
+            covered_swept.clear();
+        }
+    }
     if (frame_tick % 600 == 0 && (cold_cap_frames != 0 || cap_value > 0)) {
         LOG_INFO(HW_GPU,
                  "Cold sweep cap (FRITCHII_COLD_SWEEP_MAX={}) last 600 frames: {} a frame at "
@@ -4292,6 +4536,24 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
                 superseded_swept.erase(swept);
             }
         }
+        // FRITCHII_COVERED_RETIRE: the same for images retired as covered.
+        if (image_id && !covered_swept.empty()) [[unlikely]] {
+            if (const auto swept = covered_swept.find(image_gpu_addr);
+                swept != covered_swept.end()) {
+                ++covered_stats.sampled_after;
+                if (covered_sampled_logged < 20) {
+                    ++covered_sampled_logged;
+                    const ImageBase& made = slot_images[image_id];
+                    LOG_WARNING(HW_GPU,
+                                "Covered retire: format {} {}x{} at {:#x} sampled {} frames after "
+                                "an image there was retired as covered",
+                                static_cast<u32>(made.info.format), made.info.size.width,
+                                made.info.size.height, image_gpu_addr,
+                                frame_tick - swept->second);
+                }
+                covered_swept.erase(swept);
+            }
+        }
         if (image_id) {
             NoteNewSampledImage(image_id, image_gpu_addr);
             if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) [[unlikely]] {
@@ -5283,6 +5545,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                         ImageBase& other = slot_images[other_id];
                         other.overlapping_images.push_back(old_id);
                         moved.overlapping_images.push_back(other_id);
+                        other.covered_overlap_frame = frame_tick + 1; // FRITCHII_COVERED_RETIRE
                         if (other.info.resources.levels == 1 && other.info.block.depth == 0 &&
                             other.overlapping_images.size() > 1) {
                             other.flags |= ImageFlagBits::BadOverlap;
@@ -5731,6 +5994,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         ImageBase& aliased = slot_images[aliased_id];
         aliased.overlapping_images.push_back(new_image_id);
         new_image.overlapping_images.push_back(aliased_id);
+        aliased.covered_overlap_frame = frame_tick + 1; // FRITCHII_COVERED_RETIRE: check again
         if (aliased.info.resources.levels == 1 && aliased.info.block.depth == 0 &&
             aliased.overlapping_images.size() > 1) {
             aliased.flags |= ImageFlagBits::BadOverlap;

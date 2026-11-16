@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace Common::Windows {
 
@@ -24,5 +25,12 @@ void GuaranteeStackForCrashReport();
 /// written to <directory>/fritchii_hang_<pid>_<n>.dmp while the process keeps running (dbghelp
 /// suspends the other threads for the write). At most three a process. Returns what to log.
 std::string WriteHangDump(const std::filesystem::path& directory);
+
+/// The hang report's and the shutdown watch's thread list: one line per stack, threads with the
+/// same stack on one line ("2 threads [name id (CPU ms), ...]: module+offset < caller ..."),
+/// x64 frames as module+offset (resolve them with the build's PDB, e.g. llvm-symbolizer). Each
+/// thread is suspended only to read its registers; the unwind runs after it resumes, so a
+/// waiting thread's stack is exact. `main_thread_id` is labelled "main".
+std::vector<std::string> ThreadStackLines(unsigned long main_thread_id);
 
 } // namespace Common::Windows

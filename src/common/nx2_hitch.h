@@ -219,8 +219,10 @@ void OnPresent(long long gap_us);
 // hooks below say so: powered on, not paused, not stalled), it logs one "Hang report:" block at
 // Critical: the stall snapshot as a present would log it, then the emulator's side through
 // `report` (GPU acquires and syncpoint waits, the GPU split / one follower state, service calls
-// in flight, the game's threads in kernel waits). FRITCHII_HANG_DUMP=1 (boot) adds a minidump
-// next to the log (Windows). One report per freeze: the next present re-arms it. Read only.
+// in flight, the game's threads in kernel waits), then every thread's stack (Windows x64,
+// module+offset). FRITCHII_HANG_DUMP=1 (boot) adds a minidump next to the log (Windows). One
+// report per freeze: the next present re-arms it. Read only (threads are suspended only for the
+// moment their registers are read).
 struct HangHooks {
     /// The report's threshold in seconds while the game runs, 0 while it does not (or the
     /// switch is 0). Called once a second under the hooks' lock.
@@ -233,6 +235,16 @@ struct HangHooks {
 void SetHangHooks(const HangHooks& hooks);
 /// Removes them if `context` installed them; no hook call runs after this returns.
 void ClearHangHooks(const void* context);
+
+/// The report's thread part, shared with the shutdown watch (common/shutdown_watch.h): the stall
+/// snapshot (unless EDEN_NX2_STALL_SNAPSHOT=0) and every thread's stack (Windows x64), each line
+/// at Critical under `prefix`. `shutdown`: the session's hooks are gone, said in the line.
+/// `main_thread_id` (0 = unknown) is labelled "main" in the stacks.
+void LogThreadReport(const char* prefix, bool shutdown, unsigned long main_thread_id);
+/// FRITCHII_HANG_DUMP=1 (boot, default 0).
+[[nodiscard]] bool HangDumpSwitch();
+/// Writes the hang minidump next to the log (at most three a process); returns what to log.
+[[nodiscard]] std::string WriteHangDumpNow();
 
 // Stall snapshot (fable52_answer_stall2 section 2): on by default since 2026-11-14,
 // EDEN_NX2_STALL_SNAPSHOT=0 turns it off (read as each thread is named, so nx2_switches.txt applies). A present gap of 100 ms or more then logs one

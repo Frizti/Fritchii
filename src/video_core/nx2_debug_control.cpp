@@ -10,6 +10,7 @@
 
 #include "common/host_memory.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/small_card.h"
 
 namespace VideoCore::Nx2Debug {
 namespace {
@@ -476,6 +477,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_VRAM_REPORT") {
         return &g_vram_report;
     }
+    if (name == "FRITCHII_SMALL_CARD") {
+        return &SmallCard::g_small_card;
+    }
     if (name == "FRITCHII_E2C_ON_E") {
         return &g_e2c_on_e;
     }
@@ -752,6 +756,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_COLD_SWEEP_MAX") {
         return &g_cold_sweep_max;
+    }
+    if (name == "FRITCHII_COVERED_RETIRE") {
+        return &g_covered_retire;
+    }
+    if (name == "FRITCHII_COLLECT_LAND_UNDER") {
+        return &g_collect_land_under;
     }
     if (name == "FRITCHII_NOTED_OVERFLOW") {
         return &g_noted_overflow;

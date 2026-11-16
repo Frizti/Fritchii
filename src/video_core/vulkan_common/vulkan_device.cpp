@@ -33,6 +33,7 @@
 #include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/small_card.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -40,7 +41,11 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
-#include "video_core/one_follower.h"
+// Only this declaration: one_follower.h pulls in nvdata.h, whose enum names (BadValue, ...) the
+// X11 headers vulkan.h includes on Linux define as macros.
+namespace VideoCommon::OneFollower {
+void NoteAmdProprietaryDriver() noexcept;
+}
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
@@ -775,6 +780,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     supports_conditional_barriers = !is_intel_windows;
 
     CollectPhysicalMemoryInfo();
+    // FRITCHII_SMALL_CARD (part RefuseScale): the presenting device only (not Force maximum
+    // clocks' second one), before the renderer's caches read the scale.
+    if (surface != VkSurfaceKHR{}) {
+        VideoCore::SmallCard::RefuseScaleIfNeeded();
+    }
     CollectToolingInfo();
 
     if (is_qualcomm) {
@@ -1246,7 +1256,26 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         return value == nullptr || value[0] == '\0' || value[0] != '0';
     }();
     if (split_allocators) {
-        if (vmaCreateAllocator(&allocator_info, &buffer_allocator) != VK_SUCCESS) {
+        // FRITCHII_SMALL_CARD (part BufferBlocks, boot): the buffer allocator held ~1.4 GiB of
+        // blocks for ~0.7 GiB of buffers at OoT's market (8 GB and 6 GB card simulations), the
+        // largest part of the block slack the driver counts as used. Buffers of 8 to 16 MiB shared
+        // 32 MiB blocks; with 16 MiB blocks VMA gives them exact memory of their own (over half a
+        // block), which goes back to the driver whole when they are freed. Buffers up to 8 MiB
+        // keep their separate pool. FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB (boot, default 16)
+        // tries other sizes.
+        VmaAllocatorCreateInfo buffer_allocator_info = allocator_info;
+        if (VideoCore::SmallCard::On(VideoCore::SmallCard::BufferBlocks)) {
+            const char* value = std::getenv("FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB");
+            const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 16;
+            if (mib >= 4 && mib <= 256) {
+                buffer_allocator_info.preferredLargeHeapBlockSize = mib << 20;
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Small card profile: buffer allocator blocks of {} MiB (images keep {} MiB)",
+                     buffer_allocator_info.preferredLargeHeapBlockSize >> 20,
+                     allocator_info.preferredLargeHeapBlockSize >> 20);
+        }
+        if (vmaCreateAllocator(&buffer_allocator_info, &buffer_allocator) != VK_SUCCESS) {
             LOG_WARNING(Render_Vulkan, "Buffer VMA allocator could not be made; one allocator");
             buffer_allocator = nullptr;
         }
@@ -2915,6 +2944,15 @@ void Device::CollectPhysicalMemoryInfo() {
             continue;
         }
         device_access_memory += heap_size;
+    }
+    // FRITCHII_SMALL_CARD: auto mode's verdict from the main heap's size and budget (the
+    // simulated card's when EDEN_NX2_VRAM_LIMIT_MIB is set). Without VK_EXT_memory_budget the
+    // heap's size stands in for the budget.
+    if (num_properties != 0) {
+        const u64 main_size = limit(mem_properties.memoryHeaps[main_heap].size);
+        const u64 main_budget =
+            extensions.memory_budget ? limit(budget.heapBudget[main_heap]) : main_size;
+        VideoCore::SmallCard::Decide(main_size, main_budget, is_integrated);
     }
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);

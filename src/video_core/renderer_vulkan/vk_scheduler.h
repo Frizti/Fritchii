@@ -551,6 +551,24 @@ private:
     bool trace_gpu_pending{};
     bool trace_gpu_failed{};
 
+    /// The performance overlay's GPU time (common/frame_budget.h), while it shows its time rows:
+    /// one timestamp pair per submission in a ring, read back once the tick is done, never waited
+    /// for. Worker thread only.
+    void BudgetGpuSubmission();
+    void ReadBudgetResults();
+    static constexpr u32 BudgetSlots = 256;
+    vk::QueryPool budget_pool;
+    std::array<u64, BudgetSlots> budget_ticks{}; ///< each pending slot's tick
+    u32 budget_next_slot{};    ///< slot of the next submission (counts up, modulo BudgetSlots)
+    u32 budget_pending{};      ///< submitted, not read back: the slots before budget_next_slot
+    u64 budget_last_end{};     ///< end of the latest read submission, GPU clock
+    u64 budget_last_tick{};    ///< latest tick that wrote to budget_pool
+    u32 budget_timestamp_bits{};
+    float budget_timestamp_period{};
+    bool budget_recording{};   ///< the current command buffers carry a start stamp
+    bool budget_has_end{};
+    bool budget_failed{};
+
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 
     vk::CommandBuffer current_cmdbuf;

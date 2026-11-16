@@ -21,6 +21,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/shutdown_progress.h"
+#include "common/shutdown_watch.h"
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
@@ -589,9 +590,13 @@ struct System::Impl {
     void ShutdownMainProcess() {
         // First: no hang report reads anything the teardown below frees.
         Common::Nx2Hitch::ClearHangHooks(this);
+        // Common::ShutdownWatch steps (a no-op unless the frontend armed the watch).
+        Common::ShutdownWatch::Step("teardown: debug server");
         debug_service.reset();
+        Common::ShutdownWatch::Step("teardown: JIT block list writer");
         Common::FritchiiJitList::End(); // FRITCHII_JIT_BLOCK_LIST: writes what is left
         // Waits for a call in progress (it opens the RomFS, a quick step).
+        Common::ShutdownWatch::Step("teardown: precompile game files");
         VideoCommon::Nx2Precompile::SetGameFiles(0, {});
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
@@ -603,6 +608,7 @@ struct System::Impl {
         // completes would read its own request back and abort (2010-0212, a Userspace PANIC on
         // every stop). Keep guest threads from running again first; the wait for running ones
         // comes after the GPU has released any that it holds in host code.
+        Common::ShutdownWatch::Step("teardown: suspending guest threads, stopping GPU threads");
         kernel.RequestSuspendEmulation();
         is_powered_on = false;
         exit_locked = false;
@@ -610,6 +616,7 @@ struct System::Impl {
         if (gpu_core)
             gpu_core->NotifyShutdown();
 
+        Common::ShutdownWatch::Step("teardown: suspending emulation, closing services");
         stop_event.request_stop();
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
@@ -618,8 +625,10 @@ struct System::Impl {
         // Each step done tells the frontend the teardown still moves (see
         // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.
         Common::NoteShutdownProgress();
+        Common::ShutdownWatch::Step("teardown: guest cores");
         kernel.ShutdownCores();
         Common::NoteShutdownProgress();
+        Common::ShutdownWatch::Step("teardown: services, file system, loader");
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
@@ -627,10 +636,13 @@ struct System::Impl {
         core_timing.ClearPendingEvents();
         app_loader.reset();
         Common::NoteShutdownProgress();
+        Common::ShutdownWatch::Step("teardown: audio");
         audio_core.reset();
         Common::NoteShutdownProgress();
+        Common::ShutdownWatch::Step("teardown: GPU and renderer (pipeline caches, Vulkan device)");
         gpu_core.reset();
         Common::NoteShutdownProgress();
+        Common::ShutdownWatch::Step("teardown: host1x, CPU manager, kernel");
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();

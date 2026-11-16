@@ -169,6 +169,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Automatic picks the mode from the game's own resolution. Native (DLAA) keeps the "
               "game's resolution and only smooths it. Other modes apply when they fit the game's "
               "resolution, otherwise Automatic is used. Changes apply while playing."));
+    INSERT(Settings, oot_dlss_jitter, tr("DLSS jitter"),
+           tr("Tiny camera shifts each frame that DLSS uses for smoother edges. On by "
+              "default.\nTakes effect when the game starts."));
+    INSERT(Settings, oot_texture_sharpness, tr("Texture sharpness:"),
+           tr("Auto matches OoT's render and output sizes. Sharper goes half a step further. "
+              "Custom uses the LOD bias you set.\nTakes effect when the game starts."));
+    INSERT(Settings, oot_lod_bias_custom, tr("LOD bias:"),
+           tr("Lower is sharper. Too low makes textures shimmer.\nTakes effect when the game "
+              "starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
@@ -634,6 +643,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotRefreshCap, Hz144, tr("144 FPS")),
                               PAIR(OotRefreshCap, Hz165, tr("165 FPS")),
                               PAIR(OotRefreshCap, Unlimited, tr("Unlimited")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::OotTextureSharpness>::Index(),
+                          {
+                              PAIR(OotTextureSharpness, Auto, tr("Auto")),
+                              PAIR(OotTextureSharpness, Sharper, tr("Sharper")),
+                              PAIR(OotTextureSharpness, Custom, tr("Custom")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {

@@ -43,6 +43,23 @@ inline bool OcarinaDlssSanitize() {
     return on;
 }
 
+/// FRITCHII_FSR4_JITTER (boot, 0 = off): AMD FSR 4 gets the camera jitter and texture LOD bias
+/// FSR 3.1 uses. Off, FSR 4 takes the scene as the game draws it, without jitter or bias, as in
+/// CheezyEmu, whose FSR 4 AMD testers report as working well (RX 9070 XT). FSR 3.1 and DLSS
+/// are unchanged.
+inline bool OcarinaFsr4Jitter() {
+    static const bool on = OcarinaSwitch::Read("FRITCHII_FSR4_JITTER", 0) != 0;
+    return on;
+}
+
+/// FRITCHII_FSR4_LINEAR (boot, 0 = off): AMD FSR 4 is told the colour is linear, as before.
+/// Off, it is told the colour is perceptual (gamma encoded), which OoT's tonemapped colour is
+/// (CheezyEmu's FSR 4 setup).
+inline bool OcarinaFsr4LinearColor() {
+    static const bool on = OcarinaSwitch::Read("FRITCHII_FSR4_LINEAR", 0) != 0;
+    return on;
+}
+
 /// FRITCHII_OOT_CAMERA_GUEST (boot, 0 = off): the camera tracker reads vertex uniform slot 3 as
 /// the game bound it, not as the draw's shader sees it. The shader's view leaves out slots it does
 /// not use and stops at the last byte it reads, so draws that read less than the camera block gave
@@ -87,12 +104,12 @@ inline std::array<float, 2> OcarinaJitter(unsigned index, bool truncated_viewpor
     return {halton(index, 2) - center, halton(index, 3) - center};
 }
 
-/// FRITCHII_OOT_LOD_RATIO (boot, 0 = off): the texture LOD bias follows the real render and
-/// output sizes instead of the fixed numbers. 1: FSR log2(render / output) - 1 (AMD), DLSS with
-/// EDEN_NX2_DLSS_JITTER log2(render / output) (NVIDIA). 2: DLSS gets FSR's formula too, so the
-/// same sharpness as FSR (-1.58 for 1440p -> 4K). Off: FSR -1.58, DLSS with jitter -0.58.
+/// FRITCHII_OOT_LOD_RATIO (boot, 1 = by default): the texture LOD bias follows the render and
+/// output sizes: FSR log2(render / output) - 1 (AMD), DLSS with its jitter log2(render / output)
+/// (NVIDIA). 2: DLSS gets FSR's formula too, so the same sharpness as FSR (-1.58 for
+/// 1440p -> 4K). 0: the fixed numbers as before (FSR -1.58, DLSS with jitter -0.58).
 inline int OcarinaLodRatioMode() {
-    static const int mode = OcarinaSwitch::Read("FRITCHII_OOT_LOD_RATIO", 0);
+    static const int mode = OcarinaSwitch::Read("FRITCHII_OOT_LOD_RATIO", 1);
     return mode;
 }
 
@@ -126,15 +143,27 @@ constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(Settings::OotAntiAliasing 
     return SelectOcarinaUpscaler(fsr, dlss_enabled && !fsr, dlss_available, override);
 }
 
-/// EDEN_NX2_DLSS_JITTER (boot, 0 = off): DLSS gets the camera jitter and the texture LOD bias
-/// the FSR path uses (a player's request; DLSS is made for jittered input). 1 = the jitter as FSR
-/// gets it, 2 = with its vertical sign flipped (Streamline's convention is unverified here).
-inline int OcarinaDlssJitterMode() {
-    static const int mode = [] {
-        const char* value = std::getenv("EDEN_NX2_DLSS_JITTER");
-        return value != nullptr ? std::atoi(value) : 0;
-    }();
+/// EDEN_NX2_DLSS_JITTER (boot): overrides the "DLSS jitter" setting. Unset: the setting (on by
+/// default). 0 = off, 1 = on, 2 = on with the vertical sign flipped for DLSS (a test only: the
+/// offset DLSS gets is the one the scene moved by, the convention of NVIDIA's own Streamline
+/// sample and of AMD's FSR, so 1 is right). -1 when unset.
+inline int OcarinaDlssJitterOverride() {
+    static const int mode = OcarinaSwitch::Read("EDEN_NX2_DLSS_JITTER", -1);
     return mode;
+}
+
+/// Whether DLSS gets the camera jitter and the texture bias that goes with it (DLSS is made for
+/// jittered input): the override when set, else the "DLSS jitter" setting.
+constexpr bool OcarinaDlssJitterOn(int override_mode, bool setting) {
+    return override_mode >= 0 ? override_mode != 0 : setting;
+}
+inline bool OcarinaDlssJitterOn(bool setting) {
+    return OcarinaDlssJitterOn(OcarinaDlssJitterOverride(), setting);
+}
+
+/// EDEN_NX2_DLSS_JITTER=2: DLSS is told the offset with y flipped.
+inline bool OcarinaDlssJitterFlipY() {
+    return OcarinaDlssJitterOverride() == 2;
 }
 
 /// FRITCHII_DLSS_SCALED (boot, 0 = off): with DLSS or FSR picked for OoT, keep the player's
@@ -182,18 +211,18 @@ constexpr OcarinaScaledOutput SelectOcarinaScaledOutput(OcarinaExtent render, Oc
 }
 
 /// Texture LOD bias added to Ocarina's mipmapped samplers while FSR upscales. AMD recommends
-/// log2(render / output) - 1: -1.58 for docked 1440p -> 4K. With EDEN_NX2_DLSS_JITTER, DLSS gets
-/// NVIDIA's log2(render / output): -0.58.
-inline float OcarinaFsrLodBias(OcarinaUpscaleBackend backend) {
+/// log2(render / output) - 1: -1.58 for docked 1440p -> 4K. With the DLSS jitter, DLSS gets
+/// NVIDIA's log2(render / output): -0.58. The fixed numbers of FRITCHII_OOT_LOD_RATIO=0.
+inline float OcarinaFsrLodBias(OcarinaUpscaleBackend backend, bool dlss_jitter = false) {
     if (backend == OcarinaUpscaleBackend::Fsr) {
         return -1.58f;
     }
-    return backend == OcarinaUpscaleBackend::Dlss && OcarinaDlssJitterMode() != 0 ? -0.58f : 0.0f;
+    return backend == OcarinaUpscaleBackend::Dlss && dlss_jitter ? -0.58f : 0.0f;
 }
 
-/// FRITCHII_OOT_LOD_RATIO: the bias for the real render and output sizes (one side). `mode` 1: AMD's and
-/// NVIDIA's formulas, 2: FSR's for DLSS too. DLSS gets a bias only with its jitter on (without
-/// jitter a sharper mip only shimmers).
+/// The bias for the render and output sizes (one side). `mode` 1: AMD's and NVIDIA's formulas,
+/// 2: FSR's for DLSS too. DLSS gets a bias only with its jitter on (without jitter a sharper mip
+/// only shimmers).
 inline float OcarinaLodBiasForSizes(OcarinaUpscaleBackend backend, unsigned render_size,
                                     unsigned output_size, bool dlss_jitter, int mode) {
     if (render_size == 0 || output_size == 0 || backend == OcarinaUpscaleBackend::Native) {
@@ -208,6 +237,29 @@ inline float OcarinaLodBiasForSizes(OcarinaUpscaleBackend backend, unsigned rend
         return 0.0f;
     }
     return mode >= 2 ? ratio - 1.0f : ratio;
+}
+
+/// The "Texture sharpness" choice: Auto is the bias for the sizes (or the fixed numbers with
+/// FRITCHII_OOT_LOD_RATIO=0), Sharper half a mip more, Custom the player's value as is (DLSS
+/// without its jitter too: the player asked for it). Nothing for the game's own upscale.
+inline float OcarinaTextureLodBias(OcarinaUpscaleBackend backend, unsigned render_size,
+                                   unsigned output_size, bool dlss_jitter, int ratio_mode,
+                                   Settings::OotTextureSharpness choice, float custom) {
+    if (backend == OcarinaUpscaleBackend::Native) {
+        return 0.0f;
+    }
+    if (choice == Settings::OotTextureSharpness::Custom) {
+        return std::isfinite(custom) ? custom : 0.0f;
+    }
+    const float automatic =
+        ratio_mode == 0
+            ? OcarinaFsrLodBias(backend, dlss_jitter)
+            : OcarinaLodBiasForSizes(backend, render_size, output_size, dlss_jitter, ratio_mode);
+    if (choice != Settings::OotTextureSharpness::Sharper ||
+        (backend == OcarinaUpscaleBackend::Dlss && !dlss_jitter)) {
+        return automatic;
+    }
+    return automatic - 0.5f;
 }
 
 /// Whether a sampler with that bias keeps it for an image: only docked (handheld isn't measured),

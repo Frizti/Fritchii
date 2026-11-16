@@ -25,6 +25,7 @@
 #include "video_core/memory_stage_link.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/small_card.h"
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -58,6 +59,12 @@ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 constexpr VkDeviceSize STREAM_BUFFER_TAIL = 64_KiB;
 
 size_t GetStreamBufferSize(const Device& device) {
+    // FRITCHII_SMALL_CARD (part Stream, boot, not in the default parts): 64 MiB, which sits in
+    // device memory with resizable BAR. Saves 64 MiB; more waits on a wrap if a frame streams more.
+    if (VideoCore::SmallCard::On(VideoCore::SmallCard::Stream) &&
+        !device.HasDebuggingToolAttached()) {
+        return MAX_STREAM_BUFFER_SIZE / 2;
+    }
     if (!device.HasDebuggingToolAttached()) {
         if (device.IsIntegrated()) {
             // An integrated GPU's device-local host-visible heap can be no bigger than the stream

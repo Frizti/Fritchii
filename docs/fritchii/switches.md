@@ -306,6 +306,19 @@ driver's cache takes 0.2-1.1 s to compile, and an RX 7900 XT session held 76 s o
 pipelines, a ~1 s freeze whenever something new showed up (tester log t1858). The boot log says so
 once; FRITCHII_ASYNC_REDRAWN=0 waits as before. Other GPUs keep 0.
 
+Also turns on by itself, on any driver, once the session shows the driver compiling prepared
+pipelines again (helper BV, 2026-11-16): a Linux NVIDIA tester (RTX 4070 SUPER, 615.71) saw ~650 of
+1,128 prepared builds take over 20 ms, up to 2.5 s, 18 s of draws held in one boot (log t0419). The
+rule, checked every 10 s with the "Driver compiles of prepared pipelines" line: 16 or more prepared
+pipelines over 20 ms that are a quarter or more of the prepared builds, or 3 or more over 250 ms.
+Where the driver cache holds the preparation (NVIDIA on Windows) prepared builds take 2-10 ms and it
+never triggers. Decided once per boot, no time limit. Log: "Prepared pipelines are compiled again by
+this driver (n so far, longest t ms): new objects pop in instead of waiting (FRITCHII_ASYNC_REDRAWN
+auto)". A value in the environment (nx2_switches.txt) or set live wins; storing -1 live gives it back
+to the default and the auto rule. Only prepared (kept SPIR-V) builds count now; runtime pipelines a
+worker emits are new to every driver and no longer mix into the count. Compute dispatches still wait
+for their pipeline (skipping one would lose its results).
+
 ### FRITCHII_OCCLUSION_VISIBLE
 
 TEST, off by default (helper AN, 2026-11-15, idea from DahBard's Blitchii LICHII_FAKE_OCCLUSION);
@@ -483,6 +496,36 @@ with FRITCHII_JIT_INDIRECT_CACHE=2/3 (the slot array, then the slot's offset in 
 - Judge: =2 at market and castletown must say 0 (stage 1 needs it); then fresh A/B 0/1/1/0 (boot)
   at the market for fps, plus the hitch score. Exact: the same values, read from the state block.
 
+### FRITCHII_JIT_SHARED
+
+TEST, boot, default 0 (helper BX, 2026-11-16; stage 1 of helper BO's one code cache for all cores,
+helper_bx_answer.md). 1 = every guest core of a process runs one CPU recompiler code cache: one
+code space, one block map, one emitter, blocks compiled once under a lock (one compiler at a time)
+and linked for all cores. Each core keeps its state block, run loop, fast dispatch table, return
+stack buffer, FRITCHII_JIT_INDIRECT_CACHE slots and counters. Needs FRITCHII_JIT_STATE_REFS=1 and
+compact links (FRITCHII_JIT_CHAIN=4/5/6/7 or 1 with FRITCHII_JIT_FAR_CODE=1); without them, with the
+debugger, cycle counting or 32-bit games each core keeps its own cache (a warning says why).
+Lock-free: running code, links (patched by one aligned 4-byte store of a jump's rel32, or an 8-byte
+store of the return stack push's immediate), the per-core dispatch table and the shared map's
+lookup. Removed blocks (code changed or unmapped, fastmem recompiles) keep their code until a
+whole-cache clear; each core drops them from its own tables at its next entry. A whole-cache clear
+(cache full with 32 MiB left, or a guest IC IALLU) halts every core and runs once all are out of
+generated code. Not with FRITCHII_JIT_HOT_PACK (each core's pack would clear the shared cache).
+FRITCHII_JIT_DUMP records blocks on the core that compiled them. FRITCHII_JIT_STATE_REFS=2 scans
+shared blocks for every core's objects. 2 = 1 plus checks: 1 in 64 lock-free lookups compared with
+the map under the lock, and the state block's own objects checked at 1 in 64 entries (both must be 0).
+Also fixes FRITCHII_JIT_INLINE_CNTPCT's per-core address under FRITCHII_JIT_STATE_REFS (read through
+the state register now, so stage 0's scan covers it).
+- Log: "FRITCHII_JIT_SHARED=N: ..." at boot, "JIT shared code (FRITCHII_JIT_SHARED=N) core C made/joined
+  the process's code cache" per core, then every 10 s: "JIT shared code (FRITCHII_JIT_SHARED=N) T s: B
+  blocks compiled once (+b); blocks by cores that looked them up 1:a 2:b ...; first lookups of a block
+  another core had L (+l); compile lock: W waits, X ms waited (+x), Y found compiled by the core waited
+  for; removals R, whole-cache clears C; near/far MiB used, map K keys; patch shape errors P (must be
+  0)" (=2 adds "checks, mismatches (must be 0)").
+- Judge: boot =1 at market and castletown (with STATE_REFS=1 and the test set), RAM census (exec
+  memory should drop by about 5 cores' code), hitch score fresh 0/1/1/0, fps A/B, a 10-minute run.
+  Exact: the same blocks, compiled once.
+
 ### FRITCHII_JIT_CACHE_MIB
 
 TEST, boot, default 0 = 512 MiB (helper BA, 2026-11-16). 512-1536: the CPU recompiler's code cache
@@ -493,6 +536,41 @@ them. Exact: the same code, more room. Memory is committed only as code is writt
 per core, 4-6 cores). Log: "FRITCHII_JIT_CACHE_MIB=N: code cache of N MiB per core". Only worth a
 test when FRITCHII_HITCH_SPLIT=1 shows "warm compiles refused" before the load; judge by the load
 cluster's hitch score and its "another core had" time, fresh launches (boot setting).
+### FRITCHII_SMALL_CARD, FRITCHII_SMALL_CARD_PARTS, FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB
+
+TEST, off by default (helper BY, 2026-11-16). FRITCHII_SMALL_CARD (live): 0 off, 1 on, 2 auto = on
+when the main device-local heap is under 9 GiB or its budget at boot under 7.5 GiB (8 GB and 6 GB
+cards; never integrated GPUs; a simulated card's limit counts). The small card profile: an 8 GB
+card should stop overflowing in real play (RTX 2080 at 1440p: 7.9 GB of a 6.7-7.2 GB budget, 32
+pressure events, read-backs stalling for seconds; RTX 3070 Ti 6850 of 7181) and a 6 GB card should
+fit at 1x, with nothing reserved for show. Big cards never turn it on in auto mode.
+FRITCHII_SMALL_CARD_PARTS (boot, bit mask, default 0xF) picks the parts:
+- 0x1 fit (live): the texture cache's critical threshold = budget less 1/16 of it (at most 512
+  MiB; was 1/8, at most 1 GiB) less the out-of-memory margin, the block slack and what the cache's
+  usage leaves out: the image pool, deleted images still in flight, collector downloads, frees
+  queued for the free thread ("uncounted", reserved at once when it grows, 16 MiB a check when it
+  shrinks). No fixed 5 GiB cap. The out-of-memory margin stops at 1/8 of the budget instead of 3
+  GiB (the RTX 2080's Castle Town load drove it to 3 GiB: critical ~3.6 GiB, the collector evicted
+  the scene it drew). Expected stays 1/8 of the budget under critical.
+- 0x2 pool (live): EXP42's image pool cap = 1/16 of the budget, at least 256 MiB (~450 MiB on 8 GB,
+  ~340 on 6 GB) instead of EXP66's 1 GiB.
+- 0x4 buffer blocks (boot): the buffer allocator's VMA blocks are 16 MiB instead of 32
+  (FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB, 4-256, tries others), so buffers over 8 MiB get exact
+  memory. At the market the buffer allocator held ~1.4 GiB of blocks for ~0.7 GiB of buffers (8 GB
+  and 6 GB simulations): most of the block slack.
+- 0x8 refuse scale (boot): a resolution scale over 1x runs at 1x for the session (the setting
+  stays); the status bar reads "Scale: 1x (2x DOESN'T FIT)". Log: "Small card profile: resolution
+  scale ... does not fit".
+- 0x10 stream (boot, not in the default): stream buffer 64 MiB instead of 128.
+Logs: at boot "Small card profile (FRITCHII_SMALL_CARD=N): main heap H MiB, budget B MiB, a small /
+not a small card; profile on/off (parts ...)"; the thresholds' "Memory margins" line adds
+"uncounted U MiB (small card profile on/off)"; with FRITCHII_VRAM_REPORT=1 a second line "VRAM split
+(FRITCHII_VRAM_REPORT): main allocator blocks / allocated, buffer allocator blocks / allocated,
+outside the allocators MiB; small card profile ...". Judge under EDEN_NX2_VRAM_LIMIT_MIB=8192 / 6144
++ FRITCHII_VRAM_SIM_OTHERS=1 (work\helper_by_answer.md): "over the budget" samples 0, fps and 1% lows
+not lower; with no limit on a 16 GB card, FRITCHII_SMALL_CARD=2 must log "not a small card" and
+change nothing.
+
 ### FRITCHII_VRAM_POOL_FIT
 
 TEST, off by default (helper BF, 2026-11-16; 8 GB cards). Live: 1 = EXP42's image pool (pooled
@@ -4455,6 +4533,28 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   8 GB cards. The cold sweep (4 frames, on by default) and EXP64 already do that here, at most 16
   a frame; this raises the cap. Line every 600 frames "Cold sweep cap (...)" whenever the cap was
   reached (also with the switch at 0): frames that stopped at the cap, images watched.
+
+### Pot room VRAM (helper CC)
+
+- FRITCHII_COVERED_RETIRE (live, frames, default 0 = off): a GPU-written render target whose whole
+  memory newer GPU writes cover (images written after its last write and touched no earlier than
+  it last was) is deleted without a download once untouched for N frames. Checked once after each
+  new image comes to overlap it: by the cold sweep (its own caps, 64 checks and 64 deletes a
+  frame, guarded shapes too), by the collector (no download for such an image), and when an
+  EXP121 download it queued is dropped for a newer overlap. Owner's pot room log (build 9): ~30
+  targets a frame made at bump-allocated addresses (6,964 384x384 D32 in 600 frames), 20-300 dead
+  ones under each new clear, kept until EXP58's 60 frames; device-local 9.2 -> 12.4 GB. Line every
+  600 frames "Covered retire (...)": checks and ms, deletes by sweep / collector / landing, MiB,
+  kept as busy, cap frames, and textures sampled again at a retired address (must stay near 0;
+  the first 20 get a "Covered retire: ... sampled N frames after" warning).
+- FRITCHII_COLLECT_LAND_UNDER (live, default 0): an EXP121 collector download still lands when the
+  overlap the GPU wrote since is still GPU-only (its bytes are not in guest memory; its own
+  download lands over ours later, and one that lands first drops ours). Before, such downloads
+  were dropped and the image kept, so the next pass queued it again: 5,028 queued and 4,956
+  "written again" in 600 frames in the pot room. The collector line now splits "written again"
+  into newer overlap / CPU write and counts landings under a GPU-only overlap.
+- Bug fix (always on): an EXP121 download no longer lands over a CPU write made to its image after
+  it was queued (counted in the collector line as "by the CPU").
 
 ### FRITCHII_JIT_BLOCK_LIST (the "JIT block list" lines)
 

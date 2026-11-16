@@ -171,6 +171,8 @@ ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
 // Ocarina of Time's frame rate cap with its high refresh rate mode on (Settings oot_high_refresh).
 // New values go at the end: saved configs store the index.
 ENUM(OotRefreshCap, Display, Hz90, Hz120, Hz144, Hz165, Unlimited);
+// Ocarina of Time's texture LOD bias while DLSS or FSR upscales (Settings oot_texture_sharpness).
+ENUM(OotTextureSharpness, Auto, Sharper, Custom);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {

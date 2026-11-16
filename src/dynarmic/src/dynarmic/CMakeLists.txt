@@ -180,6 +180,7 @@ if ("x86_64" IN_LIST ARCHITECTURE)
         backend/x64/perf_map.h
         backend/x64/reg_alloc.cpp
         backend/x64/reg_alloc.h
+        backend/x64/shared_code.h
         backend/x64/stack_layout.h
         backend/x64/verbose_debugging_output.cpp
         backend/x64/verbose_debugging_output.h

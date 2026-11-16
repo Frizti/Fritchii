@@ -8,9 +8,11 @@
 
 #include "dynarmic/backend/x64/emit_x64.h"
 
+#include <atomic>
 #include <iterator>
 
 #include "common/assert.h"
+#include "common/logging.h"
 #include <boost/variant/detail/apply_visitor_binary.hpp>
 #include "dynarmic/mcl/bit.hpp"
 #include "common/common_types.h"
@@ -20,6 +22,7 @@
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/nzcv_util.h"
 #include "dynarmic/backend/x64/perf_map.h"
+#include "dynarmic/backend/x64/shared_code.h"
 #include "dynarmic/backend/x64/stack_layout.h"
 #include "dynarmic/backend/x64/verbose_debugging_output.h"
 #include "dynarmic/ir/basic_block.h"
@@ -104,6 +107,9 @@ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, I
 
     code.mov(index_reg.cvt32(), dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_rsb_ptr]);
     code.mov(loc_desc_reg, target.Value());
+    if (shared_code) {
+        AlignPatchField(2, 8);  // Fritchii (FRITCHII_JIT_SHARED): mov rcx, imm64's immediate
+    }
     AddPatchLocation(target, PatchKind::MovRcx);
     EmitPatchMovRcx(target_code_ptr);
     code.mov(qword[code.ABI_JIT_PTR + index_reg * 8 + code.GetJitStateInfo().offsetof_rsb_location_descriptors], loc_desc_reg);
@@ -380,7 +386,18 @@ EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& de
 
     BlockDescriptor block_desc{entrypoint, size};
     block_descriptors.insert({IR::LocationDescriptor{descriptor.Value()}, block_desc});
+    if (shared_code) {
+        // Fritchii (FRITCHII_JIT_SHARED): other cores find it from here on without the lock.
+        shared_code->Insert(descriptor.Value(), entrypoint);
+    }
     return block_desc;
+}
+
+void EmitX64::AlignPatchField(size_t field_offset, size_t field_size) {
+    const size_t misalignment = (reinterpret_cast<uintptr_t>(code.getCurr()) + field_offset) & (field_size - 1);
+    if (misalignment != 0) {
+        code.nop(field_size - misalignment);
+    }
 }
 
 void EmitX64::AddPatchLocation(const IR::LocationDescriptor& target_desc, PatchKind kind) {
@@ -403,6 +420,57 @@ void EmitX64::AddPatchLocation(const IR::LocationDescriptor& target_desc, PatchK
 void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const auto it = patch_information.find(target_desc);
     if (it == patch_information.end()) {
+        return;
+    }
+    if (shared_code) {
+        // Fritchii (FRITCHII_JIT_SHARED): other cores may be running the code being patched, so
+        // each site is rewritten by one aligned atomic store of its displacement or immediate (an
+        // instruction fetch sees the old or the new target, both valid code). Only the two shapes
+        // emitted for it exist: a compact jump (E9 rel32, rel32 4-aligned) and the return stack
+        // push's mov rcx, imm64 (48 B9 imm64, imm64 8-aligned).
+        u8* const base = code.getCode<u8*>();
+        const auto patch = [&](u32 entry) {
+            u8* const site = base + (entry >> 2);
+            switch (PatchKind(entry & 3)) {
+            case PatchKind::Jmp: {
+                const CodePtr target = target_code_ptr ? target_code_ptr : UnlinkedJumpTarget(target_desc);
+                if (site[0] != 0xE9 || (uintptr_t(site + 1) & 3) != 0 || target == nullptr) {
+                    break;
+                }
+                const s64 disp = static_cast<const u8*>(target) - (site + 5);
+                ASSERT(disp >= INT32_MIN && disp <= INT32_MAX);
+                std::atomic_ref<u32>{*reinterpret_cast<u32*>(site + 1)}.store(u32(s32(disp)), std::memory_order_release);
+                return;
+            }
+            case PatchKind::MovRcx: {
+                const CodePtr target = target_code_ptr ? target_code_ptr : code.GetReturnFromRunCodeAddress();
+                if (site[0] != 0x48 || site[1] != 0xB9 || (uintptr_t(site + 2) & 7) != 0) {
+                    break;
+                }
+                std::atomic_ref<u64>{*reinterpret_cast<u64*>(site + 2)}.store(u64(reinterpret_cast<uintptr_t>(target)), std::memory_order_release);
+                return;
+            }
+            default:
+                break;
+            }
+            // Never expected (the switch refuses Jg/Jz links): left as it is, counted, must be 0.
+            const u64 errors = shared_code->patch_shape_errors.fetch_add(1, std::memory_order_relaxed);
+            if (errors < 8) {
+                LOG_ERROR(Core_ARM, "JIT shared code (FRITCHII_JIT_SHARED): patch site {} kind {} is not in the atomic shape "
+                                    "(bytes {:02x} {:02x}), left unpatched",
+                          fmt::ptr(site), entry & 3, site[0], site[1]);
+            }
+        };
+        for (const u32 entry : it->second.first) {
+            if (entry != 0) {
+                patch(entry);
+            }
+        }
+        if (it->second.rest) {
+            for (const u32 entry : *it->second.rest) {
+                patch(entry);
+            }
+        }
         return;
     }
     const CodePtr save_code_ptr = code.getCurr();
@@ -443,6 +511,9 @@ void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
 void EmitX64::ClearCache() {
     block_descriptors.clear();
     patch_information.clear();
+    if (shared_code) {
+        shared_code->Clear();  // Fritchii (FRITCHII_JIT_SHARED): every core is out of the code
+    }
 
     PerfMapClear();
 }
@@ -453,6 +524,12 @@ void EmitX64::InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDe
         if (auto const it = block_descriptors.find(descriptor); it != block_descriptors.end()) {
             Unpatch(descriptor);
             block_descriptors.erase(it);
+            if (shared_code) {
+                // Fritchii (FRITCHII_JIT_SHARED): out of the map; each core drops it from its own
+                // dispatch table at its next entry. The code stays until a whole-cache clear, so a
+                // core still inside it finishes safely.
+                shared_code->Remove(descriptor.Value());
+            }
         }
     }
     code.DisableWriting();

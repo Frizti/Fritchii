@@ -205,23 +205,30 @@ void ComputeMeshEpilogue(EmitContext& ctx) {
         }
     }
     // Primitive p: its three vertex indices, or 0 0 0 (a degenerate triangle) past the count.
+    // A point or line has one or two indices at map byte 4 + p * vertices (the last repeated in
+    // the three words) and MESH_EMULATION_CULLED past the count: a point at vertex 0 would draw.
+    const u32 primitive_vertices{mesh.PrimitiveVertices()};
+    const Id unused_index{primitive_vertices == 3 ? ctx.u32_zero_value
+                                                  : ctx.Const(MESH_EMULATION_CULLED)};
     const Id index_base{ctx.OpIAdd(ctx.U32[1], block, ctx.Const(vertex_words))};
     for (u32 first = 0; first < mesh.max_primitives; first += threads) {
         const Id primitive{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
         const auto write = [&] {
             const Id used{ctx.OpULessThan(ctx.U1, primitive, count)};
-            const Id byte{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(3U)),
-                                     ctx.Const(4U))};
+            const Id byte{ctx.OpIAdd(
+                ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(primitive_vertices)),
+                ctx.Const(4U))};
             const Id destination{ctx.OpIAdd(
                 ctx.U32[1], index_base, ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(3U)))};
             for (u32 element = 0; element < 3; ++element) {
+                const u32 source_element{(std::min)(element, primitive_vertices - 1)};
                 const Id map_index{
-                    Clamped(ctx, ctx.OpIAdd(ctx.U32[1], byte, ctx.Const(element)),
+                    Clamped(ctx, ctx.OpIAdd(ctx.U32[1], byte, ctx.Const(source_element)),
                             ctx.mesh_map_bytes)};
                 const Id value{ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, map_index))};
                 ctx.OpStore(
                     OutputWord(ctx, ctx.OpIAdd(ctx.U32[1], destination, ctx.Const(element))),
-                    ctx.OpSelect(ctx.U32[1], used, value, ctx.u32_zero_value));
+                    ctx.OpSelect(ctx.U32[1], used, value, unused_index));
             }
         };
         if (first + threads > mesh.max_primitives) {
@@ -464,7 +471,7 @@ void EmitMeshEpilogue(EmitContext& ctx) {
 }
 
 std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo& mesh, u32 binding,
-                                         u32 args_binding, bool convert_depth) {
+                                         u32 args_binding, bool convert_depth, float point_size) {
     Sirit::Module module{profile.supported_spirv};
     module.AddCapability(spv::Capability::Shader);
     module.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -515,6 +522,26 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
     const Id position{module.AddGlobalVariable(output_vec4, spv::StorageClass::Output)};
     module.Decorate(position, spv::Decoration::BuiltIn, spv::BuiltIn::Position);
     interfaces.push_back(position);
+    // A point list needs a size from its last pre-rasterization stage.
+    const u32 primitive_vertices{mesh.PrimitiveVertices()};
+    Id point_size_output{};
+    if (primitive_vertices == 1) {
+        point_size_output = module.AddGlobalVariable(output_f32, spv::StorageClass::Output);
+        module.Decorate(point_size_output, spv::Decoration::BuiltIn, spv::BuiltIn::PointSize);
+        interfaces.push_back(point_size_output);
+    }
+    // Points and lines past the primitive count are culled with a negative clip distance too:
+    // a position outside the view volume alone still let RADV draw some such points
+    // (zortos293/Lichii#863, which found it on an RX 5700 XT).
+    Id clip_distance{};
+    if (primitive_vertices != 3 && profile.max_user_clip_distances > 0) {
+        module.AddCapability(spv::Capability::ClipDistance);
+        const Id clip_array{module.TypeArray(f32_type, constant(1))};
+        clip_distance = module.AddGlobalVariable(
+            module.TypePointer(spv::StorageClass::Output, clip_array), spv::StorageClass::Output);
+        module.Decorate(clip_distance, spv::Decoration::BuiltIn, spv::BuiltIn::ClipDistance);
+        interfaces.push_back(clip_distance);
+    }
     std::array<Id, IR::NUM_GENERICS> generics{};
     for (const u32 line : mesh.vertex_lines) {
         const IR::Attribute attribute{line};
@@ -544,11 +571,11 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
     };
     const u32 vertex_lines{static_cast<u32>(mesh.vertex_lines.size())};
     const u32 max_primitives{(std::max)(mesh.max_primitives, 1U)};
-    // Vertex i of the draw: corner i % 3 of primitive slot i / 3, which belongs to workgroup
-    // slot / max_primitives.
+    // Vertex i of the draw: corner i % n of primitive slot i / n (n vertices per primitive: 3, 2
+    // or 1), which belongs to workgroup slot / max_primitives.
     const Id draw_vertex{module.OpBitcast(u32_type, module.OpLoad(s32_type, vertex_index))};
-    const Id slot{module.OpUDiv(u32_type, draw_vertex, constant(3))};
-    const Id corner{module.OpUMod(u32_type, draw_vertex, constant(3))};
+    const Id slot{module.OpUDiv(u32_type, draw_vertex, constant(primitive_vertices))};
+    const Id corner{module.OpUMod(u32_type, draw_vertex, constant(primitive_vertices))};
     const Id workgroup{module.OpUDiv(u32_type, slot, constant(max_primitives))};
     const Id primitive{module.OpUMod(u32_type, slot, constant(max_primitives))};
     Id block{module.OpIMul(u32_type, workgroup, constant(MeshEmulationBlockWords(mesh)))};
@@ -561,12 +588,16 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
     const Id index_word{module.OpIAdd(
         u32_type, module.OpIAdd(u32_type, block, constant(mesh.max_vertices * vertex_lines)),
         module.OpIAdd(u32_type, module.OpIMul(u32_type, primitive, constant(3)), corner))};
-    const Id vertex{module.OpUMin(u32_type, load(index_word),
+    const Id raw_vertex{load(index_word)};
+    const Id vertex{module.OpUMin(u32_type, raw_vertex,
                                   constant((std::max)(mesh.max_vertices, 1U) - 1))};
     const Id vertex_base{
         module.OpIAdd(u32_type, block, module.OpIMul(u32_type, vertex, constant(vertex_lines)))};
 
     module.OpStore(position, default_vec4);
+    if (Sirit::ValidId(point_size_output)) {
+        module.OpStore(point_size_output, module.Constant(f32_type, point_size));
+    }
     for (const Id generic : generics) {
         if (Sirit::ValidId(generic)) {
             module.OpStore(generic, default_vec4);
@@ -591,6 +622,8 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
                                                 generics[IR::GenericAttributeIndex(attribute)],
                                                 constant(IR::GenericAttributeElement(attribute))),
                            value);
+        } else if (attribute == IR::Attribute::PointSize && Sirit::ValidId(point_size_output)) {
+            module.OpStore(point_size_output, value);
         }
     }
     // OpenGL-style clip space, as the mesh epilogue's ConvertDepth: z = (z + w) / 2.
@@ -598,6 +631,30 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
         const Id z{module.OpFMul(f32_type, module.OpFAdd(f32_type, position_z, position_w),
                                  module.Constant(f32_type, 0.5f))};
         module.OpStore(module.OpAccessChain(output_f32, position, constant(2)), z);
+    }
+    if (primitive_vertices != 3) {
+        // A point or line past the primitive count (MESH_EMULATION_CULLED): far outside the
+        // clip volume, size 1 and a negative clip distance, so it is clipped away.
+        const Id culled{module.OpIEqual(module.TypeBool(), raw_vertex,
+                                        constant(MESH_EMULATION_CULLED))};
+        const std::array<float, 4> far_away{8.0f, 8.0f, 0.0f, 1.0f};
+        for (u32 element = 0; element < 4; ++element) {
+            const Id pointer{module.OpAccessChain(output_f32, position, constant(element))};
+            module.OpStore(pointer,
+                           module.OpSelect(f32_type, culled,
+                                           module.Constant(f32_type, far_away[element]),
+                                           module.OpLoad(f32_type, pointer)));
+        }
+        if (Sirit::ValidId(point_size_output)) {
+            module.OpStore(point_size_output,
+                           module.OpSelect(f32_type, culled, one_f,
+                                           module.OpLoad(f32_type, point_size_output)));
+        }
+        if (Sirit::ValidId(clip_distance)) {
+            module.OpStore(module.OpAccessChain(output_f32, clip_distance, constant(0)),
+                           module.OpSelect(f32_type, culled, module.Constant(f32_type, -1.0f),
+                                           one_f));
+        }
     }
     module.OpReturn();
     module.OpFunctionEnd();

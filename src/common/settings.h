@@ -64,6 +64,8 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(OotTextureSharpness, false);
+SWITCHABLE(float, true);
 SWITCHABLE(DlssPreset, false);
 SWITCHABLE(NvidiaDlssQuality, false);
 SWITCHABLE(OotRefreshCap, false);
@@ -416,6 +418,9 @@ struct Values {
                                                    Specialization::Default,
                                                    true,
                                                    true};
+    // OoT: DLSS gets the camera jitter it is made for (and the texture bias that goes with it).
+    // On by default; EDEN_NX2_DLSS_JITTER still overrides it. Takes effect when the game starts.
+    SwitchableSetting<bool> oot_dlss_jitter{linkage, true, "oot_dlss_jitter", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -438,6 +443,14 @@ struct Values {
     // when on, still replaces Game and No sharpening; an FSR choice wins over it.
     SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
                                                          "oot_anti_aliasing", Category::Renderer};
+    // OoT's texture LOD bias while DLSS or FSR upscales (VideoCommon::OcarinaTextureLodBias).
+    // Auto: from the render and output sizes (NVIDIA's log2(render / output) for DLSS with its
+    // jitter, AMD's log2(render / output) - 1 for FSR). Sharper: 0.5 lower. Custom: the value
+    // below as is. Takes effect when the game starts.
+    SwitchableSetting<OotTextureSharpness> oot_texture_sharpness{
+        linkage, OotTextureSharpness::Auto, "oot_texture_sharpness", Category::Renderer};
+    SwitchableSetting<float, true> oot_lod_bias_custom{linkage, -1.58f, -3.0f, 1.0f,
+                                                       "oot_lod_bias_custom", Category::Renderer};
     // The title screen's and cutscenes' videos (AV1 1080p60): the game's own upscaler (removes
     // banding, 1080p -> 1440p; tensor operations) or a bilinear copy. Automatic: the game's where
     // the GPU runs tensor operations natively (RTX), the copy elsewhere (its emulated matrices

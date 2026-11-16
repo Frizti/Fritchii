@@ -23,6 +23,7 @@
 #include "common/nx2_sample_profile.h"
 #include "common/assert.h"
 #include "common/thread.h"
+#include "common/frame_budget.h"
 #include "common/nx2_hitch.h"
 #include "common/thread_pinning.h"
 #ifdef __APPLE__
@@ -677,6 +678,7 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 void SetCurrentThreadName(const char* name) {
     Nx2SampleProfile::OnThreadNamed(name);
     Nx2Hitch::RegisterThread(name);
+    FrameBudget::RegisterThread(name);
     WriteRing::NameThread(name);
 #ifdef _MSC_VER
     // Sets the debugger-visible name of the current thread.

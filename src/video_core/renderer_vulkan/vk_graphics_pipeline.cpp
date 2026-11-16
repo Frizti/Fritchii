@@ -570,6 +570,7 @@ std::atomic<std::chrono::nanoseconds::rep> hold_time_total_ns{};
 // waiting for them froze the game (tester log t1858), while a cache hit takes a few ms.
 std::atomic<u64> kept_builds{};
 std::atomic<u64> kept_builds_slow{};
+std::atomic<u64> kept_builds_long{};
 std::atomic<std::chrono::nanoseconds::rep> kept_builds_slow_ns{};
 std::atomic<std::chrono::nanoseconds::rep> kept_builds_longest_ns{};
 
@@ -654,6 +655,7 @@ GraphicsPipeline::KeptBuildStats GraphicsPipeline::TakeKeptBuildStats() noexcept
     return KeptBuildStats{
         .builds = kept_builds.exchange(0, std::memory_order::relaxed),
         .slow = kept_builds_slow.exchange(0, std::memory_order::relaxed),
+        .long_builds = kept_builds_long.exchange(0, std::memory_order::relaxed),
         .slow_time = std::chrono::nanoseconds{
             kept_builds_slow_ns.exchange(0, std::memory_order::relaxed)},
         .longest = std::chrono::nanoseconds{
@@ -682,6 +684,7 @@ GraphicsPipeline::GraphicsPipeline(
       libraries_only{library_params.library_cache && library_params.libraries_only},
       spirv_hashes{library_params.spirv_hashes},
       worker_only_build{worker_thread && static_cast<bool>(emit_stages)},
+      prepared_build{worker_only_build && library_params.prepared},
       mesh_emulation{std::move(mesh_emulation_)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
@@ -931,8 +934,13 @@ GraphicsPipeline::GraphicsPipeline(
         }
         if (worker_only_build) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
-            kept_builds.fetch_add(1, std::memory_order::relaxed);
-            if (elapsed > KeptBuildSlow) {
+            if (prepared_build) {
+                kept_builds.fetch_add(1, std::memory_order::relaxed);
+            }
+            if (prepared_build && elapsed > KeptBuildLong) {
+                kept_builds_long.fetch_add(1, std::memory_order::relaxed);
+            }
+            if (prepared_build && elapsed > KeptBuildSlow) {
                 const auto ns =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
                 kept_builds_slow.fetch_add(1, std::memory_order::relaxed);
@@ -2892,7 +2900,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 .payload_words = mesh_emulation->payload_stride,
                 .capacity_words = capacity,
                 .block_words = mesh_emulation->block_words,
-                .vertices_per_group = mesh_emulation->max_primitives * 3,
+                .vertices_per_group =
+                    mesh_emulation->max_primitives * mesh_emulation->primitive_vertices,
                 .max_groups = device.GetMaxComputeWorkGroupCount()[0],
             };
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_pipeline);
@@ -3606,7 +3615,11 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        // The mesh program's output topology (points and lines since Fritchii's point fallback).
+        .topology = !mesh_emulation                           ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                    : mesh_emulation->primitive_vertices == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                    : mesh_emulation->primitive_vertices == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                                                              : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         .primitiveRestartEnable = VK_FALSE,
     };
     VkPipelineCreateFlags flags{};

@@ -233,6 +233,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     view->addAction(ui.action_Single_Window_Mode);
     view->addSeparator();
     view->addAction(ui.action_Show_Performance_Overlay);
+    view->addAction(ui.action_Show_Frame_Times);
     view->addAction(ui.action_Show_Status_Bar);
     view->addAction(ui.action_Show_Filter_Bar);
     view->addSeparator();
@@ -328,6 +329,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     Rename(ui.action_Carousel_View, tr("&Carousel"));
     Rename(ui.action_Show_Game_Name, tr("Show Game &Names"));
     Rename(ui.action_Show_Performance_Overlay, tr("&Performance Overlay"));
+    Rename(ui.action_Show_Frame_Times, tr("Overlay &Frame Times"));
     Rename(ui.action_Show_Status_Bar, tr("&Status Bar"));
     Rename(ui.action_Show_Filter_Bar, tr("Search &Bar"));
     Rename(ui.action_Single_Window_Mode, tr("Single &Window"));

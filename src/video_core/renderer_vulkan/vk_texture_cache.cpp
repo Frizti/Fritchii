@@ -34,6 +34,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/small_card.h"
 #include "video_core/render_trace.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
@@ -43,6 +44,7 @@
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
+#include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -3191,6 +3193,31 @@ void TextureCacheRuntime::SampleVramReport() {
              staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20,
              staging_buffer_pool.StreamBufferBytes() >> 20, pressure - vram_report_seen_pressure,
              failed - vram_report_seen_failed);
+    // Where the main heap's usage sits: each allocator's blocks against what is allocated in
+    // them (their difference is the block slack), and what the driver holds outside both
+    // (pipelines, descriptor and command memory, the swapchain, its own reservations).
+    {
+        const size_t heap = device.GetMainHeap();
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> main_budgets{};
+        vmaGetHeapBudgets(device.GetAllocator(), main_budgets.data());
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> buffer_budgets{};
+        if (device.HasSplitAllocators()) {
+            device.BufferHeapBudgets(buffer_budgets.data());
+        }
+        const VmaStatistics& images = main_budgets[heap].statistics;
+        const VmaStatistics& buffers = buffer_budgets[heap].statistics;
+        const u64 blocks = images.blockBytes + buffers.blockBytes;
+        LOG_INFO(Render_Vulkan,
+                 "VRAM split (FRITCHII_VRAM_REPORT): main allocator blocks {} MiB ({} MiB "
+                 "allocated, {} allocations), buffer allocator blocks {} MiB ({} MiB allocated, "
+                 "{} allocations), outside the allocators {} MiB; small card profile {} "
+                 "(FRITCHII_SMALL_CARD={}, parts {:#x})",
+                 images.blockBytes >> 20, images.allocationBytes >> 20, images.allocationCount,
+                 buffers.blockBytes >> 20, buffers.allocationBytes >> 20,
+                 buffers.allocationCount, (usage - (std::min)(usage, blocks)) >> 20,
+                 VideoCore::SmallCard::Active() ? "on" : "off", VideoCore::SmallCard::Mode(),
+                 VideoCore::SmallCard::Parts());
+    }
     vram_report_samples = vram_report_over = 0;
     vram_report_peak_usage = vram_report_peak_over = 0;
     vram_report_seen_pressure = pressure;
@@ -3397,6 +3424,17 @@ void TextureCacheRuntime::TickFrame() {
             pool_fit_frames = 0;
         } else if (pool_fit_frames++ % 30 == 0) {
             UpdatePoolFitCap();
+        }
+        // FRITCHII_SMALL_CARD (part Pool): the pool held 850-1000 MiB of deleted render targets at
+        // the market (EXP66 = 1024), a seventh of an 8 GB card's budget and a fifth of a 6 GB
+        // one's. On a small card it gets 1/16 of the budget (~450 MiB on 8 GB, ~340 on 6 GB, at
+        // least 256), trimmed oldest first as before; the cache's part Fit counts what it holds.
+        if (!VideoCore::SmallCard::On(VideoCore::SmallCard::Pool)) {
+            small_pool_cap = ~u64{0};
+            small_pool_frames = 0;
+        } else if (small_pool_frames++ % 30 == 0) {
+            const u64 budget = device.GetDeviceMemoryBudget();
+            small_pool_cap = budget != 0 ? (std::max)(budget / 16, u64{256} << 20) : ~u64{0};
         }
         SampleVramReport();
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
@@ -5304,25 +5342,45 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
         const auto backend = ResolveOcarinaUpscaler(device);
         if (!ocarina) {
             ocarina_fsr_lod_bias = 0.0f;
-        } else if (const int mode = VideoCommon::OcarinaLodRatioMode(); mode != 0) {
-            // FRITCHII_OOT_LOD_RATIO: from the real sizes, docked (handheld drops the bias). The
-            // scene is 1440p tall, or what the DLSS render scale made it; the output is 4K, or
-            // the scene's own size for DLAA (the quality when the game started).
-            const u32 render_height =
-                Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale());
+        } else if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
+                   Fsr4Upscaler::RunsUnjittered(device)) {
+            // FSR 4 takes the scene without camera jitter: a sharper mip would only shimmer.
+            ocarina_fsr_lod_bias = 0.0f;
+            LOG_INFO(Render_Vulkan, "Ocarina texture LOD bias 0 (FSR 4 without camera jitter)");
+        } else {
+            // From the sizes, docked (handheld drops the bias). Max Resolution: the scene is
+            // 1440p tall, or what the DLSS render scale made it, and the output 4K. Without it
+            // the game's dynamic scene (1080p at most) goes to 1440p. DLAA (the quality when the
+            // game started) keeps the scene's size. FRITCHII_DLSS_SCALED: the scaled scene, and
+            // a scene above the output is upscaled to its own size (supersampling).
+            const bool max_resolution = Settings::OcarinaMaxResolutionOn();
+            u32 render_height =
+                max_resolution
+                    ? Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale())
+                    : 1080;
+            const auto& resolution = Settings::values.resolution_info;
+            if (VideoCommon::OcarinaScaledUpscale() && resolution.active) {
+                render_height = static_cast<u32>(
+                    static_cast<f32>(render_height) * resolution.up_factor + 0.5f);
+            }
             const bool dlaa = backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
                               Settings::GetNvidiaDlssRuntimeSettings().quality ==
                                   Settings::NvidiaDlssQuality::Native;
-            const u32 output_height = dlaa ? render_height : 2160;
-            ocarina_fsr_lod_bias = VideoCommon::OcarinaLodBiasForSizes(
-                backend, render_height, output_height, VideoCommon::OcarinaDlssJitterMode() != 0,
-                mode);
+            const u32 output_height =
+                dlaa ? render_height : std::max(render_height, max_resolution ? 2160U : 1440U);
+            const bool dlss_jitter =
+                VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());
+            const int mode = VideoCommon::OcarinaLodRatioMode();
+            const auto choice = Settings::values.oot_texture_sharpness.GetValue();
+            ocarina_fsr_lod_bias = VideoCommon::OcarinaTextureLodBias(
+                backend, render_height, output_height, dlss_jitter, mode, choice,
+                Settings::values.oot_lod_bias_custom.GetValue());
             LOG_INFO(Render_Vulkan,
-                     "Ocarina texture LOD bias {:.2f} ({} {}p -> {}p, FRITCHII_OOT_LOD_RATIO={})",
+                     "Ocarina texture LOD bias {:.2f} ({} {}p -> {}p, texture sharpness {}, "
+                     "DLSS jitter {}, FRITCHII_OOT_LOD_RATIO={})",
                      *ocarina_fsr_lod_bias, VideoCommon::OcarinaBackendName(backend),
-                     render_height, output_height, mode);
-        } else {
-            ocarina_fsr_lod_bias = VideoCommon::OcarinaFsrLodBias(backend);
+                     render_height, output_height, Settings::CanonicalizeEnum(choice),
+                     dlss_jitter ? "on" : "off", mode);
         }
     }
     return *ocarina_fsr_lod_bias;

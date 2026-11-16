@@ -60,6 +60,55 @@ TEST_CASE("OoT FSR texture LOD bias follows the upscaler, the console mode and f
     CHECK_FALSE(KeepOcarinaFsrLodBias(true, true, true));
 }
 
+TEST_CASE("OoT DLSS jitter: the override wins over the setting", "[video_core][ocarina]") {
+    using VideoCommon::OcarinaDlssJitterOn;
+    CHECK(OcarinaDlssJitterOn(-1, true));
+    CHECK_FALSE(OcarinaDlssJitterOn(-1, false));
+    CHECK_FALSE(OcarinaDlssJitterOn(0, true));
+    CHECK(OcarinaDlssJitterOn(1, false));
+    CHECK(OcarinaDlssJitterOn(2, false));
+}
+
+TEST_CASE("OoT texture sharpness: Auto from the sizes, Sharper, Custom", "[video_core][ocarina]") {
+    using enum VideoCommon::OcarinaUpscaleBackend;
+    using VideoCommon::OcarinaTextureLodBias;
+    using Settings::OotTextureSharpness;
+    const auto about = [](float a, float b) { return std::abs(a - b) < 0.01f; };
+    // 1440p -> 4K: NVIDIA's log2(render / output), AMD's one lower.
+    CHECK(about(OcarinaTextureLodBias(Dlss, 1440, 2160, true, 1, OotTextureSharpness::Auto, 0.0f),
+               -0.58f));
+    CHECK(about(OcarinaTextureLodBias(Fsr, 1440, 2160, false, 1, OotTextureSharpness::Auto, 0.0f),
+               -1.58f));
+    // DLAA and 1080p -> 4K.
+    CHECK(about(OcarinaTextureLodBias(Dlss, 1440, 1440, true, 1, OotTextureSharpness::Auto, 0.0f),
+               0.0f));
+    CHECK(about(OcarinaTextureLodBias(Dlss, 1080, 2160, true, 1, OotTextureSharpness::Auto, 0.0f),
+               -1.0f));
+    // FRITCHII_OOT_LOD_RATIO=2: FSR's formula for DLSS; 0: the fixed numbers.
+    CHECK(about(OcarinaTextureLodBias(Dlss, 1440, 2160, true, 2, OotTextureSharpness::Auto, 0.0f),
+               -1.58f));
+    CHECK(about(OcarinaTextureLodBias(Dlss, 1080, 2160, true, 0, OotTextureSharpness::Auto, 0.0f),
+               -0.58f));
+    // DLSS without its jitter: no bias, Sharper neither; Custom is the player's value.
+    CHECK(OcarinaTextureLodBias(Dlss, 1440, 2160, false, 1, OotTextureSharpness::Auto, 0.0f) ==
+          0.0f);
+    CHECK(OcarinaTextureLodBias(Dlss, 1440, 2160, false, 1, OotTextureSharpness::Sharper, 0.0f) ==
+          0.0f);
+    CHECK(OcarinaTextureLodBias(Dlss, 1440, 2160, false, 1, OotTextureSharpness::Custom, -1.75f) ==
+          -1.75f);
+    CHECK(about(
+        OcarinaTextureLodBias(Dlss, 1440, 2160, true, 1, OotTextureSharpness::Sharper, 0.0f),
+        -1.08f));
+    CHECK(about(
+        OcarinaTextureLodBias(Fsr, 1440, 2160, false, 1, OotTextureSharpness::Sharper, 0.0f),
+        -2.08f));
+    CHECK(OcarinaTextureLodBias(Fsr, 1440, 2160, false, 1, OotTextureSharpness::Custom, -1.52f) ==
+          -1.52f);
+    // The game's own upscale: nothing, whatever the choice.
+    CHECK(OcarinaTextureLodBias(Native, 1440, 2160, true, 1, OotTextureSharpness::Custom, -1.75f) ==
+          0.0f);
+}
+
 TEST_CASE("FSR temporal sharpness uses the existing stops slider", "[video_core][fsr][ocarina]") {
     CHECK(FSR::RcasSharpnessFromStops(0.0f) == 1.0f);
     CHECK(FSR::RcasSharpnessFromStops(0.81f) == 0.595f);

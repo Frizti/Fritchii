@@ -418,6 +418,21 @@ bool HangDumpEnabled() {
     return enabled;
 }
 
+/// Every thread's stack, one line per distinct stack (Windows; nothing elsewhere).
+void LogThreadStacks(const char* prefix, unsigned long main_thread_id) {
+#ifdef _WIN32
+    const std::vector<std::string> lines = Common::Windows::ThreadStackLines(main_thread_id);
+    LOG_CRITICAL(Render, "{}: {} stacks (module+offset, innermost first; resolve with the PDB):",
+                 prefix, lines.size());
+    for (const std::string& line : lines) {
+        LOG_CRITICAL(Render, "{}: {}", prefix, line);
+    }
+#else
+    static_cast<void>(prefix);
+    static_cast<void>(main_thread_id);
+#endif
+}
+
 /// Once a second, from the Pulse thread or the hang watch thread (one of them, never both).
 void HangTick() {
     static u64 last_presents = ~u64{0};
@@ -463,6 +478,7 @@ void HangTick() {
         g_hang_hooks.report(g_hang_hooks.context);
     }
     lock.unlock();
+    LogThreadStacks("Hang report", 0);
     if (HangDumpEnabled()) {
 #ifdef _WIN32
         LOG_CRITICAL(Render, "Hang report: minidump (FRITCHII_HANG_DUMP=1) {}",
@@ -524,6 +540,33 @@ void ClearHangHooks(const void* context) {
     if (g_hang_hooks.context == context) {
         g_hang_hooks = {};
     }
+}
+
+void LogThreadReport(const char* prefix, bool shutdown, unsigned long main_thread_id) {
+    const u64 last_present = g_hang_last_present_ns.load(std::memory_order_relaxed);
+    const u64 now = NowNs();
+    const long long gap_us =
+        last_present != 0 && now > last_present ? static_cast<long long>((now - last_present) / 1000)
+                                                : 0;
+    if (StallOn()) {
+        // The session's hooks (GPU acquires, service calls, guest waits) are gone in a shutdown:
+        // the teardown frees what they read. The stall slots are plain statics.
+        LOG_CRITICAL(Render, "{}: {}{}", prefix, StallSnapshotLine(gap_us),
+                     shutdown ? " (shutting down: stopped GPU threads show their last span)" : "");
+    }
+    LogThreadStacks(prefix, main_thread_id);
+}
+
+bool HangDumpSwitch() {
+    return HangDumpEnabled();
+}
+
+std::string WriteHangDumpNow() {
+#ifdef _WIN32
+    return Common::Windows::WriteHangDump(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir));
+#else
+    return "not written: Windows only; attach a debugger or use gcore for one";
+#endif
 }
 
 // Machine pulse (fable52_answer_dips section 4c): tells "the machine got slower" (another program,

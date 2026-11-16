@@ -338,6 +338,12 @@ private:
     [[nodiscard]] bool DrawMayBeSkipped() const;
     /// FRITCHII_ASYNC_REDRAWN when unset: 1 on AMD's Windows driver, else 0.
     [[nodiscard]] int AsyncRedrawnDefault() const;
+    /// FRITCHII_ASYNC_REDRAWN's value: set live or in the environment, else AsyncRedrawnDefault
+    /// or async_redrawn_auto.
+    [[nodiscard]] bool AsyncRedrawnOn() const;
+    /// Set once this session's prepared pipelines show the driver compiling them again
+    /// (ReportKeptDriverCompiles): FRITCHII_ASYNC_REDRAWN on while it is not set.
+    std::atomic<bool> async_redrawn_auto{};
     /// Counts CurrentGraphicsPipeline calls, so DrawMayBeSkipped classifies the targets once per
     /// lookup however often a lookup asks.
     u64 lookup_serial{};
@@ -447,10 +453,16 @@ private:
     void ReportPrecompiled();
     /// ReportPrecompiled: how many prepared pipelines the driver compiled again (cache misses).
     void ReportKeptDriverCompiles();
+    /// ReportKeptDriverCompiles: async_redrawn_auto once the driver compiles prepared pipelines
+    /// again (thresholds at the definition).
+    void MaybeAutoAsyncRedrawn();
     struct {
         u64 builds{};
         u64 slow{};
+        u64 long_builds{};
+        std::chrono::nanoseconds longest{};
         bool warned{};
+        bool auto_checked{};
     } kept_compiles_session;
     /// Publishes the kept file's index for the GPU thread (`kept`, or a finished `part` the
     /// preparation could not rename over it); false when there is none for `stamp`. With

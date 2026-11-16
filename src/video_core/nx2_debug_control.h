@@ -272,7 +272,9 @@ inline std::atomic<int> g_store_memo{-1};
 inline std::atomic<int> g_write_remark{-1};
 /// FRITCHII_JIT_HOT_PACK: docs/fritchii/switches.md.
 inline std::atomic<int> g_jit_hot_pack{-1};
-/// FRITCHII_ASYNC_REDRAWN (live, default 0, 1 on AMD's Windows driver): docs/fritchii/switches.md.
+/// FRITCHII_ASYNC_REDRAWN (live, default 0, 1 on AMD's Windows driver or once the driver compiles
+/// prepared pipelines again; -1 = unset, see PipelineCache::AsyncRedrawnOn):
+/// docs/fritchii/switches.md.
 inline std::atomic<int> g_async_redrawn{-1};
 /// FRITCHII_OCCLUSION_VISIBLE (live, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_occlusion_visible{-1};
@@ -470,6 +472,17 @@ inline std::atomic<int> g_sweep_superseded{-1};
 /// FRITCHII_COLD_SWEEP_MAX (live, default 0 = 16; helper AG, the part of zortos #1571 we lack):
 /// how many images the cold sweep deletes a frame at most.
 inline std::atomic<int> g_cold_sweep_max{-1};
+/// FRITCHII_COVERED_RETIRE (live, frames, default 0 = off): a GPU-written render target whose
+/// whole memory newer GPU-written images cover (OoT's pot room: per-object D32 targets bump-
+/// allocated over last frames' ones, 20-300 dead ones under each new clear) is deleted without a
+/// download once untouched for N frames, by the cold sweep and by the collector, instead of
+/// living until EXP58's 60 frames or the collector's LRU reaching it.
+inline std::atomic<int> g_covered_retire{-1};
+/// FRITCHII_COLLECT_LAND_UNDER (live, default 0): EXP121's queued collector downloads still land
+/// when an overlapping image the GPU wrote since is still GPU-only (its own download lands over
+/// ours later, and landing it first drops ours); without it they were dropped and the image kept,
+/// then queued again by the next pass (pot room: 5,000 downloads per 600 frames, 99% dropped).
+inline std::atomic<int> g_collect_land_under{-1};
 /// FRITCHII_NOTED_OVERFLOW (live, default 0; F7, with FRITCHII_NOTED_FAST 1 to 3): the table's
 /// overflow answer of NotedWriteSinceFast asked again of the note chains, which keep the position
 /// of each forgotten link: 1 = on (a chain-proved "no write" answers at FRITCHII_NOTED_FAST=1),

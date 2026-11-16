@@ -4,12 +4,18 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <functional>
+#include <string>
 #include <vector>
+#include <fmt/format.h>
+#include <QSignalBlocker>
 #include <QBoxLayout>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
@@ -28,6 +34,8 @@
 #include <vulkan/vulkan_core.h>
 
 #include "common/common_types.h"
+#include "common/fs/fs.h"
+#include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -224,6 +232,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     QLayout& graphics_layout = *ui->graphics_widget->layout();
 
     std::map<u32, QWidget*> hold_graphics;
+    std::map<u32, QWidget*> all_rows; ///< Every built row by setting id (not the groups)
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
 
@@ -238,6 +247,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         if (setting->Id() == Settings::values.nvidia_dlss.Id() ||
             setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
             setting->Id() == Settings::values.nvidia_dlss_preset.Id()) {
+            continue;
+        }
+        if (setting->Id() == Settings::values.oot_dlss_jitter.Id()) {
             continue;
         }
 #endif
@@ -268,6 +280,14 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         }
         if (setting->Id() == Settings::values.nvidia_dlss_quality.Id()) {
             dlss_quality_combobox = widget->combobox;
+            dlss_quality_widget = widget;
+        }
+        all_rows.emplace(setting->Id(), widget);
+        if (setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
+            setting->Id() == Settings::values.nvidia_dlss_preset.Id() ||
+            setting->Id() == Settings::values.game_dlss_network.Id() ||
+            setting->Id() == Settings::values.oot_dlss_jitter.Id()) {
+            dlss_rows.push_back(widget);
         }
 
         if (setting->Id() == Settings::values.renderer_backend.Id()) {
@@ -329,23 +349,16 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         } else if (setting->Id() == Settings::values.resolution_setup.Id()) {
             // Keep track of the resolution combobox to update other UI tabs that need it
             resolution_combobox = widget->combobox;
+            resolution_widget = widget;
             if (FritchiiUi::Enabled()) {
-                // One line under it while DLSS or FSR sets OoT's resolution (the scale goes to
-                // 1x for the session then; RasterizerVulkan::ApplyOcarinaResolution).
+                // The resolution, the upscaler and what goes with them, in one group (the
+                // explanations live in the tooltips: no text under the rows).
                 QWidget* group = new QWidget(this);
                 QVBoxLayout* group_layout = new QVBoxLayout(group);
+                resolution_group_layout = group_layout;
                 group_layout->setContentsMargins(0, 0, 0, 0);
                 group_layout->setSpacing(2);
                 group_layout->addWidget(widget);
-                resolution_note = new QLabel(group);
-                resolution_note->setObjectName(QStringLiteral("FritchiiSettingsNote"));
-                resolution_note->setWordWrap(true);
-                QFont font = resolution_note->font();
-                font.setPointSizeF(font.pointSizeF() * 1.15);
-                resolution_note->setFont(font);
-                resolution_note->setContentsMargins(0, 2, 0, 6);
-                resolution_note->setVisible(false);
-                group_layout->addWidget(resolution_note);
                 hold_graphics.emplace(setting->Id(), group);
             } else {
                 hold_graphics.emplace(setting->Id(), widget);
@@ -370,6 +383,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 #ifdef EGLANTINE_STREAMLINE
         } else if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
             nvidia_dlss_checkbox = widget->checkbox;
+            nvidia_dlss_widget = widget;
             // NVIDIA's files and a download button under the checkbox.
             QWidget* group = new QWidget(this);
             QVBoxLayout* group_layout = new QVBoxLayout(group);
@@ -393,6 +407,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             group_layout->setSpacing(2);
             group_layout->addWidget(widget);
             oot_aa_combobox = widget->combobox;
+            oot_aa_widget = widget;
             amd_fsr4_panel = new AmdFsr4Panel(group);
             group_layout->addWidget(amd_fsr4_panel);
             connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
@@ -405,6 +420,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             hold_graphics.emplace(setting->Id(), widget);
         }
     }
+
+    SetupUpscalerChoice(hold_graphics);
 
     for (const auto& [id, widget] : hold_graphics) {
         graphics_layout.addWidget(widget);
@@ -430,6 +447,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     }
 
     SetupOcarinaUpscalerLabels();
+    SetupOcarinaTextureRows(all_rows);
+    SetupPictureMenu(all_rows);
+    SetupPlainNames(all_rows);
 
     // Background color is too specific to build into the new system, so we manage it here
     // (3 settings, all collected into a single widget with a QColor to manage on top)
@@ -476,6 +496,21 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 
 const QString ConfigureGraphics::TranslateVSyncMode(VkPresentModeKHR mode,
                                                     Settings::RendererBackend backend) const {
+    // Fritchii: plain names (Mailbox is what the host frame pacer is made for).
+    if (FritchiiUi::Enabled() && backend == Settings::RendererBackend::Vulkan) {
+        switch (mode) {
+        case VK_PRESENT_MODE_IMMEDIATE_KHR:
+            return tr("Off");
+        case VK_PRESENT_MODE_MAILBOX_KHR:
+            return tr("On (recommended)");
+        case VK_PRESENT_MODE_FIFO_KHR:
+            return tr("On, classic");
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+            return tr("On, tears when slow");
+        default:
+            return {};
+        }
+    }
     switch (mode) {
     case VK_PRESENT_MODE_IMMEDIATE_KHR:
         return (backend == Settings::RendererBackend::OpenGL_GLSL ||
@@ -590,7 +625,15 @@ void ConfigureGraphics::UpdateDlssVisibility() {
     const bool nvidia = GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
                         device >= 0 && static_cast<size_t>(device) < records.size() &&
                         records[device].nvidia;
-    nvidia_dlss_group->setVisible(nvidia || nvidia_dlss_checkbox->isChecked());
+    // Not NVIDIA: every DLSS row goes, a saved "on" included (2026-11-16: an RX 7900 XT's game
+    // settings still showed DLSS quality and model; DLSS can't run there, the value does nothing).
+    nvidia_dlss_group->setVisible(nvidia);
+    if (!nvidia) {
+        for (QWidget* const row : dlss_rows) {
+            row->setVisible(false);
+        }
+    }
+    UpdateUpscalerChoice();
 }
 
 void ConfigureGraphics::UpdateAmdFsr4Visibility() {
@@ -615,14 +658,270 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
         view->setRowHidden(fsr4_row, !capable && !fsr4_picked);
     }
     amd_fsr4_panel->setVisible(capable && fsr4_picked);
+    UpdateUpscalerChoice();
 }
 
 namespace {
-/// "1440p", or "4K" for 2160 lines.
-QString OcarinaHeightName(u32 height) {
-    return height == 2160 ? QStringLiteral("4K") : QStringLiteral("%1p").arg(height);
+/// The "Upscaler" row for DLSS, which is the nvidia_dlss checkbox, not an OotAntiAliasing value.
+constexpr u32 UPSCALER_DLSS = 0x100;
+
+/// What a picture choice asks DLSS for: an upscale (the quality the player had, or Automatic),
+/// Native (DLAA), or the FRITCHII_DLSS_RENDER_SCALE qualities.
+enum class PictureKind : u8 { Upscaled, Native, Performance, UltraPerformance };
+
+/// One combination OoT's upscale path really runs, docked (VideoCommon::OcarinaScaledUpscale off):
+/// - Max Resolution on: the game renders a fixed 2560x1440 and the upscaler replaces its 1440p
+///   pass. FSR and every DLSS quality but Native make 4K (TryOcarinaUpscale's upscale_4k);
+///   Native keeps 1440p. FRITCHII_DLSS_RENDER_SCALE renders 1080p (Performance) or 720p (Ultra
+///   Performance) first. Without it, every DLSS quality but Native takes 1440p -> 4K, so they are
+///   one choice.
+/// - Max Resolution off: the game's dynamic resolution (1920x1080 at most) and its 3/4 pass to
+///   1440p, which the upscaler replaces: 1440p out, or the game's size with DLSS Native.
+struct PictureChoice {
+    bool dlss;
+    u32 output;          ///< Height the upscaler makes
+    bool max_resolution; ///< OoT's "Max Resolution (built-in)" add-on
+    PictureKind kind;
+    u32 input;           ///< Height the game draws
+    bool up_to;          ///< The game's dynamic resolution: at most `input`
+    bool render_scale;   ///< Only with FRITCHII_DLSS_RENDER_SCALE
+};
+
+constexpr std::array<PictureChoice, 8> PICTURE_CHOICES{{
+    {true, 2160, true, PictureKind::Upscaled, 1440, false, false},
+    {true, 2160, true, PictureKind::Performance, 1080, false, true},
+    {true, 2160, true, PictureKind::UltraPerformance, 720, false, true},
+    {true, 1440, true, PictureKind::Native, 1440, false, false},
+    {true, 1440, false, PictureKind::Upscaled, 1080, true, false},
+    {true, 1080, false, PictureKind::Native, 1080, true, false},
+    {false, 2160, true, PictureKind::Upscaled, 1440, false, false},
+    {false, 1440, false, PictureKind::Upscaled, 1080, true, false},
+}};
+
+const std::array<PictureChoice, 8>& PictureChoices() {
+    return PICTURE_CHOICES;
+}
+
+/// Of `choices`, the one with that output, of the same kind as `from` (native or not) if any.
+int PictureChoiceFor(const std::vector<int>& choices, int from, u32 output) {
+    const bool native = PICTURE_CHOICES[from].kind == PictureKind::Native;
+    int pick = -1;
+    for (const int choice : choices) {
+        if (PICTURE_CHOICES[choice].output != output) {
+            continue;
+        }
+        if ((PICTURE_CHOICES[choice].kind == PictureKind::Native) == native) {
+            return choice;
+        }
+        if (pick < 0) {
+            pick = choice;
+        }
+    }
+    return pick;
+}
+
+/// "1440p", or "4K" for 2160 lines and "8K" for 4320.
+QString HeightName(u32 height) {
+    if (height == 2160) {
+        return QStringLiteral("4K");
+    }
+    if (height == 4320) {
+        return QStringLiteral("8K");
+    }
+    return QStringLiteral("%1p").arg(height);
+}
+
+constexpr u64 OCARINA_TITLE_ID = 0x0400486024DEC000ULL;
+constexpr const char* MAX_RESOLUTION_ADDON = "Max Resolution (built-in)";
+
+/// The Max Resolution add-on as saved (on unless disabled in Add-Ons), without the
+/// EDEN_NX2_NO_MAX_RES test override Settings::OcarinaMaxResolutionOn reads.
+bool MaxResolutionSaved() {
+    const auto it = Settings::values.disabled_addons.find(OCARINA_TITLE_ID);
+    return it == Settings::values.disabled_addons.end() ||
+           std::find(it->second.begin(), it->second.end(), MAX_RESOLUTION_ADDON) ==
+               it->second.end();
+}
+
+/// Turns the add-on on or off as the game's Add-Ons page does.
+void SaveMaxResolution(bool on) {
+    if (on == MaxResolutionSaved()) {
+        return;
+    }
+    auto& disabled = Settings::values.disabled_addons[OCARINA_TITLE_ID];
+    if (on) {
+        std::erase(disabled, std::string{MAX_RESOLUTION_ADDON});
+    } else {
+        disabled.emplace_back(MAX_RESOLUTION_ADDON);
+        std::sort(disabled.begin(), disabled.end());
+    }
+    // The game list caches the add-ons it shows (ConfigurePerGameAddons::ApplyConfiguration).
+    Common::FS::RemoveFile(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "game_list" /
+                           fmt::format("{:016X}.pv.txt", OCARINA_TITLE_ID));
 }
 } // namespace
+
+void ConfigureGraphics::SetupUpscalerChoice(std::map<u32, QWidget*>& hold_graphics) {
+    // Per-game settings keep the separate rows: each has its own "use global" button.
+    if (!FritchiiUi::Enabled() || !Settings::IsConfiguringGlobal() || oot_aa_combobox == nullptr ||
+        oot_aa_widget == nullptr || resolution_group_layout == nullptr) {
+        return;
+    }
+    // A row like the setting rows: the name on the left, the choice on the right.
+    const auto make_row = [this](const QString& name, QWidget* control, QWidget* second = nullptr) {
+        QWidget* row = new QWidget(this);
+        QHBoxLayout* row_layout = new QHBoxLayout(row);
+        row_layout->setContentsMargins(0, 0, 0, 0);
+        QLabel* label = new QLabel(name, row);
+        label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        control->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        row_layout->addWidget(label, 1);
+        row_layout->addWidget(control, 1);
+        if (second != nullptr) {
+            second->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            row_layout->addWidget(second, 1);
+        }
+        resolution_group_layout->addWidget(row);
+        return row;
+    };
+    // Docked and without FRITCHII_DLSS_SCALED, OoT's upscale sizes are known: the picture menu
+    // (SetupPictureMenu) puts the upscaler's output in "Resolution" and input -> output in
+    // "Quality". In handheld or with the scaled test switch, the plain rows stay.
+    const bool picture_menu = Settings::IsDockedMode() && !VideoCommon::OcarinaScaledUpscale();
+    if (picture_menu) {
+        output_combobox = new QComboBox;
+        output_row = make_row(tr("Resolution:"), output_combobox);
+        output_row->setToolTip(tr("The picture size FSR or DLSS makes.\nBigger is sharper, "
+                                  "smaller runs faster."));
+        output_row->setVisible(false);
+    }
+
+    upscaler_combobox = new QComboBox;
+    QWidget* const row = make_row(tr("Upscaler:"), upscaler_combobox);
+    row->setToolTip(tr("Makes a sharp picture from a smaller one, so the game runs faster.\n"
+                       "DLSS: NVIDIA RTX cards. FSR 4: Radeon RX 6000 and newer. FSR 3.1: any "
+                       "card.\nOoT only. Off keeps the game's own look."));
+    using Aa = Settings::OotAntiAliasing;
+    upscaler_combobox->addItem(tr("Off"), static_cast<u32>(Aa::Game));
+    upscaler_combobox->addItem(tr("Off, no sharpening"), static_cast<u32>(Aa::NoSharpening));
+    upscaler_combobox->addItem(tr("FSR 3.1"), static_cast<u32>(Aa::Fsr3));
+    upscaler_combobox->addItem(tr("FSR 4"), static_cast<u32>(Aa::Fsr4));
+    if (nvidia_dlss_checkbox != nullptr) {
+        upscaler_combobox->addItem(tr("DLSS"), UPSCALER_DLSS);
+    }
+    // OoT's anti-aliasing and the DLSS checkbox apply when the game starts: locked while it runs.
+    upscaler_combobox->setEnabled(oot_aa_widget->isEnabled() &&
+                                  (nvidia_dlss_widget == nullptr || nvidia_dlss_widget->isEnabled()));
+
+    if (picture_menu) {
+        quality_combobox = new QComboBox;
+        quality_fixed_label = new QLabel;
+        quality_row = make_row(tr("Quality:"), quality_combobox, quality_fixed_label);
+        quality_row->setToolTip(tr("Left: the size the game draws. Right: the size you see.\n"
+                                   "A smaller left number runs faster but looks softer."));
+        quality_row->setVisible(false);
+    }
+
+    // The old rows' widgets keep the settings (and save them); only the choice above shows.
+    oot_aa_widget->setVisible(false);
+    if (nvidia_dlss_widget != nullptr) {
+        nvidia_dlss_widget->setVisible(false);
+    }
+    // AMD's and NVIDIA's download panels and the upscaler's options move under the choice.
+    for (const u32 id : {Settings::values.oot_anti_aliasing.Id(), Settings::values.nvidia_dlss.Id(),
+                         Settings::values.nvidia_dlss_quality.Id(),
+                         Settings::values.nvidia_dlss_preset.Id(),
+                         Settings::values.oot_dlss_jitter.Id(),
+                         Settings::values.oot_texture_sharpness.Id(),
+                         Settings::values.oot_lod_bias_custom.Id()}) {
+        if (const auto it = hold_graphics.find(id); it != hold_graphics.end()) {
+            resolution_group_layout->addWidget(it->second);
+            hold_graphics.erase(it);
+        }
+    }
+
+    connect(upscaler_combobox, QOverload<int>::of(&QComboBox::activated), this,
+            [this](int index) { ApplyUpscalerChoice(index); });
+    connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int) { UpdateUpscalerChoice(); });
+    if (nvidia_dlss_checkbox != nullptr) {
+        connect(nvidia_dlss_checkbox, &QCheckBox::toggled, this,
+                [this](bool) { UpdateUpscalerChoice(); });
+    }
+    UpdateUpscalerChoice();
+}
+
+void ConfigureGraphics::ApplyUpscalerChoice(int index) {
+    if (upscaler_combobox == nullptr || index < 0) {
+        return;
+    }
+    using Aa = Settings::OotAntiAliasing;
+    // The picture menu keeps the output size picked with the other upscaler.
+    const int before = CurrentPictureChoice();
+    const u32 choice = upscaler_combobox->itemData(index).toUInt();
+    const auto current = static_cast<Aa>(oot_aa_combobox->currentData().toUInt());
+    const bool dlss = choice == UPSCALER_DLSS;
+    // DLSS keeps Game or No sharpening under it (an FSR choice would win over DLSS).
+    const Aa aa = dlss ? (VideoCommon::OcarinaFsrChosen(current) ? Aa::Game : current)
+                       : static_cast<Aa>(choice);
+    const int aa_row = oot_aa_combobox->findData(static_cast<u32>(aa));
+    if (aa_row >= 0) {
+        oot_aa_combobox->setCurrentIndex(aa_row);
+    }
+    if (nvidia_dlss_checkbox != nullptr) {
+        nvidia_dlss_checkbox->setChecked(dlss);
+    }
+    if (output_row != nullptr) {
+        const std::vector<int> choices = PictureChoicesNow();
+        if (choices.empty()) {
+            // Off: the game's own upscale gets Max Resolution back as it was (or on).
+            max_resolution_choice = max_resolution_when_off;
+        } else if (before >= 0) {
+            const int same = PictureChoiceFor(choices, before, PictureChoices()[before].output);
+            if (same >= 0) {
+                ApplyPictureChoice(same);
+            }
+        }
+    }
+    UpdateUpscalerChoice();
+}
+
+void ConfigureGraphics::UpdateUpscalerChoice() {
+    if (upscaler_combobox == nullptr || oot_aa_combobox == nullptr) {
+        return;
+    }
+    using Aa = Settings::OotAntiAliasing;
+    const auto aa = static_cast<Aa>(oot_aa_combobox->currentData().toUInt());
+    const bool dlss_on = nvidia_dlss_checkbox != nullptr && nvidia_dlss_checkbox->isChecked();
+    // What runs: an FSR choice wins over DLSS (VideoCommon::SelectOcarinaUpscaler).
+    const u32 shown =
+        !VideoCommon::OcarinaFsrChosen(aa) && dlss_on ? UPSCALER_DLSS : static_cast<u32>(aa);
+    const int shown_row = upscaler_combobox->findData(shown);
+    if (shown_row >= 0 && upscaler_combobox->currentIndex() != shown_row) {
+        upscaler_combobox->setCurrentIndex(shown_row);
+    }
+    // FSR 4 and DLSS only where they run, like the rows they stand for; a saved choice stays.
+    const int device = vulkan_device_combobox ? vulkan_device_combobox->currentIndex() : -1;
+    const bool vulkan = GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
+                        device >= 0 && static_cast<size_t>(device) < records.size();
+#ifdef _WIN32
+    const bool fsr4_capable = vulkan && records[device].fsr4_capable;
+#else
+    constexpr bool fsr4_capable = false;
+#endif
+    const bool nvidia = vulkan && records[device].nvidia;
+    if (auto* view = qobject_cast<QListView*>(upscaler_combobox->view())) {
+        const int fsr4_row = upscaler_combobox->findData(static_cast<u32>(Aa::Fsr4));
+        if (fsr4_row >= 0) {
+            view->setRowHidden(fsr4_row, !fsr4_capable && shown_row != fsr4_row);
+        }
+        const int dlss_row = upscaler_combobox->findData(UPSCALER_DLSS);
+        if (dlss_row >= 0) {
+            view->setRowHidden(dlss_row, !nvidia && shown_row != dlss_row);
+        }
+    }
+    UpdatePictureMenu();
+}
 
 void ConfigureGraphics::SetupOcarinaUpscalerLabels() {
     if (!FritchiiUi::Enabled()) {
@@ -660,12 +959,12 @@ void ConfigureGraphics::SetupOcarinaUpscalerLabels() {
                 const bool scaled = Settings::OcarinaDlssRenderScaleSwitch() &&
                                     (quality == Settings::NvidiaDlssQuality::Performance ||
                                      quality == Settings::NvidiaDlssQuality::UltraPerformance);
-                const QString render = OcarinaHeightName(Settings::OcarinaRenderHeightFor(
+                const QString render = HeightName(Settings::OcarinaRenderHeightFor(
                     scaled ? std::optional{quality} : std::nullopt));
-                sizes = native ? render : render + arrow + OcarinaHeightName(2160);
+                sizes = native ? render : render + arrow + HeightName(2160);
             } else {
                 const QString game_size = tr("game's size");
-                sizes = native ? game_size : game_size + arrow + OcarinaHeightName(1440);
+                sizes = native ? game_size : game_size + arrow + HeightName(1440);
             }
             dlss_quality_combobox->setItemText(
                 row, QStringLiteral("%1: %2").arg(dlss_quality_combobox->itemText(row), sizes));
@@ -675,7 +974,7 @@ void ConfigureGraphics::SetupOcarinaUpscalerLabels() {
 }
 
 void ConfigureGraphics::UpdateOcarinaUpscalerLabels() {
-    if (resolution_note == nullptr) {
+    if (!FritchiiUi::Enabled() || resolution_widget == nullptr) {
         return;
     }
     // An FSR choice for OoT wins over DLSS (VideoCommon::SelectOcarinaUpscaler).
@@ -684,12 +983,383 @@ void ConfigureGraphics::UpdateOcarinaUpscalerLabels() {
         fsr = VideoCommon::OcarinaFsrChosen(
             static_cast<Settings::OotAntiAliasing>(oot_aa_combobox->currentData().toUInt()));
     }
-    const bool dlss = nvidia_dlss_checkbox != nullptr && nvidia_dlss_checkbox->isChecked();
-    resolution_note->setText(
-        fsr ? tr("FSR picks OoT's resolution itself, so this stays at 1x while it's on.")
-            : tr("DLSS picks OoT's resolution itself, so this stays at 1x while it's on."));
-    // FRITCHII_DLSS_SCALED keeps the scale.
-    resolution_note->setVisible((fsr || dlss) && !VideoCommon::OcarinaScaledUpscale());
+    // Per game the DLSS checkbox isn't shown: its global value counts.
+    const bool dlss = nvidia_dlss_checkbox != nullptr ? nvidia_dlss_checkbox->isChecked()
+                                                      : Settings::values.nvidia_dlss.GetValue();
+    // While DLSS or FSR runs, OoT's scale goes to 1x for the session
+    // (RasterizerVulkan::ApplyOcarinaResolution; FRITCHII_DLSS_SCALED keeps it). The picture menu
+    // hides this row then; elsewhere (handheld, per game) the tooltip says it.
+    QString tip = tr("Sharper picture. Higher costs fps and video memory.\nBelow 1080p can look "
+                     "blocky.");
+    if ((fsr || dlss) && !VideoCommon::OcarinaScaledUpscale()) {
+        tip += tr("\nWith FSR or DLSS on, OoT ignores this: the upscaler picks the size.");
+    }
+    resolution_widget->setToolTip(tip);
+}
+
+void ConfigureGraphics::SetupOcarinaTextureRows(const std::map<u32, QWidget*>& rows) {
+    const auto find = [&rows](u32 id) -> ConfigurationShared::Widget* {
+        const auto it = rows.find(id);
+        return it == rows.end() ? nullptr
+                                : qobject_cast<ConfigurationShared::Widget*>(it->second);
+    };
+    // "DLSS jitter": only while DLSS would upscale OoT (its checkbox on and no FSR choice, which
+    // wins over DLSS). Per game the DLSS checkbox isn't shown: its global value counts.
+    if (ConfigurationShared::Widget* const jitter = find(Settings::values.oot_dlss_jitter.Id())) {
+        const auto update = [this, jitter] {
+            const bool dlss = nvidia_dlss_checkbox != nullptr
+                                  ? nvidia_dlss_checkbox->isChecked()
+                                  : Settings::values.nvidia_dlss.GetValue();
+            bool fsr = false;
+            if (oot_aa_combobox != nullptr && oot_aa_combobox->currentIndex() >= 0) {
+                fsr = VideoCommon::OcarinaFsrChosen(static_cast<Settings::OotAntiAliasing>(
+                    oot_aa_combobox->currentData().toUInt()));
+            }
+            jitter->setVisible(dlss && !fsr);
+        };
+        if (nvidia_dlss_checkbox != nullptr) {
+            connect(nvidia_dlss_checkbox, &QCheckBox::toggled, jitter, update);
+        }
+        if (oot_aa_combobox != nullptr) {
+            connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), jitter,
+                    update);
+        }
+        update();
+    }
+    // The LOD bias value only with Custom, in steps of 0.05.
+    ConfigurationShared::Widget* const custom = find(Settings::values.oot_lod_bias_custom.Id());
+    if (custom != nullptr && custom->double_spinbox != nullptr) {
+        custom->double_spinbox->setSingleStep(0.05);
+    }
+    ConfigurationShared::Widget* const sharpness =
+        find(Settings::values.oot_texture_sharpness.Id());
+    if (custom != nullptr && sharpness != nullptr && sharpness->combobox != nullptr) {
+        QComboBox* const combobox = sharpness->combobox;
+        const auto update = [combobox, custom] {
+            custom->setVisible(combobox->currentData().toUInt() ==
+                               static_cast<u32>(Settings::OotTextureSharpness::Custom));
+        };
+        connect(combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), custom, update);
+        update();
+    }
+}
+
+std::vector<int> ConfigureGraphics::PictureChoicesNow() const {
+    std::vector<int> choices;
+    if (output_row == nullptr || oot_aa_combobox == nullptr || oot_aa_combobox->currentIndex() < 0) {
+        return choices;
+    }
+    // What runs: an FSR choice wins over DLSS (VideoCommon::SelectOcarinaUpscaler).
+    const bool fsr = VideoCommon::OcarinaFsrChosen(
+        static_cast<Settings::OotAntiAliasing>(oot_aa_combobox->currentData().toUInt()));
+    const bool dlss = !fsr && nvidia_dlss_checkbox != nullptr && nvidia_dlss_checkbox->isChecked();
+    if (!fsr && !dlss) {
+        return choices;
+    }
+    // The add-on applies when the game starts: while it runs, only the choices that keep it
+    // (the DLSS quality applies live).
+    const bool running = system.IsPoweredOn();
+    for (int index = 0; index < static_cast<int>(PictureChoices().size()); ++index) {
+        const PictureChoice& choice = PictureChoices()[index];
+        if (choice.dlss != dlss ||
+            (choice.render_scale && !Settings::OcarinaDlssRenderScaleSwitch()) ||
+            (running && choice.max_resolution != max_resolution_saved)) {
+            continue;
+        }
+        choices.push_back(index);
+    }
+    return choices;
+}
+
+int ConfigureGraphics::CurrentPictureChoice() const {
+    const std::vector<int> choices = PictureChoicesNow();
+    if (choices.empty()) {
+        return -1;
+    }
+    using Quality = Settings::NvidiaDlssQuality;
+    PictureKind kind = PictureKind::Upscaled;
+    if (dlss_quality_combobox != nullptr && dlss_quality_combobox->currentIndex() >= 0 &&
+        PictureChoices()[choices.front()].dlss) {
+        const auto quality = static_cast<Quality>(dlss_quality_combobox->currentData().toUInt());
+        // The render-scale qualities need the switch and Max Resolution (OcarinaDlssRenderScale);
+        // without them they take the same sizes as Quality.
+        const bool render_scale =
+            Settings::OcarinaDlssRenderScaleSwitch() && max_resolution_choice;
+        if (quality == Quality::Native) {
+            kind = PictureKind::Native;
+        } else if (render_scale && quality == Quality::Performance) {
+            kind = PictureKind::Performance;
+        } else if (render_scale && quality == Quality::UltraPerformance) {
+            kind = PictureKind::UltraPerformance;
+        }
+    }
+    for (const int choice : choices) {
+        if (PictureChoices()[choice].max_resolution == max_resolution_choice &&
+            PictureChoices()[choice].kind == kind) {
+            return choice;
+        }
+    }
+    return choices.front();
+}
+
+void ConfigureGraphics::ApplyPictureChoice(int index) {
+    if (index < 0 || index >= static_cast<int>(PictureChoices().size())) {
+        return;
+    }
+    const PictureChoice& choice = PictureChoices()[index];
+    max_resolution_choice = choice.max_resolution;
+    if (choice.dlss && dlss_quality_combobox != nullptr) {
+        using Quality = Settings::NvidiaDlssQuality;
+        const auto current = static_cast<Quality>(dlss_quality_combobox->currentData().toUInt());
+        Quality quality = current;
+        switch (choice.kind) {
+        case PictureKind::Native:
+            quality = Quality::Native;
+            break;
+        case PictureKind::Performance:
+            quality = Quality::Performance;
+            break;
+        case PictureKind::UltraPerformance:
+            quality = Quality::UltraPerformance;
+            break;
+        case PictureKind::Upscaled: {
+            // The player's own quality stays while it gives these sizes (Automatic, Quality and
+            // Balanced always do; it matters to other games); else Automatic.
+            const bool render_scale =
+                Settings::OcarinaDlssRenderScaleSwitch() && choice.max_resolution;
+            if (current == Quality::Native ||
+                (render_scale &&
+                 (current == Quality::Performance || current == Quality::UltraPerformance))) {
+                quality = Quality::Automatic;
+            }
+            break;
+        }
+        }
+        const int row = dlss_quality_combobox->findData(static_cast<u32>(quality));
+        if (row >= 0) {
+            dlss_quality_combobox->setCurrentIndex(row);
+        }
+    }
+    UpdatePictureMenu();
+}
+
+void ConfigureGraphics::SetupPictureMenu(const std::map<u32, QWidget*>& rows) {
+    if (output_row == nullptr || quality_row == nullptr) {
+        return;
+    }
+    const auto find = [&rows](u32 id) -> QWidget* {
+        const auto it = rows.find(id);
+        return it == rows.end() ? nullptr : it->second;
+    };
+    texture_sharpness_widget = find(Settings::values.oot_texture_sharpness.Id());
+    lod_custom_widget = find(Settings::values.oot_lod_bias_custom.Id());
+    if (auto* row = qobject_cast<ConfigurationShared::Widget*>(texture_sharpness_widget)) {
+        texture_sharpness_combobox = row->combobox;
+    }
+
+    max_resolution_saved = MaxResolutionSaved();
+    max_resolution_choice = max_resolution_saved;
+    // Turning the upscaler off brings the add-on back as it was with the game's own upscale, or
+    // on (the game's full 1440p) when the page opened with an upscaler.
+    max_resolution_when_off = PictureChoicesNow().empty() ? max_resolution_saved : true;
+
+    connect(output_combobox, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
+        if (index < 0) {
+            return;
+        }
+        const u32 output = output_combobox->itemData(index).toUInt();
+        const int choice = PictureChoiceFor(PictureChoicesNow(), CurrentPictureChoice(), output);
+        if (choice >= 0) {
+            ApplyPictureChoice(choice);
+        }
+    });
+    connect(quality_combobox, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
+        if (index >= 0) {
+            ApplyPictureChoice(quality_combobox->itemData(index).toInt());
+        }
+    });
+    if (texture_sharpness_combobox != nullptr) {
+        // After SetupOcarinaTextureRows' own update of the LOD bias row.
+        connect(texture_sharpness_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, [this](int) { UpdatePictureMenu(); });
+    }
+    // Saved with the other add-ons by the global config (Config::SaveDisabledAddOnValues).
+    apply_funcs.push_back([this](bool) { SaveMaxResolution(max_resolution_choice); });
+    UpdatePictureMenu();
+}
+
+void ConfigureGraphics::UpdatePictureMenu() {
+    if (output_row == nullptr || quality_row == nullptr || resolution_widget == nullptr) {
+        return;
+    }
+    const std::vector<int> choices = PictureChoicesNow();
+    const bool upscaling = !choices.empty();
+    // The scale row while the game's own upscale runs, the upscaler's output while one is on
+    // (OoT's scale is 1x then: RasterizerVulkan::ApplyOcarinaResolution).
+    resolution_widget->setVisible(!upscaling);
+    output_row->setVisible(upscaling);
+    quality_row->setVisible(upscaling);
+    // Its choice sits in "Quality" (the checkbox's toggle shows the row: hide it again).
+    if (dlss_quality_widget != nullptr) {
+        dlss_quality_widget->setVisible(false);
+    }
+    // The texture bias works only with FSR or DLSS (VideoCommon::OcarinaTextureLodBias).
+    if (texture_sharpness_widget != nullptr) {
+        texture_sharpness_widget->setVisible(upscaling);
+    }
+    if (lod_custom_widget != nullptr) {
+        lod_custom_widget->setVisible(
+            upscaling && texture_sharpness_combobox != nullptr &&
+            texture_sharpness_combobox->currentData().toUInt() ==
+                static_cast<u32>(Settings::OotTextureSharpness::Custom));
+    }
+    if (!upscaling) {
+        return;
+    }
+    const int current = CurrentPictureChoice();
+    const PictureChoice& picked = PictureChoices()[current];
+
+    const QSignalBlocker block_output(output_combobox);
+    const QSignalBlocker block_quality(quality_combobox);
+    output_combobox->clear();
+    for (const int choice : choices) {
+        const u32 output = PictureChoices()[choice].output;
+        if (output_combobox->findData(output) < 0) {
+            output_combobox->addItem(HeightName(output), output);
+        }
+    }
+    output_combobox->setCurrentIndex(output_combobox->findData(picked.output));
+
+    const QString arrow = QStringLiteral(" %1 ").arg(QChar(0x2192));
+    const auto sizes = [&arrow](const PictureChoice& choice) {
+        const QString input = choice.up_to ? tr("up to %1").arg(HeightName(choice.input))
+                                           : HeightName(choice.input);
+        return choice.kind == PictureKind::Native ? input
+                                                  : input + arrow + HeightName(choice.output);
+    };
+    const auto name = [&sizes](const PictureChoice& choice) {
+        if (!choice.dlss) {
+            return sizes(choice);
+        }
+        switch (choice.kind) {
+        case PictureKind::Native:
+            return tr("Native: %1").arg(sizes(choice));
+        case PictureKind::Performance:
+            return tr("Performance: %1").arg(sizes(choice));
+        case PictureKind::UltraPerformance:
+            return tr("Ultra Performance: %1").arg(sizes(choice));
+        case PictureKind::Upscaled:
+            break;
+        }
+        return tr("Quality: %1").arg(sizes(choice));
+    };
+    quality_combobox->clear();
+    for (const int choice : choices) {
+        if (PictureChoices()[choice].output == picked.output) {
+            quality_combobox->addItem(name(PictureChoices()[choice]), choice);
+        }
+    }
+    quality_combobox->setCurrentIndex(quality_combobox->findData(current));
+    // One choice: its sizes as plain text, not a list with one row.
+    const bool single = quality_combobox->count() <= 1;
+    quality_combobox->setVisible(!single);
+    quality_fixed_label->setVisible(single);
+    quality_fixed_label->setText(name(picked));
+    // The DLSS quality applies live; the rest when the game starts.
+    output_combobox->setEnabled(output_combobox->count() > 1);
+}
+
+void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
+    if (!FritchiiUi::Enabled()) {
+        return;
+    }
+    // Short names and tooltips in plain words: what it does, what it's good for, what it costs.
+    const auto set = [&rows](u32 id, const QString& name, const QString& tip) {
+        const auto it = rows.find(id);
+        if (it == rows.end()) {
+            return;
+        }
+        auto* row = qobject_cast<ConfigurationShared::Widget*>(it->second);
+        if (row == nullptr) {
+            return;
+        }
+        row->setToolTip(tip);
+        if (name.isEmpty()) {
+            return;
+        }
+        if (row->checkbox != nullptr && row->combobox == nullptr && row->slider == nullptr) {
+            row->checkbox->setText(name);
+            return;
+        }
+        // The name label ends with ':' (a slider's value label shows "25%").
+        for (QLabel* label : row->findChildren<QLabel*>()) {
+            if (label->text().endsWith(QLatin1Char(':'))) {
+                label->setText(name);
+                break;
+            }
+        }
+    };
+    using Settings::values;
+    set(values.renderer_backend.Id(), tr("Graphics API:"),
+        tr("How the picture is drawn.\nVulkan is fastest. Try OpenGL only if Vulkan fails."));
+    set(values.vulkan_device.Id(), tr("Graphics card:"), tr("The graphics card that runs games."));
+    set(values.vsync_mode.Id(), tr("VSync:"),
+        tr("Stops the picture from tearing.\nOff has the least lag but the picture can tear."));
+    set(values.scaling_filter.Id(), tr("Window filter:"),
+        tr("How the picture is stretched to fit your window or screen.\nSharper filters can "
+           "look grainy."));
+    set(values.game_dlss_network.Id(), tr("Use the game's own DLSS"),
+        tr("Switch 2 games with DLSS use the game's own upscaler instead of FSR 3.1.\nCan be slow "
+           "on older cards."));
+    set(values.fsr_sharpening_slider.Id(), tr("FSR sharpness:"),
+        tr("How much FSR sharpens. 0% turns it off.\nToo high looks grainy. Also used by the FSR "
+           "window filters."));
+    set(values.nvidia_dlss.Id(), tr("NVIDIA DLSS"),
+        tr("NVIDIA's upscaler, RTX cards only.\nNeeds NVIDIA's files: use the download button."));
+    set(values.nvidia_dlss_preset.Id(), tr("DLSS model:"),
+        tr("Which DLSS version to use. K is the tested one.\nOthers can look sharper or softer."));
+    set(values.nvidia_dlss_quality.Id(), tr("DLSS quality:"),
+        tr("Lower quality runs faster but looks softer.\nNative only smooths edges, no "
+           "upscaling."));
+    set(values.oot_dlss_jitter.Id(), tr("DLSS jitter"),
+        tr("Sharper fine detail with DLSS.\nTurn off if the picture shakes."));
+    set(values.aspect_ratio.Id(), tr("Aspect ratio:"),
+        tr("The picture's shape. 16:9 fits most screens.\nOthers stretch the picture."));
+    set(values.anti_aliasing.Id(), tr("Anti-aliasing:"),
+        tr("Smooths jagged edges.\nSMAA looks best, FXAA costs less fps."));
+    set(values.oot_anti_aliasing.Id(), tr("Upscaler:"),
+        tr("Makes a sharp picture from a smaller one, so the game runs faster.\nDLSS: NVIDIA RTX "
+           "cards. FSR 4: Radeon RX 6000 and newer. FSR 3.1: any card.\nOoT only. Game keeps the "
+           "game's own look."));
+    set(values.oot_texture_sharpness.Id(), tr("Texture sharpness:"),
+        tr("Sharper textures with FSR or DLSS.\nSharper can make surfaces shimmer."));
+    set(values.oot_lod_bias_custom.Id(), tr("Sharpness value:"),
+        tr("Lower is sharper.\nToo low makes textures shimmer."));
+    set(values.oot_movie_upscale.Id(), tr("Cutscene videos:"),
+        tr("How the videos are scaled up.\nThe game's own way looks best but is slow without an "
+           "RTX card."));
+    set(values.post_shader_enabled.Id(), {},
+        tr("Extra picture effects.\nEach effect costs some fps."));
+    set(values.fullscreen_mode.Id(), tr("Fullscreen:"),
+        tr("Borderless switches windows faster.\nExclusive can lower lag a little."));
+    ui->label->setText(tr("Background color:"));
+    ui->bg_widget->setToolTip(tr("The color around the picture when it doesn't fill the "
+                                 "window."));
+
+    // The scales as the heights they make: docked, then handheld.
+    if (resolution_combobox != nullptr) {
+        using Res = Settings::ResolutionSetup;
+        for (int row = 0; row < resolution_combobox->count(); ++row) {
+            const auto setup = static_cast<Res>(resolution_combobox->itemData(row).toUInt());
+            Settings::ResolutionScalingInfo info{};
+            Settings::TranslateResolutionInfo(setup, info);
+            const u32 docked = 1080 * info.up_scale >> info.down_shift;
+            const u32 handheld = 720 * info.up_scale >> info.down_shift;
+            resolution_combobox->setItemText(
+                row, tr("%1  (%2 handheld)").arg(HeightName(docked), HeightName(handheld)));
+        }
+    }
+    UpdateOcarinaUpscalerLabels();
 }
 
 void ConfigureGraphics::RetrieveVulkanDevices() {

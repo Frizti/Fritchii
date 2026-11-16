@@ -119,6 +119,10 @@ struct GraphicsPipelineLibraryParams {
     GraphicsPipelineLibraryCache* library_cache{};
     std::array<u128, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> spirv_hashes{};
     bool libraries_only{};
+    /// Not a library setting (carried here to keep the constructor as it is): a prepared
+    /// pipeline built from kept SPIR-V, timed for TakeKeptBuildStats. Runtime pipelines whose
+    /// SPIR-V a worker emits are new to the driver anyway, so they are not counted.
+    bool prepared{};
 };
 
 /// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
@@ -128,7 +132,9 @@ struct MeshEmulationSetup {
     std::vector<u32> vertex_spirv;
     u32 output_binding{};
     u32 block_words{};    ///< output words per mesh workgroup
-    u32 max_primitives{}; ///< triangles per mesh workgroup
+    u32 max_primitives{}; ///< primitives per mesh workgroup
+    /// Vertices per primitive: 3 triangles, 2 lines, 1 points (the draw's topology).
+    u32 primitive_vertices{3};
     // With a task program (stage 0, the mesh program at mesh_stage): its payload buffer and the
     // distribution pass's offsets and arguments (Shader::RuntimeInfo), and that pass's shader.
     bool has_task{};
@@ -192,11 +198,14 @@ public:
     static std::chrono::nanoseconds HoldTimeTotal() noexcept;
 
     /// Worker builds of kept SPIR-V since the last call: over KeptBuildSlow means the driver
-    /// compiled the pipeline again (not in its cache), under it a cache hit.
+    /// compiled the pipeline again (not in its cache), under it a cache hit. Over KeptBuildLong
+    /// is a compile long enough that a draw waiting for it is a visible freeze.
     static constexpr std::chrono::milliseconds KeptBuildSlow{20};
+    static constexpr std::chrono::milliseconds KeptBuildLong{250};
     struct KeptBuildStats {
         u64 builds;
         u64 slow;
+        u64 long_builds;
         std::chrono::nanoseconds slow_time;
         std::chrono::nanoseconds longest;
     };
@@ -299,9 +308,11 @@ public:
         return mesh_emulation ? u64{mesh_emulation->block_words} * 4 : 0;
     }
 
-    /// Vertices of the emulation's triangle list for one mesh workgroup.
+    /// Vertices of the emulation's point, line or triangle list for one mesh workgroup.
     [[nodiscard]] u32 MeshEmulationVerticesPerGroup() const noexcept {
-        return mesh_emulation ? mesh_emulation->max_primitives * 3 : 0;
+        return mesh_emulation
+                   ? mesh_emulation->max_primitives * mesh_emulation->primitive_vertices
+                   : 0;
     }
 
     /// The emulation's setup (output layout), or null.
@@ -739,6 +750,8 @@ private:
     u64 last_descriptor_buffer_generation{};
 
     const bool worker_only_build;
+    /// LibraryParams::prepared: a worker build of kept SPIR-V (TakeKeptBuildStats).
+    const bool prepared_build;
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
 

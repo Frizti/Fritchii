@@ -11,11 +11,14 @@
 #include <cstring>
 #include <cwchar>
 #include <exception>
+#include <map>
 #include <string>
+#include <vector>
 
 #include <windows.h>
 
 #include <dbghelp.h>
+#include <tlhelp32.h>
 
 #include "common/logging.h"
 #include "common/windows/crash_handler.h"
@@ -538,6 +541,179 @@ void GuaranteeStackForCrashReport() {
         ULONG bytes = 64 * 1024;
         SetThreadStackGuarantee(&bytes);
     }
+}
+
+namespace {
+
+constexpr int ThreadStackDepth = 24;
+
+#if defined(_M_X64) || defined(__x86_64__)
+/// Unwinds a copy of a thread's context taken while it was suspended. The thread runs again by
+/// then (so no unwinder lock can be held by a suspended thread), which keeps the stack of a
+/// waiting thread exact; a busy thread's may be stale past its first frame.
+int UnwindThreadUnguarded(CONTEXT& context, DWORD64* frames) {
+    int depth = 0;
+    while (depth < ThreadStackDepth && context.Rip != 0) {
+        frames[depth++] = context.Rip;
+        DWORD64 image_base{};
+        const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+        if (function == nullptr) {
+            // A leaf without unwind data has its return address on top. Past the first frame
+            // this is code without unwind data (JIT): stop there.
+            if (depth > 1) {
+                break;
+            }
+            context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+            context.Rsp += sizeof(DWORD64);
+            continue;
+        }
+        PVOID handler_data{};
+        DWORD64 establisher_frame{};
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+                         &handler_data, &establisher_frame, nullptr);
+    }
+    return depth;
+}
+
+/// `frames` holds ThreadStackDepth + 1 zeroed entries; a fault keeps the frames found before it.
+int UnwindThread(CONTEXT& context, DWORD64* frames) {
+    int depth = 0;
+#ifdef _MSC_VER
+    __try {
+        depth = UnwindThreadUnguarded(context, frames);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        depth = 0;
+        while (depth < ThreadStackDepth && frames[depth] != 0) {
+            ++depth;
+        }
+    }
+#else
+    frames[0] = context.Rip; // No guard: the current frame only.
+    depth = 1;
+#endif
+    return depth;
+}
+#endif
+
+std::string ThreadName(HANDLE thread) {
+    static const auto get_description = reinterpret_cast<GetThreadDescriptionFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                               "GetThreadDescription")));
+    std::string name;
+    PWSTR wide = nullptr;
+    if (get_description != nullptr && SUCCEEDED(get_description(thread, &wide)) &&
+        wide != nullptr) {
+        const int size = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+        if (size > 1) {
+            name.resize(static_cast<size_t>(size - 1));
+            WideCharToMultiByte(CP_UTF8, 0, wide, -1, name.data(), size, nullptr, nullptr);
+        }
+        LocalFree(wide);
+    }
+    return name;
+}
+
+} // Anonymous namespace
+
+std::vector<std::string> ThreadStackLines(unsigned long main_thread_id) {
+    std::vector<std::string> lines;
+    const DWORD process = GetCurrentProcessId();
+    const DWORD self = GetCurrentThreadId();
+    std::vector<DWORD> ids;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        lines.push_back("no thread list (error " + std::to_string(GetLastError()) + ")");
+        return lines;
+    }
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID == process && entry.th32ThreadID != self) {
+            ids.push_back(entry.th32ThreadID);
+        }
+    }
+    CloseHandle(snapshot);
+
+    // Threads with the same stack share a line: worker pools wait in the same place.
+    struct Group {
+        std::string threads;
+        size_t count{};
+    };
+    std::map<std::string, Group> groups;
+    std::vector<std::string> order;
+    std::vector<DWORD64> frames(ThreadStackDepth + 1);
+    size_t unreadable = 0;
+    for (const DWORD id : ids) {
+        const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                             THREAD_QUERY_LIMITED_INFORMATION,
+                                         FALSE, id);
+        if (thread == nullptr) {
+            ++unreadable;
+            continue;
+        }
+        std::string name = ThreadName(thread);
+        if (id == main_thread_id) {
+            name = name.empty() ? std::string{"main"} : "main " + name;
+        }
+        FILETIME created{}, exited{}, kernel{}, user{};
+        double cpu_ms = 0.0;
+        if (GetThreadTimes(thread, &created, &exited, &kernel, &user)) {
+            const auto value = [](const FILETIME& time) {
+                return (static_cast<unsigned long long>(time.dwHighDateTime) << 32) |
+                       time.dwLowDateTime;
+            };
+            cpu_ms = static_cast<double>(value(kernel) + value(user)) / 1e4;
+        }
+        std::fill(frames.begin(), frames.end(), DWORD64{0});
+        int depth = 0;
+#if defined(_M_X64) || defined(__x86_64__)
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        bool have_context = false;
+        // Nothing between the suspend and the resume allocates: the thread may hold a heap lock.
+        if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+            have_context = GetThreadContext(thread, &context) != FALSE;
+            ResumeThread(thread);
+        }
+        if (have_context) {
+            depth = UnwindThread(context, frames.data());
+        }
+#endif
+        CloseHandle(thread);
+
+        std::string stack;
+        for (int i = 0; i < depth; ++i) {
+            const CodeAddress at =
+                Locate(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(frames[i])));
+            char text[96];
+            std::snprintf(text, sizeof(text), "%s%s+0x%llx", i == 0 ? "" : " < ", at.module,
+                          at.offset);
+            stack += text;
+        }
+        if (stack.empty()) {
+            stack = "(no stack)";
+        }
+        Group& group = groups[stack];
+        if (group.count == 0) {
+            order.push_back(stack);
+        }
+        char label[160];
+        std::snprintf(label, sizeof(label), "%s%s %lu (%.0f ms CPU)", group.count != 0 ? ", " : "",
+                      name.empty() ? "unnamed" : name.c_str(), static_cast<unsigned long>(id),
+                      cpu_ms);
+        group.threads += label;
+        ++group.count;
+    }
+    for (const std::string& stack : order) {
+        const Group& group = groups[stack];
+        lines.push_back(std::to_string(group.count) +
+                        (group.count == 1 ? " thread [" : " threads [") + group.threads +
+                        "]: " + stack);
+    }
+    if (unreadable != 0) {
+        lines.push_back(std::to_string(unreadable) + " threads could not be opened");
+    }
+    return lines;
 }
 
 } // namespace Common::Windows

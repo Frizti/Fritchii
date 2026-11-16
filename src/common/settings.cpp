@@ -49,6 +49,8 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(OotTextureSharpness, false);
+SWITCHABLE(float, true);
 SWITCHABLE(DlssPreset, false);
 SWITCHABLE(NvidiaDlssQuality, false);
 SWITCHABLE(OotRefreshCap, false);

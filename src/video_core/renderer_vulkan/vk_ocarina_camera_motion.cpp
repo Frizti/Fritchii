@@ -656,8 +656,10 @@ struct OcarinaFrameSlot {
                               allocator, extent, MOTION_FORMAT, VK_IMAGE_USAGE_STORAGE_BIT |
                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)},
           motion_view{CreateOcarinaView(device, *motion, MOTION_FORMAT)},
+          // TRANSFER_SRC: the FSR 4 output check reads a few pixels of it.
           color{CreateOcarinaImage(allocator, extent, LIVE_COLOR_FORMAT,
-                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)},
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT)},
           color_view{CreateOcarinaView(device, *color, LIVE_COLOR_FORMAT)} {}
 
     VkExtent2D extent;
@@ -1005,11 +1007,12 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
                                COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT},
             .render_size = extent,
             .upscale_size = output_extent,
-            // EDEN_NX2_DLSS_JITTER: the scene's offset this frame (1), or with y flipped (2).
-            .jitter = {VideoCommon::OcarinaDlssJitterMode() != 0 ? jitter[0] : 0.0f,
-                       VideoCommon::OcarinaDlssJitterMode() == 2   ? -jitter[1]
-                       : VideoCommon::OcarinaDlssJitterMode() != 0 ? jitter[1]
-                                                                   : 0.0f},
+            // The offset the scene moved by this frame, in render pixels with y down (0 when the
+            // DLSS jitter is off: no scene draw was offset). The convention of NVIDIA's own
+            // Streamline sample (Donut: projection + (2x / w, -2y / h), the same values to
+            // sl::Constants::jitterOffset) and of AMD's FSR, so it goes as is to both, and to
+            // NGX's InJitterOffset. EDEN_NX2_DLSS_JITTER=2 flips y, as a test only.
+            .jitter = {jitter[0], VideoCommon::OcarinaDlssJitterFlipY() ? -jitter[1] : jitter[1]},
             .motion_vector_scale = {1.0f, 1.0f},
             .reset = reset,
             .depth_inverted = false,

@@ -46,6 +46,8 @@ add_library(
     dkb_cpu_trace.h
     jit_symbols.cpp
     jit_symbols.h
+    frame_budget.cpp
+    frame_budget.h
     nx2_hitch.cpp
     nx2_hitch.h
     nx2_sampler.cpp
@@ -120,6 +122,8 @@ add_library(
     scm_rev.h
     scope_exit.h
     shutdown_progress.h
+    shutdown_watch.cpp
+    shutdown_watch.h
     spin_recursive_mutex.h
     scratch_buffer.h
     settings.cpp

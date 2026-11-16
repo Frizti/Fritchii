@@ -513,8 +513,12 @@ public:
     [[nodiscard]] static u64 ImagePoolCap();
     /// ImagePoolCap, lowered to the room under the device budget with FRITCHII_VRAM_POOL_FIT.
     [[nodiscard]] u64 FittedPoolCap() const {
-        return (std::min)(ImagePoolCap(), pool_fit_cap);
+        return (std::min)((std::min)(ImagePoolCap(), pool_fit_cap), small_pool_cap);
     }
+    /// FRITCHII_SMALL_CARD (part Pool): 1/16 of the budget, at least 256 MiB; ~0 while off.
+    /// Re-read every 30 frames with the budget.
+    u64 small_pool_cap{~u64{0}};
+    u32 small_pool_frames{};
     /// FRITCHII_VRAM_POOL_FIT: recomputes pool_fit_cap from the budget and the usage.
     void UpdatePoolFitCap();
     u64 pool_fit_cap{~u64{0}};  ///< ~0 while FRITCHII_VRAM_POOL_FIT is off

@@ -80,6 +80,7 @@ enum class CoreRef : u32 {
     FastDispatchTable,  ///< the fast dispatch table
     IndirectSlots,      ///< FRITCHII_JIT_INDIRECT_CACHE's slot array
     IndirectCounters,   ///< FRITCHII_JIT_INDIRECT_CACHE's counters
+    CntpctLast,         ///< FRITCHII_JIT_INLINE_CNTPCT's previous read (the callbacks object's)
     Count,
 };
 struct StateRefConfig {

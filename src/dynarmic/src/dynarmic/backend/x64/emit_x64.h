@@ -46,6 +46,7 @@ namespace Dynarmic::Backend::X64 {
 
 class A64EmitX64;
 class BlockOfCode;
+struct SharedCode;
 
 using A64FullVectorWidth = std::integral_constant<size_t, 128>;
 
@@ -191,6 +192,12 @@ public:
     virtual void EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) = 0;
     virtual void EmitPatchJmp(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) = 0;
     virtual void EmitPatchMovRcx(CodePtr target_code_ptr = nullptr) = 0;
+    /// Fritchii (FRITCHII_JIT_SHARED): where an unlinked compact jump goes (the A64 link stub).
+    virtual CodePtr UnlinkedJumpTarget(const IR::LocationDescriptor& target_desc) { return nullptr; }
+    /// Fritchii (FRITCHII_JIT_SHARED): pads with nops so the patched field of the patch site about
+    /// to be emitted (`field_offset` bytes into it, `field_size` bytes long) is aligned, so one
+    /// atomic store rewrites it while other cores may run that code. Nothing per core.
+    void AlignPatchField(size_t field_offset, size_t field_size);
 
     // State
     BlockOfCode& code;
@@ -199,6 +206,10 @@ public:
     ::Common::unordered_map<IR::LocationDescriptor, PatchInformation> patch_information;
     /// Fritchii (FRITCHII_JIT_SHARED_FASTMEM_MARKS): set by the A64 emitter only; null = per-core.
     std::shared_ptr<SharedFastmemMarks> shared_fastmem_marks;
+    /// Fritchii (FRITCHII_JIT_SHARED): set when this emitter's cache is run by every guest core of
+    /// the process (A64 only); null = one cache per core, the old code. With it, blocks go into its
+    /// lock-free map, removals into its log, and patches are single aligned atomic stores.
+    SharedCode* shared_code = nullptr;
 
     // We need materialized protected members
     friend class A64EmitX64;

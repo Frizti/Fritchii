@@ -161,6 +161,10 @@ struct ImageBase {
     /// Consecutive render frames with a write, up to last_write_frame (NextWriteStreak).
     u32 write_streak = 0;
     u8 relocation_guard_noted = 0;
+    /// FRITCHII_COVERED_RETIRE: the frame a newer image last came to overlap this one (a bad
+    /// overlap in JoinImages), and the frame its coverage was last checked.
+    u64 covered_overlap_frame = 0;
+    u64 covered_check_frame = 0;
 
     /// Unmapped images (TextureCache::UnmapGPUMemory): the frame + 1 at which an unmap of its GPU
     /// memory flagged it Remapped (0 = none did, or it was found again since) and its device

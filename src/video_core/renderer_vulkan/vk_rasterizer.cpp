@@ -60,6 +60,7 @@
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
+#include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/streamline.h"
@@ -7957,13 +7958,26 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
         return *oot_backend != VideoCommon::OcarinaUpscaleBackend::Native;
     }
     oot_backend = ResolveOcarinaUpscaler(device);
+    // FSR 4 takes the scene without camera jitter (FRITCHII_FSR4_JITTER), decided once.
+    oot_fsr4_unjittered = *oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
+                          Fsr4Upscaler::RunsUnjittered(device);
+    const bool fsr4_wanted = *oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
+                             Fsr4Upscaler::IsWanted(device);
+    oot_dlss_jitter = VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());
+    if (*oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
+        LOG_INFO(Render_Vulkan, "Ocarina temporal: DLSS jitter {} ({})",
+                 oot_dlss_jitter ? "on" : "off",
+                 VideoCommon::OcarinaDlssJitterOverride() >= 0 ? "EDEN_NX2_DLSS_JITTER" : "setting");
+    }
     // Which upscaler OoT got and from what (2026-11-11: a player with DLSS on and Streamline
     // loaded had no DLSS in 10 minutes, and the log couldn't say why).
     LOG_INFO(Render_Vulkan,
-             "Ocarina temporal: upscaler {} (DLSS setting {}, OoT anti-aliasing {}, {})",
+             "Ocarina temporal: upscaler {}{} (DLSS setting {}, OoT anti-aliasing {}, {})",
              *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss  ? "DLSS"
+             : fsr4_wanted                                             ? "FSR 4 (else FSR 3.1)"
              : *oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ? "FSR 3.1"
                                                                        : "the game's own",
+             oot_fsr4_unjittered ? ", no camera jitter" : "",
              Settings::values.nvidia_dlss.GetValue() ? "on" : "off",
              Settings::CanonicalizeEnum(Settings::values.oot_anti_aliasing.GetValue()),
 #ifdef EGLANTINE_STREAMLINE
@@ -8147,11 +8161,11 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
     // half-size passes and full-screen passes (which keep the depth bound without using it, as
     // a ported change found, some with depth writes on: with the test off nothing writes depth) stay put.
     const auto& regs = maxwell3d->regs;
-    // FSR, and DLSS with EDEN_NX2_DLSS_JITTER (it is made for jittered input too).
+    // FSR (FSR 4 without it unless FRITCHII_FSR4_JITTER: oot_fsr4_unjittered), and DLSS with
+    // its jitter on (the "DLSS jitter" setting, on by default, or EDEN_NX2_DLSS_JITTER).
     const bool jittered_backend =
-        oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ||
-        (oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
-         VideoCommon::OcarinaDlssJitterMode() != 0);
+        (oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !oot_fsr4_unjittered) ||
+        (oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss && oot_dlss_jitter);
     if (jittered_backend && oot_motion.extent.width != 0 &&
         oot_dlss_frame && *oot_dlss_frame + 1 >= render_trace_frame && regs.depth_test_enable) {
         const auto& targets = texture_cache.GetRenderTargets();

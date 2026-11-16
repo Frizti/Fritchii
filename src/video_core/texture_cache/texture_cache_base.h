@@ -167,6 +167,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
+    /// FRITCHII_SMALL_CARD (part Fit): room for the device memory the usage leaves out
+    /// (UncountedDeviceBytes), smoothed like slack_margin; 0 while the part is off.
+    u64 held_margin{};
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;
@@ -1194,6 +1197,26 @@ private:
     /// Addresses the superseded sweep deleted at (emptied at 65,536), and the frame: a texture made
     /// at one by sampling counts in sampled_after (should stay near 0).
     std::unordered_map<GPUVAddr, u64> superseded_swept;
+    /// FRITCHII_COVERED_RETIRE: whether newer GPU writes (images written after this one's last
+    /// write and touched since its last use) cover every byte of the image's memory.
+    [[nodiscard]] bool CoveredByNewerWrites(ImageId image_id, ImageBase& image);
+    /// Deletes a covered image without a download (as the collector deletes a bad overlap).
+    void RetireCovered(ImageId image_id, Image& image);
+    struct CoveredStats {
+        u64 checked{};         ///< Coverage checks
+        u64 sweep_deleted{};   ///< Deleted by the cold sweep
+        u64 collect_deleted{}; ///< Deleted by the collector without the download it would make
+        u64 landing_deleted{}; ///< Queued collector downloads dropped as covered, image deleted
+        u64 deleted_bytes{};   ///< Their device memory
+        u64 busy{};            ///< Covered but bound or with a download queued
+        u64 capped_frames{};   ///< Frames the sweep hit its per-frame caps
+        u64 sampled_after{};   ///< A texture made at a retired address (must stay near 0)
+        u64 check_ns{};        ///< Time spent in the checks
+    } covered_stats{};
+    /// Addresses retired as covered (emptied at 65,536), for sampled_after.
+    std::unordered_map<GPUVAddr, u64> covered_swept;
+    u32 covered_sampled_logged{};
+    std::vector<std::pair<DAddr, DAddr>> covered_ranges; ///< Scratch for CoveredByNewerWrites
     std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
     ::Common::unordered_set<ImageId> cold_watch_set;
     u64 cold_deleted{};       ///< Since the last report
@@ -1373,6 +1396,16 @@ private:
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
 
+    /// FRITCHII_SMALL_CARD (part Fit): device memory the driver counts that TickFrame leaves out
+    /// of total_used_memory (deleted images still in flight, collector downloads, frees handed to
+    /// the free thread, the image pool).
+    [[nodiscard]] u64 UncountedDeviceBytes() const;
+    /// FRITCHII_SMALL_CARD (part Fit): the thresholds' margin under the budget, 1/16 of it and at
+    /// most 512 MiB (1/8 and 1 GiB without the profile).
+    [[nodiscard]] static u64 SmallCardMargin(u64 budget) noexcept {
+        return (std::min)(budget / 16, u64{512} << 20);
+    }
+
     /// A GPU-written image dropped without being written back leaves its
     /// guest memory stale (the GPU's data is gone). Its whole pages are marked here and kept
     /// tracked, so CPU writes, unmaps and write-backs clear them. An image made entirely on marked
@@ -1519,6 +1552,7 @@ private:
         u64 cache_modification; ///< the cache's modification_tick then
         u64 staging_bytes;
         u64 memory_bytes;      ///< device memory counted as freed while queued
+        bool cpu_modified;     ///< the image was CpuModified then (a CPU write since drops it)
     };
     std::deque<CollectDownload> collect_downloads;
     u64 collect_download_staging{};
@@ -1526,6 +1560,9 @@ private:
     struct CollectDownloadStats {
         u64 waits, made, landed, dropped_used, dropped_written, dropped_deleted, fallback_cap,
             fallback_oom, mismatches, land_frames;
+        u64 dropped_cpu;    ///< of dropped_written: a CPU write to the image since it was queued
+        u64 dropped_under;  ///< of dropped_written: an overlap the GPU wrote since
+        u64 landed_under;   ///< landed although such an overlap is still GPU-only (LAND_UNDER)
     } collect_stats{};
 
     /// FRITCHII_TC_COLLECT_OVER and FRITCHII_TC_COLLECT_EVICTABLE, since the last report.

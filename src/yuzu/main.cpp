@@ -22,6 +22,7 @@
 
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
+#include "common/shutdown_watch.h"
 #include "startup_checks.h"
 
 #ifdef __unix__
@@ -472,6 +473,16 @@ int main(int argc, char* argv[]) {
     QApplication::setStyle(QStringLiteral("windowsvista"));
 #endif
 
+    // Shutdown watch steps of the process exit (common/shutdown_watch.h), named as each object
+    // below goes: this one after the QApplication.
+    struct ExitStep {
+        const char* name;
+        ~ExitStep() {
+            Common::ShutdownWatch::Exiting(name);
+        }
+    };
+    const ExitStep after_app{"QApplication destroyed: static destructors, then the process exit"};
+
     QApplication app(argc, argv);
 
 #ifdef _WIN32
@@ -494,6 +505,7 @@ int main(int argc, char* argv[]) {
     setlocale(LC_ALL, "C");
 
     try {
+        const ExitStep after_window{"main window destroyed: QApplication destructor (thread pool)"};
         MainWindow main_window{has_broken_vulkan};
         main_window.show();
         app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window,

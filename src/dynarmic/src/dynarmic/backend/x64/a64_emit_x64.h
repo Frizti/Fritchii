@@ -160,6 +160,15 @@ public:
     static int StateRefsMode();
     /// Built before the emitter: BlockOfCode takes it. `jit` = the lookup's argument.
     static StateRefConfig StateRefSetup(const A64::UserConfig& conf, const void* jit);
+    /// Fritchii: FRITCHII_JIT_SHARED (boot, 0..2; stage 1 of one code cache for all cores). 1 =
+    /// every guest core of a process runs one code cache (this emitter, one BlockOfCode), compiled
+    /// once under a lock; each core keeps its state, dispatch table, return stack buffer and
+    /// indirect slots. Needs FRITCHII_JIT_STATE_REFS=1 and compact links (FRITCHII_JIT_CHAIN 4 or 1
+    /// with FRITCHII_JIT_FAR_CODE=1). 2 = 1 plus checks (lookups compared with the map, the cores'
+    /// state refs checked at entry). 0 = one cache per core, the old code.
+    static int SharedMode();
+    /// FRITCHII_JIT_SHARED: the link stub an unlinked compact jump goes to.
+    CodePtr UnlinkedJumpTarget(const IR::LocationDescriptor& target_desc) override;
     /// FRITCHII_JIT_STATE_REFS=2: an object of this core the scan looks for (from Jit::Impl).
     void AddStateRefScanRange(const void* begin, size_t size, const char* name);
     /// FRITCHII_JIT_STATE_REFS=2: count what in [begin, begin + size) points into this core's
@@ -257,6 +266,9 @@ public:
     void EmitCalculateLocationDescriptor();
     /// The dry counters' line, at most every 10 s (from Jit::Run, on the owner thread).
     void LogIndirectCounters();
+    /// The same for any core's counters (FRITCHII_JIT_SHARED: each core has its own).
+    struct IndirectLog;
+    void LogIndirectCounters(const u64* counters, IndirectLog& log, unsigned core);
     enum IndirectCounter : size_t {
         IndirectRuns,       ///< =1: indirect branches run through a dry site
         IndirectSameTarget, ///< of them, same target as the site's last
@@ -288,10 +300,14 @@ public:
     bool terminal_check_bit_in_host_zf = false;
     static constexpr size_t indirect_slot_capacity = size_t{1} << 18; // 4 MiB per JIT
     std::unique_ptr<FastDispatchEntry[]> indirect_slots;
-    size_t indirect_slots_used = 0;
+    /// Atomic for FRITCHII_JIT_SHARED, where other cores read it to empty their own slots.
+    std::atomic<size_t> indirect_slots_used{0};
     std::array<u64, IndirectCounterCount> indirect_counters{};  // written by generated code
-    std::array<u64, IndirectCounterCount> indirect_counters_logged{};
-    s64 indirect_log_ns = 0;
+    struct IndirectLog {
+        std::array<u64, IndirectCounterCount> logged{};
+        s64 log_ns = 0;
+    };
+    IndirectLog indirect_log;
     /// Inside the fast dispatch handler, right after the descriptor is computed (rbx).
     const void* terminal_handler_fast_dispatch_after_calc = nullptr;
     const void* terminal_handler_indirect_dry = nullptr;  ///< rax = the site's slot

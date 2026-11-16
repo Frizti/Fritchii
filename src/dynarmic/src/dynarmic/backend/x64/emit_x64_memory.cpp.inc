@@ -72,6 +72,13 @@ void AxxEmitX64::AddFastmemPatch(CodePtr location, CodePtr resume_location, void
 }
 
 FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+    // Fritchii (FRITCHII_JIT_SHARED): the patch table, the markers and the block map are the
+    // process's, written by whichever core compiles; the compile lock covers them. No thread holds
+    // it while running generated code, so the faulting core can always take it.
+    std::unique_lock<std::mutex> shared_lock;
+    if (shared_code) {
+        shared_lock = std::unique_lock<std::mutex>{shared_code->compile_mutex};
+    }
     const u64 base = std::bit_cast<u64>(code.getCode());
     const auto iter = rip_ >= base && rip_ - base <= UINT32_MAX
                         ? std::lower_bound(fastmem_patch_info.begin(), fastmem_patch_info.end(), u32(rip_ - base),
@@ -94,8 +101,19 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
                     shared_fastmem_marks->faults.fetch_add(1, std::memory_order_relaxed);
                 }
             }
-            InvalidateBasicBlocks({std::get<0>(marker)});
-            if (::Common::Nx2Hitch::SplitEnabled()) {
+            bool drop = true;
+            if (shared_code) {
+                // FRITCHII_JIT_SHARED: another core may still run a copy dropped before (its own
+                // dispatch table drops it at its next entry); only the block now in the map, the
+                // one holding this access, goes, not the one compiled again without fastmem.
+                const auto current = block_descriptors.find(iter->location);
+                const u64 entry = current != block_descriptors.end() ? std::bit_cast<u64>(current->second.entrypoint) : 0;
+                drop = entry != 0 && rip_ >= entry && rip_ - entry < current->second.size;
+            }
+            if (drop) {
+                InvalidateBasicBlocks({std::get<0>(marker)});
+            }
+            if (drop && ::Common::Nx2Hitch::SplitEnabled()) {
                 // Fritchii (FRITCHII_HITCH_SPLIT): a block dropped to be compiled again without
                 // fastmem for this access (once per access and core).
                 ::Common::Nx2Hitch::AddCount(::Common::Nx2Hitch::Cause::CodeDropFastmem, 0, 1);

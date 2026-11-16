@@ -232,6 +232,8 @@ struct Values {
 
     // perf overlay
     Setting<bool> show_perf_overlay{linkage, false, "show_perf_overlay", Category::UiGameList};
+    // View > Frame Times: the overlay's GPU, CPU and thread time rows (common/frame_budget.h).
+    Setting<bool> perf_overlay_times{linkage, true, "perf_overlay_times", Category::UiGameList};
 
     // Profiling mode (Help > Profiling Mode): the profiling switches from the next start on and a
     // banner on the game. main.cpp reads it straight from qt-config.ini ([UI] profiling_mode)

@@ -298,6 +298,71 @@ constexpr std::string_view WATER_RIPPLE_NAME = "Water ripples at any frame rate 
 constexpr std::string_view DYNAMIC_FPS_NAME = "Dynamic FPS by Dark (built-in)";
 constexpr std::string_view HIGH_REFRESH_NAME = "High refresh rate (built-in, experimental)";
 
+// Pickup counter above 60 fps: the number shown above Link after a pickup (rupees, sticks...)
+// counts toward the wallet in the indicator's update (main+0xA67E50): shown (+0x360) moves toward
+// the target (+0x35C) by trunc(step * max(distance / 50, 1)) (fcvtzs w12, s0 at main+0xA68300), and
+// the indicator fades only once they meet. In the high refresh mode the step is under 1.0 above
+// 60 fps, so the cut is 0 every frame and the count never moves: the indicator stays up until a
+// door or a talk replaces it. That fcvtzs branches to a stub at main+0x3C46B00 that keeps the
+// fraction per counter (4 slots of {u64 counter address, f32 rest} at main+0x4E9FEB0 + 0x10, a u32
+// round-robin index at +0) and returns the whole units in it; a new slot returns at least 1. It
+// does that only while the frame step calls the high refresh routine (the word at main+0x6E6CC4
+// is HIGH_REFRESH_CALL, read at each call, so Ctrl+U's live switch is followed); otherwise it
+// returns the game's own fcvtzs, so Dark's mode is unchanged. The same bug and fix as the
+// "pickup window count-up" of zortos293/Lichii#1587 (by atk3001) and NotRexed/Hookshot#2006.
+//   +0x00 save x13-x16, d16-d17 ; w12 = fcvtzs(s0)
+//   +0x10 adrp x13, 0x6e6000 ; ldr w13, [x13, #0xcc4] ; w14 = 0x94d5804f ; cmp ; b.ne done
+//   +0x28 fcmp s0, #0.0 ; b.le done ; x14 = x19 + 0x360 ; x13 = 0x4e9feb0 ; find x14's slot
+//   +0x5C (miss) take slot [index], index = (index + 1) & 3, key = x14, rest = 0,
+//         w12 = max(fcvtzs(s0), 1)
+//   +0x88 (hit) rest += s0 ; w12 = fcvtzs(rest) ; rest -= w12
+//   +0xA0 done: restore ; b 0xa68304
+constexpr size_t PICKUP_HOOK_OFFSET = 0xA68300;
+constexpr u32 PICKUP_FCVTZS = 0x1E38000C;                         // fcvtzs w12, s0
+constexpr std::array<u8, 4> PICKUP_HOOK{0x00, 0x7A, 0xC7, 0x14}; // b 0x3c46b00
+constexpr size_t PICKUP_STUB_OFFSET = 0x3C46B00;
+constexpr std::array<u8, 176> PICKUP_STUB{
+    0xED, 0x3B, 0xBD, 0xA9, 0xEF, 0x43, 0x01, 0xA9, 0xF0, 0x47, 0x02, 0x6D,
+    0x0C, 0x00, 0x38, 0x1E, 0x0D, 0x55, 0xFE, 0x90, 0xAD, 0xC5, 0x4C, 0xB9,
+    0xEE, 0x09, 0x90, 0x52, 0xAE, 0x9A, 0xB2, 0x72, 0xBF, 0x01, 0x0E, 0x6B,
+    0xE1, 0x03, 0x00, 0x54, 0x08, 0x20, 0x20, 0x1E, 0xAD, 0x03, 0x00, 0x54,
+    0x6E, 0x82, 0x0D, 0x91, 0xCD, 0x92, 0x00, 0xB0, 0xAD, 0xC1, 0x3A, 0x91,
+    0xAF, 0x41, 0x00, 0x91, 0x90, 0x00, 0x80, 0x52, 0xEC, 0x01, 0x40, 0xF9,
+    0x9F, 0x01, 0x0E, 0xEB, 0xE0, 0x01, 0x00, 0x54, 0xEF, 0x41, 0x00, 0x91,
+    0x10, 0x06, 0x00, 0x71, 0x61, 0xFF, 0xFF, 0x54, 0xB0, 0x01, 0x40, 0xB9,
+    0x0C, 0x06, 0x00, 0x11, 0x8C, 0x05, 0x00, 0x12, 0xAC, 0x01, 0x00, 0xB9,
+    0xAF, 0x51, 0x30, 0x8B, 0xEE, 0x09, 0x00, 0xF9, 0xFF, 0x19, 0x00, 0xB9,
+    0x0C, 0x00, 0x38, 0x1E, 0x9F, 0x05, 0x00, 0x71, 0x8C, 0xA5, 0x9F, 0x1A,
+    0x07, 0x00, 0x00, 0x14, 0xF0, 0x09, 0x40, 0xBD, 0x10, 0x2A, 0x20, 0x1E,
+    0x0C, 0x02, 0x38, 0x1E, 0x91, 0x01, 0x22, 0x1E, 0x10, 0x3A, 0x31, 0x1E,
+    0xF0, 0x09, 0x00, 0xBD, 0xF0, 0x47, 0x42, 0x6D, 0xEF, 0x43, 0x41, 0xA9,
+    0xED, 0x3B, 0xC3, 0xA8, 0xD6, 0x85, 0x38, 0x17, // +0xAC b 0xa68304
+};
+// Its slots: after Dark's timer state and the ripple slots (+0x00..+0xA0), with +0xA0..+0xB0 left
+// free. The BSS of this main runs to main+0x4EA0000.
+constexpr size_t PICKUP_STATE_OFFSET = 0x4E9FEB0;
+constexpr size_t PICKUP_STATE_SIZE = 0x50;
+static_assert(PICKUP_STATE_OFFSET >= HIGH_REFRESH_STATE_OFFSET + HIGH_REFRESH_STATE_SIZE);
+// Free padding on the page of Dark's routine, before the spots other mods are known to use
+// (a community ultrawide mod from main+0x3C46C00) and our own shadow steps (main+0x3C46DC0).
+static_assert(PICKUP_STUB_OFFSET + PICKUP_STUB.size() <= 0x3C46C00);
+// The hook over its fcvtzs, then the stub one word at a time, each checked to be zero.
+constexpr auto PICKUP_COUNTER_RECORDS = [] {
+    std::array<BuiltinPatchRecord, 1 + PICKUP_STUB.size() / 4> records{};
+    records[0] = BuiltinPatchRecord{.module_offset = PICKUP_HOOK_OFFSET,
+                                    .bytes = PICKUP_HOOK,
+                                    .checked = true,
+                                    .original = PICKUP_FCVTZS};
+    for (size_t i = 1, offset = 0; offset < PICKUP_STUB.size(); ++i, offset += 4) {
+        records[i] = BuiltinPatchRecord{.module_offset = PICKUP_STUB_OFFSET + offset,
+                                        .bytes = std::span<const u8>{PICKUP_STUB}.subspan(offset, 4),
+                                        .checked = true,
+                                        .original = 0};
+    }
+    return records;
+}();
+constexpr std::string_view PICKUP_COUNTER_NAME = "Pickup counter at any frame rate (built-in)";
+
 bool HighRefreshSettingOn() {
     // Tests boot either way without touching the player's config: EDEN_NX2_OOT_HIGH_REFRESH=0/1.
     if (const char* const value = std::getenv("EDEN_NX2_OOT_HIGH_REFRESH"); value && *value) {
@@ -407,6 +472,18 @@ constexpr std::array BUILTIN_PATCHES{
         .records = WATER_RIPPLE_RECORDS,
         .state_offset = HIGH_REFRESH_STATE_OFFSET,
         .state_size = HIGH_REFRESH_STATE_SIZE,
+    },
+    // In both modes, so Ctrl+U can switch the high refresh mode on live; the stub only changes
+    // anything while the frame step calls the high refresh routine (Dark's mode: the game's own
+    // cut, bit for bit).
+    BuiltinPatch{
+        .name = PICKUP_COUNTER_NAME,
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = PICKUP_COUNTER_RECORDS,
+        .state_offset = PICKUP_STATE_OFFSET,
+        .state_size = PICKUP_STATE_SIZE,
     },
     BuiltinPatch{
         .name = "Occlusion Off (built-in, EDEN_NX2_OCCLUSION_OFF=1)",

@@ -586,6 +586,60 @@ TEST_CASE("High refresh rate mode switches live between the two boot layouts",
     }
 }
 
+TEST_CASE("Pickup counter built-in hooks the indicator's cut in both modes", "[patch_manager]") {
+    constexpr std::string_view PickupCounter = "Pickup counter at any frame rate (built-in)";
+    constexpr size_t Code = sizeof(Loader::NSOHeader);
+    constexpr size_t Hook = Code + 0xA68300;
+    constexpr size_t Stub = Code + 0x3C46B00;
+    constexpr u32 Fcvtzs = 0x1E38000C;  // fcvtzs w12, s0
+    constexpr u32 HookWord = 0x14C77A00; // b 0x3c46b00
+    const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
+        u32 word;
+        std::memcpy(&word, nso.data() + offset, sizeof(word));
+        return word;
+    };
+    struct RestoreSetting {
+        ~RestoreSetting() {
+            Settings::values.oot_high_refresh.SetValue(false);
+        }
+    } restore;
+
+    PatchManagerTestContext context;
+    auto nso = MakeOcarinaMain();
+    std::memcpy(nso.data() + Hook, &Fcvtzs, sizeof(Fcvtzs));
+    const auto applied = [&](const std::vector<u8>& patched) {
+        return word_at(patched, Hook) == HookWord &&
+               word_at(patched, Stub + 0x10) == 0x90FE550D && // adrp x13, 0x6e6000
+               word_at(patched, Stub + 0x14) == 0xB94CC5AD && // ldr w13, [x13, #0xcc4]
+               word_at(patched, Stub + 0x38) == 0x913AC1AD && // add x13, x13, #0xeb0
+               word_at(patched, Stub + 0xAC) == 0x173885D6 && // b 0xa68304
+               word_at(patched, Stub + 0xB0) == 0;
+    };
+
+    SECTION("Dark's mode and the high refresh mode both get it") {
+        Settings::values.oot_high_refresh.SetValue(false);
+        REQUIRE(applied(context.Manager().PatchNSO(nso, "main")));
+        Settings::values.oot_high_refresh.SetValue(true);
+        REQUIRE(applied(context.Manager().PatchNSO(nso, "main")));
+    }
+
+    SECTION("Another word at the hook, a stub word in use, or off in Add-Ons: skipped whole") {
+        SECTION("hook") {
+            std::memcpy(nso.data() + Hook, &NopInstruction, sizeof(u32));
+        }
+        SECTION("stub") {
+            nso[Stub + 0x50] = 1;
+        }
+        SECTION("Add-Ons") {
+            Settings::values.disabled_addons[OcarinaTitleId] = {std::string{PickupCounter}};
+        }
+        const auto patched = context.Manager().PatchNSO(nso, "main");
+        Settings::values.disabled_addons.erase(OcarinaTitleId);
+        REQUIRE(word_at(patched, Hook) == word_at(nso, Hook));
+        REQUIRE(word_at(patched, Stub) == 0);
+    }
+}
+
 TEST_CASE("Dark's standalone Dynamic FPS mod is skipped and hidden for the built-in",
           "[patch_manager]") {
     constexpr std::string_view DynamicFps = "Dynamic FPS by Dark (built-in)";

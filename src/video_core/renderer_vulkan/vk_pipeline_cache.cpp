@@ -237,6 +237,28 @@ void PruneUnreadGeometryOutputs(Shader::IR::Program& geometry, const Shader::IR:
     }
 }
 
+/// FRITCHII_AMD_NOPERSPECTIVE=1 on an AMD driver (see MakeRuntimeInfo). Read once, after
+/// nx2_switches.txt was applied (the first pipeline build).
+bool AmdNoPerspectiveFix(const Vulkan::Device& device) {
+    static const bool on = [&device] {
+        const char* const value = std::getenv("FRITCHII_AMD_NOPERSPECTIVE");
+        const VkDriverId driver = device.GetDriverID();
+        const bool amd = driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                         driver == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+                         driver == VK_DRIVER_ID_MESA_RADV;
+        const bool enabled = amd && value != nullptr && value[0] == '1';
+        if (amd) {
+            LOG_INFO(Render_Vulkan,
+                     "FRITCHII_AMD_NOPERSPECTIVE={}: noperspective varyings {} (red flash fix "
+                     "for water on AMD)",
+                     enabled ? 1 : 0,
+                     enabled ? "interpolated perspective-correct" : "left native");
+        }
+        return enabled;
+    }();
+    return on;
+}
+
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
                                     const GraphicsPipelineCacheKey& key,
                                     const Shader::IR::Program& program,
@@ -402,6 +424,43 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     }
     info.force_early_z = key.state.early_z != 0;
     info.y_negate = key.state.y_negate != 0;
+    // FRITCHII_AMD_NOPERSPECTIVE=1 (off by default, AMD drivers only): noperspective varyings
+    // written times Position.w and read perspective-correct times FragCoord.w (port of
+    // zortos293/Lichii#820, reverted for every GPU in 9b30eec8ca after white fog at the Hyrule
+    // Field drawbridge on an RTX 4080). OoT's water volumes write a screen-space coordinate as a
+    // noperspective varying; AMD's driver interpolates it wrongly when a primitive is clipped close
+    // to the camera, and an exp2 overflows to the R11G11B10 maximum: red flashes (CheezyEmu
+    // re-applied it on AMD for that). Transform feedback would capture the scaled values, a
+    // passthrough geometry shader doesn't scale the outputs it writes itself, and indexed attribute
+    // reads in the fragment stage don't undo the scaling, so all three keep native noperspective.
+    if (AmdNoPerspectiveFix(device)) {
+        const bool geometry_passthrough{key.unique_hashes[4] != 0 &&
+                                        programs[4].is_geometry_passthrough};
+        if (key.unique_hashes[5] != 0 && !geometry_passthrough && key.state.xfb_enabled == 0 &&
+            !programs[5].info.loads_indexed_attributes) {
+            const bool has_tess{key.unique_hashes[3] != 0};
+            const bool last_pre_raster{
+                (stage == Shader::Stage::VertexB && !has_tess && !has_geometry) ||
+                (stage == Shader::Stage::TessellationEval && !has_geometry) ||
+                (stage == Shader::Stage::Geometry && has_geometry)};
+            if (stage == Shader::Stage::Fragment) {
+                info.scaled_noperspective_inputs =
+                    previous_program &&
+                    (previous_program->stage == Shader::Stage::VertexB ||
+                     previous_program->stage == Shader::Stage::TessellationEval ||
+                     previous_program->stage == Shader::Stage::Geometry);
+            }
+            if (last_pre_raster) {
+                const auto& fragment_info{programs[5].info};
+                for (size_t index = 0; index < 32; ++index) {
+                    if (fragment_info.interpolation[index] ==
+                        Shader::Interpolation::NoPerspective) {
+                        info.noperspective_outputs.set(index);
+                    }
+                }
+            }
+        }
+    }
     return info;
 }
 
@@ -655,17 +714,20 @@ namespace {
 // only kept every pipeline the title ever built in host memory (title 1: a 245 MB file, ~0.35 GB
 // of RAM for the session) and copied it whole at each save, which stalled frames; pipelines built
 // no slower without it.
-/// The driver's own disk cache folder (NVIDIA's GLCache, AMD's VkCache) on Windows: files, size
-/// and the newest write, so a "shaders build again" report shows whether the driver kept what the
-/// preparation built (fable52_answer_3: an AMD player's cache kept ~44% and nothing after a
-/// restart). Logged at boot, after a preparation and at exit.
+/// The driver's own disk cache folder (NVIDIA's GLCache, AMD's VkCache on Windows; NVIDIA's
+/// GLCache on Linux): files, size and the newest write, so a "shaders build again" report shows
+/// whether the driver kept what the preparation built (fable52_answer_3: an AMD player's cache
+/// kept ~44% and nothing after a restart). Logged at boot, after a preparation and at exit.
 void LogDriverCacheFolder(const Device& device, std::string_view when) {
+#if defined(_WIN32) || defined(__linux__)
+    std::filesystem::path folder;
+    std::string settings;
 #ifdef _WIN32
     const char* const local = std::getenv("LOCALAPPDATA");
     if (local == nullptr) {
         return;
     }
-    std::filesystem::path folder{local};
+    folder = local;
     switch (device.GetDriverID()) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
         folder /= "NVIDIA/GLCache";
@@ -676,9 +738,34 @@ void LogDriverCacheFolder(const Device& device, std::string_view when) {
     default:
         return;
     }
+#else
+    // NVIDIA on Linux: __GL_SHADER_DISK_CACHE_PATH, else $XDG_CACHE_HOME/nvidia/GLCache, else
+    // ~/.cache/nvidia/GLCache (the driver's README). An AppImage keeps the player's HOME and
+    // XDG_CACHE_HOME (unless a portable .home folder sits next to it), so the folder persists.
+    // The size and cleanup variables main() sets for Fritchii are logged with it: a Linux NVIDIA
+    // tester's driver compiled ~650 of 1,128 prepared pipelines again (log t0419).
+    if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+        return;
+    }
+    if (const char* const path = std::getenv("__GL_SHADER_DISK_CACHE_PATH")) {
+        folder = path;
+    } else if (const char* const xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg == '/') {
+        folder = std::filesystem::path{xdg} / "nvidia/GLCache";
+    } else if (const char* const home = std::getenv("HOME")) {
+        folder = std::filesystem::path{home} / ".cache/nvidia/GLCache";
+    } else {
+        return;
+    }
+    for (const char* const name : {"__GL_SHADER_DISK_CACHE", "__GL_SHADER_DISK_CACHE_SIZE",
+                                   "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"}) {
+        const char* const value = std::getenv(name);
+        settings += fmt::format("; {}={}", name, value != nullptr ? value : "(unset)");
+    }
+#endif
     std::error_code ec;
     if (!std::filesystem::is_directory(folder, ec)) {
-        LOG_INFO(Render_Vulkan, "Driver cache folder {} ({}): not there", folder.string(), when);
+        LOG_INFO(Render_Vulkan, "Driver cache folder {} ({}): not there{}", folder.string(), when,
+                 settings);
         return;
     }
     u64 files = 0;
@@ -714,11 +801,11 @@ void LogDriverCacheFolder(const Device& device, std::string_view when) {
     const char* const amd_path = std::getenv("AMD_VK_PIPELINE_CACHE_PATH");
     LOG_INFO(Render_Vulkan,
              "Driver cache folder {} ({}): {} files, {} MiB, newest written {} s ago; biggest: "
-             "{}{}{}",
+             "{}{}{}{}",
              folder.string(), when, files, bytes >> 20, files != 0 ? age.count() : -1,
              largest.empty() ? "none" : largest,
              amd_path != nullptr ? "; AMD_VK_PIPELINE_CACHE_PATH=" : "",
-             amd_path != nullptr ? amd_path : "");
+             amd_path != nullptr ? amd_path : "", settings);
 #endif
 }
 
@@ -3972,6 +4059,10 @@ u64 SpirvSettingsStamp() {
             << 17;
     bits |= static_cast<u64>(Settings::values.fix_bloom_effects.GetValue() ? 1 : 0) << 18;
     bits |= static_cast<u64>(Settings::values.renderer_debug.GetValue() ? 1 : 0) << 19;
+    // FRITCHII_AMD_NOPERSPECTIVE=1 changes the SPIR-V of every stage pair with a noperspective
+    // varying (MakeRuntimeInfo), so kept modules of the other form are not used.
+    const char* const noperspective = std::getenv("FRITCHII_AMD_NOPERSPECTIVE");
+    bits |= static_cast<u64>(noperspective != nullptr && noperspective[0] == '1' ? 1 : 0) << 20;
     return bits;
 }
 
@@ -5802,6 +5893,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         };
     GraphicsPipeline::LibraryParams library_params{
         .library_cache = libraries ? &graphics_libraries : nullptr,
+        .prepared = true,
     };
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, PlayPipelineCache(), &shader_notify, device,
@@ -5987,6 +6079,8 @@ void PipelineCache::ReportKeptDriverCompiles() {
     }
     kept_compiles_session.builds += taken.builds;
     kept_compiles_session.slow += taken.slow;
+    kept_compiles_session.long_builds += taken.long_builds;
+    kept_compiles_session.longest = (std::max)(kept_compiles_session.longest, taken.longest);
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     LOG_INFO(Render_Vulkan,
              "Driver compiles of prepared pipelines in the last 10 s: {} built from kept SPIR-V, {} "
@@ -6005,8 +6099,57 @@ void PipelineCache::ReportKeptDriverCompiles() {
                         ? "AMD: check Adrenalin > Gaming > Graphics > Shader Cache is on (not Off) "
                           "and never use Reset Shader Cache; the folder sizes in the Driver cache "
                           "folder lines show what the driver kept"
+#ifdef _WIN32
                         : "NVIDIA: set Shader Cache Size to Unlimited in the NVIDIA Control Panel");
+#else
+                        : "NVIDIA on Linux: the Driver cache folder line shows the folder and its "
+                          "__GL_SHADER_DISK_CACHE variables; keep space free on its disk");
+#endif
     }
+    MaybeAutoAsyncRedrawn();
+}
+
+void PipelineCache::MaybeAutoAsyncRedrawn() {
+    // FRITCHII_ASYNC_REDRAWN on for the session once the driver shows it compiles prepared
+    // pipelines again, on any driver: AMD's on Windows (0.2-1.1 s each, tester log t1858) and
+    // NVIDIA's on Linux too (RTX 4070 SUPER, 615.71: ~650 of 1,128 prepared builds over 20 ms,
+    // up to 2.5 s, 18 s of draws held in one boot; log t0419). Where the driver cache holds the
+    // preparation (NVIDIA on Windows, the same Linux PC in its other boots) prepared builds take
+    // 2-10 ms and none of this triggers, so draws keep waiting there as before.
+    //   - 16 or more compiled again (over KeptBuildSlow, 20 ms) and they are a quarter or more
+    //     of the prepared builds: a cache that lost part of the preparation. A cache hit slowed
+    //     down by busy cores stays far under 20 ms nearly always, and a few odd ones never reach
+    //     both the count and the share.
+    //   - Or 3 or more over KeptBuildLong (250 ms): each one is a visible freeze for the draws
+    //     waiting on it, whatever the share.
+    // No time limit: a driver can drop its entries at any point of a session. Decided once.
+    auto& session = kept_compiles_session;
+    if (session.auto_checked) {
+        return;
+    }
+    const bool many_missed = session.slow >= 16 && session.slow * 4 >= session.builds;
+    const bool long_ones = session.long_builds >= 3;
+    if (!many_missed && !long_ones) {
+        return;
+    }
+    session.auto_checked = true;
+    const auto longest_ms = std::chrono::duration<double, std::milli>(session.longest).count();
+    if (VideoCore::Nx2Debug::g_async_redrawn.load(std::memory_order_relaxed) >= 0 ||
+        std::getenv("FRITCHII_ASYNC_REDRAWN") != nullptr) {
+        LOG_INFO(Render_Vulkan,
+                 "Prepared pipelines are compiled again by this driver ({} so far, longest {:.0f} "
+                 "ms); FRITCHII_ASYNC_REDRAWN is set, so it stays at {}",
+                 session.slow, longest_ms, AsyncRedrawnOn() ? 1 : 0);
+        return;
+    }
+    if (AsyncRedrawnDefault() > 0) {
+        return; // Already on by default (AMD's Windows driver).
+    }
+    async_redrawn_auto.store(true, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan,
+             "Prepared pipelines are compiled again by this driver ({} so far, longest {:.0f} ms): "
+             "new objects pop in instead of waiting (FRITCHII_ASYNC_REDRAWN auto)",
+             session.slow, longest_ms);
 }
 
 void PipelineCache::ReportPrecompiled() {
@@ -6833,6 +6976,31 @@ bool IsDepthTestedColorDraw(const Maxwell& regs) noexcept {
 }
 } // Anonymous namespace
 
+bool PipelineCache::AsyncRedrawnOn() const {
+    // Set live (the debug server's switch stores 0 or 1) or in the environment: that value.
+    // Unset (-1) stays unset, so the default can still turn on during the session
+    // (MaybeAutoAsyncRedrawn); storing -1 live hands it back to the default.
+    using VideoCore::Nx2Debug::g_async_redrawn;
+    static const bool from_environment = [] {
+        if (std::getenv("FRITCHII_ASYNC_REDRAWN") == nullptr) {
+            return false;
+        }
+        int unset = -1;
+        if (g_async_redrawn.compare_exchange_strong(
+                unset, VideoCore::Nx2Debug::EnvSwitch("FRITCHII_ASYNC_REDRAWN"),
+                std::memory_order_relaxed)) {
+            VideoCore::Nx2Debug::BumpSwitchGeneration();
+        }
+        return true;
+    }();
+    static_cast<void>(from_environment);
+    const int value = g_async_redrawn.load(std::memory_order_relaxed);
+    if (value >= 0) {
+        return value > 0;
+    }
+    return AsyncRedrawnDefault() > 0 || async_redrawn_auto.load(std::memory_order_relaxed);
+}
+
 int PipelineCache::AsyncRedrawnDefault() const {
     // FRITCHII_ASYNC_REDRAWN's value when unset: 1 on AMD's Windows driver (see DrawMayBeSkipped).
     static const int value = [this] {
@@ -6885,11 +7053,11 @@ bool PipelineCache::DrawMayBeSkipped() const {
     // 0.2-1.1 s to compile (NVIDIA: tens of ms), and an RX 7900 XT session held 76 s of draws
     // for unbuilt pipelines, the game freezing ~1 s whenever something new showed up (tester
     // log t1858). The object is missing for that time instead. FRITCHII_ASYNC_REDRAWN=0 waits.
+    // Also on for the session on any driver once it compiles prepared pipelines again
+    // (MaybeAutoAsyncRedrawn).
     bool redrawn = false;
     if (!recurring && targets.kind_if_redrawn == VideoCommon::DrawTargetClass::Recurring &&
-        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_async_redrawn,
-                                         "FRITCHII_ASYNC_REDRAWN", AsyncRedrawnDefault()) > 0 &&
-        IsDepthTestedColorDraw(maxwell3d->regs)) {
+        AsyncRedrawnOn() && IsDepthTestedColorDraw(maxwell3d->regs)) {
         recurring = true;
         redrawn = true;
     }
@@ -7143,7 +7311,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             std::span{stages.data(), num_stages}, host_info);
     }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional
-    // task program, drawing triangles without per-primitive outputs, before a pixel program only.
+    // task program, drawing triangles, lines or points without per-primitive outputs, before a
+    // pixel program only.
     std::optional<MeshEmulationSetup> mesh_emulation;
     size_t mesh_index{};
     if (mesh_unsupported) {
@@ -7159,15 +7328,40 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         bool eligible{mesh_index != 0 && (mesh_index == 1 || has_task) &&
                       layer_source_program == nullptr};
         const Shader::IR::Program& mesh{programs[mesh_index]};
-        eligible = eligible && mesh.mesh.topology == 4 && mesh.mesh.primitive_lines.empty() &&
-                   !mesh.mesh.vertex_lines.empty() && mesh.mesh.max_vertices != 0 &&
-                   mesh.mesh.max_primitives != 0;
-        for (size_t index = 1; index < Maxwell::MaxShaderProgram && eligible; ++index) {
-            const bool emulated{index == mesh_index || (has_task && index == 1)};
-            eligible = emulated || key.unique_hashes[index] == 0 ||
-                       programs[index].stage == Shader::Stage::Fragment;
-        }
+        // Points (OoT's Zora's Domain draws two point-list mesh programs every frame, 32 points
+        // per workgroup with their own size) and lines are drawn as point and line lists.
+        const char* refused{nullptr};
         if (!eligible) {
+            refused = mesh_index == 0 ? "no mesh program"
+                      : layer_source_program != nullptr ? "layer emulation"
+                                                        : "mesh program after a non-task stage";
+        } else if (mesh.mesh.topology != 0 && mesh.mesh.topology != 1 &&
+                   mesh.mesh.topology != 4) {
+            refused = "output topology";
+        } else if (!mesh.mesh.primitive_lines.empty()) {
+            refused = "per-primitive outputs";
+        } else if (mesh.mesh.vertex_lines.empty() || mesh.mesh.max_vertices == 0 ||
+                   mesh.mesh.max_primitives == 0) {
+            refused = "empty output";
+        }
+        for (size_t index = 1; index < Maxwell::MaxShaderProgram && refused == nullptr; ++index) {
+            const bool emulated{index == mesh_index || (has_task && index == 1)};
+            if (!emulated && key.unique_hashes[index] != 0 &&
+                programs[index].stage != Shader::Stage::Fragment) {
+                refused = "a stage besides task, mesh and pixel";
+            }
+        }
+        if (refused != nullptr) {
+            // Its draws are dropped (the rasterizer's "mesh draws dropped" count): say why, for
+            // the first 32 refusals.
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Mesh emulation refused for {}: {} (topology {}, primitive lines {})",
+                            PipelineShaders(key), refused,
+                            mesh_index != 0 ? mesh.mesh.topology : 0U,
+                            mesh_index != 0 ? mesh.mesh.primitive_lines.size() : size_t{0});
+            }
             return nullptr;
         }
         // The output buffer's binding follows every program's. The task and mesh programs
@@ -7251,6 +7445,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         mesh_emulation->block_words = Shader::Backend::SPIRV::MeshEmulationBlockWords(mesh.mesh);
         mesh_emulation->max_primitives = mesh.mesh.max_primitives;
+        mesh_emulation->primitive_vertices = mesh.mesh.PrimitiveVertices();
         mesh_emulation->max_vertices = mesh.mesh.max_vertices;
         mesh_emulation->vertex_lines = static_cast<u32>(mesh.mesh.vertex_lines.size());
         for (u32 line = 0; line < mesh.mesh.vertex_lines.size(); ++line) {
@@ -7275,11 +7470,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 }
             }
             LOG_INFO(Render_Vulkan,
-                     "Mesh emulation #{}: pipeline {:016x}, {} vertices x {} lines, {} triangles "
+                     "Mesh emulation #{}: pipeline {:016x}, {} vertices x {} lines, {} {} "
                      "per workgroup, output binding {}, task {} (payload {} words), input "
                      "reads:{}",
                      count, hash, mesh.mesh.max_vertices, mesh.mesh.vertex_lines.size(),
-                     mesh.mesh.max_primitives, output_binding, has_task,
+                     mesh.mesh.max_primitives,
+                     mesh.mesh.topology == 0   ? "points"
+                     : mesh.mesh.topology == 1 ? "lines"
+                                               : "triangles",
+                     output_binding, has_task,
                      mesh_emulation->payload_stride, reads.empty() ? " none" : reads);
         }
     }
@@ -7412,7 +7611,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 mesh_emulation->vertex_spirv = Shader::Backend::SPIRV::EmitMeshEmulationVertex(
                     profile, program.mesh, mesh_emulation->output_binding,
                     mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
-                    runtime_info.convert_depth_mode && !profile.support_native_ndc);
+                    runtime_info.convert_depth_mode && !profile.support_native_ndc,
+                    runtime_info.fixed_state_point_size.value_or(1.0f));
             }
         }
         ConvertLegacyToGeneric(program, runtime_info);
