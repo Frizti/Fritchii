@@ -664,17 +664,14 @@ endif()
 # NVIDIA DLSS through NVIDIA Streamline, in place of a game's DLSS (before FSR 3.1) when the
 # setting is on. Only Streamline's MIT-licensed headers are compiled in and nothing of NVIDIA's is
 # linked or copied: sl.interposer.dll and the DLSS plugins are loaded at run time from the user's PC.
-cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS through NVIDIA Streamline" ON
-                       "MSVC AND ARCHITECTURE_x86_64" OFF)
+# On Linux the NVIDIA driver's own libnvidia-ngx.so.1 is loaded at run time (dlopen) through
+# Fritchii's own declarations of its entry points: no NVIDIA header or library is used, and the
+# DLSS model (libnvidia-ngx-dlss.so) is downloaded by the player from NVIDIA's GitHub.
+cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS (Streamline on Windows, the driver's NGX on Linux)" ON
+                       "ARCHITECTURE_x86_64 AND (MSVC OR (LINUX AND NOT ANDROID))" OFF)
 set(EGLANTINE_STREAMLINE_SDK "" CACHE PATH
     "NVIDIA Streamline SDK directory for its headers (empty: download them)")
 if (ENABLE_NVIDIA_DLSS)
-    if (EGLANTINE_STREAMLINE_SDK)
-        set(STREAMLINE_INCLUDE_DIR "${EGLANTINE_STREAMLINE_SDK}/include")
-    else()
-        AddJsonPackage(NAME streamline DOWNLOAD_ONLY)
-        set(STREAMLINE_INCLUDE_DIR "${streamline_SOURCE_DIR}/include")
-    endif()
     target_sources(video_core PRIVATE
         renderer_vulkan/vk_streamline_dlss.cpp
         renderer_vulkan/vk_streamline_dlss.h
@@ -682,10 +679,23 @@ if (ENABLE_NVIDIA_DLSS)
         vulkan_common/streamline.h
         vulkan_common/streamline_api.h
     )
-    target_include_directories(video_core PRIVATE "${STREAMLINE_INCLUDE_DIR}")
-    target_link_libraries(video_core PRIVATE version wintrust crypt32)
+    if (WIN32)
+        if (EGLANTINE_STREAMLINE_SDK)
+            set(STREAMLINE_INCLUDE_DIR "${EGLANTINE_STREAMLINE_SDK}/include")
+        else()
+            AddJsonPackage(NAME streamline DOWNLOAD_ONLY)
+            set(STREAMLINE_INCLUDE_DIR "${streamline_SOURCE_DIR}/include")
+        endif()
+        target_include_directories(video_core PRIVATE "${STREAMLINE_INCLUDE_DIR}")
+        target_link_libraries(video_core PRIVATE version wintrust crypt32)
+        message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
+    else()
+        # dlopen/dlsym for the driver's NGX, OpenSSL's SHA-256 for the model file check (OpenSSL
+        # is set up by the top-level CMakeLists, as for core and the Qt frontend).
+        target_link_libraries(video_core PRIVATE ${CMAKE_DL_LIBS} OpenSSL::Crypto)
+        message(STATUS "NVIDIA DLSS through the NVIDIA driver's NGX (libnvidia-ngx.so.1, loaded at run time)")
+    endif()
     target_compile_definitions(video_core PUBLIC EGLANTINE_STREAMLINE)
-    message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
 endif()
 
 create_target_directory_groups(video_core)

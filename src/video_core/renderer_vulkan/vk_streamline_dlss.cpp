@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS evaluation.
+// NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS evaluation. On Linux through
+// the NVIDIA driver's NGX (see vulkan_common/streamline.h).
 
 #include <array>
 #include <atomic>
@@ -33,17 +34,20 @@ std::atomic<u64> evaluations{};
 std::atomic<u32> last_evaluation{}; ///< Mode, requested mode and preset, a byte each
 std::atomic<u32> last_sizes{};      ///< Render height (low 16 bits) and output height
 
+#ifdef _WIN32
 // slEvaluateFeature returns eWarnOutOfVRAM after it has evaluated DLSS, when the VRAM budget is
 // used up (commonInterface.cpp, slEvaluateFeatureInternal). The output is written; it is a warning.
 bool Evaluated(sl::Result result) {
     return result == sl::Result::eOk || result == sl::Result::eWarnOutOfVRAM;
 }
+#endif
 
 int EnvInt(const char* name, int fallback) {
     const char* const value = std::getenv(name);
     return value ? std::atoi(value) : fallback;
 }
 
+#ifdef _WIN32
 sl::DLSSMode ModeFor(Settings::NvidiaDlssQuality mode) {
     using Quality = Settings::NvidiaDlssQuality;
     switch (mode) {
@@ -99,6 +103,7 @@ sl::float4x4 Identity() {
     matrix.setRow(3, {0.0f, 0.0f, 0.0f, 1.0f});
     return matrix;
 }
+#endif
 
 VkImageMemoryBarrier Barrier(const StreamlineDlssUpscaler::Image& image, VkAccessFlags src_access,
                              VkAccessFlags dst_access, VkImageLayout old_layout,
@@ -119,6 +124,7 @@ VkImageMemoryBarrier Barrier(const StreamlineDlssUpscaler::Image& image, VkAcces
     };
 }
 
+#ifdef _WIN32
 sl::Resource Resource(VkImage image, VkImageView view, VkFormat format, VkImageLayout layout,
                       VkExtent2D size, VkImageUsageFlags usage) {
     sl::Resource resource{sl::ResourceType::eTex2d, image, nullptr, view,
@@ -132,6 +138,93 @@ sl::Resource Resource(VkImage image, VkImageView view, VkFormat format, VkImageL
     resource.usage = usage;
     return resource;
 }
+#else
+Streamline::NgxPerfQuality NgxQualityFor(Settings::NvidiaDlssQuality mode) {
+    using Quality = Settings::NvidiaDlssQuality;
+    switch (mode) {
+    case Quality::Native:
+        return Streamline::NgxPerfQuality::DLAA;
+    case Quality::Quality:
+        return Streamline::NgxPerfQuality::MaxQuality;
+    case Quality::Balanced:
+        return Streamline::NgxPerfQuality::Balanced;
+    case Quality::Performance:
+        return Streamline::NgxPerfQuality::MaxPerf;
+    case Quality::UltraPerformance:
+        return Streamline::NgxPerfQuality::UltraPerformance;
+    case Quality::Automatic:
+        break;
+    }
+    return Streamline::NgxPerfQuality::MaxQuality;
+}
+
+// The same model choice as the Windows path (setting, then EDEN_NX2_DLSS_PRESET over it). NGX
+// numbers the presets as Streamline does.
+Streamline::NgxDlssPreset NgxPresetFor(Settings::DlssPreset preset) {
+    const char* const value = std::getenv("EDEN_NX2_DLSS_PRESET");
+    if (value && value[0] >= 'J' && value[0] <= 'M') {
+        return static_cast<Streamline::NgxDlssPreset>(
+            static_cast<u32>(Streamline::NgxDlssPreset::J) + static_cast<u32>(value[0] - 'J'));
+    }
+    if (value && std::string_view{value} == "default") {
+        return Streamline::NgxDlssPreset::Default;
+    }
+    switch (preset) {
+    case Settings::DlssPreset::Default:
+        return Streamline::NgxDlssPreset::Default;
+    case Settings::DlssPreset::J:
+        return Streamline::NgxDlssPreset::J;
+    case Settings::DlssPreset::L:
+        return Streamline::NgxDlssPreset::L;
+    case Settings::DlssPreset::M:
+        return Streamline::NgxDlssPreset::M;
+    case Settings::DlssPreset::K:
+        break;
+    }
+    return Streamline::NgxDlssPreset::K;
+}
+
+/// The render sizes DLSS takes for a mode at this output size (DLSS's own optimal settings query,
+/// as slDLSSGetOptimalSettings on Windows). Drivers without the query: any size up to the output.
+std::optional<VideoCommon::DlssMode::Range> NgxRange(Streamline::NgxParameter* params,
+                                                     Settings::NvidiaDlssQuality mode,
+                                                     VkExtent2D output) {
+    using VideoCommon::DlssMode::Range;
+    void* callback = nullptr;
+    if (Streamline::NgxFailed(params->GetVoidPointer("DLSSOptimalSettingsCallback", &callback)) ||
+        !callback) {
+        if (mode == Settings::NvidiaDlssQuality::Native) {
+            return Range{{output.width, output.height}, {output.width, output.height}};
+        }
+        return Range{{1, 1}, {output.width, output.height}};
+    }
+    params->SetUI("Width", output.width);
+    params->SetUI("Height", output.height);
+    params->SetI("PerfQualityValue", static_cast<int>(NgxQualityFor(mode)));
+    params->SetI("RTXValue", 0);
+    const auto query = reinterpret_cast<Streamline::PFN_NgxDlssOptimalSettingsCallback>(callback);
+    if (Streamline::NgxFailed(query(params))) {
+        return std::nullopt;
+    }
+    unsigned int width = 0;
+    unsigned int height = 0;
+    params->GetUI("OutWidth", &width);
+    params->GetUI("OutHeight", &height);
+    if (width == 0 || height == 0) {
+        return std::nullopt;
+    }
+    // Older DLSS reports only the optimal size.
+    unsigned int min_width = width;
+    unsigned int min_height = height;
+    unsigned int max_width = width;
+    unsigned int max_height = height;
+    params->GetUI("DLSS.Get.Dynamic.Min.Render.Width", &min_width);
+    params->GetUI("DLSS.Get.Dynamic.Min.Render.Height", &min_height);
+    params->GetUI("DLSS.Get.Dynamic.Max.Render.Width", &max_width);
+    params->GetUI("DLSS.Get.Dynamic.Max.Render.Height", &max_height);
+    return Range{{min_width, min_height}, {max_width, max_height}};
+}
+#endif
 
 } // Anonymous namespace
 
@@ -141,6 +234,7 @@ StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler&
     if (!Streamline::IsDlssAvailable()) {
         throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
     }
+#ifdef _WIN32
     const sl::Result result = Streamline::GetApi().get_feature_function(
         sl::kFeatureDLSS, "slDLSSSetOptions", set_options);
     if (result != sl::Result::eOk || !set_options) {
@@ -154,6 +248,14 @@ StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler&
         LOG_ERROR(Render_Vulkan, "Streamline's DLSS has no slDLSSGetOptimalSettings");
         throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
     }
+#else
+    const Streamline::NgxApi& api = Streamline::GetNgxApi();
+    if (!Streamline::GetNgxParameters() || !api.create_feature1 || !api.evaluate_feature ||
+        !api.release_feature) {
+        LOG_ERROR(Render_Vulkan, "The NVIDIA driver's NGX is not ready for DLSS");
+        throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
+    }
+#endif
     VkSamplerCreateInfo sampler_info{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
@@ -185,8 +287,17 @@ StreamlineDlssUpscaler::~StreamlineDlssUpscaler() {
     // released, and a submit would touch their state. Nothing more gets recorded by then.
     void(device.GetLogical().WaitIdle());
     if (Streamline::IsDlssAvailable()) {
+#ifdef _WIN32
         Streamline::GetApi().free_resources(sl::kFeatureDLSS, sl::ViewportHandle{0u});
+#else
+        if (ngx_feature) {
+            Streamline::GetNgxApi().release_feature(static_cast<Streamline::NgxHandle*>(ngx_feature));
+        }
+#endif
     }
+#ifndef _WIN32
+    ngx_feature = nullptr;
+#endif
 }
 
 void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
@@ -276,6 +387,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     quality_mode = settings.quality;
     model_preset = settings.preset;
 
+#ifdef _WIN32
     // Keep the existing HDR controls for linear input such as Fortune's Weave. Tonemapped
     // input such as Ocarina's already has its exposure applied.
     sl::DLSSOptions options{};
@@ -513,6 +625,254 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                          std::memory_order_relaxed);
         evaluations.fetch_add(1, std::memory_order_release);
     });
+#else
+    // Linux: the NVIDIA driver's NGX. The same mode choice, presets and HDR controls as above;
+    // the options go into NGX's parameter block when the DLSS feature is (re)created, the
+    // images and per-frame values before each evaluation.
+    const bool hdr = in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0;
+    const bool auto_exposure = in.hdr && EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0;
+    const Streamline::NgxDlssPreset preset = NgxPresetFor(settings.preset);
+
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([this, in, reset, hdr, auto_exposure, preset, options_changed,
+                      requested = settings.quality, preset_setting = settings.preset,
+                      output_image_handle = *output_image,
+                      output_view_handle = *output_view](vk::CommandBuffer cmdbuf) {
+        const Streamline::NgxApi& api = Streamline::GetNgxApi();
+        Streamline::NgxParameter* const params = Streamline::GetNgxParameters();
+        // The caller draws the output this frame even when DLSS writes nothing to it: clear it
+        // then, rather than show undefined contents (FSR 3.1 takes over from the next frame).
+        const auto clear_output = [&] {
+            const VkImageSubresourceRange range{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            };
+            const auto barrier = [&](VkAccessFlags src_access, VkAccessFlags dst_access) {
+                return VkImageMemoryBarrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = src_access,
+                    .dstAccessMask = dst_access,
+                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = output_image_handle,
+                    .subresourceRange = range,
+                };
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                   barrier(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                           VK_ACCESS_TRANSFER_WRITE_BIT));
+            cmdbuf.ClearColorImage(output_image_handle, VK_IMAGE_LAYOUT_GENERAL,
+                                   VkClearColorValue{}, range);
+            cmdbuf.PipelineBarrier(
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT));
+        };
+
+        constexpr VkAccessFlags WRITES =
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        // The inputs come from the game's draws and dispatches and stay in GENERAL otherwise;
+        // DLSS reads them as sampled images.
+        const std::array to_read{
+            Barrier(in.color, WRITES, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+            Barrier(in.depth, WRITES, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+            Barrier(in.motion_vectors, WRITES, VK_ACCESS_SHADER_READ_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+        };
+        const std::array to_general{
+            Barrier(in.color, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+            Barrier(in.depth, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+            Barrier(in.motion_vectors, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+        };
+        const VkMemoryBarrier output_written{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        };
+        // NGX reads these through pointers in the parameter block: they stay put until the
+        // evaluation is recorded.
+        Streamline::NgxResourceVk color = Streamline::MakeNgxImageViewResource(
+            in.color.view, in.color.image, in.color.range, in.color.format, in.render_size.width,
+            in.render_size.height, false);
+        Streamline::NgxResourceVk depth = Streamline::MakeNgxImageViewResource(
+            in.depth.view, in.depth.image, in.depth.range, in.depth.format, in.render_size.width,
+            in.render_size.height, false);
+        Streamline::NgxResourceVk motion = Streamline::MakeNgxImageViewResource(
+            in.motion_vectors.view, in.motion_vectors.image, in.motion_vectors.range,
+            in.motion_vectors.format, in.render_size.width, in.render_size.height, false);
+        const VkImageSubresourceRange output_range{
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        Streamline::NgxResourceVk output = Streamline::MakeNgxImageViewResource(
+            output_view_handle, output_image_handle, output_range, OUTPUT_FORMAT,
+            in.upscale_size.width, in.upscale_size.height, true);
+
+        Streamline::NgxResult api_result = Streamline::NgxSuccess;
+        const auto result = VideoCommon::RecordDlssEvaluation(
+            [&] {
+                if (!params) {
+                    return false;
+                }
+                if (!options_changed) {
+                    return true;
+                }
+                namespace Mode = VideoCommon::DlssMode;
+                const auto selection = Mode::Select(
+                    requested, {in.render_size.width, in.render_size.height},
+                    {in.upscale_size.width, in.upscale_size.height},
+                    [&](Settings::NvidiaDlssQuality mode) {
+                        return NgxRange(params, mode, in.upscale_size);
+                    });
+                if (selection.fallback) {
+                    const Mode::Range range = selection.requested_range.value_or(Mode::Range{});
+                    LOG_WARNING(
+                        Render_Vulkan,
+                        "NVIDIA DLSS requested {} but using {} for {}x{} -> {}x{}; "
+                        "requested range {}x{} to {}x{} (query {})",
+                        Settings::CanonicalizeEnum(requested),
+                        selection.mode ? Settings::CanonicalizeEnum(*selection.mode) : "FSR 3.1",
+                        in.render_size.width, in.render_size.height, in.upscale_size.width,
+                        in.upscale_size.height, range.min.width, range.min.height, range.max.width,
+                        range.max.height, selection.requested_range ? "supported" : "unavailable");
+                }
+                if (!selection.mode) {
+                    LOG_WARNING(Render_Vulkan, "No NVIDIA DLSS mode accepts {}x{} -> {}x{}",
+                                in.render_size.width, in.render_size.height, in.upscale_size.width,
+                                in.upscale_size.height);
+                    return false;
+                }
+                evaluated_mode = *selection.mode;
+                // Upscale() finished the scheduler before any options change, so the GPU is done
+                // with the old feature.
+                if (ngx_feature) {
+                    api.release_feature(static_cast<Streamline::NgxHandle*>(ngx_feature));
+                    ngx_feature = nullptr;
+                }
+                int flags = Streamline::NgxDlssFlagMVLowRes;
+                if (in.depth_inverted) {
+                    flags |= Streamline::NgxDlssFlagDepthInverted;
+                }
+                if (hdr) {
+                    flags |= Streamline::NgxDlssFlagIsHDR;
+                }
+                if (auto_exposure) {
+                    flags |= Streamline::NgxDlssFlagAutoExposure;
+                }
+                const auto preset_value = static_cast<unsigned int>(preset);
+                params->SetUI("DLSS.Hint.Render.Preset.DLAA", preset_value);
+                params->SetUI("DLSS.Hint.Render.Preset.Quality", preset_value);
+                params->SetUI("DLSS.Hint.Render.Preset.Balanced", preset_value);
+                params->SetUI("DLSS.Hint.Render.Preset.Performance", preset_value);
+                params->SetUI("DLSS.Hint.Render.Preset.UltraPerformance", preset_value);
+                params->SetUI("DLSS.Hint.Render.Preset.UltraQuality", preset_value);
+                params->SetUI("CreationNodeMask", 1u);
+                params->SetUI("VisibilityNodeMask", 1u);
+                params->SetUI("Width", in.render_size.width);
+                params->SetUI("Height", in.render_size.height);
+                params->SetUI("OutWidth", in.upscale_size.width);
+                params->SetUI("OutHeight", in.upscale_size.height);
+                params->SetI("PerfQualityValue", static_cast<int>(NgxQualityFor(*selection.mode)));
+                params->SetI("DLSS.Feature.Create.Flags", flags);
+                params->SetI("DLSS.Enable.Output.Subrects", 0);
+                LOG_INFO(Render_Vulkan, "NVIDIA DLSS (NGX): {}x{} -> {}x{}, mode {}, preset {}, {}",
+                         in.render_size.width, in.render_size.height, in.upscale_size.width,
+                         in.upscale_size.height, Settings::CanonicalizeEnum(*selection.mode),
+                         preset_value, hdr ? "HDR" : "LDR");
+                Streamline::NgxHandle* handle = nullptr;
+                api_result = api.create_feature1(*device.GetLogical(), *cmdbuf,
+                                                 Streamline::NgxFeature::SuperSampling, params,
+                                                 &handle);
+                if (Streamline::NgxFailed(api_result) || !handle) {
+                    return false;
+                }
+                ngx_feature = handle;
+                return true;
+            },
+            [&] { return ngx_feature != nullptr; },
+            [&] {
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, to_read);
+            },
+            [&] {
+                params->SetVoidPointer("Color", &color);
+                params->SetVoidPointer("Output", &output);
+                params->SetVoidPointer("Depth", &depth);
+                params->SetVoidPointer("MotionVectors", &motion);
+                params->SetVoidPointer("TransparencyMask", nullptr);
+                params->SetVoidPointer("ExposureTexture", nullptr);
+                params->SetVoidPointer("DLSS.Input.Bias.Current.Color.Mask", nullptr);
+                params->SetF("Jitter.Offset.X", in.jitter[0]);
+                params->SetF("Jitter.Offset.Y", in.jitter[1]);
+                // NGX scales motion into render pixels, which is what our scale gives.
+                params->SetF("MV.Scale.X", in.motion_vector_scale[0]);
+                params->SetF("MV.Scale.Y", in.motion_vector_scale[1]);
+                params->SetF("Sharpness", 0.0f);
+                params->SetI("Reset", reset ? 1 : 0);
+                for (const char* const name :
+                     {"DLSS.Input.Color.Subrect.Base.X", "DLSS.Input.Color.Subrect.Base.Y",
+                      "DLSS.Input.Depth.Subrect.Base.X", "DLSS.Input.Depth.Subrect.Base.Y",
+                      "DLSS.Input.MV.Subrect.Base.X", "DLSS.Input.MV.Subrect.Base.Y",
+                      "DLSS.Input.Translucency.Subrect.Base.X",
+                      "DLSS.Input.Translucency.Subrect.Base.Y",
+                      "DLSS.Input.Bias.Current.Color.Subrect.Base.X",
+                      "DLSS.Input.Bias.Current.Color.Subrect.Base.Y",
+                      "DLSS.Output.Subrect.Base.X", "DLSS.Output.Subrect.Base.Y"}) {
+                    params->SetUI(name, 0u);
+                }
+                params->SetUI("DLSS.Render.Subrect.Dimensions.Width", in.render_size.width);
+                params->SetUI("DLSS.Render.Subrect.Dimensions.Height", in.render_size.height);
+                params->SetF("DLSS.Pre.Exposure", 1.0f);
+                params->SetF("DLSS.Exposure.Scale", 1.0f);
+                params->SetI("DLSS.Indicator.Invert.X.Axis", 0);
+                params->SetI("DLSS.Indicator.Invert.Y.Axis", 0);
+                return true;
+            },
+            [&] {
+                api_result = api.evaluate_feature(
+                    *cmdbuf, static_cast<const Streamline::NgxHandle*>(ngx_feature), params,
+                    nullptr);
+                return Streamline::NgxSucceeded(api_result);
+            },
+            [&] {
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, output_written, {},
+                                       to_general);
+            });
+        if (result != VideoCommon::DlssEvaluationResult::Succeeded && !failed.exchange(true)) {
+            LOG_ERROR(Render_Vulkan,
+                      "NVIDIA DLSS recording failed at stage {} (NGX result 0x{:x}); using FSR 3.1",
+                      static_cast<int>(result), api_result);
+        }
+        if (result != VideoCommon::DlssEvaluationResult::Succeeded) {
+            clear_output();
+            return;
+        }
+        last_evaluation.store(static_cast<u32>(evaluated_mode) |
+                                  (static_cast<u32>(requested) << 8) |
+                                  (static_cast<u32>(preset_setting) << 16),
+                              std::memory_order_relaxed);
+        last_sizes.store((in.render_size.height & 0xffff) | (in.upscale_size.height << 16),
+                         std::memory_order_relaxed);
+        evaluations.fetch_add(1, std::memory_order_release);
+    });
+#endif
     // DLSS binds its own pipelines and descriptors on the command buffer.
     scheduler.InvalidateState();
     return true;

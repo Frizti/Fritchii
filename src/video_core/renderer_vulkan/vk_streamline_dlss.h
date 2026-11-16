@@ -86,6 +86,9 @@ private:
     MemoryAllocator& memory_allocator;
     void* set_options{}; ///< slDLSSSetOptions
     void* get_optimal_settings{}; ///< slDLSSGetOptimalSettings
+#ifndef _WIN32
+    void* ngx_feature{}; ///< The NGX DLSS feature (Linux); used on the scheduler's worker
+#endif
     VkExtent2D render_extent{};
     VkExtent2D upscale_extent{};
     bool hdr_input = true;

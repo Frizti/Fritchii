@@ -233,7 +233,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         }
 #endif
 #ifndef EGLANTINE_STREAMLINE
-        // Only builds with NVIDIA Streamline (Windows) can use it.
+        // Only builds with NVIDIA DLSS (Streamline on Windows, the NVIDIA driver on Linux) can use it.
         if (setting->Id() == Settings::values.nvidia_dlss.Id() ||
             setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
             setting->Id() == Settings::values.nvidia_dlss_preset.Id()) {

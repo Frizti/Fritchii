@@ -16,6 +16,21 @@
 
 namespace Vulkan::Streamline {
 
+#ifndef _WIN32
+// Linux: DLSS runs through the NVIDIA driver's NGX (libnvidia-ngx.so.1, reported as the
+// "interposer" below) and NVIDIA's DLSS model for Linux (the "model"), which the player downloads
+// from NVIDIA's DLSS repository on GitHub. IsSignedByNvidia() checks the model's SHA-256.
+inline constexpr const char* LINUX_DLSS_VERSION = "310.9.16";
+inline constexpr const char* LINUX_DLSS_FILE = "libnvidia-ngx-dlss.so.310.9.16";
+inline constexpr u64 LINUX_DLSS_SIZE = 59481944;
+inline constexpr const char* LINUX_DLSS_HOST = "https://raw.githubusercontent.com";
+inline constexpr const char* LINUX_DLSS_PATH =
+    "/NVIDIA/DLSS/v310.9.16/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.310.9.16";
+inline constexpr const char* LINUX_DLSS_LICENSE_PATH = "/NVIDIA/DLSS/v310.9.16/LICENSE.txt";
+inline constexpr const char* LINUX_DLSS_PAGE =
+    "https://github.com/NVIDIA/DLSS/tree/v310.9.16/lib/Linux_x86_64/rel";
+#endif
+
 /// NVIDIA's files DLSS needs, as found on this PC. Paths are empty when missing.
 struct DlssFiles {
     std::filesystem::path folder;     ///< Where the loader is, or where it should go

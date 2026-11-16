@@ -46,6 +46,7 @@ namespace {
 
 namespace Streamline = Vulkan::Streamline;
 
+#ifdef _WIN32
 constexpr const char* RELEASE_PAGE = "https://github.com/NVIDIA-RTX/Streamline/releases";
 constexpr const char* RELEASE_VERSION = "2.14.16";
 constexpr const char* ZIP_HOST = "https://github.com";
@@ -55,11 +56,13 @@ constexpr const char* INTERPOSER_ENTRY = "bin/x64/sl.interposer.dll";
 constexpr const char* MODEL_ENTRY = "bin/x64/nvngx_dlss.dll";
 constexpr const char* STREAMLINE_LICENSE_ENTRY = "license.txt";
 constexpr const char* DLSS_LICENSE_ENTRY = "bin/x64/nvngx_dlss.license.txt";
+#endif
 
 QString Tr(const char* text) {
     return QCoreApplication::translate("NvidiaDlssPanel", text);
 }
 
+#ifdef _WIN32
 u16 U16(const std::string& data, size_t at) {
     return static_cast<u16>(static_cast<u8>(data[at]) | static_cast<u8>(data[at + 1]) << 8);
 }
@@ -298,14 +301,32 @@ private:
     u64 zip_size{};
     std::map<std::string, ZipEntry> entries;
 };
+#endif
 
 QString Named(const QString& name, const std::string& version) {
     return version.empty() ? name : QStringLiteral("%1 %2").arg(name, QString::fromStdString(version));
 }
 
 QString PathText(const std::filesystem::path& path) {
+#ifdef _WIN32
     return QString::fromStdWString(path.wstring());
+#else
+    return QString::fromStdString(Common::FS::PathToUTF8String(path));
+#endif
 }
+
+#ifndef _WIN32
+std::unique_ptr<httplib::Client> MakeLinuxDlssClient() {
+    auto client = std::make_unique<httplib::Client>(Streamline::LINUX_DLSS_HOST);
+    client->set_connection_timeout(30);
+    client->set_read_timeout(60);
+    client->set_write_timeout(30);
+#ifdef YUZU_BUNDLED_OPENSSL
+    client->load_ca_cert_store(kCert, sizeof(kCert));
+#endif
+    return client;
+}
+#endif
 
 } // Anonymous namespace
 
@@ -330,6 +351,14 @@ NvidiaDlssPanel::NvidiaDlssPanel(QWidget* parent) : QWidget(parent) {
     button_row->setContentsMargins(24, 0, 0, 0);
     download_button = new QPushButton(this);
     folder_button = new QPushButton(Tr("Open Folder"), this);
+#ifndef _WIN32
+    QLabel* about = new QLabel(
+        QStringLiteral("<a href=\"%1\">%2</a>").arg(QString::fromLatin1(Streamline::LINUX_DLSS_PAGE),
+                                                   Tr("Where does this file come from?")),
+        this);
+    about->setOpenExternalLinks(true);
+    about->setToolTip(Tr("NVIDIA's DLSS repository on GitHub, folder lib/Linux_x86_64/rel."));
+#else
     QLabel* about = new QLabel(
         QStringLiteral("<a href=\"%1\">%2</a>").arg(QString::fromLatin1(RELEASE_PAGE),
                                                    Tr("Where do these files come from?")),
@@ -337,6 +366,7 @@ NvidiaDlssPanel::NvidiaDlssPanel(QWidget* parent) : QWidget(parent) {
     about->setOpenExternalLinks(true);
     about->setToolTip(Tr("NVIDIA's Streamline releases on GitHub. The files are in bin\\x64 of "
                          "the release zip."));
+#endif
     button_row->addWidget(download_button);
     button_row->addWidget(folder_button);
     button_row->addStretch(1);
@@ -360,6 +390,180 @@ void NvidiaDlssPanel::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
 }
 
+#ifndef _WIN32
+// Linux: DLSS needs the NVIDIA driver's NGX (nothing to download: it comes with NVIDIA's own
+// driver) and NVIDIA's DLSS model for Linux, downloaded from NVIDIA's DLSS repository on GitHub.
+void NvidiaDlssPanel::Refresh() {
+    const Streamline::DlssFiles files = Streamline::FindDlssFiles();
+    const bool has_driver = !files.interposer.empty();
+    const bool has_model = !files.model.empty();
+    QString status;
+    if (!has_driver) {
+        status = Tr("<b>Needs NVIDIA's own driver.</b> DLSS on Linux runs through the "
+                    "proprietary NVIDIA driver, and libnvidia-ngx.so.1 was not found. Nouveau and "
+                    "NVK can't run it. Games use AMD FSR 3.1.");
+    } else if (has_model) {
+        status =
+            Tr("<b>Ready.</b> Found %1 and %2.<br>DLSS and the settings below apply only "
+               "when a game uses its own DLSS. While DLSS runs, the status bar shows DLSS, "
+               "its mode and its preset.")
+                .arg(Named(QStringLiteral("DLSS"), files.model_version),
+                     Named(Tr("NVIDIA driver"), files.interposer_version));
+    } else {
+        status = Tr("<b>One file needed:</b> NVIDIA DLSS for Linux (%1). Until then, games use "
+                    "AMD FSR 3.1.")
+                     .arg(QString::fromLatin1(Streamline::LINUX_DLSS_FILE));
+    }
+    const bool ready = has_driver && has_model;
+    icon_label->setText(ready ? QStringLiteral("<span style=\"color:#2ea043\">&#10004;</span>")
+                              : QStringLiteral("<span style=\"color:#d29922\">&#9888;</span>"));
+    status_label->setText(status);
+    status_label->setToolTip(Tr("Folder: %1").arg(PathText(files.folder)));
+    download_button->setText(Tr("Download from NVIDIA (57 MB)"));
+    download_button->setVisible(has_driver && !has_model);
+}
+
+void NvidiaDlssPanel::Download() {
+    const Streamline::DlssFiles files = Streamline::FindDlssFiles();
+    if (files.interposer.empty() || !files.model.empty()) {
+        return;
+    }
+    const std::filesystem::path folder = Streamline::UserFolder();
+    const auto fail = [this](const std::string& error) {
+        LOG_ERROR(Frontend, "NVIDIA DLSS download failed: {}", error);
+        QMessageBox::warning(this, Tr("NVIDIA DLSS"),
+                             Tr("Could not download NVIDIA's files: %1")
+                                 .arg(QString::fromStdString(error)));
+        Refresh();
+    };
+
+    // NVIDIA's licence first, as on Windows.
+    std::string licence;
+    {
+        QProgressDialog busy(Tr("Contacting NVIDIA's download..."), QString{}, 0, 0, this);
+        busy.setWindowTitle(Tr("NVIDIA DLSS"));
+        busy.setWindowModality(Qt::WindowModal);
+        busy.setMinimumDuration(0);
+        busy.show();
+        QApplication::processEvents();
+        const auto result = MakeLinuxDlssClient()->Get(Streamline::LINUX_DLSS_LICENSE_PATH);
+        busy.close();
+        if (!result || result->status != 200 || result->body.empty()) {
+            fail(result ? fmt::format("HTTP {}", result->status)
+                        : httplib::to_string(result.error()));
+            return;
+        }
+        licence = fmt::format("==== {} ====\n\n{}\n", Tr("NVIDIA DLSS").toStdString(),
+                              result->body);
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(Tr("Download NVIDIA DLSS"));
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    QLabel* intro = new QLabel(
+        Tr("Fritchii will download %1 from NVIDIA's DLSS %2 release on GitHub into %3.<br>"
+           "This file is NVIDIA's, under NVIDIA's licence terms below.")
+            .arg(QString::fromLatin1(Streamline::LINUX_DLSS_FILE),
+                 QString::fromLatin1(Streamline::LINUX_DLSS_VERSION), PathText(folder)),
+        &dialog);
+    intro->setWordWrap(true);
+    QPlainTextEdit* licence_text = new QPlainTextEdit(QString::fromStdString(licence), &dialog);
+    licence_text->setReadOnly(true);
+    licence_text->setMinimumSize(640, 380);
+    QDialogButtonBox* buttons = new QDialogButtonBox(&dialog);
+    buttons->addButton(Tr("Accept and Download"), QDialogButtonBox::AcceptRole);
+    buttons->addButton(QDialogButtonBox::Cancel);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(intro);
+    layout->addWidget(licence_text, 1);
+    layout->addWidget(buttons);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    QProgressDialog progress(Tr("Downloading NVIDIA's DLSS files..."), Tr("Cancel"), 0, 1000,
+                             this);
+    progress.setWindowTitle(Tr("NVIDIA DLSS"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setValue(0);
+    QApplication::processEvents();
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    const std::filesystem::path target = folder / Streamline::LINUX_DLSS_FILE;
+    std::filesystem::path partial = target;
+    partial += ".download";
+    std::string error;
+    bool canceled = false;
+    {
+        std::ofstream file(partial, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            progress.close();
+            fail("could not write " + Common::FS::PathToUTF8String(partial));
+            return;
+        }
+        u64 received = 0;
+        bool write_failed = false;
+        int status = 0;
+        const auto result = MakeLinuxDlssClient()->Get(
+            Streamline::LINUX_DLSS_PATH, httplib::Headers{},
+            [&status](const httplib::Response& response) {
+                status = response.status;
+                return response.status == 200;
+            },
+            [&](const char* data, size_t length) {
+                if (!file.write(data, static_cast<std::streamsize>(length))) {
+                    write_failed = true;
+                    return false;
+                }
+                received += length;
+                progress.setValue(static_cast<int>(
+                    std::min<u64>(received * 1000 / Streamline::LINUX_DLSS_SIZE, 999)));
+                QApplication::processEvents();
+                if (progress.wasCanceled()) {
+                    canceled = true;
+                    return false;
+                }
+                return true;
+            });
+        file.close();
+        if (write_failed || !file) {
+            error = "could not write " + Common::FS::PathToUTF8String(partial);
+        } else if (!canceled && (!result || status != 200)) {
+            error = result ? fmt::format("HTTP {}", status) : httplib::to_string(result.error());
+        }
+    }
+    progress.close();
+    if (canceled || !error.empty()) {
+        std::filesystem::remove(partial, ec);
+        if (canceled) {
+            Refresh();
+        } else {
+            fail(error);
+        }
+        return;
+    }
+    if (!Streamline::IsSignedByNvidia(partial)) {
+        std::filesystem::remove(partial, ec);
+        fail(fmt::format("{} doesn't match NVIDIA's DLSS {} (SHA-256)", Streamline::LINUX_DLSS_FILE,
+                         Streamline::LINUX_DLSS_VERSION));
+        return;
+    }
+    std::filesystem::rename(partial, target, ec);
+    if (ec) {
+        std::filesystem::remove(partial, ec);
+        fail("could not save " + Common::FS::PathToUTF8String(target));
+        return;
+    }
+    LOG_INFO(Frontend, "Downloaded {} from NVIDIA's DLSS {} release",
+             Common::FS::PathToUTF8String(target), Streamline::LINUX_DLSS_VERSION);
+    Refresh();
+    QMessageBox::information(this, Tr("NVIDIA DLSS"),
+                             Tr("NVIDIA DLSS is ready. It is used the next time a game starts."));
+}
+
+#else
 void NvidiaDlssPanel::Refresh() {
     const Streamline::DlssFiles files = Streamline::FindDlssFiles();
     const bool has_loader = !files.interposer.empty();
@@ -560,5 +764,6 @@ void NvidiaDlssPanel::Download() {
     QMessageBox::information(this, Tr("NVIDIA DLSS"),
                              Tr("NVIDIA DLSS is ready. It is used the next time a game starts."));
 }
+#endif // _WIN32
 
 #endif
