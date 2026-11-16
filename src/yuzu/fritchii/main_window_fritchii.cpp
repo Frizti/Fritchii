@@ -26,6 +26,10 @@
 
 void MainWindow::SetUpFritchiiUi() {
     if (!FritchiiUi::Enabled()) {
+        // The classic UI of a Fritchii build gets the "Preparing shaders" screen too.
+        if (FritchiiUi::FritchiiBuild()) {
+            SetUpPrecompileGate();
+        }
         return;
     }
 
@@ -153,7 +157,12 @@ void MainWindow::SetUpFritchiiUi() {
     connect(this, &MainWindow::EmulationStarting, controls, &FritchiiUi::GameControls::Start);
     connect(this, &MainWindow::EmulationStopping, controls, &FritchiiUi::GameControls::Stop);
 
-    // "Preparing shaders" before the game starts when its precompiled pipelines need preparing.
+    SetUpPrecompileGate();
+}
+
+// "Preparing shaders" before the game starts when its precompiled pipelines need preparing.
+void MainWindow::SetUpPrecompileGate() {
+    constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
     auto* gate = new FritchiiUi::PrecompileGate(
         this, statusBar(),
         {.pause = [this] { OnPauseGame(); },

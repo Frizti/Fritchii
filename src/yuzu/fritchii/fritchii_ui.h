@@ -28,6 +28,9 @@ namespace FritchiiUi {
 /// Fritchii builds (g_build_name "Fritchii"). FRITCHII_CLASSIC_UI=1 shows the original UI.
 [[nodiscard]] bool Enabled();
 
+/// A Fritchii build, whichever UI it shows (the classic one too).
+[[nodiscard]] bool FritchiiBuild();
+
 /// Fusion style, the Graphite palette, Inter and the stylesheet. Does nothing (and returns false)
 /// when the Fritchii UI is off.
 bool ApplyTheme();

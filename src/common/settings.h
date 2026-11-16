@@ -714,6 +714,10 @@ struct Values {
     // applied once (MainWindow::MigrateFriztiSettings; config/frizti.ini keeps it too).
     Setting<u32> frizti_settings_revision{linkage, 0, "frizti_settings_revision",
                                           Category::RendererAdvanced};
+    // Linux: handheld mode was set once on this Steam Deck (MainWindow::MigrateFriztiSettings);
+    // the player's later choice is kept, revision applies included.
+    Setting<bool> steam_deck_handheld_set{linkage, false, "steam_deck_handheld_set",
+                                          Category::RendererAdvanced};
 
     // Mario Kart World: select a fixed or dynamic in-game frame-rate mode (loader/nso.cpp).
     SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};

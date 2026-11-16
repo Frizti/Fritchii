@@ -6,6 +6,7 @@
 
 #include <QDialog>
 #include <QEvent>
+#include <QFont>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLocale>
@@ -22,6 +23,7 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/shader_notify.h"
+#include "yuzu/fritchii/fritchii_ui.h"
 #include "yuzu/loading_screen.h"
 
 namespace FritchiiUi {
@@ -211,6 +213,18 @@ void PrecompileGate::ShowScreen() {
     numbers->addWidget(count);
     numbers->addStretch(1);
     numbers->addWidget(eta);
+    // The classic UI has no Fritchii stylesheet: the same big type set here.
+    if (!Enabled()) {
+        QFont title_font = title->font();
+        title_font.setPixelSize(30);
+        title_font.setWeight(QFont::Medium);
+        title->setFont(title_font);
+        QFont lead_font = sentence->font();
+        lead_font.setPixelSize(16);
+        for (QLabel* const label : {sentence, count, eta}) {
+            label->setFont(lead_font);
+        }
+    }
     column->addLayout(numbers);
     column->addSpacing(40);
 

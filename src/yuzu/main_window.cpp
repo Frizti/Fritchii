@@ -9,6 +9,9 @@
 #endif
 
 #include <boost/algorithm/string/split.hpp>
+#ifdef __linux__
+#include <fstream>
+#endif
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
 #include "common/shutdown_progress.h"
@@ -579,6 +582,28 @@ std::string OcarinaConfigName() {
     return fmt::format("{:016X}", Settings::Frizti::OcarinaOfTimeProgramId);
 }
 
+#ifdef __linux__
+std::string ReadDmiField(const char* name) {
+    std::ifstream file(std::string{"/sys/devices/virtual/dmi/id/"} + name);
+    std::string value;
+    std::getline(file, value);
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\r')) {
+        value.pop_back();
+    }
+    return value;
+}
+
+// Steam Deck LCD (Jupiter) or OLED (Galileo). Other Valve hardware is not handheld.
+bool IsSteamDeck() {
+    if (!ReadDmiField("board_vendor").starts_with("Valve") &&
+        !ReadDmiField("sys_vendor").starts_with("Valve")) {
+        return false;
+    }
+    const std::string product = ReadDmiField("product_name");
+    return product == "Jupiter" || product == "Galileo";
+}
+#endif
+
 std::filesystem::path FriztiRecordPath() {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "frizti.ini";
 }
@@ -638,8 +663,36 @@ void MainWindow::MigrateFriztiSettings() {
     const u32 applied =
         (std::min)(Settings::values.frizti_settings_revision.GetValue(), record.revision);
     const bool full = applied < Frizti::Revision;
+#ifdef __linux__
+    auto& docked = Settings::values.use_docked_mode;
+    const auto console_mode = docked.GetValue(true);
+    const std::string console_mode_text = docked.Canonicalize();
+#endif
 
     auto changes = Frizti::ReconcileGlobal(tuned, record, full);
+    bool save = false;
+#ifdef __linux__
+    // Steam Deck: handheld mode (720p) once; docked renders 1080p, too heavy for its GPU (6-8 fps
+    // in the Deku Tree). After that the player's choice stays, revision applies included.
+    if (IsSteamDeck()) {
+        const bool first = !Settings::values.steam_deck_handheld_set.GetValue();
+        const auto keep = first ? Settings::ConsoleMode::Handheld : console_mode;
+        if ((first || full) && docked.GetValue(true) != keep) {
+            docked.SetValue(keep);
+        }
+        std::erase_if(changes, [&](const Frizti::Change& change) {
+            return change.label == docked.GetLabel();
+        });
+        if (docked.GetValue(true) != console_mode) {
+            changes.push_back({docked.GetLabel(), console_mode_text,
+                               docked.Canonicalize() + (first ? " (Steam Deck)" : "")});
+        }
+        if (first) {
+            Settings::values.steam_deck_handheld_set.SetValue(true);
+            save = true;
+        }
+    }
+#endif
     for (auto& change : Frizti::FixDockedController(Settings::values)) {
         changes.push_back(std::move(change));
     }
@@ -663,7 +716,8 @@ void MainWindow::MigrateFriztiSettings() {
 
     // A newer Frizti build's revision is kept.
     const u32 revision = (std::max)(applied, Frizti::Revision);
-    if (!changes.empty() || Settings::values.frizti_settings_revision.GetValue() != revision) {
+    if (save || !changes.empty() ||
+        Settings::values.frizti_settings_revision.GetValue() != revision) {
         Settings::values.frizti_settings_revision.SetValue(revision);
         config->SaveAllValues();
     }

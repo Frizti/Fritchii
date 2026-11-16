@@ -130,9 +130,13 @@ bool Enabled() {
         if (qEnvironmentVariableIntValue("FRITCHII_CLASSIC_UI") != 0) {
             return false;
         }
-        return std::string_view{Common::g_build_name} == "Fritchii";
+        return FritchiiBuild();
     }();
     return enabled;
+}
+
+bool FritchiiBuild() {
+    return std::string_view{Common::g_build_name} == "Fritchii";
 }
 
 bool ApplyTheme() {
@@ -161,8 +165,9 @@ bool ApplyTheme() {
 }
 
 bool HidesSetting(const std::string& label) {
-    // No frame generation in Fritchii (real frames only), and its options are dev tools.
-    return Enabled() && label.starts_with("frame_gen");
+    // No frame generation in Fritchii (real frames only), and its options are dev tools. The
+    // classic UI of a Fritchii build hides them too.
+    return FritchiiBuild() && label.starts_with("frame_gen");
 }
 
 QIcon IconTinted(const QString& name, const QColor& color, int px) {

@@ -417,6 +417,8 @@ private slots:
     void ShowErrorWithExportLog(const QString& title, const QString& text);
     /// The Fritchii look (fritchii/main_window_fritchii.cpp); nothing in other builds.
     void SetUpFritchiiUi();
+    /// The "Preparing shaders" screen (both UIs of a Fritchii build).
+    void SetUpPrecompileGate();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();
