@@ -69,6 +69,7 @@
 #include "util/clickable_label.h"
 #include "util/controller_navigation.h"
 #include "util/export_log.h"
+#include "util/profiling_mode.h"
 #include "fritchii/fritchii_ui.h"
 #include "fritchii/perf_overlay.h"
 #include "util/overlay_dialog.h"
@@ -151,6 +152,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "common/scm_rev.h"
 #include "common/scope_exit.h"
 #include "common/string_util.h"
+#include "common/thread.h"
 
 #ifdef ARCHITECTURE_x86_64
 #include "common/cpu_features.h"
@@ -334,6 +336,87 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
 
+// main.cpp: the test switches this launch runs with, grouped by where each came from.
+std::string Nx2SwitchSummary();
+
+#ifdef _WIN32
+// The Windows power plan and power mode (Settings > Power: Best power efficiency, Balanced, Best
+// performance), logged at each game start: the mode changes how fast the cores clock up, so two
+// runs on different modes can differ in fps. powrprof.dll is loaded here, not linked; the mode
+// call (PowerGetEffectiveOverlayScheme) exists from Windows 10 1709 on.
+static std::string WindowsPowerText() {
+    std::string text;
+    if (const HMODULE powrprof = LoadLibraryW(L"powrprof.dll")) {
+        using GetActiveScheme = DWORD(WINAPI*)(HKEY, GUID**);
+        using ReadFriendlyName = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*,
+                                                UCHAR*, DWORD*);
+        using GetOverlay = DWORD(WINAPI*)(GUID*);
+        const auto get_active = reinterpret_cast<GetActiveScheme>(
+            reinterpret_cast<void*>(GetProcAddress(powrprof, "PowerGetActiveScheme")));
+        const auto read_name = reinterpret_cast<ReadFriendlyName>(
+            reinterpret_cast<void*>(GetProcAddress(powrprof, "PowerReadFriendlyName")));
+        const auto get_overlay = reinterpret_cast<GetOverlay>(
+            reinterpret_cast<void*>(GetProcAddress(powrprof, "PowerGetEffectiveOverlayScheme")));
+        GUID* scheme = nullptr;
+        if (get_active != nullptr && get_active(nullptr, &scheme) == ERROR_SUCCESS && scheme) {
+            DWORD size = 0;
+            std::wstring name;
+            if (read_name != nullptr &&
+                read_name(nullptr, scheme, nullptr, nullptr, nullptr, &size) == ERROR_SUCCESS &&
+                size >= sizeof(wchar_t)) {
+                name.resize(size / sizeof(wchar_t));
+                if (read_name(nullptr, scheme, nullptr, nullptr,
+                              reinterpret_cast<UCHAR*>(name.data()), &size) != ERROR_SUCCESS) {
+                    name.clear();
+                }
+            }
+            text += fmt::format("plan {}",
+                                name.empty() ? std::string{"unknown"}
+                                             : QString::fromWCharArray(name.c_str()).toStdString());
+            LocalFree(scheme);
+        }
+        GUID overlay{};
+        if (get_overlay != nullptr && get_overlay(&overlay) == ERROR_SUCCESS) {
+            struct Mode {
+                GUID guid;
+                const char* name;
+            };
+            static constexpr Mode Modes[] = {
+                {{0x961cc777, 0x2547, 0x4f9d, {0x81, 0x74, 0x7d, 0x86, 0x18, 0x1b, 0x8a, 0x7a}},
+                 "best power efficiency"},
+                {{0x00000000, 0x0000, 0x0000, {0, 0, 0, 0, 0, 0, 0, 0}}, "balanced"},
+                {{0x3af9b8d9, 0x7c97, 0x431d, {0xad, 0x78, 0x34, 0xa8, 0xbf, 0xea, 0x43, 0x9f}},
+                 "better performance"},
+                {{0xded574b5, 0x45a0, 0x4f42, {0x87, 0x37, 0x46, 0x34, 0x5c, 0x09, 0xc2, 0x38}},
+                 "best performance"},
+            };
+            std::string mode;
+            for (const Mode& known : Modes) {
+                if (IsEqualGUID(overlay, known.guid)) {
+                    mode = known.name;
+                }
+            }
+            if (mode.empty()) {
+                const auto& d = overlay.Data4;
+                mode = fmt::format("{:08x}-{:04x}-{:04x}-{:02x}{:02x}-"
+                                   "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                                   overlay.Data1, overlay.Data2, overlay.Data3, d[0], d[1], d[2],
+                                   d[3], d[4], d[5], d[6], d[7]);
+            }
+            text += fmt::format("{}mode {}", text.empty() ? "" : ", ", mode);
+        }
+        FreeLibrary(powrprof);
+    }
+    SYSTEM_POWER_STATUS status{};
+    if (GetSystemPowerStatus(&status) && status.BatteryFlag != 128 && status.BatteryFlag != 255) {
+        text += fmt::format("{}{}{}", text.empty() ? "" : ", ",
+                            status.ACLineStatus == 0 ? "on battery" : "plugged in",
+                            status.SystemStatusFlag == 1 ? ", battery saver on" : "");
+    }
+    return text.empty() ? std::string{"unknown"} : text;
+}
+#endif
+
 constexpr int default_mouse_hide_timeout = 2500;
 constexpr int default_input_update_timeout = 1;
 constexpr int EmuThreadStopTimeoutMs = 10'000;
@@ -437,6 +520,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     ConnectMenuEvents();
     ConnectWidgetEvents();
     SetUpFritchiiUi();
+    SetUpProfilingMode();
 
     QtCommon::SetupHID();
     controller_dialog->refreshConfiguration();
@@ -2423,6 +2507,20 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                      .arg(QString::fromStdString(title_name), instruction_set_suffix)
                      .toStdString();
     LOG_INFO(Frontend, "Booting game: {:016X} | {} | {}", title_id, title_name, title_version);
+    if (const std::string switches = Nx2SwitchSummary(); !switches.empty()) {
+        LOG_INFO(Frontend, "Test switches: {}", switches);
+    } else {
+        LOG_INFO(Frontend, "Test switches: none set");
+    }
+    if (ProfilingMode::Active()) {
+        const std::string& applied = ProfilingMode::Applied();
+        LOG_INFO(Frontend, "Profiling mode ON: {}",
+                 applied.empty() ? std::string{"no switches added (all set elsewhere)"} : applied);
+    }
+#ifdef _WIN32
+    LOG_INFO(Frontend, "Power: {}", WindowsPowerText());
+    Common::LogCpuPlacement();
+#endif
     const auto gpu_vendor = QtCommon::system->GPU().Renderer().GetDeviceVendor();
     UpdateWindowTitle(title_name, title_version, gpu_vendor);
 
@@ -3710,6 +3808,9 @@ void MainWindow::ShowFullscreen() {
             return;
         }
         window->hide();
+        // A maximized window keeps the work area and ignores the new geometry, so the taskbar
+        // stays visible; the saved geometry restores the maximized state afterwards.
+        window->setWindowState(window->windowState() & ~Qt::WindowMaximized);
         window->setWindowFlags(window->windowFlags() | Qt::FramelessWindowHint);
         const auto screen_geometry = GuessCurrentScreen(window)->geometry();
         window->setGeometry(screen_geometry.x(), screen_geometry.y(), screen_geometry.width(),
@@ -4353,6 +4454,57 @@ void MainWindow::OnOpenModFolder() {
 
 void MainWindow::OnExportLog() {
     ExportLog::Export(this, vk_device_records);
+}
+
+void MainWindow::SetUpProfilingMode() {
+    // Help > Profiling Mode (both looks), first in the menu: turn it on, play, Export Log.
+    auto* action = new QAction(tr("Profiling Mode"), this);
+    action->setCheckable(true);
+    action->setChecked(UISettings::values.profiling_mode.GetValue());
+    QAction* first = ui->menu_Help->actions().value(0);
+    ui->menu_Help->insertAction(first, action);
+    if (!FritchiiUi::Enabled()) {
+        ui->menu_Help->insertSeparator(first);
+    }
+    connect(action, &QAction::toggled, this, [this](bool on) {
+        UISettings::values.profiling_mode = on;
+        config->SaveAllValues();
+        // Its switches are read once per process: only a new start of Fritchii changes them.
+        if (on == ProfilingMode::Active()) {
+            return;
+        }
+        QString text = on ? tr("Restart Fritchii to turn profiling mode on.")
+                          : tr("Restart Fritchii to turn profiling mode off.");
+        if (emulation_running || boot_in_progress) {
+            text += QStringLiteral("\n\n") + tr("Save your game first.");
+        }
+        if (on) {
+            text += QStringLiteral("\n\n") + tr("Then play as usual and send us Help > Export Log.");
+        }
+        QMessageBox box(QMessageBox::Question, tr("Profiling Mode"), text, QMessageBox::NoButton,
+                        this);
+        QPushButton* restart = box.addButton(tr("Restart Now"), QMessageBox::AcceptRole);
+        box.addButton(tr("Later"), QMessageBox::RejectRole);
+        box.setDefaultButton(restart);
+        box.exec();
+        if (box.clickedButton() == restart) {
+            ProfilingMode::RestartFritchii(*this, [this] { return close_pending || !isVisible(); });
+        }
+    });
+
+    if (!ProfilingMode::Active()) {
+        return;
+    }
+    // On in this start: a red label in the status bar and the banner on the game.
+    auto* label = new QLabel(tr("PROFILING ON"), this);
+    label->setStyleSheet(QStringLiteral("QLabel { background: #d31f2f; color: white; "
+                                        "font-weight: bold; padding: 2px 10px; "
+                                        "border-radius: 4px; }"));
+    statusBar()->insertPermanentWidget(0, label);
+    auto* banner =
+        new ProfilingMode::Banner(this, [this] { return static_cast<QWidget*>(render_window); });
+    connect(this, &MainWindow::EmulationStarting, banner, [banner] { banner->Start(); });
+    connect(this, &MainWindow::EmulationStopping, banner, [banner] { banner->Stop(); });
 }
 
 void MainWindow::ShowErrorWithExportLog(const QString& title, const QString& text) {
@@ -5268,7 +5420,9 @@ void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view
 
     const auto override_title =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
-    const auto window_title = override_title.empty() ? yuzu_title : override_title;
+    // Profiling mode: the title says so too (taskbar, window list).
+    const auto window_title = fmt::format("{}{}", ProfilingMode::Active() ? "[PROFILING] " : "",
+                                          override_title.empty() ? yuzu_title : override_title);
 
     if (title_name.empty()) {
         setWindowTitle(QString::fromStdString(window_title));
@@ -5511,12 +5665,16 @@ void MainWindow::SetOotHighRefresh(bool on) {
         case Settings::OotRefreshCap::Hz165:
             hz = 165;
             break;
+        case Settings::OotRefreshCap::Unlimited:
+            hz = -1;
+            break;
         case Settings::OotRefreshCap::Display:
         default:
             break;
         }
-        text = hz != 0 ? tr("High refresh: on (%1 FPS cap)").arg(hz)
-                       : tr("High refresh: on (monitor refresh cap)");
+        text = hz > 0   ? tr("High refresh: on (%1 FPS cap)").arg(hz)
+               : hz < 0 ? tr("High refresh: on (no cap)")
+                        : tr("High refresh: on (monitor refresh cap)");
         break;
     }
     case FileSys::OotHighRefreshSwitch::DisabledInAddOns:

@@ -10,8 +10,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <utility>
@@ -23,6 +25,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/memory_detect.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -33,9 +36,11 @@
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_kept_blocks.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/one_follower.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
@@ -486,6 +491,146 @@ void GetHeapBudgets(const Device& device, std::array<VmaBudget, VK_MAX_MEMORY_HE
     }
 }
 
+// FRITCHII_KEEP_BLOCKS: VMA's vkAllocateMemory and vkFreeMemory go through these, so a freed
+// block can be kept and handed back (vulkan_kept_blocks.h). With nothing kept and the switch off
+// they only pass the call on.
+PFN_vkAllocateMemory g_real_allocate_memory{};
+PFN_vkFreeMemory g_real_free_memory{};
+
+// FRITCHII_MEM_CENSUS (boot): VMA's maps of host-visible memory are tagged "VMA host maps" in the
+// memory census, so their resident pages are told apart from the driver's other memory. Off: VMA
+// calls the driver directly.
+PFN_vkMapMemory g_real_map_memory{};
+PFN_vkUnmapMemory g_real_unmap_memory{};
+struct CensusMemory {
+    VkDeviceSize first{};  ///< Size
+    void* second{};        ///< Where VMA mapped it (null: not mapped)
+    bool device_local{};
+    bool host_visible{};
+};
+std::mutex g_census_map_mutex;
+std::unordered_map<VkDeviceMemory, CensusMemory> g_census_maps;
+
+void CensusNoteAllocation(VmaAllocator allocator, uint32_t type, VkDeviceMemory memory,
+                          VkDeviceSize size) {
+    VkMemoryPropertyFlags flags{};
+    vmaGetMemoryTypeProperties(allocator, type, &flags);
+    std::scoped_lock lock{g_census_map_mutex};
+    g_census_maps[memory] = {size, nullptr, (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
+                             (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0};
+}
+
+void CensusForgetAllocation(VkDeviceMemory memory) {
+    std::scoped_lock lock{g_census_map_mutex};
+    if (const auto it = g_census_maps.find(memory); it != g_census_maps.end()) {
+        if (it->second.second != nullptr) {
+            Common::MemCensus::Untag(it->second.second);
+        }
+        g_census_maps.erase(it);
+    }
+}
+
+/// The census's size matches: sizes of VMA's live device memory of one kind. 16-64 MiB private
+/// allocations (315, 8.4 GB committed, 1.35 GB resident at the market, 2026-11-16) looked like
+/// the driver's copies of device-local memory (VMA's 32 MiB blocks and dedicated images).
+std::vector<u64> CensusMemorySizes(bool device_local_only) {
+    std::vector<u64> sizes;
+    std::scoped_lock lock{g_census_map_mutex};
+    for (const auto& [memory, entry] : g_census_maps) {
+        if (device_local_only ? (entry.device_local && !entry.host_visible)
+                              : (entry.host_visible && entry.second == nullptr)) {
+            sizes.push_back(entry.first);
+        }
+    }
+    return sizes;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CensusMapMemory(VkDevice device, VkDeviceMemory memory,
+                                               VkDeviceSize offset, VkDeviceSize size,
+                                               VkMemoryMapFlags flags, void** data) {
+    const VkResult result = g_real_map_memory(device, memory, offset, size, flags, data);
+    if (result == VK_SUCCESS && data != nullptr && *data != nullptr) {
+        std::scoped_lock lock{g_census_map_mutex};
+        auto& entry = g_census_maps[memory];
+        const VkDeviceSize bytes =
+            size != VK_WHOLE_SIZE ? size : (entry.first > offset ? entry.first - offset : 0);
+        entry.second = *data;
+        Common::MemCensus::Tag("VMA host maps", *data, bytes);
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL CensusUnmapMemory(VkDevice device, VkDeviceMemory memory) {
+    {
+        std::scoped_lock lock{g_census_map_mutex};
+        if (const auto it = g_census_maps.find(memory); it != g_census_maps.end() &&
+                                                         it->second.second != nullptr) {
+            Common::MemCensus::Untag(it->second.second);
+            it->second.second = nullptr;
+        }
+    }
+    g_real_unmap_memory(device, memory);
+}
+
+u64 NanosecondsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL KeptBlocksAllocateMemory(VkDevice device,
+                                                        const VkMemoryAllocateInfo* allocate_info,
+                                                        const VkAllocationCallbacks* allocator,
+                                                        VkDeviceMemory* memory) {
+    KeptBlocks* const kept = KeptBlocks::Active(device);
+    if (kept == nullptr) {
+        return g_real_allocate_memory(device, allocate_info, allocator, memory);
+    }
+    if (kept->Take(*allocate_info, *memory)) {
+        return VK_SUCCESS;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    VkResult result = g_real_allocate_memory(device, allocate_info, allocator, memory);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+        result == VK_ERROR_TOO_MANY_OBJECTS) {
+        // The kept blocks may hold what the driver did not find: they all go, and nothing is
+        // kept until the texture cache sets the limit again.
+        kept->SetLimit(0);
+        if (const u64 released = kept->Release(); released != 0) {
+            const VkResult failed = result;
+            result = g_real_allocate_memory(device, allocate_info, allocator, memory);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "FRITCHII_KEEP_BLOCKS: a {} MiB allocation in memory type {} failed "
+                            "({}); gave back the {} MiB kept and tried again ({})",
+                            allocate_info->allocationSize >> 20, allocate_info->memoryTypeIndex,
+                            static_cast<int>(failed), released >> 20, static_cast<int>(result));
+            }
+        }
+    }
+    if (result == VK_SUCCESS) {
+        kept->CountDriverAllocation(allocate_info->allocationSize, NanosecondsSince(start));
+        kept->Track(*allocate_info, *memory);
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL KeptBlocksFreeMemory(VkDevice device, VkDeviceMemory memory,
+                                                const VkAllocationCallbacks* allocator) {
+    KeptBlocks* const kept = KeptBlocks::Active(device);
+    if (kept == nullptr) {
+        g_real_free_memory(device, memory, allocator);
+        return;
+    }
+    if (kept->Keep(memory)) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    g_real_free_memory(device, memory, allocator);
+    kept->CountDriverFree(NanosecondsSince(start));
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -553,6 +698,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     const bool is_amd = is_amd_driver || is_radv;
 
     const bool is_intel_windows = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+    if (driver_id == VK_DRIVER_ID_AMD_PROPRIETARY) {
+        // The one follower's AMD safe default reads it at the split's start (later, on the GPU
+        // thread).
+        VideoCommon::OneFollower::NoteAmdProprietaryDriver();
+    }
 
     const bool is_nvidia = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
     const bool is_mvk = driver_id == VK_DRIVER_ID_MOLTENVK;
@@ -586,6 +736,25 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                      VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV,
         };
         first_next = &diagnostics_nv;
+    }
+
+    // FRITCHII_AMD_OVERALLOCATE (boot, default 0; port of zortos293/Lichii #1335 via Frizti/Fritchii
+    // #61): AMD's own Windows driver fails device-local allocations once the heap is full unless
+    // overallocation is allowed, which lets them spill into system memory as other drivers do.
+    // 27 failing sessions upstream, 24 on AMD, mostly 8 GB cards running OoT.
+    VkDeviceMemoryOverallocationCreateInfoAMD overallocation_amd{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD,
+        .pNext = first_next,
+        .overallocationBehavior = VK_MEMORY_OVERALLOCATION_BEHAVIOR_ALLOWED_AMD,
+    };
+    if (const char* overallocate = std::getenv("FRITCHII_AMD_OVERALLOCATE");
+        overallocate != nullptr && overallocate[0] != '\0' && overallocate[0] != '0' &&
+        is_amd_driver &&
+        supported_extensions.contains(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME)) {
+        loaded_extensions.insert(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
+        first_next = &overallocation_amd;
+        LOG_INFO(Render_Vulkan, "FRITCHII_AMD_OVERALLOCATE: VK_AMD_memory_overallocation_behavior "
+                                "on, device memory may overflow into system memory");
     }
 
     is_blit_depth24_stencil8_supported = TestDepthStencilBlits(VK_FORMAT_D24_UNORM_S8_UINT);
@@ -860,7 +1029,61 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (device_float16 && WantsAmdFsr4(driver_id)) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
-    logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
+    // FRITCHII_QUEUE_PRIORITY (boot, default 0; helper BN, 2026-11-16, docs/fritchii/switches.md):
+    // 1 = the device's queues ask for high global priority (VK_KHR/EXT_global_priority), 2 =
+    // realtime. The driver may refuse (not permitted, or no support): the device is then made as
+    // before, and the log says so.
+    std::vector<VkDeviceQueueCreateInfo> priority_queue_cis(queue_cis.begin(), queue_cis.end());
+    VkDeviceQueueGlobalPriorityCreateInfoKHR queue_global_priority{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
+        .pNext = nullptr,
+        .globalPriority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR,
+    };
+    const char* global_priority_extension = nullptr;
+    if (const char* queue_priority = std::getenv("FRITCHII_QUEUE_PRIORITY");
+        queue_priority != nullptr && std::atoi(queue_priority) > 0) {
+        if (std::atoi(queue_priority) >= 2) {
+            queue_global_priority.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR;
+        }
+        if (supported_extensions.contains(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            global_priority_extension = VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME;
+        } else if (supported_extensions.contains(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            global_priority_extension = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
+        } else {
+            LOG_INFO(Render_Vulkan, "FRITCHII_QUEUE_PRIORITY: the driver has no global priority "
+                                    "extension, queues keep the default priority");
+        }
+        if (global_priority_extension != nullptr &&
+            !loaded_extensions.contains(global_priority_extension)) {
+            loaded_extensions.insert(global_priority_extension);
+            for (auto& ci : priority_queue_cis) {
+                ci.pNext = &queue_global_priority;
+            }
+        } else {
+            global_priority_extension = nullptr;
+        }
+    }
+    if (global_priority_extension != nullptr) {
+        try {
+            logical = vk::Device::Create(physical, priority_queue_cis,
+                                         ExtensionListForVulkan(loaded_extensions), first_next, dld);
+            LOG_INFO(Render_Vulkan, "FRITCHII_QUEUE_PRIORITY: queues made with {} global priority ({})",
+                     queue_global_priority.globalPriority == VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR
+                         ? "realtime"
+                         : "high",
+                     global_priority_extension);
+        } catch (const vk::Exception& exception) {
+            LOG_WARNING(Render_Vulkan,
+                        "FRITCHII_QUEUE_PRIORITY: the driver refused the global priority ({}), "
+                        "device made with the default priority",
+                        exception.what());
+            loaded_extensions.erase(std::string{global_priority_extension});
+            global_priority_extension = nullptr;
+        }
+    }
+    if (global_priority_extension == nullptr) {
+        logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
+    }
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
@@ -877,6 +1100,28 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
+    // FRITCHII_KEEP_BLOCKS set at boot (any value, 0 included, so a session can toggle it live):
+    // VMA's memory calls go through the kept blocks (CreateKeptBlocks). Unset: VMA calls the
+    // driver directly, as before.
+    if (std::getenv("FRITCHII_KEEP_BLOCKS") != nullptr && dld.vkAllocateMemory != nullptr &&
+        dld.vkFreeMemory != nullptr) {
+        g_real_allocate_memory = dld.vkAllocateMemory;
+        g_real_free_memory = dld.vkFreeMemory;
+        functions.vkAllocateMemory = KeptBlocksAllocateMemory;
+        functions.vkFreeMemory = KeptBlocksFreeMemory;
+    }
+    const bool census_maps = Common::MemCensus::Mode() != 0 && dld.vkMapMemory != nullptr &&
+                             dld.vkUnmapMemory != nullptr;
+    if (census_maps) {
+        g_real_map_memory = dld.vkMapMemory;
+        g_real_unmap_memory = dld.vkUnmapMemory;
+        functions.vkMapMemory = CensusMapMemory;
+        functions.vkUnmapMemory = CensusUnmapMemory;
+        Common::MemCensus::SetSizeSource("device-local memory (driver copy?)",
+                                         [] { return CensusMemorySizes(true); });
+        Common::MemCensus::SetSizeSource("host-visible memory not mapped",
+                                         [] { return CensusMemorySizes(false); });
+    }
     // EDEN_NX2_VMA_NO_PREFER_DEDICATED (boot, default on, 0 = off; ported;
     // with 32 MiB blocks market A/B 2026-11-11: off 41.4/40.3, on 41.5/42.8 fps,
     // same VRAM):
@@ -943,12 +1188,20 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
     // Counts the allocator's vkAllocateMemory / vkFreeMemory calls (blocks and dedicated
     // memory) for the "Churn (600 frames)" line.
+    // With FRITCHII_MEM_CENSUS they also note each memory's size for the census's map tags.
     static const VmaDeviceMemoryCallbacks churn_callbacks{
-        .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+        .pfnAllocate = [](VmaAllocator allocator, uint32_t type, VkDeviceMemory memory,
+                          VkDeviceSize size, void*) {
             VideoCommon::Churn::Add(VideoCommon::Churn::DeviceAllocations);
+            if (g_real_map_memory != nullptr) {
+                CensusNoteAllocation(allocator, type, memory, size);
+            }
         },
-        .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+        .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory memory, VkDeviceSize, void*) {
             VideoCommon::Churn::Add(VideoCommon::Churn::DeviceFrees);
+            if (g_real_map_memory != nullptr) {
+                CensusForgetAllocation(memory);
+            }
         },
         .pUserData = nullptr,
     };
@@ -1000,6 +1253,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         // The memory stage counts the calls on it and who makes them (memory_stage_link.cpp).
         VideoCommon::MemoryStageLink::WatchBufferAllocator(buffer_allocator);
     }
+    if (functions.vkAllocateMemory == KeptBlocksAllocateMemory) {
+        CreateKeptBlocks();
+    }
 
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
@@ -1016,6 +1272,11 @@ Device::~Device() {
 #endif
     SaveStaticPipelineCache();
     ShutdownGPULogging();
+    // FRITCHII_KEEP_BLOCKS: kept blocks go back to the driver, and the blocks VMA frees below go
+    // straight to it.
+    if (kept_blocks) {
+        kept_blocks->Close();
+    }
     // Everything allocated from either allocator (the renderer's caches) is gone by now.
     const std::array<VmaAllocator, 2> owners{allocator, buffer_allocator};
     for (size_t owner = 0; owner < owners.size(); ++owner) {
@@ -1032,6 +1293,107 @@ Device::~Device() {
         vmaDestroyAllocator(buffer_allocator);
     }
     vmaDestroyAllocator(allocator);
+}
+
+void Device::CreateKeptBlocks() {
+    const VkPhysicalDeviceMemoryProperties memory_properties =
+        physical.GetMemoryProperties().memoryProperties;
+    auto kept = std::make_unique<KeptBlocks>(*logical, g_real_allocate_memory, g_real_free_memory,
+                                             memory_properties);
+    // The memory type images take from VMA's default blocks.
+    const VkImageCreateInfo probe_ci{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = {1024, 1024, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VmaAllocationCreateInfo image_alloc{};
+    image_alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    image_alloc.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    u32 image_type = VK_MAX_MEMORY_TYPES;
+    if (vmaFindMemoryTypeIndexForImageInfo(allocator, &probe_ci, &image_alloc, &image_type) !=
+        VK_SUCCESS) {
+        image_type = VK_MAX_MEMORY_TYPES;
+    }
+    if (is_integrated || !kept->Keeps(image_type)) {
+        // An integrated GPU's device-local memory is system memory, and its types are mostly
+        // host-visible: nothing to keep.
+        LOG_INFO(Render_Vulkan,
+                 "Kept blocks (FRITCHII_KEEP_BLOCKS): off, images take memory type {} which is "
+                 "not kept{}",
+                 image_type, is_integrated ? " (integrated GPU)" : "");
+        return;
+    }
+    kept->Activate();
+    kept_blocks = std::move(kept);
+    // FRITCHII_KEEP_BLOCKS_PREMAKE=1 (boot): the cap's worth of VMA default-size blocks now.
+    const u64 cap = KeptBlocks::SwitchCap();
+    const char* premake = std::getenv("FRITCHII_KEEP_BLOCKS_PREMAKE");
+    u32 made = 0;
+    double ms = 0.0;
+    const VkDeviceSize block_size = [] {
+        const char* value = std::getenv("EDEN_NX2_VMA_BLOCK_MIB");
+        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 32;
+        return VkDeviceSize{(mib != 0 ? mib : 16) * 1024u * 1024u};
+    }();
+    if (premake != nullptr && std::atoi(premake) != 0 && cap != 0) {
+        // The flags VMA gives its blocks (VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT).
+        const VkMemoryAllocateFlags flags =
+            extensions.buffer_device_address
+                ? static_cast<VkMemoryAllocateFlags>(VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
+                : VkMemoryAllocateFlags{0};
+        const auto start = std::chrono::steady_clock::now();
+        made = kept_blocks->Make(image_type, block_size, static_cast<u32>(cap / block_size),
+                                 flags);
+        ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                 .count();
+    }
+    LOG_INFO(Render_Vulkan,
+             "Kept blocks (FRITCHII_KEEP_BLOCKS, live): cap {} MiB now (at most 512), memory type "
+             "{}; premade {} blocks of {} MiB in {:.1f} ms (FRITCHII_KEEP_BLOCKS_PREMAKE)",
+             cap >> 20, image_type, made, block_size >> 20, ms);
+}
+
+void Device::LimitKeptBlocks(u64 budget, u64 critical) const {
+    if (!kept_blocks) {
+        return;
+    }
+    // The live usage (the kept blocks counted as free) may fill to the cache's critical use; the
+    // kept blocks get what it leaves under that, plus half of the margin above it, so the
+    // process stays at least half the margin under the budget (Windows lowers the budget as the
+    // card fills).
+    const u64 ceiling = critical < budget ? critical + (budget - critical) / 2 : budget;
+    const u64 live = GetDeviceMemoryUsage();
+    kept_blocks->SetLimit(ceiling > live ? ceiling - live : 0);
+}
+
+u64 Device::ReleaseKeptBlocks() const {
+    if (!kept_blocks) {
+        return 0;
+    }
+    return kept_blocks->Release();
+}
+
+void Device::TickKeptBlocks() const {
+    if (kept_blocks) {
+        kept_blocks->Tick();
+    }
+}
+
+u64 Device::KeptBlockBytes() const noexcept {
+    return kept_blocks ? kept_blocks->KeptBytes() : 0;
 }
 
 VmaPool Device::GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const {
@@ -1175,9 +1537,78 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 
 void Device::ReportLoss() const {
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+    ReportDeviceFault();
 
     // Wait for the log to flush and for Nsight Aftermath to dump the results
     std::this_thread::sleep_for(std::chrono::seconds{15});
+}
+
+void Device::ReportDeviceFault() const {
+    if (!device_fault_features.deviceFault || !dld.vkGetDeviceFaultInfoEXT) {
+        LOG_CRITICAL(Render_Vulkan, "Device fault info: not supported by the driver");
+        return;
+    }
+    VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult result = dld.vkGetDeviceFaultInfoEXT(*logical, &counts, nullptr);
+    if (result != VK_SUCCESS) {
+        LOG_CRITICAL(Render_Vulkan, "Device fault info: query failed ({})",
+                     static_cast<int>(result));
+        return;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendor_infos(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
+        .pAddressInfos = addresses.data(),
+        .pVendorInfos = vendor_infos.data(),
+    };
+    result = dld.vkGetDeviceFaultInfoEXT(*logical, &counts, &info);
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        LOG_CRITICAL(Render_Vulkan, "Device fault info: query failed ({})",
+                     static_cast<int>(result));
+        return;
+    }
+    LOG_CRITICAL(Render_Vulkan, "Device fault: {} ({} addresses, {} vendor records)",
+                 info.description, counts.addressInfoCount, counts.vendorInfoCount);
+    for (u32 i = 0; i < counts.addressInfoCount; ++i) {
+        const VkDeviceFaultAddressInfoEXT& address = addresses[i];
+        const char* type = "unknown";
+        switch (address.addressType) {
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT:
+            type = "none";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT:
+            type = "invalid read";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT:
+            type = "invalid write";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT:
+            type = "invalid execute";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT:
+            type = "instruction pointer (unknown)";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT:
+            type = "instruction pointer (invalid)";
+            break;
+        case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT:
+            type = "instruction pointer (fault)";
+            break;
+        default:
+            break;
+        }
+        const VkDeviceSize precision = (std::max)(address.addressPrecision, VkDeviceSize{1});
+        const VkDeviceSize lower = address.reportedAddress & ~(precision - 1);
+        LOG_CRITICAL(Render_Vulkan, "Device fault address {}: {} at {:#x} (range [{:#x}, {:#x}))",
+                     i, type, address.reportedAddress, lower, lower + precision);
+    }
+    for (u32 i = 0; i < counts.vendorInfoCount; ++i) {
+        const VkDeviceFaultVendorInfoEXT& vendor = vendor_infos[i];
+        LOG_CRITICAL(Render_Vulkan, "Device fault vendor record {}: {} (code {:#x}, data {:#x})", i,
+                     vendor.description, vendor.vendorFaultCode, vendor.vendorFaultData);
+    }
 }
 
 void Device::SaveShader(std::span<const u32> spirv) const {
@@ -1479,8 +1910,25 @@ bool Device::GetSuitability(bool requires_swapchain) {
         SetNext(next, graphics_pipeline_library_features);
     }
 
+    // VK_EXT_device_fault: what the driver knows about a device loss (ReportLoss). Only the
+    // report reads it; FRITCHII_DEVICE_FAULT=0 (boot) leaves the extension off.
+    const char* const device_fault_switch = std::getenv("FRITCHII_DEVICE_FAULT");
+    const bool has_device_fault_extension =
+        supported_extensions.contains(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) &&
+        (device_fault_switch == nullptr || std::atoi(device_fault_switch) != 0);
+    if (has_device_fault_extension) {
+        device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+        SetNext(next, device_fault_features);
+    }
+
     // Perform the feature test.
     physical.GetFeatures2(features2);
+
+    if (has_device_fault_extension) {
+        loaded_extensions.insert(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        // No vendor binary dumps: only the description, addresses and vendor codes are logged.
+        device_fault_features.deviceFaultVendorBinary = VK_FALSE;
+    }
 
     // Base Vulkan 1.0 features are always valid regardless of instance version.
     features.features = features2.features;
@@ -2276,7 +2724,12 @@ u64 Device::QueryDeviceMemoryUsage() const {
     }
     u64 result{};
     for (const size_t heap : valid_heap_memory) {
-        result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
+        u64 usage = AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
+        if (kept_blocks) {
+            // FRITCHII_KEEP_BLOCKS: kept blocks are free memory to the caches.
+            usage -= (std::min)(usage, kept_blocks->KeptBytes(static_cast<u32>(heap)));
+        }
+        result += usage;
     }
     return result;
 }
@@ -2289,6 +2742,65 @@ u64 Device::GetDeviceMemorySlack() const {
     GetHeapBudgets(*this, heap_budgets);
     const VmaStatistics& statistics = heap_budgets[main_heap].statistics;
     return statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
+}
+
+bool Device::MainHeapUsage(u64& usage, u64& budget_bytes) const {
+    if (!extensions.memory_budget) {
+        return false;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    physical.GetMemoryProperties(&budget);
+    usage = budget.heapUsage[main_heap];
+    budget_bytes = budget.heapBudget[main_heap];
+    if (heap_size_limit != 0) {
+        budget_bytes = (std::min)(budget_bytes, heap_size_limit);
+    }
+    return true;
+}
+
+void Device::LogMemoryHeaps() const {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    const auto mem_info =
+        physical.GetMemoryProperties(extensions.memory_budget ? &budget : nullptr);
+    const auto& properties = mem_info.memoryProperties;
+    for (u32 heap = 0; heap < properties.memoryHeapCount; ++heap) {
+        const VkMemoryHeap& entry = properties.memoryHeaps[heap];
+        const bool local = (entry.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+        const std::string state =
+            extensions.memory_budget
+                ? fmt::format("driver budget {} MiB, usage {} MiB", budget.heapBudget[heap] >> 20,
+                              budget.heapUsage[heap] >> 20)
+                : std::string{"no budget (no VK_EXT_memory_budget)"};
+        LOG_INFO(Render_Vulkan, "Memory heap {}: {} MiB, {}{}, {}", heap, entry.size >> 20,
+                 local ? "device-local" : "host", heap == main_heap ? " (main heap, images)" : "",
+                 state);
+    }
+    std::string types;
+    for (u32 type = 0; type < properties.memoryTypeCount; ++type) {
+        const VkMemoryPropertyFlags flags = properties.memoryTypes[type].propertyFlags;
+        std::string kind;
+        if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+            kind += "local ";
+        }
+        if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+            kind += "visible ";
+        }
+        if ((flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0) {
+            kind += "coherent ";
+        }
+        if ((flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0) {
+            kind += "cached ";
+        }
+        if (!kind.empty()) {
+            kind.pop_back();
+        }
+        fmt::format_to(std::back_inserter(types), "{}{} heap {} ({})", type == 0 ? "" : "; ",
+                       type, properties.memoryTypes[type].heapIndex,
+                       kind.empty() ? "none" : kind);
+    }
+    LOG_INFO(Render_Vulkan, "Memory types: {}", types);
 }
 
 u64 Device::GetDeviceMemoryBudget() const {
@@ -2346,6 +2858,36 @@ void Device::CollectPhysicalMemoryInfo() {
             LOG_WARNING(Render_Vulkan, "EDEN_NX2_VRAM_LIMIT_MIB={} is not a size in MiB, ignored",
                         value);
         }
+    }
+    // FRITCHII_VRAM_SIM_OTHERS (boot, default 0; with EDEN_NX2_VRAM_LIMIT_MIB): the limit alone
+    // gives the simulated card a budget of the whole limit, but a real card's budget is its heap
+    // less what Windows and the other programs hold (16 GB card: 16376 MiB heap, 15297 budget).
+    // An 8 GB card on the same desktop has the same others, so its budget is ~7.1 GiB, not 8.
+    // With the switch the limit becomes the limit less those others, measured here once: the
+    // budget, the texture cache's thresholds and VMA's heap limit then sit where a real card's
+    // budget would. VMA fails past it, where a real card would spill into system memory; images
+    // then go to host memory, which is as slow as the spill.
+    if (const char* sim = std::getenv("FRITCHII_VRAM_SIM_OTHERS");
+        sim != nullptr && sim[0] != '\0' && sim[0] != '0' && heap_size_limit != 0 &&
+        extensions.memory_budget && !is_integrated) {
+        size_t largest = 0;
+        for (size_t heap = 0; heap < num_properties; ++heap) {
+            const VkMemoryHeap& candidate = mem_properties.memoryHeaps[heap];
+            if ((candidate.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 &&
+                ((mem_properties.memoryHeaps[largest].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ==
+                     0 ||
+                 candidate.size > mem_properties.memoryHeaps[largest].size)) {
+                largest = heap;
+            }
+        }
+        const u64 heap_size = mem_properties.memoryHeaps[largest].size;
+        const u64 others = heap_size - (std::min)(heap_size, u64{budget.heapBudget[largest]});
+        const u64 limited = heap_size_limit - (std::min)(others, heap_size_limit / 2);
+        LOG_INFO(Render_Vulkan,
+                 "FRITCHII_VRAM_SIM_OTHERS: others hold {} MiB of this card's {} MiB heap; the "
+                 "simulated card's limit and budget are {} MiB (EDEN_NX2_VRAM_LIMIT_MIB {})",
+                 others >> 20, heap_size >> 20, limited >> 20, heap_size_limit >> 20);
+        heap_size_limit = limited;
     }
     const auto limit = [this](u64 size) {
         return heap_size_limit != 0 ? (std::min)(size, heap_size_limit) : size;

@@ -16,6 +16,7 @@
 #include "common/nx2_hitch.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
@@ -306,6 +307,14 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     const VkCompositeAlphaFlagBitsKHR alpha_flags{ChooseAlphaFlags(capabilities)};
     surface_format = ChooseSwapSurfaceFormat(formats);
     present_mode = ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed);
+    // For Ocarina of Time's high refresh rate cap (nx2_gsv.h): only FIFO limits it to the display.
+    VideoCommon::Nx2Perf::g_present_mode.store(
+        static_cast<int>(present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? Settings::VSyncMode::Immediate
+                         : present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? Settings::VSyncMode::Mailbox
+                         : present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR
+                             ? Settings::VSyncMode::FifoRelaxed
+                             : Settings::VSyncMode::Fifo),
+        std::memory_order_relaxed);
 
     u32 requested_image_count{capabilities.minImageCount + 1};
     // Ensure Triple buffering if possible.

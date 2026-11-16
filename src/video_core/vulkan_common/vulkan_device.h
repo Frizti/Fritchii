@@ -219,6 +219,7 @@ struct VmaBudget;
 namespace Vulkan {
 
 class NsightAftermathTracker;
+class KeptBlocks;
 
 /// Format usage descriptor.
 enum class FormatType { Linear, Optimal, Buffer };
@@ -258,6 +259,9 @@ public:
 
     /// Reports a device loss.
     void ReportLoss() const;
+
+    /// Logs what VK_EXT_device_fault reports about a device loss.
+    void ReportDeviceFault() const;
 
     /// Reports a shader to Nsight Aftermath.
     void SaveShader(std::span<const u32> spirv) const;
@@ -477,6 +481,7 @@ public:
     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
+    FN_MAX_LIMIT_ELEM(ImageDimension2D) \
     FN_MAX_LIMIT_ELEM(FramebufferWidth) \
     FN_MAX_LIMIT_ELEM(FramebufferHeight) \
     FN_MAX_LIMIT_ELEM(FramebufferLayers)
@@ -666,7 +671,15 @@ FN_MAX_LIMIT_LIST
 
     /// Returns true if formatless image load is supported.
     bool IsFormatlessImageLoadSupported() const {
-        return features.features.shaderStorageImageReadWithoutFormat;
+        // FRITCHII_FORMATLESS_13 (boot, default 0): Vulkan 1.3 allows formatless reads per format
+        // even when the global feature is false (Intel on Windows, where every typeless image
+        // read became a constant 0 and scenes rendered black). Off, as before.
+        static const bool formatless_13 = [] {
+            const char* value = std::getenv("FRITCHII_FORMATLESS_13");
+            return value != nullptr && std::atoi(value) != 0;
+        }();
+        return features.features.shaderStorageImageReadWithoutFormat ||
+               (formatless_13 && instance_version >= VK_API_VERSION_1_3);
     }
 
     /// Returns true if storage images of the extended formats (e.g. R16F, RG16F, R8) are supported.
@@ -1192,6 +1205,17 @@ FN_MAX_LIMIT_LIST
         return memory_usage_value.load(std::memory_order_relaxed);
     }
 
+    /// FRITCHII_KEEP_BLOCKS (vulkan_kept_blocks.h): the most the kept blocks may hold, from the
+    /// texture cache's budget check: half the room between the cache's critical use and the
+    /// budget, plus what the live usage leaves under the critical use.
+    void LimitKeptBlocks(u64 budget, u64 critical) const;
+    /// Gives every kept block back now (memory pressure); returns the bytes.
+    u64 ReleaseKeptBlocks() const;
+    /// Once a frame from the texture cache runtime: trims and logs the kept blocks.
+    void TickKeptBlocks() const;
+    /// Bytes the kept blocks hold (counted as free by GetDeviceMemoryUsage).
+    [[nodiscard]] u64 KeptBlockBytes() const noexcept;
+
     /// The buffer allocator's heap budgets: VMA's at FRITCHII_MEMSTAGE_THREAD=0, as its user
     /// published them at 1 (vulkan_device.cpp).
     void BufferHeapBudgets(VmaBudget* budgets) const;
@@ -1207,6 +1231,20 @@ FN_MAX_LIMIT_LIST
     /// allocation in (the unused part of its blocks). GetDeviceMemoryUsage() does not count it,
     /// yet the driver does: with the heap at its budget it is not available to new images.
     u64 GetDeviceMemorySlack() const;
+
+    /// FRITCHII_VRAM_REPORT: the main device-local heap's usage and budget as the driver reports
+    /// them (all of this process's memory in it, the unused part of blocks included), the budget
+    /// at most the EDEN_NX2_VRAM_LIMIT_MIB limit. False without VK_EXT_memory_budget.
+    bool MainHeapUsage(u64& usage, u64& budget) const;
+
+    /// The largest device-local heap, where images live.
+    size_t GetMainHeap() const {
+        return main_heap;
+    }
+
+    /// Boot: one line per memory heap (size, kind, the driver's budget and usage) and one line
+    /// with every memory type (flags and heap).
+    void LogMemoryHeaps() const;
 
     u32 GetSetsPerPool() const {
         return sets_per_pool;
@@ -1483,6 +1521,7 @@ private:
     bool graphics_pipeline_library_enabled{};
 
     VkPhysicalDeviceFeatures2 features2{};
+    VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
     VkPhysicalDeviceProperties2 properties2{};
 
     // Misc features
@@ -1538,6 +1577,10 @@ private:
 
     /// Nsight Aftermath GPU crash tracker
     std::unique_ptr<NsightAftermathTracker> nsight_aftermath_tracker;
+
+    /// FRITCHII_KEEP_BLOCKS: VMA's freed device-local blocks (vulkan_kept_blocks.h).
+    void CreateKeptBlocks();
+    std::unique_ptr<KeptBlocks> kept_blocks;
 };
 
 } // namespace Vulkan

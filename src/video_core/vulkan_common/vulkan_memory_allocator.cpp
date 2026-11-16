@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <tuple>
 #include <unordered_set>
@@ -36,6 +37,7 @@
 #include "common/memory_detect.h"
 #include <ranges>
 #include "video_core/memory_stage_link.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -396,6 +398,314 @@ static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateIn
     return pool;
 }
 
+namespace {
+
+// FRITCHII_KILL_RT_POOL (live, default 0): colour render targets from their own VMA pool, as
+// EDEN_NX2_DEPTH_POOL does for depth. Outside a pool the driver's preference gives a colour
+// target its own memory, so each new one is a driver allocation on the GPU back thread. In the
+// owner's Stalchild fights (fight-keepers*, 2026-11-14) the only frames over 50 ms after the load
+// were single image creates of 35 and 124 ms right at kills (one of 159 ms in a playtest), with
+// the back blocked and the worker, fencing and present threads idle behind it. 1 = colour targets
+// of up to 32 MiB are made with vkCreateImage, allocated from the pool (64 MiB blocks) and bound;
+// an image the pool refuses goes the old way. 2 = dry: nothing moves, the census below counts
+// the candidates and how many of them got memory of their own. Only memory placement changes,
+// never what is drawn. Images made before a switch change stay where they are.
+int KillRtPoolMode() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_kill_rt_pool,
+                                            "FRITCHII_KILL_RT_POOL");
+}
+
+constexpr VkDeviceSize KillPoolBlockBytes = VkDeviceSize{64} << 20;
+constexpr VkDeviceSize KillPoolMaxBytes = KillPoolBlockBytes / 2;
+
+bool IsKillPoolCandidate(const VkImageCreateInfo& ci, bool dedicated) {
+    constexpr VkImageCreateFlags refused = VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                                           VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                                           VK_IMAGE_CREATE_SPARSE_ALIASED_BIT |
+                                           VK_IMAGE_CREATE_DISJOINT_BIT;
+    return !dedicated && (ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0 &&
+           (ci.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0 &&
+           (ci.flags & refused) == 0 && ci.imageType == VK_IMAGE_TYPE_2D;
+}
+
+struct KillPoolEntry {
+    VmaAllocator owner;
+    u32 type;
+    VmaPool pool;
+};
+std::mutex g_kill_pool_mutex;
+std::vector<KillPoolEntry> g_kill_pools;
+
+// One pool per allocator and memory type, never destroyed (images may outlive the allocator
+// object). FRITCHII_KILL_RT_POOL_BLOCKS (boot, default 2, at most 8 = 512 MiB): blocks the pool
+// makes at once and never gives back, so the first targets of a fight find memory already made.
+VmaPool ColourAttachmentPool(VmaAllocator allocator, const VkImageCreateInfo& ci,
+                             const VmaAllocationCreateInfo& alloc_ci) {
+    u32 type = 0;
+    if (vmaFindMemoryTypeIndexForImageInfo(allocator, &ci, &alloc_ci, &type) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    std::scoped_lock lock{g_kill_pool_mutex};
+    for (const KillPoolEntry& entry : g_kill_pools) {
+        if (entry.owner == allocator && entry.type == type) {
+            return entry.pool;
+        }
+    }
+    static const u32 min_blocks = [] {
+        const char* value = std::getenv("FRITCHII_KILL_RT_POOL_BLOCKS");
+        const unsigned long blocks = value != nullptr ? std::strtoul(value, nullptr, 10) : 2UL;
+        return static_cast<u32>((std::min)(blocks, 8UL));
+    }();
+    const VmaPoolCreateInfo pool_ci{
+        .memoryTypeIndex = type,
+        .flags = 0,
+        .blockSize = KillPoolBlockBytes,
+        .minBlockCount = min_blocks,
+        .maxBlockCount = 0,
+        .priority = 0.f,
+        .minAllocationAlignment = 0,
+        .pMemoryAllocateNext = nullptr,
+    };
+    VmaPool pool{};
+    if (vmaCreatePool(allocator, &pool_ci, &pool) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Colour target pool (FRITCHII_KILL_RT_POOL) for memory type {}: 64 MiB blocks, {} kept",
+             type, min_blocks);
+    g_kill_pools.push_back({allocator, type, pool});
+    return pool;
+}
+
+// What the census sorts image creates into.
+enum KillKind : u32 {
+    KillColourPool,  ///< a colour target in the FRITCHII_KILL_RT_POOL pool
+    KillColourOwn,   ///< a colour target with memory of its own (a driver allocation)
+    KillColourBlock, ///< a colour target in a shared VMA block
+    KillDepthOwn,
+    KillDepthBlock, ///< includes EDEN_NX2_DEPTH_POOL
+    KillOtherOwn,
+    KillOtherBlock,
+    KillKinds,
+};
+constexpr std::array<const char*, KillKinds> kill_kind_names{
+    "colour in the kill pool", "colour own memory", "colour in a block", "depth own memory",
+    "depth in a block",        "other own memory",  "other in a block"};
+
+struct KillCensus {
+    std::array<u64, KillKinds> count{};
+    std::array<u64, KillKinds> slow5{};
+    std::array<u64, KillKinds> slow20{};
+    std::array<u64, KillKinds> ns{};
+    std::array<u64, KillKinds> longest{};
+    u64 worst_ns = 0;
+    VkExtent3D worst_extent{};
+    u32 worst_format = 0;
+    u32 worst_usage = 0;
+    u32 worst_kind = 0;
+    u64 placed = 0;      ///< taken by the pool
+    u64 too_big = 0;     ///< over KillPoolMaxBytes: went the old way
+    u64 refused = 0;     ///< the pool or its bind failed: went the old way
+    u64 candidates = 0;  ///< dry mode: colour targets the pool would have tried
+    u64 dry_own = 0;     ///< ... of them given memory of their own
+    u64 window_start = 0;
+};
+std::mutex g_census_mutex;
+KillCensus g_census;
+
+// vkCreateImage, then the pool's memory, then the bind. False with nothing left behind when the
+// pool does not take the image (too large, no pool, no room): the caller goes the old way.
+bool TryKillPool(const Device& device, VmaAllocator allocator, const VkImageCreateInfo& ci,
+                 const VmaAllocationCreateInfo& alloc_ci, VkImage& handle,
+                 VmaAllocation& allocation, VmaAllocationInfo& alloc_info, bool& too_big) {
+    too_big = false;
+    const VmaPool pool = ColourAttachmentPool(allocator, ci, alloc_ci);
+    if (pool == VK_NULL_HANDLE) {
+        return false;
+    }
+    const auto& dld = device.GetDispatchLoader();
+    const VkDevice logical = *device.GetLogical();
+    VkImage image{};
+    if (dld.vkCreateImage(logical, &ci, nullptr, &image) != VK_SUCCESS) {
+        return false;
+    }
+    VkMemoryRequirements requirements{};
+    dld.vkGetImageMemoryRequirements(logical, image, &requirements);
+    if (requirements.size > KillPoolMaxBytes) {
+        dld.vkDestroyImage(logical, image, nullptr);
+        too_big = true;
+        return false;
+    }
+    // A pool fixes the memory type; usage and preferences are not read (the AUTO usages would
+    // need vmaCreateImage's create info, see TimedVmaCreateImage).
+    VmaAllocationCreateInfo pool_ci = alloc_ci;
+    pool_ci.flags &= ~VmaAllocationCreateFlags{VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT};
+    pool_ci.usage = VMA_MEMORY_USAGE_UNKNOWN;
+    pool_ci.pool = pool;
+    VmaAllocation pooled{};
+    VmaAllocationInfo pooled_info{};
+    if (vmaAllocateMemoryForImage(allocator, image, &pool_ci, &pooled, &pooled_info) !=
+        VK_SUCCESS) {
+        dld.vkDestroyImage(logical, image, nullptr);
+        return false;
+    }
+    if (vmaBindImageMemory(allocator, pooled, image) != VK_SUCCESS) {
+        vmaFreeMemory(allocator, pooled);
+        dld.vkDestroyImage(logical, image, nullptr);
+        return false;
+    }
+    handle = image;
+    allocation = pooled;
+    alloc_info = pooled_info;
+    return true;
+}
+
+// Called after every image made with memory (same thread as the allocation: the allocator is
+// externally synchronized, so the pool statistics below may be read here). Logs every 10 s
+// while FRITCHII_KILL_RT_POOL is not 0, and at 0 only for a window that had a create of 20 ms
+// or more.
+void NoteKillCensus(VmaAllocator allocator, const VkImageCreateInfo& ci, VmaAllocation allocation,
+                    u64 elapsed_ns, bool pooled, bool candidate, int mode) {
+    bool own = false;
+    if (allocation != VK_NULL_HANDLE) {
+        VmaAllocationInfo2 info2{};
+        vmaGetAllocationInfo2(allocator, allocation, &info2);
+        own = info2.dedicatedMemory != VK_FALSE;
+    }
+    const bool colour = (ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+    const bool depth = (ci.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+    const u32 kind = pooled  ? KillColourPool
+                     : depth ? (own ? KillDepthOwn : KillDepthBlock)
+                     : colour ? (own ? KillColourOwn : KillColourBlock)
+                              : (own ? KillOtherOwn : KillOtherBlock);
+    const u64 now = Common::Nx2Hitch::NowNs();
+    std::string line;
+    {
+        std::scoped_lock lock{g_census_mutex};
+        KillCensus& c = g_census;
+        if (c.window_start == 0) {
+            c.window_start = now;
+        }
+        ++c.count[kind];
+        c.ns[kind] += elapsed_ns;
+        c.slow5[kind] += elapsed_ns >= 5'000'000 ? 1 : 0;
+        c.slow20[kind] += elapsed_ns >= 20'000'000 ? 1 : 0;
+        c.longest[kind] = (std::max)(c.longest[kind], elapsed_ns);
+        if (elapsed_ns > c.worst_ns) {
+            c.worst_ns = elapsed_ns;
+            c.worst_extent = ci.extent;
+            c.worst_format = static_cast<u32>(ci.format);
+            c.worst_usage = ci.usage;
+            c.worst_kind = kind;
+        }
+        c.placed += pooled ? 1 : 0;
+        if (mode == 2 && candidate) {
+            ++c.candidates;
+            c.dry_own += own ? 1 : 0;
+        }
+        if (now - c.window_start < 10'000'000'000ULL) {
+            return;
+        }
+        if (mode != 0 || c.worst_ns >= 20'000'000) {
+            u64 made = 0;
+            u64 total_ns = 0;
+            std::string kinds;
+            for (u32 k = 0; k < KillKinds; ++k) {
+                made += c.count[k];
+                total_ns += c.ns[k];
+                if (c.count[k] == 0) {
+                    continue;
+                }
+                kinds += fmt::format("{}{} {} ({} ms, {} over 5 ms, {} over 20 ms, longest {:.1f} ms)",
+                                     kinds.empty() ? "" : "; ", kill_kind_names[k], c.count[k],
+                                     c.ns[k] / 1'000'000, c.slow5[k], c.slow20[k],
+                                     static_cast<double>(c.longest[k]) / 1e6);
+            }
+            u64 pool_blocks = 0;
+            u64 pool_block_bytes = 0;
+            u64 pool_used_bytes = 0;
+            {
+                std::scoped_lock pool_lock{g_kill_pool_mutex};
+                for (const KillPoolEntry& entry : g_kill_pools) {
+                    if (entry.owner != allocator) {
+                        continue;
+                    }
+                    VmaStatistics stats{};
+                    vmaGetPoolStatistics(allocator, entry.pool, &stats);
+                    pool_blocks += stats.blockCount;
+                    pool_block_bytes += stats.blockBytes;
+                    pool_used_bytes += stats.allocationBytes;
+                }
+            }
+            line = fmt::format(
+                "Kill image creates (FRITCHII_KILL_RT_POOL={}) in 10 s: {} made in {} ms; {}; worst "
+                "{:.1f} ms: {}x{}x{} format {} usage {:#x} ({}); kill pool: {} placed, {} over 32 "
+                "MiB, {} refused, {} blocks, {} of {} MiB used; dry: {} colour targets the pool "
+                "would try, {} of them got memory of their own",
+                mode, made, total_ns / 1'000'000, kinds.empty() ? "none" : kinds,
+                static_cast<double>(c.worst_ns) / 1e6, c.worst_extent.width,
+                c.worst_extent.height, c.worst_extent.depth, c.worst_format, c.worst_usage,
+                kill_kind_names[c.worst_kind], c.placed, c.too_big, c.refused, pool_blocks,
+                pool_used_bytes >> 20, pool_block_bytes >> 20, c.candidates, c.dry_own);
+        }
+        c = KillCensus{};
+        c.window_start = now;
+    }
+    if (!line.empty()) {
+        LOG_INFO(Render_Vulkan, "{}", line);
+    }
+}
+
+void NoteKillPoolMiss(bool too_big) {
+    std::scoped_lock lock{g_census_mutex};
+    if (too_big) {
+        ++g_census.too_big;
+    } else {
+        ++g_census.refused;
+    }
+}
+
+/// The first refusals of a session get the heaps in full: which heap was short, by how much, and
+/// whether VMA follows the driver's budget ("over the memory budget" with 1.1 GB used could not
+/// be explained from the log).
+constexpr u32 RefusalDetailEvents = 4;
+
+/// Every heap's driver usage and budget and VMA's blocks and allocations in it, in MiB.
+std::string HeapBudgetsText(VmaAllocator allocator) {
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    std::string text;
+    for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
+        const VmaBudget& budget = budgets[heap];
+        fmt::format_to(std::back_inserter(text),
+                       "{}heap {} ({}, {} MiB): usage {} of budget {}, VMA blocks {}, allocations {}",
+                       heap == 0 ? "" : "; ", heap,
+                       (properties->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0
+                           ? "local"
+                           : "host",
+                       properties->memoryHeaps[heap].size >> 20, budget.usage >> 20,
+                       budget.budget >> 20, budget.statistics.blockBytes >> 20,
+                       budget.statistics.allocationBytes >> 20);
+    }
+    return text;
+}
+
+/// "type T (heap H, flags F)" of an allocation that was made.
+std::string PlacementText(VmaAllocator allocator, u32 memory_type) {
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    if (memory_type >= properties->memoryTypeCount) {
+        return fmt::format("type {}", memory_type);
+    }
+    const VkMemoryType& type = properties->memoryTypes[memory_type];
+    return fmt::format("type {} (heap {}, flags {:#x})", memory_type, type.heapIndex,
+                       static_cast<u32>(type.propertyFlags));
+}
+
+} // Anonymous namespace
+
 bool MemoryAllocator::ImageTimingEnabled() noexcept {
     static const bool enabled = [] {
         const char *value = std::getenv("EDEN_NX2_IMAGE_ALLOC_TIMING");
@@ -456,11 +766,64 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     if (!dedicated && (ci.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
         first_ci.pool = DepthAttachmentPool(allocator, ci, alloc_ci);
     }
-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+    // FRITCHII_KILL_RT_POOL: 1 = colour targets try their pool first; 2 = dry (census only).
+    const u64 kill_start = Common::Nx2Hitch::NowNs();
+    const int kill_mode = KillRtPoolMode();
+    const bool kill_candidate = !huge && IsKillPoolCandidate(ci, dedicated);
+    bool kill_pooled = false;
+    if (kill_candidate && kill_mode == 1) {
+        bool too_big = false;
+        kill_pooled = TryKillPool(device, allocator, ci, alloc_ci, handle, allocation, alloc_info,
+                                  too_big);
+        if (!kill_pooled) {
+            NoteKillPoolMiss(too_big);
+        }
+    }
+    VkResult result = kill_pooled ? VK_SUCCESS
+                      : huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                       : ImageTimingEnabled()
                           ? TimedVmaCreateImage(device, allocator, ci, first_ci, handle,
                                                 allocation, alloc_info)
                           : vmaCreateImage(allocator, &ci, &first_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && first_ci.pool != VK_NULL_HANDLE &&
+        !kill_pooled &&
+        (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_big,
+                                          "FRITCHII_DEPTH_POOL_BIG") > 0 ||
+         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_retry,
+                                          "FRITCHII_DEPTH_POOL_RETRY", 1) != 0)) {
+        // Same fix from two helpers (BA: FRITCHII_DEPTH_POOL_BIG, BF: FRITCHII_DEPTH_POOL_RETRY);
+        // either switch turns it on. On by default since 2026-11-16 (FRITCHII_DEPTH_POOL_RETRY=0
+        // turns it off): only where the image is placed changes. Without it every OoT area load
+        // logged a false "over the memory budget" (RX 9070 XT, 16 GB, 1.1 GB used) and the false
+        // pressure event emptied the image pool and cut the cache's thresholds by 512 MiB.
+        // FRITCHII_DEPTH_POOL_BIG: VMA refuses anything larger than a custom pool's block
+        // (64 MiB) with VK_ERROR_OUT_OF_DEVICE_MEMORY before it looks at the budget, so a large
+        // depth target (OoT, every Castle Town load: 12288x12288 D16, 288 MiB) read as "over
+        // the memory budget": a false pressure event (+512 MiB kept free) and a placement
+        // without the budget check. Such an image tries the normal heap first, budget kept.
+        result = ImageTimingEnabled()
+                     ? TimedVmaCreateImage(device, allocator, ci, alloc_ci, handle, allocation,
+                                           alloc_info)
+                     : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+        static std::atomic<u32> placed{};
+        if (const u32 n = placed.fetch_add(1, std::memory_order_relaxed); n < 8) {
+            LOG_INFO(Render_Vulkan,
+                     "Depth image {}x{}x{} (format {}) refused by the depth pool, outside it: {} "
+                     "(FRITCHII_DEPTH_POOL_BIG, {} so far)",
+                     ci.extent.width, ci.extent.height, ci.arrayLayers,
+                     static_cast<u32>(ci.format),
+                     result == VK_SUCCESS ? "placed within the budget" : "over the budget too",
+                     n + 1);
+        }
+    }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && device.KeptBlockBytes() != 0) {
+        // FRITCHII_KEEP_BLOCKS: the kept blocks count against the budget VMA checks; they go
+        // first, and VMA reads the driver's usage again before the retry.
+        if (device.ReleaseKeptBlocks() != 0) {
+            vmaSetCurrentFrameIndex(allocator, 0);
+            result = vmaCreateImage(allocator, &ci, &first_ci, &handle, &allocation, &alloc_info);
+        }
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -472,10 +835,29 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                         ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
+        static std::atomic<u32> detailed{};
+        const bool detail = detailed.fetch_add(1, std::memory_order_relaxed) < RefusalDetailEvents;
+        if (detail) {
+            const char* const first_try = kill_pooled                       ? "the colour target pool"
+                                          : first_ci.pool != VK_NULL_HANDLE ? "the depth attachment pool"
+                                                                            : "the default heaps";
+            LOG_WARNING(Render_Vulkan,
+                        "  refused: {} memory, first try in {}, VMA follows the driver budget: "
+                        "{}; {}",
+                        dedicated ? "dedicated" : "block", first_try,
+                        device.CanReportMemoryUsage() ? "yes" : "no (no VK_EXT_memory_budget)",
+                        HeapBudgetsText(allocator));
+        }
         pressure_events.fetch_add(1, std::memory_order_relaxed);
         VmaAllocationCreateInfo relaxed = alloc_ci;
         relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        if (detail) {
+            LOG_WARNING(Render_Vulkan, "  without the budget check: {}",
+                        result == VK_SUCCESS
+                            ? "placed in " + PlacementText(allocator, alloc_info.memoryType)
+                            : fmt::format("failed ({})", static_cast<int>(result)));
+        }
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Still out of device memory: a real image in host memory (slow, but valid) beats one
@@ -489,9 +871,10 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         if (result == VK_SUCCESS && host_logged++ < 16) {
             LOG_WARNING(Render_Vulkan,
                         "Image {}x{}x{} ({} levels, {} layers, format {}) is out of device memory; "
-                        "placed in host memory",
+                        "placed in host memory, {}",
                         ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
-                        ci.arrayLayers, static_cast<u32>(ci.format));
+                        ci.arrayLayers, static_cast<u32>(ci.format),
+                        PlacementText(allocator, alloc_info.memoryType));
         }
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
@@ -538,6 +921,9 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
         );
     }
+
+    NoteKillCensus(allocator, ci, allocation, Common::Nx2Hitch::NowNs() - kill_start, kill_pooled,
+                   kill_candidate, kill_mode);
 
     image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                       device.GetDispatchLoader());
@@ -682,6 +1068,14 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
             LOG_WARNING(Render_Vulkan,
                         "Buffer of {} KiB (usage {}) over the memory budget: {}", ci.size >> 10,
                         static_cast<u32>(usage), result == VK_SUCCESS ? "made anyway" : "failed");
+            static std::atomic<u32> detailed{};
+            if (detailed.fetch_add(1, std::memory_order_relaxed) < RefusalDetailEvents) {
+                LOG_WARNING(Render_Vulkan, "  {}; {}",
+                            result == VK_SUCCESS
+                                ? "placed in " + PlacementText(allocator, alloc_info.memoryType)
+                                : std::string{"not placed"},
+                            HeapBudgetsText(allocator));
+            }
         }
         vk::Check(result);
     }

@@ -34,6 +34,41 @@ class System;
 
 namespace Tegra {
 
+/// The small-page entry words (2 bits per 4 KiB page: 64 MiB for a 40-bit address space).
+/// FRITCHII_RAM_GPU_ENTRIES (boot, default 0; docs/fritchii/switches.md): 1 = from zero pages
+/// the host fills in on first touch (VirtualAlloc / anonymous mmap) instead of a zero-filled
+/// std::vector, which made every page of all 64 MiB resident per address space.
+class GpuEntryWords {
+public:
+    GpuEntryWords() = default;
+    ~GpuEntryWords();
+    GpuEntryWords(const GpuEntryWords&) = delete;
+    GpuEntryWords& operator=(const GpuEntryWords&) = delete;
+
+    void Allocate(size_t count);
+
+    u64& operator[](size_t index) noexcept {
+        return words[index];
+    }
+    const u64& operator[](size_t index) const noexcept {
+        return words[index];
+    }
+    [[nodiscard]] const void* Data() const noexcept {
+        return words;
+    }
+    [[nodiscard]] size_t Bytes() const noexcept {
+        return count * sizeof(u64);
+    }
+
+private:
+    void Release();
+
+    std::vector<u64> vector;
+    u64* words{};
+    size_t count{};
+    bool zero_pages{};
+};
+
 class MemoryManager final {
 public:
     explicit MemoryManager(Core::System& system_, u64 address_space_bits_ = 40,
@@ -438,7 +473,7 @@ private:
         Mapped = 2,
     };
 
-    std::vector<u64> entries;
+    GpuEntryWords entries;
     std::vector<u64> big_entries;
 
     GPUVAddr PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, EntryType entry_type);

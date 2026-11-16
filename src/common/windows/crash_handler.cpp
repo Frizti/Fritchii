@@ -6,9 +6,12 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <cwchar>
 #include <exception>
+#include <string>
 
 #include <windows.h>
 
@@ -27,6 +30,7 @@ using MiniDumpWriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
                                           PMINIDUMP_USER_STREAM_INFORMATION,
                                           PMINIDUMP_CALLBACK_INFORMATION);
 using GetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+using SetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
 
 // Everything the handler needs is resolved at install: loading a DLL from a crashed process can
 // deadlock on the loader lock.
@@ -35,6 +39,16 @@ GetThreadDescriptionFn get_thread_description{};
 LPTOP_LEVEL_EXCEPTION_FILTER previous_filter{};
 wchar_t dump_path[MAX_PATH]{};
 std::atomic<DWORD> reporting_thread{};
+
+// A stack overflow leaves the crashed thread only the few KiB below its guard page, too little
+// for Report() (its frame list, the module lookups, the dump): the process then ended without a
+// line or a dump. The crashed thread hands the exception to this reporter thread instead, which
+// reports it on a stack of its own.
+DWORD reporter_thread{};
+HANDLE overflow_request{};
+HANDLE overflow_done{};
+EXCEPTION_POINTERS* overflow_pointers{};
+DWORD overflow_thread{};
 
 struct CodeAddress {
     char module[64];
@@ -57,6 +71,13 @@ CodeAddress Locate(const void* address) {
     return result;
 }
 
+// Never inlined: its frame (a 1 KiB line, 40 frames) would make OnUnhandledException's too large
+// for a thread that overflowed its stack.
+#ifdef _MSC_VER
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
 void Report(EXCEPTION_POINTERS* pointers) {
     // Called on the crashed thread's stack, which the dispatcher's frames sit on top of: the
     // stack from the faulting frame on is the part after the exception address.
@@ -117,12 +138,229 @@ void Report(EXCEPTION_POINTERS* pointers) {
               written ? "written next to the log as eden_crash.dmp" : "failed", error);
 }
 
+// The innermost frames of a walk, and the outermost ones in a ring. A stack overflow is usually
+// deep recursion: the innermost frames show the recursing code, the outermost ones where it was
+// entered from.
+struct StackWalk {
+    static constexpr std::size_t inner_size = 20;
+    static constexpr std::size_t outer_size = 12;
+    DWORD64 inner[inner_size]{};
+    DWORD64 outer[outer_size]{};
+    std::size_t frames = 0;
+
+    void Add(DWORD64 address) {
+        if (frames < inner_size) {
+            inner[frames] = address;
+        } else {
+            outer[(frames - inner_size) % outer_size] = address;
+        }
+        ++frames;
+    }
+};
+
+#if defined(_M_X64) || defined(__x86_64__)
+// Whether an address is in a loaded module's code. Asks the kernel rather than the loader, whose
+// locks the crashed thread may hold.
+bool InModuleCode(DWORD64 address) {
+    MEMORY_BASIC_INFORMATION code{};
+    return VirtualQuery(reinterpret_cast<const void*>(address), &code, sizeof(code)) != 0 &&
+           code.State == MEM_COMMIT && code.Type == MEM_IMAGE &&
+           (code.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) !=
+               0;
+}
+
+// Walks the overflowed thread's stack from the exception's context, while that thread waits in
+// the filter below the frames walked. Ends at code outside the loaded modules (JIT code, whose
+// unwind data describes only the dispatcher), at a frame without unwind data past the first,
+// and when the stack pointer leaves [low, high) or stops growing.
+void WalkUnguarded(CONTEXT context, DWORD64 low, DWORD64 high, StackWalk& walk) {
+    constexpr std::size_t frame_limit = std::size_t{1} << 20;
+    while (walk.frames < frame_limit) {
+        walk.Add(context.Rip);
+        if (!InModuleCode(context.Rip)) {
+            return;
+        }
+        const DWORD64 rsp = context.Rsp;
+        DWORD64 image_base{};
+        const PRUNTIME_FUNCTION function =
+            RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+        if (function != nullptr) {
+            PVOID handler_data{};
+            DWORD64 establisher_frame{};
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+                             &handler_data, &establisher_frame, nullptr);
+        } else if (walk.frames == 1 && rsp >= low && rsp + 8 <= high) {
+            // A leaf function: its return address is on top of the stack.
+            context.Rip = *reinterpret_cast<const DWORD64*>(rsp);
+            context.Rsp = rsp + 8;
+        } else {
+            return;
+        }
+        if (context.Rip == 0 || context.Rsp <= rsp || context.Rsp < low ||
+            context.Rsp + 8 > high) {
+            return;
+        }
+    }
+}
+#endif
+
+// The walk, guarded where the compiler has structured exception handling: unwind data that does
+// not match the code can send the unwinder anywhere, and the report must still be written.
+void Walk(const EXCEPTION_POINTERS& pointers, StackWalk& walk) {
+#if defined(_M_X64) || defined(__x86_64__)
+    const CONTEXT& context = *pointers.ContextRecord;
+    MEMORY_BASIC_INFORMATION stack{};
+    if (VirtualQuery(reinterpret_cast<const void*>(context.Rsp), &stack, sizeof(stack)) == 0 ||
+        stack.State != MEM_COMMIT) {
+        walk.Add(context.Rip);
+        return;
+    }
+    const DWORD64 low = context.Rsp;
+    const DWORD64 high = reinterpret_cast<DWORD64>(stack.BaseAddress) + stack.RegionSize;
+#ifdef _MSC_VER
+    __try {
+        WalkUnguarded(context, low, high, walk);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+#else
+    walk.Add(context.Rip); // No guard: the faulting address only.
+    static_cast<void>(low);
+    static_cast<void>(high);
+#endif
+#else
+    walk.Add(reinterpret_cast<std::uintptr_t>(pointers.ExceptionRecord->ExceptionAddress));
+#endif
+}
+
+// Appends " module+offset" for each address that fits.
+void AppendFrames(char* text, std::size_t size, const DWORD64* addresses, std::size_t count) {
+    std::size_t used = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const CodeAddress frame =
+            Locate(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(addresses[i])));
+        const int written =
+            std::snprintf(text + used, size - used, " %s+%#llx", frame.module, frame.offset);
+        if (written < 0 || used + static_cast<std::size_t>(written) >= size) {
+            text[used] = '\0';
+            return;
+        }
+        used += static_cast<std::size_t>(written);
+    }
+}
+
+// The reporter thread: Report()'s line and dump for the stack overflow a crashed thread handed
+// over, with that thread's stack walked from the exception's context.
+void ReportOverflow() {
+    EXCEPTION_POINTERS* const pointers = overflow_pointers;
+    const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
+
+    StackWalk walk;
+    Walk(*pointers, walk);
+    char inner[1024] = "";
+    AppendFrames(inner, sizeof(inner), walk.inner, (std::min)(walk.frames, StackWalk::inner_size));
+    const std::size_t outer_count =
+        walk.frames > StackWalk::inner_size
+            ? (std::min)(walk.frames - StackWalk::inner_size, StackWalk::outer_size)
+            : 0;
+    DWORD64 outermost[StackWalk::outer_size]{};
+    for (std::size_t i = 0; i < outer_count; ++i) {
+        const std::size_t frame = walk.frames - outer_count + i;
+        outermost[i] = walk.outer[(frame - StackWalk::inner_size) % StackWalk::outer_size];
+    }
+    char outer[640] = "";
+    AppendFrames(outer, sizeof(outer), outermost, outer_count);
+
+    char thread_name[64] = "";
+    if (const HANDLE thread =
+            OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, overflow_thread)) {
+        PWSTR description{};
+        if (get_thread_description && SUCCEEDED(get_thread_description(thread, &description))) {
+            WideCharToMultiByte(CP_UTF8, 0, description, -1, thread_name, sizeof(thread_name) - 1,
+                                nullptr, nullptr);
+            LocalFree(description);
+        }
+        CloseHandle(thread);
+    }
+
+    const CodeAddress at = Locate(record.ExceptionAddress);
+    LOG_CRASH("Host crash: unhandled exception {:#010x} (stack overflow) at {}+{:#x} on thread {} "
+              "\"{}\", info {:#x} {:#x}; reported by thread {} \"CrashReporter\"; stack ({} "
+              "frames):{}{}{}",
+              record.ExceptionCode, at.module, at.offset, overflow_thread, thread_name,
+              record.NumberParameters > 0 ? record.ExceptionInformation[0] : 0,
+              record.NumberParameters > 1 ? record.ExceptionInformation[1] : 0,
+              GetCurrentThreadId(), walk.frames, inner,
+              walk.frames > StackWalk::inner_size + StackWalk::outer_size ? " ..." : "", outer);
+
+    if (!write_dump) {
+        return;
+    }
+    const HANDLE file = CreateFileW(dump_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    MINIDUMP_EXCEPTION_INFORMATION information{overflow_thread, pointers, FALSE};
+    const BOOL written = write_dump(GetCurrentProcess(), GetCurrentProcessId(), file,
+                                    MiniDumpWithThreadInfo, &information, nullptr, nullptr);
+    const DWORD error = written ? 0 : GetLastError();
+    CloseHandle(file);
+    LOG_CRASH("Host crash: minidump of process {} {} ({:#x})", GetCurrentProcessId(),
+              written ? "written next to the log as eden_crash.dmp" : "failed", error);
+}
+
+DWORD WINAPI ReporterMain(void*) {
+    // The C runtime gives a thread its own data from the heap on first use: not during a report.
+    errno = 0;
+    // Only a crashed thread sets the event, after storing its pointers. Any other wake (a failed
+    // wait) ends the thread rather than report nothing.
+    while (WaitForSingleObject(overflow_request, INFINITE) == WAIT_OBJECT_0 &&
+           overflow_pointers != nullptr) {
+        ReportOverflow();
+        SetEvent(overflow_done);
+    }
+    return 0;
+}
+
+// Without the reporter thread a stack overflow is reported by the crashed thread, as before.
+void StartReporter() {
+    overflow_request = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    overflow_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    DWORD id = 0;
+    const HANDLE thread = overflow_request && overflow_done
+                              ? CreateThread(nullptr, 512 * 1024, ReporterMain, nullptr,
+                                             STACK_SIZE_PARAM_IS_A_RESERVATION, &id)
+                              : nullptr;
+    if (!thread) {
+        if (overflow_request) {
+            CloseHandle(overflow_request);
+        }
+        if (overflow_done) {
+            CloseHandle(overflow_done);
+        }
+        overflow_request = nullptr;
+        overflow_done = nullptr;
+        return;
+    }
+    if (const auto set_thread_description = reinterpret_cast<SetThreadDescriptionFn>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"KernelBase.dll"),
+                                                   "SetThreadDescription")))) {
+        set_thread_description(thread, L"CrashReporter");
+    }
+    CloseHandle(thread);
+    reporter_thread = id;
+}
+
 // Only the first thread to crash reports. A second one waits a while for it to end the process,
 // then falls through to the previous handling, so a report stuck on a lock the second thread
-// holds cannot hang the process. A crash inside the report falls through at once.
+// holds cannot hang the process. A crash inside the report, the reporter thread's included, falls
+// through at once.
 bool BeginReport() {
     DWORD expected = 0;
     const DWORD self = GetCurrentThreadId();
+    if (self == reporter_thread) {
+        return false;
+    }
     if (reporting_thread.compare_exchange_strong(expected, self)) {
         return true;
     }
@@ -134,7 +372,17 @@ bool BeginReport() {
 
 LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* pointers) {
     if (BeginReport()) {
-        Report(pointers);
+        if (pointers->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW &&
+            reporter_thread != 0) {
+            // Nothing here may need much stack. The wait is bounded, so the process still ends
+            // if the reporter blocks on a lock this thread holds.
+            overflow_pointers = pointers;
+            overflow_thread = GetCurrentThreadId();
+            SetEvent(overflow_request);
+            WaitForSingleObject(overflow_done, 30000);
+        } else {
+            Report(pointers);
+        }
     }
     return previous_filter ? previous_filter(pointers) : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -227,11 +475,68 @@ void InstallCrashHandler(const std::filesystem::path& dump_directory) {
     }
     get_thread_description = reinterpret_cast<GetThreadDescriptionFn>(reinterpret_cast<void*>(
         GetProcAddress(GetModuleHandleW(L"KernelBase.dll"), "GetThreadDescription")));
+    if (reporter_thread == 0) {
+        StartReporter();
+    }
     previous_filter = SetUnhandledExceptionFilter(OnUnhandledException);
     std::signal(SIGABRT, OnAbort);
     if (const char* value = std::getenv("FRITCHII_CRASH_FIRST_CHANCE");
         value != nullptr && value[0] != '\0' && value[0] != '0') {
         AddVectoredExceptionHandler(1, OnFirstChance);
+    }
+}
+
+std::string WriteHangDump(const std::filesystem::path& directory) {
+    static std::atomic<int> written_count{0};
+    const int number = written_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (number > 3) {
+        return "not written: three hang dumps already this session";
+    }
+    // Not a crash: loading dbghelp here is safe (the crash handler resolves it at install, when
+    // it is installed at all).
+    MiniDumpWriteDumpFn writer = write_dump;
+    if (writer == nullptr) {
+        if (const HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll")) {
+            writer = reinterpret_cast<MiniDumpWriteDumpFn>(
+                reinterpret_cast<void*>(GetProcAddress(dbghelp, "MiniDumpWriteDump")));
+        }
+    }
+    if (writer == nullptr) {
+        return "not written: dbghelp.dll or MiniDumpWriteDump not found";
+    }
+    const std::filesystem::path path =
+        directory / ("fritchii_hang_" + std::to_string(GetCurrentProcessId()) + "_" +
+                     std::to_string(number) + ".dmp");
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return "not written: could not create " + path.string() + " (error " +
+               std::to_string(GetLastError()) + ")";
+    }
+    // Stacks of every thread (MiniDumpNormal), plus their times and start addresses and the
+    // modules unloaded before: a few MiB, no game memory.
+    const auto type =
+        static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules);
+    const BOOL written = writer(GetCurrentProcess(), GetCurrentProcessId(), file, type, nullptr,
+                                nullptr, nullptr);
+    const DWORD error = written ? 0 : GetLastError();
+    LARGE_INTEGER size{};
+    GetFileSizeEx(file, &size);
+    CloseHandle(file);
+    if (!written) {
+        DeleteFileW(path.c_str());
+        return "failed (error " + std::to_string(error) + ")";
+    }
+    return "written: " + path.string() + " (" + std::to_string(size.QuadPart >> 10) + " KiB)";
+}
+
+void GuaranteeStackForCrashReport() {
+    ULONG_PTR low{};
+    ULONG_PTR high{};
+    GetCurrentThreadStackLimits(&low, &high);
+    if (high - low >= 2 * 1024 * 1024) {
+        ULONG bytes = 64 * 1024;
+        SetThreadStackGuarantee(&bytes);
     }
 }
 

@@ -33,6 +33,7 @@
 #include "video_core/fritchii_draw_kinds.h"
 #include "video_core/fritchii_e_split.h"
 #include "video_core/fritchii_e_split_thread.h"
+#include "video_core/fritchii_occlusion.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -1410,10 +1411,22 @@ void Maxwell3D::ProcessQueryGet() {
         flags |= VideoCommon::QueryPropertiesFlags::HasTimeout;
     }
     const GPUVAddr sequence_address{regs.report_semaphore.Address()};
-    const VideoCommon::QueryType query_type =
+    VideoCommon::QueryType query_type =
         static_cast<VideoCommon::QueryType>(regs.report_semaphore.query.report.Value());
-    const u32 payload = regs.report_semaphore.payload;
+    u32 payload = regs.report_semaphore.payload;
     const u32 subreport = regs.report_semaphore.query.sub_report;
+    // FRITCHII_OCCLUSION_VISIBLE (live, default 0; fritchii_occlusion.h): a sample count report
+    // becomes a payload report of a made-up count, written as payload releases are (at once below
+    // High accuracy), so no host occlusion query, result copy or fence operation is made for it.
+    // Here, before anything queues or posts it, so every later path sees one kind of report.
+    if (query_type == VideoCommon::QueryType::ZPassPixelCount64) [[unlikely]] {
+        if (const int occlusion = VideoCommon::FritchiiOcclusion::Mode(); occlusion != 0) {
+            query_type = VideoCommon::QueryType::Payload;
+            payload = VideoCommon::FritchiiOcclusion::ReportValue(occlusion);
+            VideoCommon::FritchiiOcclusion::Count(
+                VideoCommon::FritchiiOcclusion::g_counters.reports);
+        }
+    }
     // FRITCHII_DRAW_KINDS: a sample count report marks the draw before it.
     if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
         using Report = Regs::ReportSemaphore::Report;
@@ -1581,6 +1594,14 @@ void Maxwell3D::ProcessCounterReset() {
             return VideoCommon::QueryType::Payload;
         }
     }();
+    // FRITCHII_OCCLUSION_VISIBLE: the sample counter is not running and its reports are made
+    // up, so its resets are dropped (each queued a fence operation). Counts kept from before
+    // only need to grow between two reports, which they still do when the switch goes off.
+    if (query_type == VideoCommon::QueryType::ZPassPixelCount64 &&
+        VideoCommon::FritchiiOcclusion::Mode() != 0) [[unlikely]] {
+        VideoCommon::FritchiiOcclusion::Count(VideoCommon::FritchiiOcclusion::g_counters.resets);
+        return;
+    }
     // FRITCHII_ESPLIT_ASYNC_KINDS bit 1: to E2's queue with its value (E1).
     if (VideoCommon::ESplit::QueueRasterOp(VideoCommon::ESplit::RasterOp::ResetCounter,
                                            *rasterizer, 0, static_cast<u32>(query_type))) {
@@ -1823,6 +1844,7 @@ struct FrontCallSwitches {
     int dead_stores;
     int list_lane; ///< FRITCHII_FRONT_LIST_LANE (bit 2: a handler's writes)
     int op_lean;   ///< FRITCHII_FRONT_OP_LEAN
+    int occlusion; ///< FRITCHII_OCCLUSION_VISIBLE
     u32 traced;    ///< MacroTraced()
     bool operator==(const FrontCallSwitches&) const = default;
 };
@@ -2550,6 +2572,7 @@ FrontCallSwitches ReadFrontCallSwitches() {
         .dead_stores = Debug::SwitchValue(Debug::g_onef_dead_stores, "FRITCHII_ONEF_DEAD_STORES"),
         .list_lane = Debug::SwitchValue(Debug::g_front_list_lane, "FRITCHII_FRONT_LIST_LANE"),
         .op_lean = Debug::SwitchValue(Debug::g_front_op_lean, "FRITCHII_FRONT_OP_LEAN"),
+        .occlusion = VideoCommon::FritchiiOcclusion::Mode(),
         .traced = MacroTraced(),
     };
 }
@@ -3417,11 +3440,15 @@ void Maxwell3D::FrontRefreshSwitches(FrontState& fs) {
     if (Debug::SwitchValue(Debug::g_draw_packet, "EDEN_NX2_DRAW_PACKET") != 0) {
         features |= 8;
     }
+    // FRITCHII_OCCLUSION_VISIBLE: only the features body knows the 0xe2c macro (its hash).
+    if (VideoCommon::FritchiiOcclusion::Mode() != 0) {
+        features |= 16;
+    }
     if (!fs.macro_features_logged || features != fs.macro_features) {
         fs.macro_features_logged = true;
         LOG_INFO(HW_GPU,
                  "Front macro switches: features={:#x} (EXP53, OOT_MACROS, FOLD_INSTANCE, "
-                 "DRAW_PACKET bits), generation {}: {} body",
+                 "DRAW_PACKET, OCCLUSION_VISIBLE bits), generation {}: {} body",
                  features, generation, features == 0 ? "plain (v5.7)" : "features");
     }
     fs.macro_features = features;
@@ -3722,8 +3749,16 @@ void Maxwell3D::FrontRunMacroFeaturesT(Core::System& system, VideoCommon::GpuSpl
     // to E where the front would wait for the back, 2 = verify (the front reads as before, E
     // evaluates every call too and compares), 3 = every call deferred. Not with EXP53's
     // predicate, and not with a replaying shadow RAM (the write's value is the shadow word then).
+    // FRITCHII_OCCLUSION_VISIBLE (live, default 0; fritchii_occlusion.h): the call's read is not
+    // made at all. Its six words are made up: counters that differ (1, the object is visible) or
+    // equal (2). Ahead of FRITCHII_E2C_ON_E; not with EXP53's predicate (it reads nothing either).
+    const int occlusion = !(fs.e2c_call && !predicate) ? 0
+                          : Lean                       ? sw.occlusion
+                                                       : VideoCommon::FritchiiOcclusion::Mode();
     const int e2c_mode =
-        !(fs.e2c_call && !predicate && fs.control != Regs::ShadowRamControl::Replay) ? 0
+        !(fs.e2c_call && !predicate && fs.control != Regs::ShadowRamControl::Replay &&
+          occlusion == 0)
+            ? 0
         : Lean ? sw.e2c_on_e
                : VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_e2c_on_e,
                                                   "FRITCHII_E2C_ON_E");
@@ -3866,6 +3901,15 @@ void Maxwell3D::FrontRunMacroFeaturesT(Core::System& system, VideoCommon::GpuSpl
                         LOG_INFO(HW_GPU, "Conditional render macro (EXP53): {} reads left to the back",
                                  n + 1);
                     }
+                } else if (occlusion != 0 && address == 0x158 && value == 6) [[unlikely]] {
+                    // FRITCHII_OCCLUSION_VISIBLE: counter, timestamp, counter. 1: the counters
+                    // differ, so the macro writes the mode of "samples passed" (p0 ^ 1); 2: equal
+                    // (p0). The back writes the reports with made-up values that agree.
+                    const u32 first = occlusion == 1 ? 1U : 0U;
+                    const std::array<u32, 6> words{first, 0U, 0U, 0U, 0U, 0U};
+                    fs.parameters.insert(fs.parameters.end(), words.begin(), words.end());
+                    VideoCommon::FritchiiOcclusion::Count(
+                        VideoCommon::FritchiiOcclusion::g_counters.front_reads);
                 } else {
                     fs.e2c_defer = (e2c_mode == 1 || e2c_mode == 3) && address == 0x158 &&
                                            value == 6

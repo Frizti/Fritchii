@@ -191,6 +191,17 @@ public:
     /// differences of it).
     static std::chrono::nanoseconds HoldTimeTotal() noexcept;
 
+    /// Worker builds of kept SPIR-V since the last call: over KeptBuildSlow means the driver
+    /// compiled the pipeline again (not in its cache), under it a cache hit.
+    static constexpr std::chrono::milliseconds KeptBuildSlow{20};
+    struct KeptBuildStats {
+        u64 builds;
+        u64 slow;
+        std::chrono::nanoseconds slow_time;
+        std::chrono::nanoseconds longest;
+    };
+    static KeptBuildStats TakeKeptBuildStats() noexcept;
+
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     [[nodiscard]] const GraphicsPipelineCacheKey& Key() const noexcept {
         return key;

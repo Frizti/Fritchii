@@ -7,6 +7,270 @@ rebuilds nothing.
 
 ## Named switches
 
+### Profiling mode (Help > Profiling Mode)
+
+For testers who send us a log (helper BP, 2026-11-16). Help > Profiling Mode (both the Fritchii
+and the classic UI), then Restart Now: Fritchii starts again with the switches below; play, then
+Help > Export Log and send the zip. Saved in qt-config.ini as [UI] profiling_mode (main.cpp reads
+it there before the settings load). The switches are read once per process, so turning it on or
+off asks to restart Fritchii (a running game closes: save first); the restart gets the launch
+environment, not the switches this process added. While it is on:
+- the switches: EDEN_NX2_GPU_PROFILE=1, FRITCHII_MEM_CENSUS=3, FRITCHII_HITCH_SPLIT=1,
+  EDEN_NX2_HITCH_MS=40, FRITCHII_VRAM_REPORT=1, EDEN_NX2_IMAGE_ALLOC_TIMING=1, EDEN_NX2_TC_LOG=1
+  (util/profiling_mode.cpp). A value from the environment or an nx2_switches.txt wins; profiling
+  mode only beats a built-in value. MEM_CENSUS is 3, not 1: 1 also queries the working set, which
+  holds its lock 150-270 ms every 30 s (a stutter). HITCH_MS is 40, not 33: with OoT at 30 FPS
+  every frame is 33.3 ms and would log a Hitch line.
+- the log: "Test switches: ...; profiling mode: ..." and "Profiling mode ON: A=1, ..." at each game
+  start; system-info.txt in the export says "Profiling mode: on (...)" or "off".
+- a red "PROFILING MODE ON  Turn it off in Help" banner at the top centre of the game, in a window
+  and in fullscreen (a frameless tool window above the Vulkan surface, like the in-game controls;
+  it steps below them while they show, hides while Fritchii is in the background or a dialog is
+  open, and ignores the mouse); "[PROFILING]" in front of the window title; a red "PROFILING ON"
+  label in the status bar.
+Cost: small. The GPU profile times its zones with the CPU's time stamp counter (~150,000 zones a
+second on the GPU thread); the rest are counters, a driver memory query per 30 frames and a few
+log lines every 10 s. Expect about 1-3% fps (not measured yet); read fps records with it off.
+### FRITCHII_GPU_PRIORITY, FRITCHII_THREAD_QOS, FRITCHII_FOCUS_GRAB, FRITCHII_QUEUE_PRIORITY
+
+TEST, off by default (helper BN, 2026-11-16): the game loses 5+ fps while its window is not
+focused, which also skews every automated test (they run unfocused). What is already ruled out:
+every GPU thread, CPU core and timer thread runs at THREAD_PRIORITY_TIME_CRITICAL (15, the top of
+the normal range), so Windows' foreground CPU boosts can't raise them; EXP111 (process priority
+class) measured no gain on 2026-11-12; the process already opts out of power throttling and timer
+throttling at start (common/windows/timer_resolution.cpp); nothing in Fritchii's own code changes
+with focus except "Pause when not in focus" and "Mute audio when in background". Left for a
+focused window: the GPU scheduler's treatment of the foreground process, the QoS level Windows
+gives threads (High in focus, Medium visible, Low covered or minimized; processes playing audio
+count as High, and tests mute the game), and how the present is shown (independent flip vs DWM
+composition). Code: common/windows/fritchii_focus.cpp, video_core/fritchii_focus.h (called once a
+frame from RasterizerVulkan::TickFrame). Windows only; nothing system-wide is read or changed.
+
+- FRITCHII_GPU_PRIORITY (live): the process's GPU scheduling priority class
+  (D3DKMTSetProcessSchedulingPriorityClass). 0 = the class the process had at start (normal),
+  1 = above normal, 2 = high. Realtime is not offered (needs extra privileges, has hung NVIDIA
+  drivers). Log on every change: "FRITCHII_GPU_PRIORITY=N: GPU scheduling class C asked (was W at
+  start), status 0x..., now C2" (status 0 = taken; anything else = Windows refused).
+- FRITCHII_THREAD_QOS (live): 1 = the process opt-out of power throttling is set again and every
+  thread that asked for High priority or above (Common::SetCurrentThreadPriority) is tagged High
+  QoS on its own (SetThreadInformation ThreadPowerThrottling, EXECUTION_SPEED in the control mask,
+  clear in the state mask); threads starting later are tagged as they start. 0 = those threads go
+  back to system-managed QoS (the process opt-out stays, as before). Log: "FRITCHII_THREAD_QOS=N:
+  T of H hot threads tagged High QoS".
+- FRITCHII_FOCUS_GRAB (live): 1 = the game's largest visible window takes the foreground (from a
+  short thread of its own; attaches to the foreground thread's input for the hand-over); 0 = the
+  window that had the foreground gets it back. For a focused vs unfocused toggle in one session.
+  It moves the owner's focus: only while nobody types. Log: "FRITCHII_FOCUS_GRAB=N: taking the
+  foreground done / refused by Windows".
+- FRITCHII_QUEUE_PRIORITY (boot): 1 = the Vulkan queues ask for high global priority
+  (VK_KHR_global_priority, else VK_EXT_global_priority), 2 = realtime. A refusal (not permitted,
+  no extension) makes the device as before; the log says which happened.
+- Always on, Windows: "Focus: game window focused/unfocused (GPU scheduling class C)", logged
+  when it changes (checked once a second), so any log can be split into focused and unfocused
+  stretches, and shows whether Windows itself moves the GPU class with the focus.
+
+### FRITCHII_HANG_REPORT_S
+
+ON by default at 5 in every build (helper BB, 2026-11-16, after helper AW's boot hang: 0 frames
+from 17 s on, every GPU thread idle, CPU 0.1, and nothing in the log said what the game waited
+on). Live, a number of seconds; 0 turns it off. Once a second (on the Pulse thread, or on a small
+"FritchiiHangWatch" thread where the Pulse does not run: FRITCHII_PULSE=0, EDEN_NX2_HITCH_LOG=0,
+Linux) the emulator looks at the game's presents. When none came for that many seconds while the
+game runs (powered on, not shutting down, not paused, not stalled by the frontend, no GDB stub),
+it logs one "Hang report:" block at Critical, then nothing more until a frame comes ("Hang report:
+frames again after N s without one (re-armed)"). Pausing stops the count; it starts again from
+zero on resume. Before the first present (the boot logo) nothing is watched. Everything it reads
+is read without changing or waking anything, and every lock it needs is only tried (it says "lock
+held for 200 ms" rather than wait). Lines, in order:
+1. "no frame for N s while the game runs (S s since the last present, P presents ...)".
+2. The stall snapshot (EDEN_NX2_STALL_SNAPSHOT) as a 100 ms present gap would log it: the span
+   each GPU thread is in now and for how long, the longest span in the gap, the present thread,
+   the master semaphore's ticks.
+3. "channels suspended on an acquire: yes/no; acquires waiting (N): device ADDR OP VALUE, word
+   now W, for T s" for every semaphore acquire a channel (or the memory stage) is suspended on.
+4. "syncpoint waits": each syncpoint something waits on, its guest and host values, the values its
+   registered actions wait for (nx2:syncpt's armed slot waits, the decoder's and the present's
+   fences) and any thread blocked in WaitGuest/WaitHost.
+5. "GPU split: front ..." (the one follower watchdog's front line: the front's wait site, target,
+   for how long, published/consumed/played) and, with FRITCHII_ONEF on, "one follower step ...;
+   positions ...; E ...; R ...; locks ...".
+6. "service calls in flight": every HLE service call not finished, as service, command, handler
+   name, "waiting for the service's lock" or "in its handler", and for how long.
+7. "game threads in kernel waits": the game's threads in a kernel wait, longest first: thread id,
+   priority, core, what (a mutex at ADDR, condition variable key, WaitForAddress ADDR,
+   WaitSynchronization on an object type, an IPC reply, SleepThread) and for how long.
+8. With FRITCHII_HANG_DUMP=1, the minidump's path.
+Cost while frames come: one clock read and one add per present, a few relaxed stores per service
+call and per guest wait. A long loading screen without presents, or a game waiting on a frontend
+dialog, can also trigger it: once, harmlessly.
+
+### FRITCHII_HANG_DUMP
+
+Off by default (helper BB, 2026-11-16). Boot; FRITCHII_HANG_DUMP=1 makes the hang report
+(FRITCHII_HANG_REPORT_S) also write a minidump of the process: every host thread's stack, thread
+times and start addresses, the modules (MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules, a
+few MiB, no game memory) to fritchii_hang_<pid>_<n>.dmp in the log folder, at most three a
+session. The game keeps running (dbghelp suspends the other threads for the write). A host thread
+blocked on a host lock (a service handler, the GPU threads) shows its whole stack there; a game
+thread blocked in a kernel wait is a parked fiber, whose stack is not in the dump: the report's
+"game threads in kernel waits" line covers those. dbghelp.dll is loaded at run time. Windows only:
+elsewhere the report says so in one line.
+### FRITCHII_MEM_CENSUS
+
+MEASURE, off by default (helper BE, 2026-11-16; the 16 GB RAM / 8 GB card goal). Boot. Why: the
+"Memory owners" line left ~3.7 GB of the private working set unattributed at the Castle Town market
+(working set 11.8 GB steady, 14.6 GB peak). With the switch on, a thread at low priority wakes
+every second; every 30 s, and whenever the working set is the highest yet and 512 MiB above the
+last census (at most every 5 s: load peaks), it walks the whole address space (VirtualQuery; one
+QueryWorkingSet for residency, the same query the zero-page pass makes, ~150-270 ms of kernel time;
+on Linux /proc/self/smaps) and logs four "Memory census (30 s|peak)" lines, committed/resident MiB:
+1) the totals: guest backing and guest views (tagged by DeviceMemory), VMA host maps (VMA's
+vkMapMemory calls, tagged while the switch is on), census scratch (its own page list), images,
+other mapped files, executable private memory (the JIT code caches: one 512 MiB reservation per
+core; driver code too), heaps (first segments of each Win32 heap; the CRT heap apart), thread
+stacks, other private memory, and "resident not in any of them" (should be ~0);
+2) images by name (nvoglv64, nvgpucomp64, Qt, ...); 3) other mapped files by name; 4) the exec
+allocations and the other private memory by reservation size (<64 KiB, 64 KiB-1 MiB, 1-16, 16-64,
+64-256, 256 MiB+) with the 10 largest allocations: base, reservation MiB, committed/resident,
+protection; 5) "more": JIT blocks compiled per core (warm/on demand), the sampled guest residency
+(backing + views - both = guest RAM: a guest page read through both addresses is counted twice in
+the working set but is one page of RAM), and with 2 every heap's summary. Values: 1 = committed
+and resident; 2 = also HeapSummary of every heap (locks each heap for its walk: ~250 ms on a 2.5 GB
+CRT heap, game threads that allocate freeze meanwhile; only for a memory hunt); 3 = committed only
+(no working set query). Also with the switch on: "Pipeline frees (FRITCHII_MEM_CENSUS)" when 32 or
+more evicted graphics pipelines are destroyed at once (private commit and working set given back,
+KiB per pipeline: the 0.45 MB in the memory lines is an estimate). Costs: the residency query
+holds the working set lock while it runs (a Hitch line shows it as "memory sample"); read the fps
+with the switch off.
+
+Added 2026-11-16 (helper BE, after the first census run, b4-census-market-log): the first line also
+names the Windows heaps' further segments ("heap segments CRT a/b (n), other heaps"; read from the
+segment header, signature 0xffeeffee: the CRT heap grows in segments up to 1 GiB reservations,
+which the first run listed as the two ~1 GiB "rw" regions), "heap big blocks" (heap blocks over
+~508 KiB, each in an allocation of its own: read from its size header; the 8 largest are listed in
+the private line), and "size matches": private allocations whose size (64 KiB granules) equals a
+live VMA memory object's, under "device-local memory (driver copy?)" and "host-visible memory not
+mapped" (the 315 private 16-64 MiB reservations of the first run, 8.4 GB committed, looked like the
+driver's own copies of device-local memory: VMA's 32 MiB blocks and dedicated images). New tags:
+"guest thread stacks" (the guest threads' fiber stacks, 2 MiB each), "GPU page entries" and "GPU big
+page entries" (Tegra::MemoryManager's tables per GPU address space). 4 = as 1, and once, at the
+first census, a walk of every block of the CRT heap ("CRT heap walk": busy blocks by power-of-two
+size, and the 16 exact sizes holding the most bytes, so owners can be told apart by block size).
+The walk holds the CRT heap's lock: every thread that allocates waits for it (~0.3-1 s); one
+hitch, early in the run.
+
+### FRITCHII_RAM_GPU_ENTRIES
+
+TEST, off by default (helper BE, 2026-11-16). Boot. Each GPU address space (Tegra::MemoryManager)
+keeps its small-page entry words, 2 bits per 4 KiB page: 64 MiB for a 40-bit space, made as a
+zero-filled std::vector, so all of it was resident (the first census run: two 64 MiB allocations,
+64/64 MiB). With 1 the words come from zero pages the host fills in only where they are touched
+(VirtualAlloc, anonymous mmap; the vector if that fails). Same contents, same accesses. Expected:
+~60 MiB less resident per address space (~120 MiB at the market, two spaces), minus the few MiB
+of pages the game's GPU mappings touch. Judge: the census tag "GPU page entries" (resident) and
+the private working set; nothing else changes.
+
+### FRITCHII_JIT_WARM_CORES
+
+TEST, off by default (helper BE, 2026-11-16). Boot, a core mask (hex with 0x, e.g. 0x3 = cores 0
+and 1); 0 or unset = every core, as before. Each guest core has its own recompiler with its own
+code cache and block tables. EDEN_NX2_JIT_WARM copies every block one core compiles to every other
+core, and FRITCHII_JIT_BLOCK_LIST=1 hands every core the whole list (OoT: 765,194 blocks, "warm-up
+handed out 765194/765194/765194/765194"), so each core holds the code of every block any core ever
+ran. Cores outside the mask take no part in either: they compile only what they run. Expected
+saving: the census's exec private (code) and part of the CRT heap (block tables) for each core left
+out; measure the per-core exec rows first (FRITCHII_MEM_CENSUS=1): if each core holds ~400 MiB of
+code + tables, leaving two cores out saves ~800 MiB. Risk: a core left out compiles on demand the
+first time it runs a block (the hitch the warm-up removed). Judge by the census's "JIT blocks
+compiled per core, warm/on demand" (the on-demand count of the cores left out after the load),
+"Recompile" in the Hitch lines, and the hitch score; pick the mask from the census (the cores with
+few on-demand compiles in a normal run are the ones to leave out).
+
+### FRITCHII_RAM_PREBUILT_KEEP
+
+TEST, off by default (helper BE, 2026-11-16). Live: N > 0 = graphics pipelines built at boot from
+the disk cache that no draw has used, unused for 9,000 frames, are destroyed past N kept (at most
+2,000, the old budget), also while the cache is under the eviction threshold (16 GB PCs ~2,280:
+the market's ~1,800 built never reached it, so nothing was ever evicted there). With the switch on
+they also go first when the cache is over the threshold. Why: each holds an estimated 0.3-0.45 MB
+of driver memory (NVIDIA). The "Memory owners" line now says how many built pipelines no draw used
+("N never used") and how many compute pipelines no dispatch used (EXP51=2 already evicts those).
+Expected saving: (never used - N) x ~0.3-0.45 MB, e.g. 1,000 unused at N = 200: ~250-350 MiB.
+Cost: one destroyed and needed later (the player reaches that content) is translated and built
+again on the GPU thread (~10 ms, or skipped draws with async shaders). Log: the eviction line adds
+"N of them boot builds no draw used (FRITCHII_RAM_PREBUILT_KEEP=K: T this session, A needed
+again)"; A must stay near 0 in a normal route, and the hitch score must not move.
+
+### FRITCHII_ZERO_TRIM_BATCH
+
+TEST, off by default (helper BE, 2026-11-16). Boot, Windows. The zero-page pass reads, through the
+backing, every resident guest view page whose backing page is not in the working set, which puts
+that backing page in the working set until the pass ends: the same RAM page counted twice. The
+market's working set peaks (12.2, 14.1 and 14.6 GB at 28, 40 and ~64 s, prof-market-log) each fall
+inside a pass, ~2 GB over the steady 12.4 GB. With 1 those pages leave the working set every 4,096
+pages instead of at the end. What is trimmed stays the same; the unlock calls are the same count
+in more batches. Expected: the peak working set ~2 GB lower (no RAM is freed: the pages were RAM
+already; but Windows and the owner's tools stop seeing a 14.6 GB process). Judge: "Memory:" peak and
+"Zero-page pass" lines (same MiB trimmed, similar ms), hitch score unchanged.
+### FRITCHII_FORMATLESS_13
+
+TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1874 by KevinLny, open
+there). Boot. 0 = as before. 1 = typeless storage image reads count as supported on a Vulkan 1.3
+instance even when the device's shaderStorageImageReadWithoutFormat feature is false. Only devices
+without that feature change (Intel on Windows; NVIDIA and AMD already have it, so nothing changes
+there). Why: on Intel Iris Xe (Windows driver 101.7092) every typeless image read became a constant
+0 and the scene rendered black (Pokopia; log line "Typeless image read not supported by host").
+The driver reports formatless reads per format through format features 2. Check: an Intel Windows
+tester with the switch at 1, the warning gone and the scene drawn.
+
+### FRITCHII_DEVICE_FAULT
+
+On by default (helper BH, 2026-11-16, port of the device fault part of zortos293/Lichii #512).
+Boot. When the driver offers VK_EXT_device_fault, Fritchii enables it (vendor binary dumps off)
+and a device loss logs what the driver knows: "Device fault: <description> (N addresses, M vendor
+records)", each fault address with its kind (invalid read/write/execute, instruction pointer) and
+range, and the vendor fault codes. A driver without it logs "Device fault info: not supported by
+the driver". Only the loss report reads it; nothing is drawn differently. FRITCHII_DEVICE_FAULT=0
+leaves the extension off, as before. Why: two AMD testers hit device losses with no clue in the log.
+
+### FRITCHII_SCALED_EXTENT_CAP
+
+On by default since 2026-11-16 (helper BR; helper BH ported it off, port of zortos293/Lichii
+#1890 by zortos293, still open there). Live, for images made after the change. 0 = as before
+(the A/B and kill switch). 1 (default) = the texture cache leaves
+an image unscaled when its scaled width or height would pass the device's 2D image or framebuffer
+limit (the smallest of the three; 16384 on AMD and RADV, 32768 on NVIDIA). Rescaling is decided
+per render target set, so that whole pass stays native while the rest of the frame scales. Why:
+OoT's sun shadow map is a 12288x12288 D16 depth target; at 1.5x it is 18432 wide and at 2x
+24576, past AMD's 16384, and drawing into it hangs the GPU: device loss entering Castle Town at
+1.5x/2x on AMD (zortos #1885: semaphore waits for 2 s, then "Device loss occurred" with no fault
+address). NVIDIA keeps scaling that map at 2x, so on NVIDIA the switch changes nothing at those
+scales. Check: an AMD tester at 1.5x enters Castle Town with the switch at 1.
+- Why on by default: it only changes an image whose scaled size is past the device's own
+  limits, which is invalid Vulkan on every driver (no driver has to accept it). At 1x, 1.25x on
+  every card and up to 2x on NVIDIA nothing changes. A scale that does not enlarge images (1x and
+  the downscales) is never refused (idea from bakemono's handoff: without that guard a 0.75x
+  downscale on an 8192-limit device would leave the image native, bigger than scaled).
+- Checked before the cached IsRescalable answer, so changing the scale in game is covered.
+- Log: "Image WxH (format F, N samples) stays at native size: scaled it would be ..., past the
+  device's limit of L (FRITCHII_SCALED_EXTENT_CAP)" (HW_GPU, Info), once per image. At 1.5x/2x on
+  AMD, expect it once for the 12288x12288 D16 sun shadow map.
+
+### FRITCHII_OOT_BYPASS_SAMPLED
+
+TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1875 by zortos293). Live;
+only matters with Ocarina of Time anti-aliasing at No sharpening (or the forced bypass on GPUs
+that can't build the network). 0 = as before: the copy that replaces the network's output pass
+takes render target 0 of the latest draw with one of three known tonemap shaders. 1 = it copies
+the image the output pass itself samples (cb0 + 0xc0, B10G11R11 or its E5B9G9R9 view), and a
+skipped prepass that no replacement followed runs the network again. Why: the game has a fourth
+tonemap shader (96d6efdbfe52605c, seen in adult Zora's Domain, Lon Lon Ranch and Kakariko houses),
+and there the copy kept an old image: the 3D view froze while the HUD and audio went on, until the
+camera turned (zortos #1688, RADV and NVIDIA). Their tester confirmed the fix. Log: "anti-aliasing
+network bypassed from the sampled image" once, and "the network's output pass was not replaced;
+running the network" once if a frame ended with another output program. Check: No sharpening in
+Zora's Domain facing King Zora, the view must follow the camera.
+
 ### FRITCHII_PROTECT_UNLOCKED
 
 TEST, off by default (helper AK, 2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live,
@@ -36,6 +300,340 @@ colour draws, which then skip while the pipeline builds (the object is missing f
 Layers drawn once or now and then, depth-only passes and draws without a depth test still wait. The
 10 s "Async discard" line counts these skips ("N of them into redrawn targets"); they stay in the
 persistent skipped column too. Only matters with unbuilt pipelines: a warm shader cache sees few.
+
+On by default on AMD's Windows driver (helper BM, 2026-11-16): there a pipeline missing from the
+driver's cache takes 0.2-1.1 s to compile, and an RX 7900 XT session held 76 s of draws for unbuilt
+pipelines, a ~1 s freeze whenever something new showed up (tester log t1858). The boot log says so
+once; FRITCHII_ASYNC_REDRAWN=0 waits as before. Other GPUs keep 0.
+
+### FRITCHII_OCCLUSION_VISIBLE
+
+TEST, off by default (helper AN, 2026-11-15, idea from DahBard's Blitchii LICHII_FAKE_OCCLUSION);
+live, not exact. OoT tests objects with two 64-bit sample count reports (type 21, 16 bytes each,
+16 bytes apart: before and after the object's test geometry), and its 0xe2c macro reads the six
+words and writes render_enable.mode = p0, or p0 ^ 1 when the counts differ (p0 = 0: draw when
+samples passed). That read was the front's largest wait (FrontDmaRead, ~16% of the front with its
+drains). With the switch on, nothing is measured:
+- Front (fritchii_occlusion.h, Maxwell3D::FrontRunMacroFeaturesT's emit): the hash-matched 0xe2c
+  call makes no read; its 0x158 write appends six made-up words. Ahead of FRITCHII_E2C_ON_E (no
+  call is deferred while it is on); not with EXP53's predicate. The switch adds bit 16 to the
+  front's macro features, so the features body runs (only it knows the macro's hash).
+- Back (Maxwell3D::ProcessQueryGet): a type 21 report becomes a payload report of a made-up count
+  before anything queues or posts it, so it is written as payload releases are (at once below High
+  accuracy, on E with FRITCHII_ONEF_SEM_E): no host occlusion query, result copy, report
+  registration or fence operation. Sample counter resets (clear_report_value) are dropped
+  (ProcessCounterReset).
+- Render thread (QueryCacheBase::CounterEnable, asked at every draw): the host sample counter stays
+  stopped, so no occlusion query wraps the draws.
+- 1: everything visible. The made-up count grows by 4096 at every report (never 0), so any two
+  reports differ, whoever reads them (the front, the back's macro path with the split off, a CPU
+  read), and the macro's words say "differ": mode p0 ^ 1.
+- 2: every report reads 4096 and the macro's words say "equal": mode p0. Objects drawn on p0 = 0 are
+  skipped. This is what a constant count (Blitchii's 4096) gives OoT's pair test; for comparison.
+- Live: turning it off, the render thread starts the counter again at the next draw and the back
+  makes real reports again; a report pair across the switch reads as different (visible) for that
+  one test. Turning it on, reports already made complete as before. E's one-follower mirror of the
+  counter state may say "started" while R's counter is stopped: the superset side, safe.
+- Log, every 10 s while it works: "Occlusion (FRITCHII_OCCLUSION_VISIBLE=N) last 10 s: X sample
+  reports/s answered without a host query, Y counter resets/s skipped, Z 0xe2c reads/s skipped on
+  the front".
+- Visual risks (1): objects behind walls drawn (more draws, and possibly lens flares, sun glare,
+  light shafts or glow sprites showing through walls and hills if the game tests those); (2):
+  tested objects missing.
+
+### FRITCHII_UNSWIZZLE_IN_PLACE
+
+TEST, off by default (helper AO, 2026-11-15, port of tomk134/lichii-custom e8e50e797 via
+DahBard/Blitchii 43321b8db9, d05a021080 and their r54 crash fix d3251a67cf); live,
+FRITCHII_UNSWIZZLE_IN_PLACE=1 turns it on. ExecuteUnswizzlePlan (the chunked upload of 2D images of
+64 MiB or more that aren't converted or GPU-decoded) copied every guest run into a fresh vector
+before untiling it. With the switch on, a run that is contiguous in host memory (MemoryManager::
+GetSpan, which checks the device pages' host continuity, not just the GPU mapping) is untiled
+straight from guest memory; other runs are copied into a grow-only thread-local scratch buffer. The
+main upload path (GpuGuestMemory) already read in place. =2 also untiles every in-place run from a
+copy and compares (exactness check, must be 0; a game write between the two reads could differ).
+Log: "Unswizzle in place in 10 s (FRITCHII_UNSWIZZLE_IN_PLACE=N): R runs read in place (X MiB), C
+copied first (Y MiB); verify V checked, M differ (must be 0)".
+
+### FRITCHII_KEEP_BLOCKS
+
+TEST, off by default (helper AO, 2026-11-15, port of DahBard/Blitchii's device memory reserve, r64
+cccc1ff9fc, capped). Set at boot to enable (any value; then live): 0 = keep nothing, 1 = 256 MiB,
+N = N MiB, at most 512 (no brute-force VRAM). Unset at boot, VMA calls the driver directly as before.
+VMA's device-local blocks it frees (plain blocks only: power-of-two sizes 1-64 MiB, no dedicated
+memory, nothing host-visible) are kept and handed back, without a driver call, to VMA's next
+allocation of the same memory type, size and flags. Area loads at the texture cache's threshold
+evict images (their blocks empty and go back to the driver) and then make new ones; on Blitchii
+vkAllocateMemory took 29-50% of the back thread in OoT's transition frames. Limits: the cap, and
+(texture cache budget check, every 30 frames) what the live usage leaves under the critical use
+plus half the room between the critical use and the budget. Everything goes back when a driver
+allocation fails (then retried), when an image is over VMA's budget (then retried before it counts
+as memory pressure), when images stop fitting (the EXP42 pool's pressure test), and at once when the
+switch goes to 0; over the limit one block a frame goes. The caches count kept blocks as free
+(Device::QueryDeviceMemoryUsage). FRITCHII_KEEP_BLOCKS_PREMAKE=1 (boot) makes the cap's worth of
+VMA default-size blocks at boot. Off on integrated GPUs. Log: "Kept blocks in 10 s
+(FRITCHII_KEEP_BLOCKS cap N MiB, limit L): A driver allocations under VMA (X MiB) in T ms, longest
+M ms; F driver frees in T ms; R blocks reused, K kept, S not kept, G given back; holds H MiB". Note
+the Churn line's device allocations still count reused blocks (VMA's own callback).
+
+### FRITCHII_KILL_RT_POOL
+
+TEST, off by default (helper AV, 2026-11-15; the kill hitches in the Stalchild fight). Live: 0 =
+as before, 1 = colour render targets (colour attachment, not depth, 2D, not sparse or disjoint, not
+asked for dedicated memory) of up to 32 MiB are made with vkCreateImage, allocated from their own
+VMA pool per memory type (64 MiB blocks, like EDEN_NX2_DEPTH_POOL for depth) and bound; anything
+the pool refuses (over 32 MiB, no room within the budget, a failed bind) goes the old way. 2 = dry:
+nothing moves, the line counts the colour targets the pool would try and how many of them got
+memory of their own. Why: outside a pool the driver's preference gives a colour target its own
+memory, a driver allocation on the GPU back thread each time. In the owner's fights
+(fight-keepers*, 2026-11-14) the only frames over 50 ms after the load were single image creates
+of 35 and 124 ms at kills (159 ms once in a playtest), the back blocked and every other GPU thread
+idle behind it. Only memory placement changes, never what is drawn; images made before a switch
+change stay where they are. FRITCHII_KILL_RT_POOL_BLOCKS (boot, default 2, at most 8 = 512 MiB):
+blocks the pool makes when it is first used and never gives back. Log, every 10 s while the switch
+is not 0, and at 0 only for a window with a create of 20 ms or more: "Kill image creates
+(FRITCHII_KILL_RT_POOL=N) in 10 s: C made in T ms; per kind (colour in the kill pool, colour own
+memory, colour in a block, depth own memory, depth in a block, other own memory, other in a block):
+count (ms, over 5 ms, over 20 ms, longest); worst W ms: size, format, usage (kind); kill pool: P
+placed, O over 32 MiB, R refused, B blocks, U of M MiB used; dry: D colour targets the pool would
+try, K of them got memory of their own". Read the worst create's kind first: "colour own memory"
+is what the pool removes; "depth in a block" points at EDEN_NX2_DEPTH_POOL_MIN_BLOCKS; "other in a
+block" at FRITCHII_KEEP_BLOCKS.
+
+### FRITCHII_DEPTH_POOL_BIG
+
+TEST, off by default (helper BA, 2026-11-16; the Castle Town load cluster). Live: 0 = as before,
+1 = a depth image the depth pool (EDEN_NX2_DEPTH_POOL, 64 MiB blocks) refuses is tried on the
+normal heap with VMA's budget check before it counts as "over the memory budget". Why: VMA refuses
+anything larger than a custom pool's block with VK_ERROR_OUT_OF_DEVICE_MEMORY before it looks at
+the budget, and every Castle Town load makes a 12288x12288 D16 depth target (288 MiB) right in the
+longest frame (raise-*-log.txt, 2026-11-16: "Image 12288x12288x1 ... format 124 is over the memory
+budget; allocating it anyway", then "Out of device memory: keeping 512 MiB more free"). That is a
+false pressure event: the texture cache keeps 512 MiB more free from then on (thresholds drop on
+cards where the budget binds, so 8 GB cards evict and upload again mid-load) and the image was
+placed with no budget check at all. Exact: only where the memory comes from. Log (first 8): "Depth
+image WxHxL (format F) refused by the depth pool, outside it: placed within the budget
+(FRITCHII_DEPTH_POOL_BIG, N so far)". How to judge: with 1 the "over the memory budget" and "Out of
+device memory" warnings are gone from the load; the hitch score should not move on a 16 GB card
+with EDEN_NX2_TC_CEILING_MIB set (the ceiling binds there), so this is a correctness fix first.
+
+### FRITCHII_HITCH_SPLIT
+
+Diagnostic, boot, default 0 (helper BA, 2026-11-16). 1 = the hitch line gets six more causes and
+the GPU threads' CPU time. Why: in the Castle Town load cluster 1.4-1.9 s of "recompiling code
+another core had" sat in gaps where the GPU threads were idle (the game waited on the recompiler),
+the 730-780 ms gap had the back busy 300-400 ms outside any span with 600k page faults, and the GPU
+threads never showed in "busiest threads" (only the first 48 named threads were measured; GPU,
+GPUBack and GPUMem start later). The new causes, shown only when they happened:
+- "recompiling code this core had compiled before (dropped since)": split out of "code another core
+  had". Large = blocks are dropped and compiled again (invalidations, fastmem faults); small with a
+  large "another core had" = the warm-up never reached those blocks on this core.
+- "game code dropped by invalidations (blocks)": blocks removed by range invalidations (kernel code
+  memory changes, instruction cache maintenance); count = blocks, time = the removal.
+- "game code dropped by fastmem faults (blocks)": blocks dropped to be compiled again without
+  fastmem for one access (guest writes to pages the GPU caches protect), once per access and core.
+- "warm compiles refused (code cache full)": precompiles refused because the code cache keeps its
+  free half; plus one line per core the first time: "JIT warm compiles refused from now on
+  (FRITCHII_HITCH_SPLIT) core c: code cache keeps K MiB free, near N MiB used, far F MiB used".
+  Refusals mean FRITCHII_JIT_CACHE_MIB is worth a test.
+- "staging buffers made" (MiB = their sizes) and "texture uploads (CPU side)" (MiB = mapped sizes;
+  includes the untiling and the first writes into new staging memory, so its page faults).
+- busiest threads: GPU, GPUBack, GPUMem and GPUBackE2 are measured even past the first 48 threads.
+Cost: a cached flag test per compile, staging buffer and upload when off; two clock reads each when
+on. Exact (counting only).
+
+### FRITCHII_JIT_SHARED_FASTMEM_MARKS
+
+TEST, boot, default 0 (helper BO, 2026-11-16; the idea of zortos293/Lichii #1861, which does it on
+the arm64 backend). 1 = the CPU recompiler's fastmem fault marks (an access that faulted on a
+write-protected or read-trapped page is compiled again without fastmem) are one set per process
+instead of one per core. An access that faulted on one core is then compiled without fastmem by
+the other cores the next time they compile that block (on-demand compiles, warm compiles, blocks
+compiled again after a drop or a cache clear), instead of faulting and recompiling there too.
+Blocks another core already compiled with fastmem still fault once each, as before.
+- Exact: a mark only sends that one access to the page table path, never changes a result.
+- Cost: a shared lock around one set lookup per memory access while a block compiles (not while
+  code runs); none when off.
+- Log: "FRITCHII_JIT_SHARED_FASTMEM_MARKS=1: ..." at boot; "JIT shared fastmem marks ...: N
+  accesses compiled without fastmem from another core's fault (M marks ...)" at N = 1, 2, 4, 8 ...
+- Judge with FRITCHII_HITCH_SPLIT=1: "game code dropped by fastmem faults" (blocks) and the
+  "dropped since" recompile time should fall; the hitch score must not rise. Up to 5/6 of the
+  fastmem recompiles of blocks compiled after the first fault (6 cores). Fresh A/B (boot).
+
+### FRITCHII_JIT_STATE_REFS
+
+TEST, boot, default 0 (helper BQ, 2026-11-16; stage 0 of helper BO's one code cache for all cores,
+helper_bo_answer.md). 1 = every per-core address the CPU recompiler used to write into a block as
+an immediate is read through the state register (r15) instead: the callbacks object (SVC,
+exceptions, cache ops, ISB, counter reads, memory slow paths, 128-bit and exclusive fallbacks), the
+JIT (the dispatcher's block lookup), the config (exclusive accesses through the monitor in C++),
+the TPIDR register addresses, this core's exclusive monitor slots, the fast dispatch table and
+FRITCHII_JIT_INDIRECT_CACHE's slots and counters. A block's bytes then no longer depend on the core
+that compiled it; caches stay per core. The inline exclusive store clears every reservation on its
+address (this core's too, as the monitor's C++ path does), addressed from the monitor's lock.
+2 = 1, and every block (near and far part) and the prelude are scanned for any 8 bytes that point
+into this core's objects (JIT object with its state block and emitter, callbacks, TPIDR, own monitor
+slot, fast dispatch table, indirect slots). Cost of 1: one load per call out (rare), a load instead
+of an immediate at TPIDR reads/writes and exclusive accesses, and one load more per indirect branch
+with FRITCHII_JIT_INDIRECT_CACHE=2/3 (the slot array, then the slot's offset in the cmp and jmp).
+- Log: "FRITCHII_JIT_STATE_REFS=N: ..." at boot. With 2: "JIT state refs (FRITCHII_JIT_STATE_REFS=2)
+  core C so far: N per-core constants left in M blocks of B scanned (must be 0); prelude P" at 256,
+  512, 1024 ... blocks, at the first block with one, and at the end; the first 8 hits get their
+  own line (block pc, offset, value, what it points into, the 2 bytes before it = the opcode).
+- Judge: =2 at market and castletown must say 0 (stage 1 needs it); then fresh A/B 0/1/1/0 (boot)
+  at the market for fps, plus the hitch score. Exact: the same values, read from the state block.
+
+### FRITCHII_JIT_CACHE_MIB
+
+TEST, boot, default 0 = 512 MiB (helper BA, 2026-11-16). 512-1536: the CPU recompiler's code cache
+per core in MiB. Why: precompiles (EDEN_NX2_JIT_WARM, FRITCHII_JIT_BLOCK_LIST's 649k-block warm-up)
+stop while half the cache (half the smaller region with FRITCHII_JIT_FAR_CODE: 96 MiB of 512) is
+free, so blocks the warm-up never reached are compiled at the area load, by each core that runs
+them. Exact: the same code, more room. Memory is committed only as code is written (up to the size
+per core, 4-6 cores). Log: "FRITCHII_JIT_CACHE_MIB=N: code cache of N MiB per core". Only worth a
+test when FRITCHII_HITCH_SPLIT=1 shows "warm compiles refused" before the load; judge by the load
+cluster's hitch score and its "another core had" time, fresh launches (boot setting).
+### FRITCHII_VRAM_POOL_FIT
+
+TEST, off by default (helper BF, 2026-11-16; 8 GB cards). Live: 1 = EXP42's image pool (pooled
+VkImages of deleted render targets, built-in cap EXP66 = 1 GiB) holds at most the room the rest of
+the process leaves under the driver's budget less the texture cache's margin (1/8 of the budget, at
+most 1 GiB), re-read every 30 frames. Why: the texture cache counts pooled images as free memory,
+so its thresholds leave the pool out. Next to a full cache the pool pushed small cards past the
+budget (6 GB card: critical ~4.2 GiB + 1 GiB of pool > a ~5 GiB budget), where Windows moves memory
+to system RAM (the 16-24 fps cliff) or an image fails and the whole pool is dropped at once. Saves
+0 on a 16 GB card (cap stays 1 GiB: ~7.7 GiB of room at the market), up to the whole 1 GiB on 6-8
+GB cards when the cache is full. Log, every 600 frames while it is on: "Image pool fit
+(FRITCHII_VRAM_POOL_FIT) last 600 frames: cap C MiB now (lowest L MiB, built-in B MiB); budget X
+MiB, the rest of the process R MiB". Judge with FRITCHII_VRAM_REPORT=1 under
+EDEN_NX2_VRAM_LIMIT_MIB=8192 / 6144 + FRITCHII_VRAM_SIM_OTHERS=1: "over the budget" samples go to 0,
+fps and 1% lows not lower, the pool line's "taken" count tells what the smaller pool costs.
+
+### FRITCHII_VRAM_CRITICAL_FIT
+
+TEST, off by default (helper BF, 2026-11-16; use with FRITCHII_VRAM_POOL_FIT). Live (read at the
+texture cache's budget check, every 30 frames): for budgets between 4 and 10 GiB the collector's
+critical threshold may reach the budget less the margin (1/8, at most 1 GiB) less 512 MiB, instead
+of the fixed 5 GiB (MaxCriticalMemory). Why: an 8 GB card (budget ~7.1 GiB with Windows and other
+programs) collected from 5 GiB on while OoT's market sits at ~5.1-5.3 GiB in the cache's view on a
+16 GB card, so it evicted and re-made textures (ASTC re-transcodes, downloads with a GPU wait) with
+~2 GiB of budget left to the pool and margins. 8 GB card: critical 5120 -> ~5700 MiB, expected 4352
+-> ~4940 MiB (+580 MiB for textures). 6 GB cards and 10 GiB+ budgets: no change. Judge at
+EDEN_NX2_VRAM_LIMIT_MIB=8192 + FRITCHII_VRAM_SIM_OTHERS=1 with EDEN_NX2_TC_LOG=1: the collector
+line's deletes (costly, downloaded) and uploads drop, "over the budget" stays 0, fps / 1% lows /
+hitch score at the market and night market.
+
+### FRITCHII_DEPTH_POOL_RETRY
+
+On by default since 2026-11-16 (helper BJ; =0 turns it off; made by helper BF). Live: 1 = a depth target that does not fit
+EDEN_NX2_DEPTH_POOL's 64 MiB blocks is made the normal way (within the budget) before anything
+counts as memory pressure. Why: OoT's 12288x12288 D16 sun shadow map (288 MiB) never fits the pool,
+so it went down the over-budget path with VRAM to spare: "is over the memory budget; allocating it
+anyway" and "Out of device memory: keeping 512 MiB more free" on a 16 GB card at 1.5 GB used
+(prof-market-log 41.0 s, also in the 8 GB run). Each such false event empties the image pool (up to
+1 GiB of render targets to re-make), releases the kept blocks and lowers the thresholds by 512 MiB
+for minutes on small cards. Log: "Depth image WxH (format F) did not fit the depth pool; made
+without it (FRITCHII_DEPTH_POOL_RETRY, N so far)". Judge: the two warnings above are gone at the
+market after load; nothing else changes (placement only).
+
+### FRITCHII_GRID_AUDIT
+
+TEST tool, off by default (helper BJ, 2026-11-16). Boot: 1 = every indirect compute dispatch (list
+dispatches, GPU-sized grids) copies the 3 grid words it ran with to host memory, and once that
+submission is done they are checked: "Dispatch grid audit: indirect dispatch of S ran grid XxYxZ
+(over the device limit / y/z past 16 bits) ... N bad of M audited". The host never sees these
+grids before vkCmdDispatchIndirect, so this is the only way to learn whether a bad grid reaches
+the GPU (AMD device losses). Costs a copy and two barriers per indirect dispatch: a diagnostic, not
+for fps runs. Must be 0 bad; any line names the shader to clamp on the GPU next.
+
+### FRITCHII_ONEF_AMD
+
+Boot, off by default (helper BJ, 2026-11-16). On AMD's proprietary Vulkan driver the one follower
+(FRITCHII_ONEF / FRITCHII_ONEF_LEAN) stays off: the desktop RX 7900 XT lost the device in game with
+it on and ran clean with every FRITCHII_ONEF_* line out. Log once: "One follower: off on AMD's
+proprietary driver ...". 1 = keep it on there (tests). RADV, NVIDIA and Intel unchanged.
+
+### FRITCHII_VRAM_REPORT
+
+TEST tool, off by default (helper BF, 2026-11-16). Live: 1 = every 30 frames the main device-local
+heap's usage against its budget as the driver reports them (all process memory there, unused
+block space included; the budget at most the simulated limit), one line every 600 frames: "VRAM
+fit (FRITCHII_VRAM_REPORT) last 600 frames: main heap U of B MiB budget now, peak P MiB; over the
+budget in O of S samples (most M MiB over); image pool, kept blocks, block slack, staging upload /
+download / device, stream MiB; memory pressure events, failed images". Over the budget is where a
+real card starts moving memory to system RAM: on an 8 GB card that is the fps cliff. One driver
+memory query per 30 frames.
+
+### FRITCHII_VRAM_SIM_OTHERS
+
+TEST, off by default (helper BF, 2026-11-16; boot, with EDEN_NX2_VRAM_LIMIT_MIB). 1 = the simulated
+card's limit becomes the limit less what Windows and the other programs hold on the real card,
+measured once at boot (heap size less the driver's budget; 16 GB card: 16376 - 15297 = ~1.1 GiB).
+Why: EDEN_NX2_VRAM_LIMIT_MIB=8192 alone gave the simulated card a budget of the whole 8 GiB, but a
+real 8 GB card next to the same desktop has ~7.1 GiB: the thresholds, VMA's budget and its heap
+limit then sat ~1 GiB too high. VMA fails past the limit where a real card would spill into system
+memory; images then go to host memory, as slow as the spill, so fps cliffs show up too. Log:
+"FRITCHII_VRAM_SIM_OTHERS: others hold N MiB of this card's H MiB heap; the simulated card's limit
+and budget are L MiB". The result depends on what else runs (OBS, browser): read the log line.
+Known gaps: each of the two VMA allocators (images, buffers) gets the limit on its own, and driver
+memory outside VMA (DLSS, pipelines, swapchain) counts in the budget but not in VMA's hard limit.
+
+### FRITCHII_AMD_OVERALLOCATE
+
+TEST, off by default (helper BF, 2026-11-16; boot; port of zortos293/Lichii #1335 via
+Frizti/Fritchii #61). 1 = on AMD's own drivers (AMD proprietary / AMD open source, not RADV) with
+VK_AMD_memory_overallocation_behavior, device memory may be overallocated: allocations past a full
+heap spill into system memory instead of failing. Why: upstream traced 27 failing sessions (24 AMD,
+mostly 8 GB cards in OoT) to failed device-local allocations with host memory free. Fritchii
+already retries out-of-budget images and then places them in host memory, so this mostly removes
+those fallbacks' "placed in host memory" / failed image lines. Log: "FRITCHII_AMD_OVERALLOCATE:
+VK_AMD_memory_overallocation_behavior on". Judge on an AMD 8 GB card only (no effect elsewhere):
+fewer "Out of device memory" and failed-image lines, no crash at full VRAM.
+
+### FRITCHII_STAGING_RING
+
+TEST, off by default (helper AO, 2026-11-15, port of DahBard/Blitchii's staging ring, r64). The
+size is read at boot (1 = 256 MiB, N = N MiB, 16-1024; host memory, not VRAM), its use is live (0
+stops it). One host-coherent upload buffer for the texture cache's staging pool, made and written
+once at boot. Uploads too big for the stream buffer's region (8 MiB on a discrete GPU) that find no
+idle cached staging buffer take a slice of the ring before a new staging buffer is made (often a
+driver allocation, then first-touch page faults). Like the stream buffer, the ring has 16 regions,
+each reused once the GPU is past its last stamp; an upload over half the ring needs all of it idle.
+The last upload's regions are stamped again at the next request (its copy may be recorded after the
+request). Log: "Staging ring in 10 s (FRITCHII_STAGING_RING=N): U uploads (X MiB), L over half the
+ring; R refused (B while an upload over half the ring was in flight), C staging buffers made after a
+refusal".
+
+### FRITCHII_HOSTTIMING_SPIN_BUDGET
+
+TEST, off by default (helper AS, 2026-11-15; idea from zortos293/Lichii #1733). Live, a percent of
+the timer thread's time; 0 = no limit (as before). EXP75 (600 us by default) makes the HostTiming
+thread spin the last 600 us before a guest timer. OoT's present poll sleeps 250 us at a time while it
+waits for a frame, so during a long wait (an area load) a timer is always that close and the thread
+spins a whole core (2.3 s of CPU in a 2.5 s Castle Town load freeze, 70-100% of every load hitch).
+With the switch, spins are paid from a budget that grows by N% of the time that passes and holds at
+most 2 ms; with less left than EXP75's window the thread spins only what is left and sleeps on the
+OS timer before that. 20 is #1733's value. Log, every 10 s (always on): "HostTiming in 10 s: spun X
+ms/s before guest timers (S spins, longest L us; EXP75=600 us, FRITCHII_HOSTTIMING_SPIN_BUDGET=N%: C
+cut by it); W OS waits; E events, callbacks M ms/s, longest T us (event name), K of 1 ms or more;
+most in one pass P; J ran 1 ms or more late (worst Z ms, event name)". The hitch line also gets
+"timer thread spin" and "timer events over 1 ms" (callbacks of 1 ms or more), so a hitch where
+HostTiming is busy says whether it spun or ran a slow callback.
+
+### FRITCHII_ONEF_RAISE_AFTER_LEND
+
+TEST, off by default (helper AS, 2026-11-15). Live. R raises `played` after every packet it plays
+except a lent one, and its raise before a lent packet stops at that packet's floor. A lend E makes
+after its last consumed position (the frame end op when E goes idle) then leaves `played` short of
+what E and R have both passed, and nobody raises it until E consumes more. If the front is waiting
+on R's position to send more (a map at an area load), nothing moves until the hang watchdog's 2 s
+rescue: "One follower hang watchdog: a lost raise of `played` (... R with nothing unplayed): raised
+now", the 2.5 s Castle Town load freeze of 2026-11-15. With 1, E raises `played` itself after every
+lend's park (min of its consumed position and R's oldest unplayed packet, as every raise). The check
+is counted with the switch off too. Log, every 10 s when it happened: "One follower raise after lend
+(FRITCHII_ONEF_RAISE_AFTER_LEND=N) 10 s: X lends/s left `played` short of what E and R had both
+passed (W ring words short on average; raised after the park / left to E's next consumed position
+or the hang watchdog), T this session".
 
 ### FRITCHII_SYNCPT_MIRROR
 
@@ -682,6 +1280,67 @@ summary misses (reads answered without a walk), summary refusals by a block stam
 stamp; then the session's verify disagreements (must be 0). Expected with 1 at the market:
 records walked near 0, "skipped by ranges" unchanged, the front macro zone back near 134 ns a
 call.
+
+### FRITCHII_LAGGED_DEFER (the "Lagged check defer" line)
+
+FRITCHII_LAGGED_DEFER (live, default 0 = exactly as before; helper BD). With EXP12=5/6 a channel
+suspended on a semaphore acquire gets a "lagged check" every 1 ms (Puller::CanResumeAcquire): the
+front waits until the back ran what was sent at the previous check (DrainSite::LaggedCheck, or
+LaggedCheckEngine with FRITCHII_ONEF_SEM_E), then reads the latch and the word again. At the
+heavy market that wait is ~50 a second, ~1.2 ms each, ~14,000 ring words behind (55-60 ms/s of
+front time, the second biggest front wait), and while it waits the front decodes nothing: not
+the other channels, not new command lists.
+- 1: when the back is short of the check's target, the check is put off: what was sent is
+  published, the poll answers "not met yet" and the front goes on with other channels and new
+  command lists. The first poll that finds the back at the target runs the check unchanged (no
+  wait left). When the front would otherwise sleep (no command list queued, every channel
+  suspended), it waits for the smallest target put off right there (LaggedDefer::WaitBeforeSleep,
+  gpu_thread.cpp) and polls again: the wait it would have made, now with nothing else to do.
+- Exact: the same checks decide the resume, in the same order within the channel; a check runs
+  only once the back reached its target, as before. Only how other channels' work interleaves
+  with the suspended channel moves, which the 1 ms timer already made timing-dependent; the
+  acquire still resumes only when met. No hang: the work sent is published at each put-off poll,
+  and the front waits for the target before any sleep.
+- Why: the front is the wall at the market (fps follows its time); a wait that blocks other work
+  for 1.2 ms is front time the frame pays for whenever there is other work to do.
+
+"Lagged check defer (FRITCHII_LAGGED_DEFER=n)" (HW_GPU, Info, every 10 s while it acts), per
+second: polls that put their check off (and how many acquires), checks run later with the back
+there (each is a wait saved), waits made where the front would sleep (and their ms/s: the part
+of the old wait that had nothing to overlap).
+How to judge: a profile_toggle 0/1 in one session (pin market, --cycles=2 --warmup=20). On the
+front: "Front waits for the back by site" lagged check ms/s must drop (the waits made where the
+front would sleep stay in that line, the defer line gives them apart; the drop is the part that
+overlapped other work), and the front per draw (macro + resume pending) must not rise. Then fps (cycles=4) only if the front
+wait drops: a keeper when fps rises; drop if the "checks run later" count is near 0 (the waits
+had nothing to overlap).
+
+### FRITCHII_DISPATCH_WAIT_CENSUS (the "Dispatch wait census" line)
+
+FRITCHII_DISPATCH_WAIT_CENSUS (live, default 0 = nothing counted; helper BD). A dry count, no
+behaviour change. A macro DMA read (0xe2c's occlusion report reads, mostly) whose page snapshot
+passed every other check waits for the native dispatches sent since the snapshot
+(DrainSite::DispatchWait, "macro dma dispatch": ~250 a second, ~68 ms/s at the market, the
+biggest front wait), because what a dispatch writes is only known once E ran it (E records its
+write marks). At the market none of those dispatches ever wrote a page read (the EXP10 line's
+dispatch overlaps stay 0), so the wait is pure latency. Removing it needs the front to bound
+what the queued dispatches write (their QMD, the shader's storage buffer descriptors, the
+pointer words in their constant buffers, image descriptors). This census says how much of the
+wait each level of such a bound would answer, before anyone builds it.
+- 1: each such wait that really waited is classified, once the dispatches it waited for ran, by
+  their records (the ones E appended for positions from E's position when the wait began):
+  buffers only (storage/texel buffer write marks: a front bound of the SSBO writes answers it),
+  buffers + QMD releases (the front predicts those already), with indirect arguments (list
+  dispatches, GPU-sized grids), with an image (a bound needs the image descriptors too),
+  anything / records lost (unbounded or past the record ring), no record. E tags each record
+  with its kind (DispatchWriteKind) whatever the switch says.
+
+"Dispatch wait census (FRITCHII_DISPATCH_WAIT_CENSUS=1)" (HW_GPU, Info, every 10 s of waits), per
+second and ms/s per class, the records per wait, and the waits whose dispatches did write the
+page read (expected 0, as the EXP10 line says).
+How to judge (Gate 1 for the front dispatch bound): the ms/s of "buffers only" + "buffers + QMD
+releases" is the ceiling of an SSBO-only bound; add "with an image" for a bound that also reads
+image descriptors. Build the bound only if the first is >= 10 ms/s on the front.
 
 ### FRITCHII_FRONT_CALL_LEAN (the "Front call lean" line)
 
@@ -3659,6 +4318,72 @@ lines and pages per core). Only with a code cache of 64 MiB or more (512 MiB her
   Info) at each full clear: checks the 5/8 : 3/8 split.
 - Expected 1 to 2% of game code time (Fable A, estimate).
 
+### FRITCHII_JIT_CHEAP_BARRIERS
+
+FRITCHII_JIT_CHEAP_BARRIERS (boot, default 0; helper AT, 2026-11-15, port of zortos293/Lichii
+#1327, ProphetWild's commit from #161 by 999sian). x86-64 hosts only. 1 = all of #1327: ordered
+and exclusive loads of up to 64 bits (LDAR, LDAPR, LDAXR, A32 LDA/LDAEX) are a plain mov instead of
+`xor reg,reg; lock xadd [addr],reg`, and DMB *LD / DMB *ST (CRm<1:0> = 01 or 10) emit nothing
+instead of mfence. 2 = only the plain loads, 3 = only the DMB change (to split a problem).
+- Exact on x86-64 (TSO): loads are never reordered with later loads or stores (so every load is
+  an acquire load), stores never with later stores. The one reordering x86 does, a store passing a
+  later load, is still covered: ordered stores (STLR) stay xchg, a full barrier, so STLR then LDAR
+  keeps its order; a full DMB and every DSB keep mfence; 128-bit ordered loads keep lock
+  cmpxchg16b; exclusive stores still lock cmpxchg against the value the exclusive load saved.
+- Side effect: an ordered load no longer faults on a write-protected (GPU-cached) page, so it
+  reads it inline like a plain LDR does instead of taking the slow path. With read traps or
+  reactive flushing on, a page that needs a GPU download has no read access at all and still
+  faults, so the data seen is the same.
+- Upstream (zortos, since 11-11) and Blitchii run it by default. Their numbers: LDAR on a
+  word shared by 4 threads 20.9 -> 1.6 ns; OoT Kokiri 36.5-36.8 -> 38.1-38.8 fps on the source
+  commit author's PC. No log line beyond "FRITCHII_JIT_CHEAP_BARRIERS=N: ..." (Core_ARM, Info) the
+  first time a block with an ordered load or a DMB compiles.
+- Our earlier revert (50d9c09292, the Kokiri slab) came with the rest of #161; the slab's likely
+  cause is #161's GPU parts, see helper_at_answer.md. Check the Kokiri Forest spot with it on.
+
+### FRITCHII_JIT_INLINE_CNTPCT
+
+FRITCHII_JIT_INLINE_CNTPCT (boot, default 0; helper BR, 2026-11-16, idea from bakemono's handoff
+and Blitchii). x86-64 hosts with the TSC wall clock only (multicore). 1 = a guest CNTPCT_EL0 read
+is computed in the block (`lfence; rdtsc; lfence`, times the wall clock's factor, high 64 bits)
+instead of a host call that saves every live register and goes through CoreTiming::GetClockTicks.
+- Same value, bit for bit: it is WallClock::GetCNTPCT's own sum. The factor is read from memory
+  at every read, and it is 0 while GetClockTicks would differ (CPU clock not Normal, core speed
+  sync, EDEN_NX2_GUEST_THREAD_STATS), so those reads take the host call through a thunk that
+  keeps every register. System::ApplySettings recomputes it, so a CPU clock changed in game goes
+  back to the host call at once.
+- The polling pause is kept: two reads closer than ~1.7 us pause twice, using the same "last read"
+  as the host callback. EDEN_NX2_CNTPCT_PAUSE=0 turns it off inline too.
+- Off by itself when the wall clock is not the TSC (Coffee Lake and older Intel without a crystal
+  frequency: "FRITCHII_JIT_INLINE_CNTPCT: off, the wall clock is not the TSC"), and with guest
+  thread stats on (they count reads in the host callback).
+- Log: "FRITCHII_JIT_INLINE_CNTPCT: guest counter reads computed in the JIT ..." (Core_Timing,
+  Info) once.
+- Expected: less guest-core CPU time per counter read (OoT's waits poll the counter millions of
+  times a second); fps only where the guest cores limit. Blitchii measured it only bundled with
+  the cheap barriers (guest core 4: 750-828 -> 703 ms/s, same fps, GPU-bound laptop).
+- Test: toggle needs a fresh launch (boot switch): market, 2 launches each, compare the guest
+  cores' ms/s and fps; check game speed (cutscene audio sync, Dynamic FPS step) stays the same.
+
+### FRITCHII_HWWAIT
+
+FRITCHII_HWWAIT (boot, default 0; helper BR, 2026-11-16, idea from bakemono's handoff). x86-64
+only, and only where CPUID says the CPU has the instruction and the wall clock is the TSC.
+1 = UMWAIT on Intel CPUs with WAITPKG (Alder Lake and newer client parts, Tremont/Gracemont);
+2 = also MWAITX on AMD (MONITORX). Anything else, or a CPU without it, is today's code.
+- Site: the GPU front's wait for the back (GpuSplit::Backoff, every split drain). Its first phase,
+  16384 PAUSEs, becomes 256 hardware waits of 64 PAUSEs' time each (PAUSE length measured at boot),
+  so the phase lasts as long as before; a store to the position the wait reads first ends it at
+  once. The yield / FrontSleep phase after it is unchanged. UMWAIT uses C0.1 (the fast wake).
+- Not a CPU-time cut in Task Manager (the OS counts the wait as running, like PAUSE); the gain, if
+  any, is power headroom for the busy cores on power-limited laptops, and the SMT sibling gets the
+  core while it waits. Unmeasured: keep it off unless a fixed-power A/B shows no fps or 1% low loss
+  (NoteSiteWait ms/s must not rise).
+- The guest cores' idle poll already has a hardware wait: EXP79 (Common::WaitForFlag, C0.2, MWAITX
+  on AMD, adaptive window). HostTiming's pre-event spin and the Vulkan worker spin are not covered.
+- Log: "FRITCHII_HWWAIT=N: spin waits use UMWAIT (C0.1) | MWAITX | off, this CPU has no usable
+  hardware wait (CPU: WAITPKG yes/no, MONITORX yes/no, TSC clock yes/no)" (Common, Info) once.
+
 ### FRITCHII_JIT_CHAIN
 
 FRITCHII_JIT_CHAIN (boot, bits, default 0; Fable A 2.2). Off with cycle counting (single core).
@@ -4682,7 +5407,7 @@ pay for those reads and are counted. The handle values are not part of 2b's earl
 pipeline's Configure fills them at the top of its handle work ("filled in Configure"). The QMD: the
 native QMD scheduler's 256-byte read goes through the dispatch packet (MemStage::Qmd), which
 opens there; the error path's 512-byte read stays direct. Null pointer slots: the compute
-pipeline lookup's pointer read (StaleNullPointerSlot) goes through the open dispatch packet too
+pipeline lookup's pointer read (StaleUnboundPointerSlot) goes through the open dispatch packet too
 (MemStage::ReadPointerSlot). With 3 the stats line adds "memory seam by value": draws and
 dispatches with values a second (values each, how many filled in Configure, how many the back
 skipped and their values), QMDs a second (and reads that ran no dispatch), null pointer slots,

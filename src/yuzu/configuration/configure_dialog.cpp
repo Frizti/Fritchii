@@ -125,7 +125,8 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
         ui->selectorList->setFixedWidth(180);
         layout()->setSizeConstraint(QLayout::SetNoConstraint);
         setMinimumSize(640, 460);
-        resize(940, 680);
+        // Wide enough for the Controls page's button columns and controller preview.
+        resize(1080, 700);
 
         // OoT's own values (Configure Game) beat these, the usual "my settings didn't apply".
         if (const QStringList overrides = FritchiiUi::OcarinaGameOverrides();

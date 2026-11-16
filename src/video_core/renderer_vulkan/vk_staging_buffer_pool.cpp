@@ -4,7 +4,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -15,6 +17,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/churn_counters.h"
@@ -130,6 +133,131 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
 }
 
+void StagingBufferPool::CreateUploadRing() {
+    // FRITCHII_STAGING_RING (port of DahBard/Blitchii's staging ring, r64): uploads over the
+    // stream buffer's region (8 MiB on a discrete GPU) took a cached staging buffer or a new one,
+    // often a driver allocation written for the first time (page faults); OoT's area loads made
+    // hundreds. Host memory, like the staging buffers it stands in for.
+    const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_staging_ring,
+                                                       "FRITCHII_STAGING_RING");
+    if (value <= 0 || upload_ring) {
+        return;
+    }
+    const u64 mib = value == 1 ? 256 : std::clamp<u64>(static_cast<u64>(value), 16, 1024);
+    const size_t size = static_cast<size_t>(mib) << 20;
+    VkBufferCreateInfo ring_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .size = size + STREAM_BUFFER_TAIL,
+        // CreateStagingBuffer's usage.
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+    };
+    if (device.IsExtTransformFeedbackSupported()) {
+        ring_ci.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
+    }
+    if (device.IsBufferDeviceAddressSupported()) {
+        ring_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    vk::Buffer buffer;
+    try {
+        buffer = memory_allocator.CreateBuffer(ring_ci, MemoryUsage::Upload);
+    } catch (const vk::Exception& e) {
+        LOG_WARNING(Render_Vulkan, "FRITCHII_STAGING_RING={}: no memory for the ring ({}); off",
+                    value, e.what());
+        return;
+    }
+    if (buffer.Mapped().size() < size || !buffer.IsHostCoherent()) {
+        LOG_WARNING(Render_Vulkan,
+                    "FRITCHII_STAGING_RING={}: the ring's memory is not mapped host-coherent; off",
+                    value);
+        return;
+    }
+    // Every page written once now, so that no upload at a load takes the first-touch faults.
+    std::memset(buffer.Mapped().data(), 0, buffer.Mapped().size());
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const u32 memory_type = buffer.Location().memory_type;
+    const VkDeviceAddress address = device.IsBufferDeviceAddressSupported()
+                                        ? device.GetLogical().GetBufferDeviceAddress(*buffer)
+                                        : VkDeviceAddress{};
+    const std::span<u8> mapped = buffer.Mapped();
+    upload_ring.emplace(UploadRing{
+        .buffer = std::move(buffer),
+        .address = address,
+        .mapped = mapped,
+        .regions = StagingRingRegions{size},
+    });
+    LOG_INFO(Render_Vulkan,
+             "Staging ring (FRITCHII_STAGING_RING={}, live: 0 stops its use): {} MiB of host memory "
+             "in memory type {}, {} regions of {} MiB, made and written in {:.1f} ms",
+             value, mib, memory_type, StagingRingRegions::NUM_REGIONS,
+             (size / StagingRingRegions::NUM_REGIONS) >> 20, ms);
+}
+
+std::optional<StagingBufferRef> StagingBufferPool::TryGetRingBuffer(size_t size) {
+    UploadRing& ring = *upload_ring;
+    const auto is_free = [this](u64 stamp) { return clock.IsFree(stamp); };
+    const u64 now = clock.Now();
+    // The last upload's copy is recorded by now at the latest.
+    ring.regions.Restamp(now);
+    const std::optional<size_t> offset = ring.regions.Take(size, now, is_free);
+    if (!offset) {
+        ++ring.refused;
+        if (size <= ring.regions.Size() && ring.regions.LargeUploadInFlight(is_free)) {
+            ++ring.refused_behind_large;
+        }
+        return std::nullopt;
+    }
+    ++ring.uploads;
+    ring.bytes += size;
+    if (size > ring.regions.Size() / 2) {
+        ++ring.large;
+    }
+    return StagingBufferRef{
+        .buffer = *ring.buffer,
+        .device_address = ring.address,
+        .offset = static_cast<VkDeviceSize>(*offset),
+        .mapped_span = ring.mapped.subspan(*offset, size),
+        .usage = MemoryUsage::Upload,
+        .log2_level{},
+        .index{},
+    };
+}
+
+void StagingBufferPool::LogUploadRing() {
+    UploadRing& ring = *upload_ring;
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (ring.last_log_ns == 0) {
+        ring.last_log_ns = now;
+        return;
+    }
+    if (now - ring.last_log_ns < 10'000'000'000) {
+        return;
+    }
+    ring.last_log_ns = now;
+    if (ring.uploads + ring.refused + ring.created_after_refusal != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Staging ring in 10 s (FRITCHII_STAGING_RING={}): {} uploads ({} MiB), {} over "
+                 "half the ring; {} refused ({} while an upload over half the ring was in flight), "
+                 "{} staging buffers made after a refusal",
+                 VideoCore::Nx2Debug::g_staging_ring.load(std::memory_order_relaxed), ring.uploads,
+                 ring.bytes >> 20, ring.large, ring.refused, ring.refused_behind_large,
+                 ring.created_after_refusal);
+    }
+    ring.uploads = ring.bytes = ring.large = 0;
+    ring.refused = ring.refused_behind_large = ring.created_after_refusal = 0;
+}
+
 StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred,
@@ -144,15 +272,14 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
 }
 
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
-    auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
-    const auto is_this_one = [&ref](const StagingBuffer& entry) {
-        return entry.index == ref.index;
-    };
-    auto it = std::find_if(entries.begin(), entries.end(), is_this_one);
-    ASSERT(it != entries.end());
-    ASSERT(it->deferred);
-    it->tick = clock.Now();
-    it->deferred = false;
+    StagingBuffers& cache_level = GetCache(ref.usage)[ref.log2_level];
+    auto node = cache_level.deferred.extract(ref.index);
+    ASSERT(!node.empty());
+    if (node.empty()) {
+        return;
+    }
+    node.mapped().tick = clock.Now();
+    cache_level.entries.push_back(std::move(node.mapped()));
 }
 
 void StagingBufferPool::TickFrame() {
@@ -162,6 +289,9 @@ void StagingBufferPool::TickFrame() {
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
     recycler.TickFrame();
+    if (upload_ring) {
+        LogUploadRing();
+    }
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(
@@ -245,6 +375,14 @@ StagingBufferRef StagingBufferPool::GetStagingBuffer(
     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
         return *ref;
     }
+    // FRITCHII_STAGING_RING: a slice of the ring before a new buffer (live: 0 stops its use).
+    if (upload_ring && usage == MemoryUsage::Upload && !deferred &&
+        VideoCore::Nx2Debug::g_staging_ring.load(std::memory_order_relaxed) > 0) {
+        if (const std::optional<StagingBufferRef> ref = TryGetRingBuffer(size)) {
+            return *ref;
+        }
+        ++upload_ring->created_after_refusal;
+    }
     return CreateStagingBuffer(size, usage, deferred, caller, stream_full);
 }
 
@@ -254,7 +392,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     StagingBuffers& cache_level = GetCache(usage)[Common::Log2Ceil(size)];
 
     const auto is_free = [this](const StagingBuffer& entry) {
-        return !entry.deferred && clock.IsFree(entry.tick);
+        return clock.IsFree(entry.tick);
     };
     auto& entries = cache_level.entries;
     const auto hint_it = entries.begin() + cache_level.iterate_index;
@@ -265,17 +403,32 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
             return std::nullopt;
         }
     }
-    cache_level.iterate_index = std::distance(entries.begin(), it) + 1;
-    it->tick = deferred ? (std::numeric_limits<u64>::max)() : clock.Now();
-    ASSERT(!it->deferred);
-    it->deferred = deferred;
-    return it->Ref();
+    const size_t position = static_cast<size_t>(std::distance(entries.begin(), it));
+    const StagingBufferRef ref = it->Ref();
+    if (!deferred) {
+        cache_level.iterate_index = position + 1;
+        it->tick = clock.Now();
+        return ref;
+    }
+    // A deferred buffer leaves the entries until FreeDeferred; the last entry takes its place,
+    // so the next lookup starts there.
+    cache_level.iterate_index = position;
+    cache_level.deferred.emplace(it->index, std::move(*it));
+    if (it != entries.end() - 1) {
+        *it = std::move(entries.back());
+    }
+    entries.pop_back();
+    return ref;
 }
 
 StagingBufferRef StagingBufferPool::CreateStagingBuffer(
     size_t size, MemoryUsage usage, bool deferred,
     VideoCommon::BufferChurnStats::StagingCaller caller, bool stream_full) {
     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
+    // FRITCHII_HITCH_SPLIT: new staging buffers in the hitch line (their first writes, the page
+    // faults of new memory, land in "texture uploads" for texture staging).
+    const Common::Nx2Hitch::SplitScope hitch_timed{Common::Nx2Hitch::Cause::StagingCreate,
+                                                   u64{1} << log2_size};
     // EDEN_NX2_MEMSTAGE_STATS: no free staging buffer of this size (any user).
     VideoCommon::MemStageStats::StagingCreated(u64{1} << log2_size);
     // EDEN_NX2_BUFFER_CHURN_STATS: the same, by caller.
@@ -317,7 +470,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
                 for (StagingBuffers& level : *cache) {
                     const size_t before = level.entries.size();
                     std::erase_if(level.entries, [this](const StagingBuffer& entry) {
-                        return !entry.deferred && clock.IsFree(entry.tick);
+                        return clock.IsFree(entry.tick);
                     });
                     freed += before - level.entries.size();
                     level.iterate_index = 0;
@@ -342,17 +495,23 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
         device.IsBufferDeviceAddressSupported()
             ? device.GetLogical().GetBufferDeviceAddress(*buffer)
             : VkDeviceAddress{};
-    StagingBuffer& entry = GetCache(usage)[log2_size].entries.emplace_back(StagingBuffer{
+    StagingBuffer entry{
         .buffer = std::move(buffer),
         .device_address = buffer_address,
         .mapped_span = mapped_span,
         .usage = usage,
         .log2_level = log2_size,
         .index = unique_ids++,
-        .tick = deferred ? (std::numeric_limits<u64>::max)() : clock.Now(),
-        .deferred = deferred,
-    });
-    return entry.Ref();
+        .tick = clock.Now(),
+    };
+    const StagingBufferRef ref = entry.Ref();
+    StagingBuffers& cache_level = GetCache(usage)[log2_size];
+    if (deferred) {
+        cache_level.deferred.emplace(entry.index, std::move(entry));
+    } else {
+        cache_level.entries.push_back(std::move(entry));
+    }
+    return ref;
 }
 
 StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage usage) {
@@ -373,8 +532,9 @@ u64 StagingBufferPool::CachedBytes(MemoryUsage usage) {
     u64 bytes{};
     const StagingBuffersCache& cache = GetCache(usage);
     for (size_t level = 0; level < NUM_LEVELS; ++level) {
-        if (!cache[level].entries.empty()) {
-            bytes += u64{cache[level].entries.size()} << level;
+        const size_t count = cache[level].entries.size() + cache[level].deferred.size();
+        if (count != 0) {
+            bytes += u64{count} << level;
         }
     }
     return bytes;
@@ -420,7 +580,8 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
         Retire(entry);
         return true;
     };
-    const size_t begin_offset = staging.delete_index;
+    // Deferred checkouts take entries out of the vector since the last sweep.
+    const size_t begin_offset = (std::min)(staging.delete_index, old_size);
     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);
     const auto begin = entries.begin() + begin_offset;
     const auto end = entries.begin() + end_offset;

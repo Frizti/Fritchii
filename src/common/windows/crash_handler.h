@@ -4,12 +4,25 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 
 namespace Common::Windows {
 
 /// On an unhandled exception or abort(), logs one Critical "Host crash" line (code, faulting
 /// address and stack as module+offset, thread), flushes the log and writes
-/// <dump_directory>/eden_crash.dmp. Call after Common::Log::Initialize.
+/// <dump_directory>/eden_crash.dmp. A stack overflow leaves the crashed thread too little stack
+/// for that: a reporter thread the handler starts writes both then. Call after
+/// Common::Log::Initialize.
 void InstallCrashHandler(const std::filesystem::path& dump_directory);
+
+/// Keeps 64 KiB of the calling thread's stack back for a stack overflow, on a stack of 2 MiB or
+/// more. Without it Windows raises the overflow with about a page left, which the exception's
+/// dispatch can use up before it reaches the handler: the process then ends without a report.
+void GuaranteeStackForCrashReport();
+
+/// The hang report's minidump (FRITCHII_HANG_DUMP=1): every thread's stack and state, no heap,
+/// written to <directory>/fritchii_hang_<pid>_<n>.dmp while the process keeps running (dbghelp
+/// suspends the other threads for the write). At most three a process. Returns what to log.
+std::string WriteHangDump(const std::filesystem::path& directory);
 
 } // namespace Common::Windows

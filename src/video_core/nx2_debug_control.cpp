@@ -440,11 +440,41 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_DISPATCH_WALK_SUMMARY") {
         return &g_dispatch_walk_summary;
     }
+    if (name == "FRITCHII_DISPATCH_WAIT_CENSUS") {
+        return &g_dispatch_wait_census;
+    }
+    if (name == "FRITCHII_LAGGED_DEFER") {
+        return &g_lagged_defer;
+    }
     if (name == "FRITCHII_ACQUIRE_TABLE_FIRST") {
         return &g_acquire_table_first;
     }
     if (name == "FRITCHII_E2C_CENSUS") {
         return &g_e2c_census;
+    }
+    if (name == "FRITCHII_KILL_RT_POOL") {
+        return &g_kill_rt_pool;
+    }
+    if (name == "FRITCHII_DEPTH_POOL_BIG") {
+        return &g_depth_pool_big;
+    }
+    if (name == "FRITCHII_HANG_REPORT_S") {
+        return &g_hang_report_s;
+    }
+    if (name == "FRITCHII_RAM_PREBUILT_KEEP") {
+        return &g_ram_prebuilt_keep;
+    }
+    if (name == "FRITCHII_DEPTH_POOL_RETRY") {
+        return &g_depth_pool_retry;
+    }
+    if (name == "FRITCHII_VRAM_POOL_FIT") {
+        return &g_vram_pool_fit;
+    }
+    if (name == "FRITCHII_VRAM_CRITICAL_FIT") {
+        return &g_vram_critical_fit;
+    }
+    if (name == "FRITCHII_VRAM_REPORT") {
+        return &g_vram_report;
     }
     if (name == "FRITCHII_E2C_ON_E") {
         return &g_e2c_on_e;
@@ -466,6 +496,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_GATHER_EMPTY_TEST") {
         return &g_gather_empty_test;
+    }
+    if (name == "FRITCHII_OOT_BYPASS_SAMPLED") {
+        return &g_oot_bypass_sampled;
+    }
+    if (name == "FRITCHII_SCALED_EXTENT_CAP") {
+        return &g_scaled_extent_cap;
     }
     if (name == "FRITCHII_FENCE_COMMIT_FAST") {
         return &g_fence_commit_fast;
@@ -505,6 +541,33 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_ASYNC_REDRAWN") {
         return &g_async_redrawn;
+    }
+    if (name == "FRITCHII_OCCLUSION_VISIBLE") {
+        return &g_occlusion_visible;
+    }
+    if (name == "FRITCHII_UNSWIZZLE_IN_PLACE") {
+        return &g_unswizzle_in_place;
+    }
+    if (name == "FRITCHII_KEEP_BLOCKS") {
+        return &g_keep_blocks;
+    }
+    if (name == "FRITCHII_STAGING_RING") {
+        return &g_staging_ring;
+    }
+    if (name == "FRITCHII_HOSTTIMING_SPIN_BUDGET") {
+        return &g_hosttiming_spin_budget;
+    }
+    if (name == "FRITCHII_GPU_PRIORITY") {
+        return &g_gpu_priority;
+    }
+    if (name == "FRITCHII_THREAD_QOS") {
+        return &g_thread_qos;
+    }
+    if (name == "FRITCHII_FOCUS_GRAB") {
+        return &g_focus_grab;
+    }
+    if (name == "FRITCHII_ONEF_RAISE_AFTER_LEND") {
+        return &g_onef_raise_after_lend;
     }
     if (name == "FRITCHII_PROTECT_UNLOCKED") {
         return &Common::g_protect_unlocked;

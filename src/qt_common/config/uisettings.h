@@ -233,6 +233,11 @@ struct Values {
     // perf overlay
     Setting<bool> show_perf_overlay{linkage, false, "show_perf_overlay", Category::UiGameList};
 
+    // Profiling mode (Help > Profiling Mode): the profiling switches from the next start on and a
+    // banner on the game. main.cpp reads it straight from qt-config.ini ([UI] profiling_mode)
+    // before the settings load: keep the name and the category.
+    Setting<bool> profiling_mode{linkage, false, "profiling_mode", Category::Ui};
+
     // Size & File Types Column
     Setting<bool> show_size{linkage, true, "show_size", Category::UiGameList};
     Setting<bool> show_types{linkage, true, "show_types", Category::UiGameList};

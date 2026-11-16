@@ -16,6 +16,7 @@
 #include "common/fritchii_s4_count.h"
 #include "common/fritchii_write_ring.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/nx2_uniform_keep_pages.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
@@ -76,8 +77,47 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& 
     big_page_table_dev.ResizeAndClear(big_page_table_size);
     big_entries.resize(big_page_table_size / 32, 0);
     big_page_continuous.resize(big_page_table_size / continuous_bits, 0);
-    entries.resize(page_table_size / 32, 0);
+    entries.Allocate(page_table_size / 32);
+    // FRITCHII_MEM_CENSUS: named in the census (no-ops when it is off).
+    Common::MemCensus::Tag("GPU page entries", entries.Data(), entries.Bytes());
+    Common::MemCensus::Tag("GPU big page entries", big_entries.data(),
+                           big_entries.size() * sizeof(u64));
     BackReadAudit::Init();
+}
+
+GpuEntryWords::~GpuEntryWords() {
+    Release();
+}
+
+void GpuEntryWords::Release() {
+    if (zero_pages && words != nullptr) {
+        Common::FreeZeroPages(words, count * sizeof(u64));
+    }
+    vector = {};
+    words = nullptr;
+    count = 0;
+    zero_pages = false;
+}
+
+void GpuEntryWords::Allocate(size_t new_count) {
+    Release();
+    count = new_count;
+    static const bool use_zero_pages = [] {
+        const char* const value = std::getenv("FRITCHII_RAM_GPU_ENTRIES");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (use_zero_pages && new_count != 0) {
+        const size_t bytes = new_count * sizeof(u64);
+        if (void* const memory = Common::AllocateZeroPages(bytes); memory != nullptr) {
+            words = static_cast<u64*>(memory);
+            zero_pages = true;
+            return;
+        }
+        LOG_WARNING(HW_GPU, "FRITCHII_RAM_GPU_ENTRIES: no zero pages for {} MiB, using a vector",
+                    bytes >> 20);
+    }
+    vector.assign(new_count, 0);
+    words = vector.data();
 }
 
 MemoryManager::MemoryManager(Core::System& system_, u64 address_space_bits_, GPUVAddr split_address_, u64 big_page_bits_, u64 page_bits_)
@@ -88,7 +128,10 @@ void MemoryManager::SetNativeSyncpointShim(GPUVAddr address) {
     native_syncpoint_shim.store(address, std::memory_order_release);
 }
 
-MemoryManager::~MemoryManager() = default;
+MemoryManager::~MemoryManager() {
+    Common::MemCensus::Untag(entries.Data());
+    Common::MemCensus::Untag(big_entries.data());
+}
 
 MemoryManager::EntryType MemoryManager::GetEntry(size_t position, bool is_big_page) const {
     if (is_big_page) {

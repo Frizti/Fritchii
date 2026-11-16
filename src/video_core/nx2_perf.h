@@ -175,6 +175,16 @@ inline std::atomic<long long> g_host_refresh_ns{0};
 /// 0. Ocarina of Time's high refresh rate cap (nx2_gsv.h) stays at or below it.
 inline std::atomic<long long> g_display_refresh_ns{0};
 
+/// The swapchain's present mode as a Settings::VSyncMode value (0 Immediate, 1 Mailbox, 2 FIFO,
+/// 3 FIFO relaxed; what the driver gave, not the setting), -1 before the first swapchain.
+/// Ocarina of Time's high refresh rate cap only stays at or below the display rate with FIFO.
+inline std::atomic<int> g_present_mode{-1};
+
+/// True while the game presents as fast as it can on purpose (Ocarina of Time's high refresh
+/// rate with no frame period). With Mailbox the host frame pacer then holds no frames: holding
+/// one per refresh capped the game at the display rate.
+inline std::atomic<bool> g_guest_unpaced{false};
+
 /// Whether the Vulkan device runs the guest's tensor operations on native cooperative matrices
 /// (set at device creation). Ocarina's movie upscaler setting picks by it on Automatic.
 inline std::atomic<bool> g_native_tensor_ops{false};

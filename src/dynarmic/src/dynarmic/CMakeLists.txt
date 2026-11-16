@@ -18,6 +18,7 @@ add_library(dynarmic STATIC
     common/crypto/aes.h
     common/crypto/crc32.cpp
     common/crypto/crc32.h
+    common/fritchii_cheap_barriers.h
     common/fp/fpcr.h
     common/fp/fpsr.h
     common/fp/fused.cpp

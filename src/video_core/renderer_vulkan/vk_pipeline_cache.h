@@ -120,8 +120,10 @@ struct ShaderPools {
 struct ComputePipelineCacheEntry {
     std::unique_ptr<ComputePipeline> pipeline;
     std::string failure;
-    /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
-    std::vector<std::pair<u32, u32>> null_pointer_slots;
+    /// Pointer slots left unbound at translation: null or unmapped plain slots and pointer-table
+    /// entries (see UnboundStoragePointerSlots). One that later holds a mapped address makes the
+    /// translation stale (CurrentComputePipeline rebuilds it).
+    std::vector<Shader::StoragePointerSlot> unbound_pointer_slots;
     /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
     std::vector<u64> mapped_pointers;
     u32 rebuilds{};
@@ -197,8 +199,10 @@ public:
     /// What the "Memory owners" log line counts here (GPU thread).
     struct MemoryOwnerCounts {
         size_t graphics_built{};       ///< Built graphics pipelines (each holds driver memory)
+        size_t graphics_never_used{};  ///< Of them, boot builds no draw has used yet
         size_t graphics_entries{};     ///< graphics_cache entries, unbuilt ones included
         size_t compute{};              ///< Compute pipelines, pending rebuilds included
+        size_t compute_never_dispatched{}; ///< Of them, boot builds no dispatch has used yet
         size_t awaiting_destruction{}; ///< Evicted or retired, destroyed once the GPU is done
         u64 cache_data_bytes{};        ///< vkGetPipelineCacheData's size, at most a minute old
     };
@@ -332,6 +336,8 @@ private:
     /// EDEN_NX2_ASYNC_DISCARD=2 only into recurring render targets). The one test BuiltPipeline
     /// and the translate queue both ask, answered once per lookup.
     [[nodiscard]] bool DrawMayBeSkipped() const;
+    /// FRITCHII_ASYNC_REDRAWN when unset: 1 on AMD's Windows driver, else 0.
+    [[nodiscard]] int AsyncRedrawnDefault() const;
     /// Counts CurrentGraphicsPipeline calls, so DrawMayBeSkipped classifies the targets once per
     /// lookup however often a lookup asks.
     u64 lookup_serial{};
@@ -439,6 +445,13 @@ private:
     void CheckPrecompiledBuilds();
     /// TickFrame: the fast path's counts of the last 10 s.
     void ReportPrecompiled();
+    /// ReportPrecompiled: how many prepared pipelines the driver compiled again (cache misses).
+    void ReportKeptDriverCompiles();
+    struct {
+        u64 builds{};
+        u64 slow{};
+        bool warned{};
+    } kept_compiles_session;
     /// Publishes the kept file's index for the GPU thread (`kept`, or a finished `part` the
     /// preparation could not rename over it); false when there is none for `stamp`. With
     /// `check` (a file another build may have written) it is published only when
@@ -488,7 +501,18 @@ private:
         std::vector<std::vector<VideoCommon::FileEnvironment>>& records,
         PipelineStatistics* statistics);
 
-    [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
+    /// Whether a slot the entry's translation left unbound (unbound_pointer_slots) now holds a
+    /// mapped address; a table entry is followed through its slot's buffer. The first such slot
+    /// and its address are stored in `filled` and `address` when given.
+    [[nodiscard]] bool StaleUnboundPointerSlot(const ComputePipelineCacheEntry& entry,
+                                               Shader::StoragePointerSlot* filled = nullptr,
+                                               GPUVAddr* address = nullptr) const;
+
+    /// Logs once per translation a dispatched native compute program's slots left unbound, with
+    /// its shader hash and where the translation came from (players' logs then name a culling
+    /// program that misses a list slot).
+    void NoteUnboundPointerSlots(const ComputePipelineCacheKey& key,
+                                 const ComputePipelineCacheEntry& entry, bool is_new);
 
     /// Translates the current compute program, binding the pointers in keep_pointers whatever
     /// their slots hold now (see GenericEnvironment::KeepStoragePointers)
@@ -651,6 +675,11 @@ private:
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> retired_translations; ///< (tick, pipeline)
     void RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
+    /// FRITCHII_RAM_PREBUILT_KEEP: key hashes of boot builds destroyed before any draw used them,
+    /// and how many went that way / were asked for again (translated anew) this session.
+    std::unordered_set<u64> evicted_unused_prebuilt;
+    u64 prebuilt_evicted_total{};
+    u64 prebuilt_evicted_needed{};
     /// The pointer slots of evicted graphics pipelines, for their next translation (ported).
     /// Forgotten once a pipeline of the key is made again.
     VideoCommon::EvictedPointerSlots evicted_pointer_slots;
@@ -670,6 +699,8 @@ private:
     ::Common::unordered_map<ComputePipelineCacheKey, EvictedCompute> evicted_compute;
     size_t compute_evicted_total{};       ///< EXP51 evictions this session
     size_t compute_rebuilt_after_evict{}; ///< Evicted compute programs dispatched again
+    u64 compute_slot_rebuilds{};          ///< Rebuilds because an unbound slot filled (session)
+    u32 compute_unbound_logged{};         ///< NoteUnboundPointerSlots lines this session
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;

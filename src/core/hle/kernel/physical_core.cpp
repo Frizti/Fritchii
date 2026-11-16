@@ -87,10 +87,6 @@ void NameGuestThreadForTimeline(const KThread* thread) {
     }
 }
 
-// EDEN_NX2_IDLE_STATS=1 (with EXP79): every 10 s, each core logs how often it went idle, how many
-// of those periods its poll caught, and how long blocked periods took to wake after the interrupt.
-const bool g_idle_stats = std::getenv("EDEN_NX2_IDLE_STATS") != nullptr;
-
 } // Anonymous namespace
 
 /// Locks the core context with whichever lock EDEN_NX2_CORE_LOCK chose.
@@ -120,7 +116,8 @@ private:
 };
 
 PhysicalCore::PhysicalCore(KernelCore& kernel, std::size_t core_index)
-    : m_core_index{core_index}, m_core_lock{CoreLockEnabled()}
+    : m_core_index{core_index}, m_core_lock{CoreLockEnabled()},
+      m_idle_stats{std::getenv("EDEN_NX2_IDLE_STATS") != nullptr}
 {
     m_is_single_core = !kernel.IsMulticore();
 }
@@ -471,7 +468,7 @@ void PhysicalCore::Idle(KernelCore& kernel) {
             while (!m_is_interrupted.load(std::memory_order_acquire)) {
                 m_is_interrupted.wait(false, std::memory_order_acquire);
             }
-            if (g_idle_stats) {
+            if (m_idle_stats) {
                 ScopedGuard lk{*this};
                 interrupt_time = m_interrupt_time.load(std::memory_order_relaxed);
             }
@@ -488,7 +485,7 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         m_idle_poll = Common::NextPollWindow(m_idle_poll, end - start, limit);
     }
 
-    if (!g_idle_stats) {
+    if (!m_idle_stats) {
         return;
     }
     if (m_stats_start == std::chrono::steady_clock::time_point{}) {
@@ -544,7 +541,7 @@ void PhysicalCore::Interrupt() {
     if (m_core_lock) {
         {
             ScopedGuard lk{*this};
-            if (g_idle_stats) {
+            if (m_idle_stats) {
                 m_interrupt_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
                                        std::memory_order_relaxed);
             }
@@ -565,7 +562,7 @@ void PhysicalCore::Interrupt() {
     auto* arm_interface = m_arm_interface;
     auto* thread = m_current_thread;
 
-    if (g_idle_stats) {
+    if (m_idle_stats) {
         m_interrupt_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
                                std::memory_order_relaxed);
     }

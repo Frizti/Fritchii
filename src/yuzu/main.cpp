@@ -6,6 +6,12 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include <fmt/format.h>
+
+#include "common/scm_rev.h"
 
 #include "common/scm_rev.h"
 
@@ -34,6 +40,7 @@
 
 #include "main_window.h"
 #include "fritchii/fritchii_ui.h"
+#include "util/profiling_mode.h"
 #ifdef ENABLE_UPDATE_CHECKER
 #include "updater/update_dialog.h"
 #endif
@@ -218,14 +225,58 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     {"FRITCHII_BANK_FLAGGED", "1"},
 };
 
+#ifndef _WIN32
+extern char** environ;
+#endif
+
+// Every test switch this launch runs with and where it came from, logged at each game start
+// ("Test switches:", main_window.cpp) so a stale one left in a file or a launcher's environment
+// can't skew a test unseen.
+static std::string g_switch_summary;
+
+std::string Nx2SwitchSummary() {
+    return g_switch_summary;
+}
+
+static bool IsTestSwitch(std::string_view name) {
+    return name.starts_with("FRITCHII_") || name.starts_with("EDEN_NX2_") ||
+           name.starts_with("LICHII_");
+}
+
 static void LoadNx2Switches(const char* argv0) {
+    // The test switches already in the real environment (a launcher script's), before the files
+    // add theirs.
+    std::map<std::string, std::string> from_environment;
+#ifdef _WIN32
+    char** const environment = _environ;
+#else
+    char** const environment = environ;
+#endif
+    for (char** it = environment; it != nullptr && *it != nullptr; ++it) {
+        const std::string_view entry{*it};
+        const auto eq = entry.find('=');
+        if (eq != std::string_view::npos && IsTestSwitch(entry.substr(0, eq))) {
+            from_environment.emplace(entry.substr(0, eq), entry.substr(eq + 1));
+        }
+    }
+
     // Later files overwrite earlier entries; the real environment is checked only at the end.
     std::map<std::string, std::string> entries;
+    std::map<std::string, int> origin; // index into the source names below
+    const auto take = [&](std::map<std::string, std::string>&& file, int source) {
+        for (auto& [name, value] : file) {
+            origin.insert_or_assign(name, source);
+            entries.insert_or_assign(name, std::move(value));
+        }
+    };
     for (const auto& [name, value] : BuiltinSwitches) {
         entries.emplace(name, value);
+        origin.emplace(name, 3);
     }
     if (const auto exe_dir = GetSwitchExeDirectory(argv0); !exe_dir.empty()) {
-        ParseSwitchFile(exe_dir / "nx2_switches.txt", entries);
+        std::map<std::string, std::string> file;
+        ParseSwitchFile(exe_dir / "nx2_switches.txt", file);
+        take(std::move(file), 2);
     }
 #ifdef _WIN32
     const auto app_data = Common::FS::GetAppDataRoamingDirectory();
@@ -238,7 +289,54 @@ static void LoadNx2Switches(const char* argv0) {
     if (!std::filesystem::exists(user_file)) {
         user_file = app_data / EDEN_LEGACY_DIR / "nx2_switches.txt";
     }
-    ParseSwitchFile(user_file, entries);
+    {
+        std::map<std::string, std::string> file;
+        ParseSwitchFile(user_file, file);
+        take(std::move(file), 1);
+    }
+
+    // Profiling mode (Help > Profiling Mode): its switches fill in what the files and the
+    // environment leave unset; they beat only a built-in value.
+    std::string profiling_applied;
+    if (ProfilingMode::OnAtLaunch()) {
+        for (const auto& [name, value] : ProfilingMode::Switches()) {
+            const auto it = origin.find(name);
+            if ((it == origin.end() || it->second == 3) && !from_environment.contains(name)) {
+                entries.insert_or_assign(name, value);
+                origin.insert_or_assign(name, 4);
+                profiling_applied +=
+                    fmt::format("{}{}={}", profiling_applied.empty() ? "" : ", ", name, value);
+            }
+        }
+    }
+    ProfilingMode::SetApplied(std::move(profiling_applied));
+
+    // "environment: A=1; user nx2_switches.txt: B=2; nx2_switches.txt next to the exe: C=1;
+    // built in: D=1, E=0; profiling mode: F=1". Anything else under these prefixes (a typo, a
+    // retired name) shows too, so it can be spotted.
+    constexpr const char* SourceNames[] = {"environment", "user nx2_switches.txt",
+                                           "nx2_switches.txt next to the exe", "built in",
+                                           "profiling mode"};
+    std::vector<std::string> groups(std::size(SourceNames));
+    const auto add = [&groups](int source, const std::string& name, const std::string& value) {
+        groups[source] += fmt::format("{}{}={}", groups[source].empty() ? "" : ", ", name, value);
+    };
+    for (const auto& [name, value] : from_environment) {
+        add(0, name, value);
+    }
+    for (const auto& [name, value] : entries) {
+        if (!from_environment.contains(name)) {
+            add(origin[name], name, value);
+        }
+    }
+    g_switch_summary.clear();
+    for (size_t i = 0; i < groups.size(); ++i) {
+        if (!groups[i].empty()) {
+            g_switch_summary += fmt::format("{}{}: {}", g_switch_summary.empty() ? "" : "; ",
+                                            SourceNames[i], groups[i]);
+        }
+    }
+
     for (const auto& [name, value] : entries) {
         if (std::getenv(name.c_str()) != nullptr) {
             continue;
@@ -256,6 +354,9 @@ int main(int argc, char* argv[]) {
     // Before the switches are added to the environment, which a restart must not inherit.
     Updater::PrepareLaunch();
 #endif
+    // Profiling mode's saved setting and the clean environment for its restart, before the
+    // switches are added.
+    ProfilingMode::ReadAtLaunch();
     LoadNx2Switches(argv[0]);
     // Fritchii: NVIDIA's driver shader cache must hold OoT's ~120,000 prepared pipelines. Its size
     // is a Control Panel setting newer drivers no longer show ("Shader Cache Size"); the driver

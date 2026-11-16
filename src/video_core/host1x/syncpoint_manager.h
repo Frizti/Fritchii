@@ -6,8 +6,11 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <chrono>
 #include <list>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -89,6 +92,12 @@ public:
         return syncpoints_host[syncpoint_id].load(std::memory_order_acquire) >= expected_value;
     }
 
+    /// The hang report (FRITCHII_HANG_REPORT_S): every syncpoint something waits on, with its
+    /// guest and host values, the values its registered actions wait for (nx2:syncpt's armed
+    /// slot waits among them) and the threads blocked in WaitGuest/WaitHost. Read only; never
+    /// blocks for long: says so when the lock stays held for 200 ms.
+    [[nodiscard]] std::string DescribeWaits();
+
 private:
     /// `timeline_name`: the Nx2Timeline marker of the increment (a literal), with the id.
     /// `guest`: a guest increment, mirrored first (SetGuestMirror) while a mirror is set.
@@ -102,7 +111,18 @@ private:
 
     void DeregisterAction(std::list<RegisteredAction>& action_storage, const ActionHandle& handle);
 
-    void Wait(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv, u32 expected_value);
+    void Wait(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv, u32 expected_value,
+              u32 syncpoint_id, bool guest);
+
+    /// A thread blocked in Wait (under `guard`), for DescribeWaits.
+    struct BlockedWait {
+        const void* token;
+        u32 syncpoint_id;
+        u32 expected_value;
+        bool guest;
+        std::chrono::steady_clock::time_point since;
+    };
+    std::vector<BlockedWait> blocked_waits;
 
     std::array<std::atomic<u32>, NUM_MAX_SYNCPOINTS> syncpoints_guest{};
     std::array<std::atomic<u32>, NUM_MAX_SYNCPOINTS> syncpoints_host{};

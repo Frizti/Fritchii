@@ -1485,6 +1485,28 @@ private:
     std::deque<GpuSentencedImage> gpu_sentenced_images;
     u64 gpu_sentenced_bytes{};
 
+    /// Fritchii's free guard (helper_bi_answer.md). An image deleted while a download of it was
+    /// queued lives in the download records (RetainPendingImageDownloads) and used to be destroyed
+    /// when that download landed: the GPU had passed the download's copy then, not the draws and
+    /// copies recorded after it and before the delete (AMD: device lost). Each such image is also
+    /// held here until the GPU passes the tick it was deleted at.
+    struct RetainedImageKeeper {
+        u64 tick;
+        std::shared_ptr<Image> image;
+    };
+    std::deque<RetainedImageKeeper> retained_image_keepers;
+    /// Session totals, logged every 600 frames once one is not 0.
+    struct FreeGuardStats {
+        u64 retained_held{};     ///< images deleted with a download queued, held by the guard
+        u64 landed_early{};      ///< of them, downloads landed before the GPU was known past the
+                                 ///< delete: the old code destroyed the image there, in use
+        u64 freed_early{};       ///< must be 0: a landing destroyed a retired image before the
+                                 ///< GPU was known past its delete (the guard's own check)
+        u64 unswizzle_dropped{}; ///< async unswizzles dropped with their deleted image
+        u64 logged_total{};      ///< the sum above when last logged
+    };
+    FreeGuardStats free_guard{};
+
     /// EXP121: collector downloads recorded without a wait, oldest first.
     struct CollectDownload {
         ImageId image_id;

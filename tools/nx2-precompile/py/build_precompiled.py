@@ -268,7 +268,7 @@ if args.mesh_combos and args.mesh_envs:
 
 
 # Storage pointer states of compute programs. A native compute program's translation leaves out
-# the accesses through a pointer slot that was null (PipelineCache::StaleNullPointerSlot), and
+# the accesses through a pointer slot that was null (PipelineCache::StaleUnboundPointerSlot), and
 # which slots the game fills depends on the area. When a slot it left out is filled, the program
 # is translated again, binding every pointer the first translation bound and those filled now:
 # SPIR-V the driver has not seen, compiled while the game waits (seconds for these programs). The

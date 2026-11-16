@@ -109,6 +109,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 bool resumed = false;
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
+                    // FRITCHII_LAGGED_DEFER: the checks this poll puts off, only.
+                    Tegra::Engines::LaggedDefer::Clear();
                     resumed = scheduler.ResumePending(system.GPU());
                 }
                 if (!state.queue.TryPop(next)) {
@@ -116,6 +118,13 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // this thread yields or sleeps (Commit publishes every 256 words).
                     if (split.Active()) {
                         split.PublishBeforeWait();
+                    }
+                    // FRITCHII_LAGGED_DEFER: lagged checks put off while the back was short of
+                    // their targets wait here, where the front has nothing else to do, then
+                    // the channels are polled again (the checks run with the back there).
+                    if (Tegra::Engines::LaggedDefer::Pending()) {
+                        Tegra::Engines::LaggedDefer::WaitBeforeSleep();
+                        continue;
                     }
                     if (gpu_wake) {
                         if (resumed) {

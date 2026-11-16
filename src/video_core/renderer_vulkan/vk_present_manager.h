@@ -84,6 +84,10 @@ private:
     /// `frame` until its target. Returns whether it was held.
     bool PaceFrame(Frame* frame, std::stop_token token);
 
+    /// Without present wait (no pacing): still reads the display's refresh rate now and then,
+    /// for Ocarina of Time's "Monitor refresh rate" cap (it fell back to 60 Hz).
+    void NoteDisplayRefresh();
+
     /// Waits for each present id until it is shown (VK_KHR_present_wait).
     void PresentWaitThread(std::stop_token token);
 

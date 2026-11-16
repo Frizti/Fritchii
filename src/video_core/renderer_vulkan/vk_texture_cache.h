@@ -202,7 +202,14 @@ public:
 
     u64 GetDeviceMemorySlack() const;
 
+    /// FRITCHII_KEEP_BLOCKS: the kept blocks' limit from the budget check (Device::LimitKeptBlocks).
+    void LimitKeptBlocks(u64 budget, u64 critical) const;
+
     bool CanReportMemoryUsage() const;
+
+    /// The largest width and height a scaled image may take: the device's 2D image and
+    /// framebuffer limits (16384 on AMD).
+    u32 GetMaxScaledExtent() const noexcept;
 
     /// Images that did not fit the device memory budget so far (see MemoryAllocator).
     u32 MemoryPressureEvents() const noexcept {
@@ -355,6 +362,8 @@ public:
     RenderPassCache& render_pass_cache;
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+    /// GetMaxScaledExtent, read once from the device's limits.
+    u32 max_scaled_extent{};
 
     /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
@@ -502,6 +511,27 @@ public:
     /// held ~17 of them and evicted 1,150-1,400 images a 600 frames in Castle Town (2026-11-10).
     static constexpr u64 ImagePoolMaxBytesDedicated = u64{1536} << 20;
     [[nodiscard]] static u64 ImagePoolCap();
+    /// ImagePoolCap, lowered to the room under the device budget with FRITCHII_VRAM_POOL_FIT.
+    [[nodiscard]] u64 FittedPoolCap() const {
+        return (std::min)(ImagePoolCap(), pool_fit_cap);
+    }
+    /// FRITCHII_VRAM_POOL_FIT: recomputes pool_fit_cap from the budget and the usage.
+    void UpdatePoolFitCap();
+    u64 pool_fit_cap{~u64{0}};  ///< ~0 while FRITCHII_VRAM_POOL_FIT is off
+    u64 pool_fit_lowest{~u64{0}}; ///< the lowest fitted cap since the last report
+    u64 pool_fit_budget{};
+    u64 pool_fit_others{};
+    u32 pool_fit_frames{};
+    /// FRITCHII_VRAM_REPORT: samples (every 30 frames) since the last report line.
+    void SampleVramReport();
+    u32 vram_report_frames{};
+    u32 vram_report_samples{};
+    u32 vram_report_over{};
+    u64 vram_report_peak_usage{};
+    u64 vram_report_peak_over{};
+    u64 vram_report_last_budget{};
+    u32 vram_report_seen_pressure{};
+    u32 vram_report_seen_failed{};
     static constexpr u64 ImagePoolMaxFrames = 180;
     std::deque<PooledImage> image_pool;
     u64 image_pool_bytes{};

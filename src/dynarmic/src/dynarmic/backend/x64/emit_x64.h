@@ -9,10 +9,14 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -53,6 +57,24 @@ using VectorArray = std::array<T, A64FullVectorWidth::value / mcl::bitsizeof<T>>
 
 template<typename T>
 using HalfVectorArray = std::array<T, A64FullVectorWidth::value / mcl::bitsizeof<T> / 2>;
+
+/// Fritchii (FRITCHII_JIT_SHARED_FASTMEM_MARKS, boot): the fastmem accesses that faulted (the
+/// do_not_fastmem markers), one set for every JIT on the same fastmem arena (one process), so an
+/// access that faulted on one core is compiled without fastmem by the others instead of faulting
+/// and recompiling there too (port of the idea of zortos293/Lichii #1861, arm64 there). A marker
+/// only sends that access to the page table path, so sharing changes no results. The lock is held
+/// only around a lookup while a block is emitted and around an insert in the fault handler; no
+/// thread faults while it holds it.
+struct SharedFastmemMarks {
+    std::shared_mutex mutex;
+    ::Common::unordered_set<std::tuple<IR::LocationDescriptor, unsigned>> marks;
+    std::atomic<std::uint64_t> used_from_other{0};  ///< compiles that took another core's marker
+    std::atomic<std::uint64_t> faults{0};           ///< markers added (first fault per access)
+};
+/// The set for this fastmem arena (null when the switch is off or there is no fastmem).
+std::shared_ptr<SharedFastmemMarks> SharedFastmemMarksFor(const void* fastmem_arena);
+/// Counts a compile that used another core's marker; logs at powers of two.
+void NoteSharedFastmemMarkUsed(SharedFastmemMarks& shared, unsigned core);
 
 using SharedLabel = Xbyak::Label*;
 struct EmitContext {
@@ -175,6 +197,8 @@ public:
     ExceptionHandler exception_handler;
     ::Common::unordered_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
     ::Common::unordered_map<IR::LocationDescriptor, PatchInformation> patch_information;
+    /// Fritchii (FRITCHII_JIT_SHARED_FASTMEM_MARKS): set by the A64 emitter only; null = per-core.
+    std::shared_ptr<SharedFastmemMarks> shared_fastmem_marks;
 
     // We need materialized protected members
     friend class A64EmitX64;

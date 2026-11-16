@@ -2181,6 +2181,8 @@ private:
     u32 m_swap_word{};
     u32 m_oot_scale_bits{}; // the speed scale last written (SetOotSpeedScale), 0 = none yet
     bool m_oot_vsync_set{}; // the vsync event follows Ocarina's high refresh rate mode
+    long long m_oot_cap_key{-1}; // the high refresh rate cap decision last logged
+    u32 m_oot_cap_logs{};
 
     struct FrameTrace {
         Common::DkbFrameTrace::RateLimit rate;
@@ -2208,12 +2210,26 @@ private:
         }
     }
 
-    /// Ocarina of Time's frame period with the high refresh rate patch: the chosen cap, never
-    /// faster than the display (FIFO would not show those frames; the host pacer holds them).
-    /// "Monitor refresh" before the display's rate is known: 60 Hz.
-    static std::chrono::nanoseconds OotHighRefreshInterval() {
+    /// The display's refresh period (the host frame pacer's measurement), 0 while unknown.
+    /// Linux: the pacer's measured period, else the rate the frontend reports for the window's
+    /// display (QScreen, FRITCHII_HOST_REFRESH_HZ).
+    static long long DisplayRefreshNs() {
+#ifdef _WIN32
+        return VideoCommon::Nx2Perf::g_display_refresh_ns.load(std::memory_order_relaxed);
+#else
+        return VideoCommon::Nx2Perf::DisplayRefreshNsOrReported();
+#endif
+    }
+
+    /// Ocarina of Time's frame period with the high refresh rate patch, 0 = none (the game runs
+    /// as fast as it can). The chosen cap; with FIFO never faster than the display (FIFO would
+    /// not show those frames and the host pacer holds them), with Immediate or Mailbox it may be.
+    /// "Unlimited": none. "Monitor refresh rate" while the display's rate is unknown (no present
+    /// wait, Linux without a reported rate): none too, not 60 Hz. Logs each new decision.
+    std::chrono::nanoseconds OotHighRefreshInterval() {
+        const auto cap = Settings::values.oot_high_refresh_cap.GetValue();
         long long hz = 0;
-        switch (Settings::values.oot_high_refresh_cap.GetValue()) {
+        switch (cap) {
         case Settings::OotRefreshCap::Hz90:
             hz = 90;
             break;
@@ -2226,25 +2242,51 @@ private:
         case Settings::OotRefreshCap::Hz165:
             hz = 165;
             break;
+        case Settings::OotRefreshCap::Unlimited:
         case Settings::OotRefreshCap::Display:
         default:
             break;
         }
-#ifdef _WIN32
-        const long long display =
-            VideoCommon::Nx2Perf::g_display_refresh_ns.load(std::memory_order_relaxed);
-#else
-        // The pacer's measured period, else the rate the frontend reports for the window's
-        // display: without the pacer (vsync Immediate, no present wait) "Display" fell back to
-        // 60 Hz on Linux.
-        const long long display = VideoCommon::Nx2Perf::DisplayRefreshNsOrReported();
-#endif
-        long long ns = hz != 0 ? 1'000'000'000LL / hz : display;
-        if (display > 0) {
+        const bool unlimited = cap == Settings::OotRefreshCap::Unlimited;
+        const long long display = DisplayRefreshNs();
+        const int mode = VideoCommon::Nx2Perf::g_present_mode.load(std::memory_order_relaxed);
+        // FIFO and FIFO relaxed wait for a refresh per frame; unknown (no swapchain yet) too.
+        const bool fifo = mode != static_cast<int>(Settings::VSyncMode::Immediate) &&
+                          mode != static_cast<int>(Settings::VSyncMode::Mailbox);
+        long long ns = unlimited ? 0 : hz != 0 ? 1'000'000'000LL / hz : display;
+        if (ns > 0 && fifo && display > 0) {
             ns = (std::max)(ns, display);
         }
-        if (ns <= 0) {
-            ns = 1'000'000'000LL / 60;
+        ns = (std::max)(ns, 0LL);
+        // One line per new decision (the display rate in whole Hz: it is measured again every
+        // 2 s), at most 16 a session.
+        const long long display_hz = display > 0 ? (1'000'000'000LL + display / 2) / display : 0;
+        const long long cap_hz = ns > 0 ? (1'000'000'000LL + ns / 2) / ns : 0;
+        const long long key = (static_cast<long long>(cap) << 40) | (display_hz << 24) |
+                              (static_cast<long long>(mode + 1) << 20) | cap_hz;
+        if (key != std::exchange(m_oot_cap_key, key) && m_oot_cap_logs < 16) {
+            ++m_oot_cap_logs;
+            static constexpr std::array<const char*, 4> ModeNames{"Immediate", "Mailbox", "FIFO",
+                                                                  "FIFO relaxed"};
+            const char* mode_name =
+                mode >= 0 && mode < 4 ? ModeNames[static_cast<size_t>(mode)] : "unknown";
+            const std::string display_text =
+                display_hz > 0 ? fmt::format("{} Hz", display_hz) : std::string{"unknown"};
+            if (ns > 0) {
+                LOG_INFO(Service, "High refresh: capped at {} Hz (display {}, vsync {}){}",
+                         cap_hz, display_text, mode_name,
+                         hz != 0 && fifo && display > 0 &&
+                                 1'000'000'000LL / hz * 100 < display * 98
+                             ? ": the cap is above the display rate and FIFO shows one frame "
+                               "per refresh; Mailbox or Immediate lift that"
+                             : "");
+            } else {
+                LOG_INFO(Service, "High refresh: no cap ({}; display {}, vsync {}){}",
+                         unlimited ? "Unlimited" : "display rate unknown", display_text,
+                         mode_name,
+                         fifo ? ": with FIFO the display still limits it to its refresh rate"
+                              : "");
+            }
         }
         return std::chrono::nanoseconds{ns};
     }
@@ -2303,19 +2345,28 @@ private:
                                           ? process->GetOotHighRefreshScaleAddress()
                                           : 0;
         const bool high_refresh = oot_scale_address != 0 && !Settings::values.oot_30fps.GetValue();
+        // Its frame period at the cap, 0 = none ("Unlimited", or the display's rate unknown).
+        const std::chrono::nanoseconds oot_period =
+            high_refresh && Settings::SpeedLimitEnabled() ? OotHighRefreshInterval()
+                                                          : std::chrono::nanoseconds{};
         if (oot_scale_address != 0) {
             SetOotSpeedScale(*process);
-            // The game starts its frames on the vsync event: at the cap, unlocked at 240 Hz.
-            SetVsyncInterval(!high_refresh ? DefaultVblankInterval()
-                             : Settings::SpeedLimitEnabled() ? OotHighRefreshInterval()
-                                                             : std::chrono::nanoseconds{
-                                                                   1'000'000'000LL / 240});
+            // The game starts its frames on the vsync event: at the cap; with no cap (also
+            // unlocked) at 240 Hz.
+            SetVsyncInterval(!high_refresh            ? DefaultVblankInterval()
+                             : oot_period.count() > 0 ? oot_period
+                                                      : std::chrono::nanoseconds{
+                                                            1'000'000'000LL / 240});
             m_oot_vsync_set = true;
         } else if (std::exchange(m_oot_vsync_set, false)) {
             // Switched off while the game runs (Ctrl+U): the vsync event back at its default.
             SetVsyncInterval(DefaultVblankInterval());
         }
-        if (!Settings::SpeedLimitEnabled() || Settings::SpeedLimit() == 0) {
+        // No frame period: no pacing here, and with Mailbox no host frame pacer holds either.
+        const bool unpaced =
+            high_refresh && Settings::SpeedLimitEnabled() && oot_period.count() == 0;
+        VideoCommon::Nx2Perf::g_guest_unpaced.store(unpaced, std::memory_order_relaxed);
+        if (!Settings::SpeedLimitEnabled() || Settings::SpeedLimit() == 0 || unpaced) {
             VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
@@ -2325,7 +2376,7 @@ private:
         }
         auto interval =
             high_refresh
-                ? OotHighRefreshInterval()
+                ? oot_period
                 : std::chrono::nanoseconds{100'000'000'000LL * swap_interval / refresh_rate /
                                            (oot_scale_address != 0 ? 100 : Settings::SpeedLimit())};
         // Genlock: with the host frame pacer on, a frame period within 1% of a whole number of

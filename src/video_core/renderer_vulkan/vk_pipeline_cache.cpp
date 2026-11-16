@@ -684,6 +684,9 @@ void LogDriverCacheFolder(const Device& device, std::string_view when) {
     u64 files = 0;
     u64 bytes = 0;
     std::filesystem::file_time_type newest{};
+    // The three biggest files: AMD keeps each program's pipelines in its own archive (.parc), so
+    // the emulator's one shows whether the preparation (gigabytes) is in there at all.
+    std::array<std::pair<u64, std::filesystem::path>, 3> biggest{};
     for (std::filesystem::recursive_directory_iterator it{folder, ec}, end; !ec && it != end;
          it.increment(ec)) {
         std::error_code entry_ec;
@@ -691,15 +694,29 @@ void LogDriverCacheFolder(const Device& device, std::string_view when) {
             continue;
         }
         ++files;
-        bytes += it->file_size(entry_ec);
+        const u64 size = it->file_size(entry_ec);
+        bytes += size;
         newest = (std::max)(newest, it->last_write_time(entry_ec));
+        if (size > biggest.back().first) {
+            biggest.back() = {size, it->path().filename()};
+            std::ranges::sort(biggest, std::greater{}, &std::pair<u64, std::filesystem::path>::first);
+        }
+    }
+    std::string largest;
+    for (const auto& [size, name] : biggest) {
+        if (size != 0) {
+            largest += fmt::format("{}{} {} MiB", largest.empty() ? "" : ", ", name.string(),
+                                   size >> 20);
+        }
     }
     const auto age = std::chrono::duration_cast<std::chrono::seconds>(
         std::filesystem::file_time_type::clock::now() - newest);
     const char* const amd_path = std::getenv("AMD_VK_PIPELINE_CACHE_PATH");
     LOG_INFO(Render_Vulkan,
-             "Driver cache folder {} ({}): {} files, {} MiB, newest written {} s ago{}{}",
+             "Driver cache folder {} ({}): {} files, {} MiB, newest written {} s ago; biggest: "
+             "{}{}{}",
              folder.string(), when, files, bytes >> 20, files != 0 ? age.count() : -1,
+             largest.empty() ? "none" : largest,
              amd_path != nullptr ? "; AMD_VK_PIPELINE_CACHE_PATH=" : "",
              amd_path != nullptr ? amd_path : "");
 #endif
@@ -3039,11 +3056,31 @@ void OrderComputeTranslations(std::vector<Candidate>& candidates, PointerKeys&& 
     }
     candidates = std::move(ordered);
 }
+
+/// "c4[0xd0]", with "[0x18]" after it for a pointer-table entry.
+std::string FormatPointerSlot(const Shader::StoragePointerSlot& slot) {
+    std::string text = fmt::format("c{}[{:#x}]", slot.index, slot.offset);
+    if (slot.indirect) {
+        text += fmt::format("[{:#x}]", *slot.indirect);
+    }
+    return text;
+}
 } // Anonymous namespace
 
-bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const {
+bool PipelineCache::StaleUnboundPointerSlot(const ComputePipelineCacheEntry& entry,
+                                            Shader::StoragePointerSlot* filled,
+                                            GPUVAddr* filled_address) const {
     const auto& qmd{kepler_compute->launch_description};
-    for (const auto& [index, offset] : entry.null_pointer_slots) {
+    const auto mapped = [this](GPUVAddr address) {
+        return address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+               gpu_memory->IsFullyMappedRange(address, 1);
+    };
+    // The memory seam (EXP123 >= 3): the slot's value is kept in the dispatch packet, which
+    // opens here or at the QMD read (vk_mem_stage.cpp).
+    MemStage& seam{buffer_cache.runtime.Seam()};
+    for (const Shader::StoragePointerSlot& unbound : entry.unbound_pointer_slots) {
+        const u32 index = unbound.index;
+        const u32 offset = unbound.offset;
         if (index >= qmd.const_buffer_config.size() ||
             ((qmd.const_buffer_enable_mask >> index) & 1) == 0) {
             continue;
@@ -3056,21 +3093,58 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
         if (!gpu_memory->IsFullyMappedRange(slot, sizeof(u64))) {
             continue;
         }
-        // The memory seam (EXP123 >= 3): the slot's value is kept in the dispatch packet, which
-        // opens here or at the QMD read (vk_mem_stage.cpp).
-        MemStage& seam{buffer_cache.runtime.Seam()};
-        const GPUVAddr address{seam.ValuesByValue() ? seam.ReadPointerSlot(*gpu_memory, slot)
-                                                    : gpu_memory->Read<u64>(slot)};
-        if (address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
-            gpu_memory->IsFullyMappedRange(address, 1)) {
-            LOG_INFO(Render_Vulkan,
-                     "Rebuilding compute program {:#x}: c{}[{:#x}] was null at translation and "
-                     "now points to {:#x}",
-                     kepler_compute->regs.code_loc.Address() + qmd.program_start, index, offset, address);
+        GPUVAddr address{seam.ValuesByValue() ? seam.ReadPointerSlot(*gpu_memory, slot)
+                                              : gpu_memory->Read<u64>(slot)};
+        if (unbound.indirect) {
+            // A pointer-table entry: the table must be mapped before its entry can be read. Read
+            // directly, as the translation reads it (IsCbufIndirectStorageBufferPointer).
+            const u32 indirect = *unbound.indirect;
+            if (!mapped(address) ||
+                !gpu_memory->IsFullyMappedRange(address + indirect, sizeof(u64))) {
+                continue;
+            }
+            address = gpu_memory->Read<u64>(address + indirect);
+        }
+        if (mapped(address)) {
+            if (filled) {
+                *filled = unbound;
+            }
+            if (filled_address) {
+                *filled_address = address;
+            }
             return true;
         }
     }
     return false;
+}
+
+void PipelineCache::NoteUnboundPointerSlots(const ComputePipelineCacheKey& key,
+                                            const ComputePipelineCacheEntry& entry, bool is_new) {
+    // About a hundred native compute programs are dispatched in a session; the cap only guards
+    // against a game that keeps making new ones.
+    constexpr u32 MaxLines = 256;
+    if (compute_unbound_logged >= MaxLines) {
+        return;
+    }
+    ++compute_unbound_logged;
+    std::string slots;
+    for (const Shader::StoragePointerSlot& slot : entry.unbound_pointer_slots) {
+        slots += ' ';
+        slots += FormatPointerSlot(slot);
+    }
+    const char* source = "cache record";
+    if (entry.pipeline && entry.pipeline->IsPrecompiled()) {
+        source = "prepared";
+    } else if (entry.rebuilds != 0) {
+        source = "rebuilt";
+    } else if (is_new) {
+        source = "translated now";
+    }
+    LOG_INFO(Render_Vulkan,
+             "Compute {:016x} ({}, rebuild {} of {}): {} pointers bound, left unbound:{}{}",
+             key.unique_hash, source, entry.rebuilds, MaxComputeRebuilds,
+             entry.mapped_pointers.size(), slots,
+             compute_unbound_logged == MaxLines ? " (last such line this session)" : "");
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline() {
@@ -3087,6 +3161,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     };
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& entry{pair->second};
+    Shader::StoragePointerSlot filled_slot{};
+    GPUVAddr filled_address{};
     if (is_new) {
         if (const auto evicted = evicted_compute.find(key); evicted != evicted_compute.end()) {
             // EXP51 evicted it: translated binding the pointers it bound, from the driver's
@@ -3125,11 +3201,21 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         retired_compute_pipelines.emplace_back(scheduler.CurrentTick(), std::move(entry.pipeline));
         entry = CreateComputePipeline(key, shader, entry.mapped_pointers);
         entry.rebuilds = rebuilds;
-    } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
-               StaleNullPointerSlot(entry)) {
-        // The translation dropped accesses through a pointer that was null back then. Which slots
-        // the game fills depends on the area, so the new one keeps binding every pointer this one
-        // binds, null now or not: a null pointer binds nothing.
+    } else if (!entry.unbound_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
+               StaleUnboundPointerSlot(entry, &filled_slot, &filled_address)) {
+        // The translation dropped accesses through a pointer that was unbound back then (null,
+        // unmapped, or a pointer-table entry). Which slots the game fills depends on the area and
+        // the moment (OoT's foliage culling during a sword swing), so the new one keeps binding
+        // every pointer this one binds, null now or not: a null pointer binds nothing.
+        ++compute_slot_rebuilds;
+        LOG_INFO(Render_Vulkan,
+                 "Compute rebuilt: slot filled after capture: program {:#x} ({:016x}, {}) {} was "
+                 "unbound at translation and now points to {:#x}; rebuild {} of {}, {} this "
+                 "session",
+                 kepler_compute->regs.code_loc.Address() + qmd.program_start, key.unique_hash,
+                 entry.pipeline && entry.pipeline->IsPrecompiled() ? "prepared" : "translated",
+                 FormatPointerSlot(filled_slot), filled_address, entry.rebuilds + 1,
+                 MaxComputeRebuilds, compute_slot_rebuilds);
         auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
         if (rebuilt.pipeline) {
             rebuilt.rebuilds = entry.rebuilds + 1;
@@ -3151,6 +3237,9 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
                         key.unique_hash, rebuilt.failure);
             entry.rebuilds = MaxComputeRebuilds;
         }
+    }
+    if (!entry.dispatched && !entry.unbound_pointer_slots.empty()) {
+        NoteUnboundPointerSlots(key, entry, is_new);
     }
     entry.last_use_frame = frame_count;
     entry.dispatched = true;
@@ -3183,8 +3272,10 @@ ComputePipeline* PipelineCache::OneFollowerComputePipeline() {
     }
     // The stale slot test reads the slots (game memory, E's; ReadPointerSlot keeps the values
     // in the open dispatch packet). Stale: a rebuild is due, lent (the lent lookup reads again).
-    if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
-        StaleNullPointerSlot(entry)) {
+    // A first dispatch with unbound slots is lent too, once, for its log line.
+    if (!entry.unbound_pointer_slots.empty() &&
+        (!entry.dispatched ||
+         (entry.rebuilds < MaxComputeRebuilds && StaleUnboundPointerSlot(entry)))) {
         return nullptr;
     }
     // From here as CurrentComputePipeline: ComputeShader's checks and hooks (they may throw:
@@ -5828,8 +5919,9 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
             descriptor_buffer_ring, &workers, nullptr, &shader_notify, *info, vk::ShaderModule{},
             key.unique_hash, std::move(make_module)),
         // The live environment answered the same questions, as the translation would have.
-        .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
-                                                    : std::vector<std::pair<u32, u32>>{},
+        .unbound_pointer_slots = env.IsNativeProgram()
+                                     ? env.UnboundStoragePointerSlots()
+                                     : std::vector<Shader::StoragePointerSlot>{},
         .mapped_pointers =
             env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{},
     };
@@ -5884,6 +5976,39 @@ void PipelineCache::CheckPrecompiledBuilds() {
     }
 }
 
+void PipelineCache::ReportKeptDriverCompiles() {
+    // Every prepared pipeline should be a driver cache hit (a few ms). Ones the driver compiles
+    // again mean its cache lost or never kept the preparation: on an RX 7900 XT 60%+ of them took
+    // 0.2-1.1 s and draws waiting for them froze the game for a second (tester log t1858), while
+    // the driver's cache folder never got near the preparation's size.
+    const auto taken = GraphicsPipeline::TakeKeptBuildStats();
+    if (taken.builds == 0) {
+        return;
+    }
+    kept_compiles_session.builds += taken.builds;
+    kept_compiles_session.slow += taken.slow;
+    const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    LOG_INFO(Render_Vulkan,
+             "Driver compiles of prepared pipelines in the last 10 s: {} built from kept SPIR-V, {} "
+             "took over {} ms (compiled again, not in the driver's cache) for {:.0f} ms, longest "
+             "{:.0f} ms; this session {} of {} compiled again",
+             taken.builds, taken.slow, GraphicsPipeline::KeptBuildSlow.count(), ms(taken.slow_time),
+             ms(taken.longest), kept_compiles_session.slow, kept_compiles_session.builds);
+    if (!kept_compiles_session.warned && kept_compiles_session.builds >= 100 &&
+        kept_compiles_session.slow * 2 >= kept_compiles_session.builds) {
+        kept_compiles_session.warned = true;
+        LOG_WARNING(Render_Vulkan,
+                    "The driver's cache does not hold the precompiled pipelines: {} of {} prepared "
+                    "pipelines were compiled again, each a stall where a draw waits for it. {}",
+                    kept_compiles_session.slow, kept_compiles_session.builds,
+                    device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY
+                        ? "AMD: check Adrenalin > Gaming > Graphics > Shader Cache is on (not Off) "
+                          "and never use Reset Shader Cache; the folder sizes in the Driver cache "
+                          "folder lines show what the driver kept"
+                        : "NVIDIA: set Shader Cache Size to Unlimited in the NVIDIA Control Panel");
+    }
+}
+
 void PipelineCache::ReportPrecompiled() {
     if (PrecompiledFastMode() == 0) {
         return;
@@ -5901,6 +6026,7 @@ void PipelineCache::ReportPrecompiled() {
     const u64 bytes_total = PrecompiledKept::BytesRead().load(std::memory_order_relaxed);
     const u64 bytes = bytes_total - stats.bytes_at_window;
     const u32 built = precompiled_worker_builds.exchange(0, std::memory_order_relaxed);
+    ReportKeptDriverCompiles();
     if (stats.graphics + stats.compute + stats.failed + stats.not_precompiled + built != 0 ||
         !stats.misses.empty()) {
         const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
@@ -6145,6 +6271,11 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     auto& pipeline{pair->second};
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
+        // FRITCHII_RAM_PREBUILT_KEEP: a boot build destroyed unused is translated again here.
+        if (!evicted_unused_prebuilt.empty() &&
+            evicted_unused_prebuilt.erase(graphics_key.Hash()) != 0) {
+            ++prebuilt_evicted_needed;
+        }
         pipeline = TakeBackgroundPipeline(graphics_key);
         // A key evicted earlier (EvictUnusedPipelines) is translated binding the storage buffer
         // pointers it bound, whatever their slots hold now: one null or unmapped around an area
@@ -6357,8 +6488,29 @@ void PipelineCache::TickFrame() {
     if (device.IsExtGraphicsPipelineLibrarySupported()) {
         graphics_libraries.Report();
     }
+    // FRITCHII_MEM_CENSUS: what destroying a batch of evicted pipelines gives back, to price a
+    // pipeline's driver memory (the 0.45 MB the memory lines use is an estimate).
+    const bool price_frees = Common::MemCensus::Mode() != 0 && evicted_pipelines.size() >= 32 &&
+                             scheduler.IsFree(evicted_pipelines[31].first);
+    const Common::ProcessMemoryUsage before_frees =
+        price_frees ? Common::GetProcessMemoryUsage() : Common::ProcessMemoryUsage{};
+    size_t freed_pipelines = 0;
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
+        ++freed_pipelines;
+    }
+    if (price_frees) {
+        const Common::ProcessMemoryUsage after = Common::GetProcessMemoryUsage();
+        const auto delta = [](u64 from, u64 to) {
+            return static_cast<double>(static_cast<s64>(from) - static_cast<s64>(to)) / 1024.0;
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline frees (FRITCHII_MEM_CENSUS): {} graphics pipelines destroyed, private "
+                 "commit -{:.0f} KiB ({:.0f} KiB each), working set -{:.0f} KiB",
+                 freed_pipelines, delta(before_frees.private_bytes, after.private_bytes),
+                 delta(before_frees.private_bytes, after.private_bytes) /
+                     static_cast<double>((std::max)(freed_pipelines, size_t{1})),
+                 delta(before_frees.working_set, after.working_set));
     }
     // A retired translation's build may still be queued on the pipeline workers: destroying it
     // now would wait for that build, or run it here on the GPU thread.
@@ -6392,10 +6544,12 @@ PipelineCache::MemoryOwnerCounts PipelineCache::MemoryOwners() {
     for (const auto& [key, pipeline] : graphics_cache) {
         if (pipeline != nullptr && pipeline->IsBuilt()) {
             ++counts.graphics_built;
+            counts.graphics_never_used += pipeline->WasUsed() ? 0 : 1;
         }
     }
     for (const auto& [key, entry] : compute_cache) {
         counts.compute += entry.pipeline != nullptr ? 1 : 0;
+        counts.compute_never_dispatched += entry.pipeline != nullptr && !entry.dispatched ? 1 : 0;
         counts.compute += entry.pending != nullptr && entry.pending->pipeline != nullptr ? 1 : 0;
     }
     counts.awaiting_destruction = evicted_pipelines.size() + retired_translations.size() +
@@ -6453,7 +6607,15 @@ void PipelineCache::EvictUnusedPipelines() {
     // Past it only the excess goes, least recently used first (ported), so
     // crossing it doesn't drop every stale pipeline at once.
     const size_t evict_above = EvictAbovePipelines();
-    if (graphics_cache.size() <= evict_above) {
+    // FRITCHII_RAM_PREBUILT_KEEP (live, default 0 = off): boot-built pipelines no draw has used,
+    // unused for EvictAfterFrames, are destroyed past this many kept, also below evict_above
+    // (16 GB PCs: ~2,280, which the market's ~1,800 never reached). 16 GB of RAM is the target:
+    // each holds ~0.3-0.45 MB of driver memory. One needed again later is translated anew
+    // (counted below as "needed again").
+    const int keep_switch = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_ram_prebuilt_keep, "FRITCHII_RAM_PREBUILT_KEEP");
+    const bool over = graphics_cache.size() > evict_above;
+    if (!over && keep_switch <= 0) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
@@ -6462,31 +6624,52 @@ void PipelineCache::EvictUnusedPipelines() {
     // again on the GPU thread when it reaches that content. Past the budget (~0.9 GB of driver
     // memory) they go like the rest, so a large cache can't hold their memory all session.
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
+    const size_t unused_budget =
+        keep_switch > 0 ? (std::min)(static_cast<size_t>(keep_switch), MaxUnusedPrebuiltPipelines)
+                        : MaxUnusedPrebuiltPipelines;
     size_t kept_prebuilt = 0;
+    size_t unused_candidates = 0;
     std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
     for (const auto& [key, pipeline] : graphics_cache) {
         if (pipeline == nullptr || pipeline.get() == current_pipeline || !pipeline->IsBuilt() ||
             pipeline->LastUse() >= cutoff) {
             continue;
         }
-        if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
-            ++kept_prebuilt;
+        if (!pipeline->WasUsed()) {
+            if (kept_prebuilt < unused_budget) {
+                ++kept_prebuilt;
+                continue;
+            }
+            // With the switch on they go first (sort key 0), whatever their build frame.
+            ++unused_candidates;
+            candidates.emplace_back(keep_switch > 0 ? 0 : pipeline->LastUse(), key);
             continue;
         }
-        candidates.emplace_back(pipeline->LastUse(), key);
+        if (over) {
+            candidates.emplace_back(pipeline->LastUse(), key);
+        }
     }
-    const size_t evicted = VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(),
-                                                                 candidates.size(), evict_above);
+    size_t evicted = over ? VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(),
+                                                                  candidates.size(), evict_above)
+                          : 0;
+    if (keep_switch > 0) {
+        evicted = (std::max)(evicted, unused_candidates);
+    }
     if (evicted == 0) {
         return;
     }
     std::nth_element(candidates.begin(), candidates.begin() + (evicted - 1), candidates.end(),
                      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
     const u64 tick = scheduler.CurrentTick();
+    size_t evicted_unused = 0;
     for (size_t i = 0; i < evicted; ++i) {
         const auto it = graphics_cache.find(candidates[i].second);
         if (used_this_session.erase(it->second.get()) != 0) {
             used_and_evicted.insert(it->first.Hash());
+        }
+        if (keep_switch > 0 && !it->second->WasUsed()) {
+            evicted_unused_prebuilt.insert(it->first.Hash());
+            ++evicted_unused;
         }
         evicted_pointer_slots.Remember(it->first.Hash(), it->second->MappedPointers());
         evicted_pipelines.emplace_back(tick, std::move(it->second));
@@ -6497,8 +6680,12 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->ClearTransitions();
         }
     }
-    LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+    prebuilt_evicted_total += evicted_unused;
+    LOG_INFO(Render_Vulkan,
+             "Evicted {} graphics pipelines unused for {} frames, {} left; {} of them boot builds "
+             "no draw used (FRITCHII_RAM_PREBUILT_KEEP={}: {} this session, {} needed again)",
+             evicted, EvictAfterFrames, graphics_cache.size(), evicted_unused, keep_switch,
+             prebuilt_evicted_total, prebuilt_evicted_needed);
 }
 
 void PipelineCache::EvictUnusedComputePipelines(int mode) {
@@ -6646,6 +6833,21 @@ bool IsDepthTestedColorDraw(const Maxwell& regs) noexcept {
 }
 } // Anonymous namespace
 
+int PipelineCache::AsyncRedrawnDefault() const {
+    // FRITCHII_ASYNC_REDRAWN's value when unset: 1 on AMD's Windows driver (see DrawMayBeSkipped).
+    static const int value = [this] {
+        const bool amd = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
+        if (amd && std::getenv("FRITCHII_ASYNC_REDRAWN") == nullptr) {
+            LOG_INFO(Render_Vulkan, "FRITCHII_ASYNC_REDRAWN=1 by default on AMD's driver: new "
+                                    "objects drawn into the scene skip a frame or more while "
+                                    "their pipeline compiles instead of freezing the game "
+                                    "(FRITCHII_ASYNC_REDRAWN=0 waits)");
+        }
+        return amd ? 1 : 0;
+    }();
+    return value;
+}
+
 bool PipelineCache::DrawMayBeSkipped() const {
     // Native draws whose pipeline is still building are skipped instead of waited for (the
     // object is missing for a frame or more rather than the game freezing while the driver
@@ -6678,10 +6880,15 @@ bool PipelineCache::DrawMayBeSkipped() const {
     // too. Before, each new object or effect drawn there waited for its pipeline: a stall in
     // Hyrule Field and on the first hit on a new enemy. Layers drawn once or now and then,
     // depth-only passes and draws without a depth test still wait.
+    //
+    // On by default on AMD's Windows driver: there a pipeline the driver cache lacks takes
+    // 0.2-1.1 s to compile (NVIDIA: tens of ms), and an RX 7900 XT session held 76 s of draws
+    // for unbuilt pipelines, the game freezing ~1 s whenever something new showed up (tester
+    // log t1858). The object is missing for that time instead. FRITCHII_ASYNC_REDRAWN=0 waits.
     bool redrawn = false;
     if (!recurring && targets.kind_if_redrawn == VideoCommon::DrawTargetClass::Recurring &&
         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_async_redrawn,
-                                         "FRITCHII_ASYNC_REDRAWN") > 0 &&
+                                         "FRITCHII_ASYNC_REDRAWN", AsyncRedrawnDefault()) > 0 &&
         IsDepthTestedColorDraw(maxwell3d->regs)) {
         recurring = true;
         redrawn = true;
@@ -8119,8 +8326,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 descriptor_buffer_ring, thread_worker, statistics,
                 warm ? nullptr : &shader_notify, info,
                 std::move(spv_module), key.unique_hash),
-            .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
-                                                        : std::vector<std::pair<u32, u32>>{},
+            .unbound_pointer_slots = env.IsNativeProgram()
+                                         ? env.UnboundStoragePointerSlots()
+                                         : std::vector<Shader::StoragePointerSlot>{},
             .mapped_pointers =
                 env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
 

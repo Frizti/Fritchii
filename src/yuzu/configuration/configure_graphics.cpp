@@ -207,6 +207,7 @@ void ConfigureGraphics::UpdateDeviceSelection(int device) {
         vulkan_device = device;
     }
     UpdateAmdFsr4Visibility();
+    UpdateDlssVisibility();
 }
 
 ConfigureGraphics::~ConfigureGraphics() = default;
@@ -379,6 +380,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             group_layout->addWidget(panel);
             panel->setVisible(widget->checkbox->isChecked());
             connect(widget->checkbox, &QCheckBox::toggled, panel, &QWidget::setVisible);
+            nvidia_dlss_group = group;
             hold_graphics.emplace(setting->Id(), group);
 #endif
         } else if (setting->Id() == Settings::values.oot_anti_aliasing.Id() &&
@@ -574,6 +576,21 @@ void ConfigureGraphics::UpdateAPILayout() {
         vulkan_device_combobox->setCurrentIndex(vulkan_device);
     }
     UpdateAmdFsr4Visibility();
+    UpdateDlssVisibility();
+}
+
+void ConfigureGraphics::UpdateDlssVisibility() {
+    if (nvidia_dlss_group == nullptr || nvidia_dlss_checkbox == nullptr) {
+        return;
+    }
+    // DLSS runs only on NVIDIA GPUs: the option is hidden for any other GPU (AMD and Intel
+    // players saw it and could turn it on for nothing). A saved choice stays visible so it can be
+    // turned off; the game falls back to FSR 3.1 or its own upscaler meanwhile.
+    const int device = vulkan_device_combobox ? vulkan_device_combobox->currentIndex() : -1;
+    const bool nvidia = GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
+                        device >= 0 && static_cast<size_t>(device) < records.size() &&
+                        records[device].nvidia;
+    nvidia_dlss_group->setVisible(nvidia || nvidia_dlss_checkbox->isChecked());
 }
 
 void ConfigureGraphics::UpdateAmdFsr4Visibility() {

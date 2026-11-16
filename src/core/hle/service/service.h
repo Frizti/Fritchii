@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <string>
 #include "common/container/unordered_map.h"
 #include "common/common_types.h"
 #include "core/hle/service/hle_ipc.h"
@@ -26,6 +27,11 @@ class ServiceThread;
 } // namespace Kernel
 
 namespace Service {
+
+/// The hang report (FRITCHII_HANG_REPORT_S): every HLE service call still in progress, with the
+/// service, command, handler name, whether it waits for the service's lock or runs its handler,
+/// and for how long. Read only, lock free.
+[[nodiscard]] std::string DescribeCallsInFlight();
 
 namespace KernelHelpers {
 class ServiceContext;

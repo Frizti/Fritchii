@@ -964,11 +964,52 @@ public:
         dispatch_confirmed = true;
     }
     void FinishDispatch(bool ran, bool replaced);
+    /// FRITCHII_DISPATCH_WAIT_CENSUS: what a recorded dispatch write is (storage and texel
+    /// buffers by their write marks, written images, indirect arguments, QMD releases, or
+    /// anything), so the census can say which waits a front-side bound of the dispatches'
+    /// buffer writes would answer.
+    enum class DispatchWriteKind : u8 {
+        Buffer,
+        Image,
+        Indirect,
+        Release,
+        Unbounded,
+        Count,
+    };
     /// Back, while recording: the dispatch writes device bytes [begin, begin + size).
-    void RecordDispatchWrite(u64 begin, u64 size) {
+    void RecordDispatchWrite(u64 begin, u64 size,
+                             DispatchWriteKind kind = DispatchWriteKind::Buffer) {
         if (size != 0) {
-            AppendDispatchWrite(begin, begin + size);
+            AppendDispatchWrite(begin, begin + size, kind);
         }
+    }
+    /// FRITCHII_DISPATCH_WAIT_CENSUS (live, default 0; 1 counts): every macro read's wait for
+    /// the dispatches (DrainSite::DispatchWait), split by what the dispatches it waited for (the
+    /// ones still queued when it began) turned out to write. Front only.
+    struct DispatchWaitCensus {
+        enum Class : u32 {
+            BufferOnly,   ///< Only buffer write marks (a front bound of SSBO writes answers it)
+            WithRelease,  ///< Buffers and QMD releases (the front predicts those already)
+            WithIndirect, ///< Indirect arguments too (list dispatches, GPU-sized grids)
+            WithImage,    ///< A written image (a bound needs the image descriptors as well)
+            Unknown,      ///< Anything (unbounded), or the records left the ring meanwhile
+            Nothing,      ///< No record at all (the dispatches wrote nothing the back marks)
+            Count,
+        };
+        std::array<u64, Class::Count> waits{};
+        std::array<u64, Class::Count> wait_ns{};
+        u64 records{};      ///< Records of the waited-for dispatches, all waits
+        u64 overlapping{};  ///< Waits where one of them wrote the page (must stay near 0)
+    };
+    [[nodiscard]] const DispatchWaitCensus& GetDispatchWaitCensus() const {
+        return dispatch_census;
+    }
+    /// Non-blocking: whether a wait for `position` at `site` would return at once (WaitUntil's
+    /// test, without publishing or waiting). Front only.
+    [[nodiscard]] bool ReachedSite(u64 position, DrainSite site) const {
+        const u64 target = (std::min)(position, write_position);
+        return PlayedNow(std::memory_order_acquire) >= target ||
+               Reached(target, UsesEngine(site), std::memory_order_acquire);
     }
     /// Back, while recording: the dispatch may write anything.
     void RecordDispatchUnbounded(DispatchUnbounded reason);
@@ -2365,6 +2406,7 @@ private:
         std::atomic<u64> position;
         std::atomic<u64> begin;
         std::atomic<u64> end;
+        std::atomic<u8> kind; ///< DispatchWriteKind (FRITCHII_DISPATCH_WAIT_CENSUS)
     };
     static constexpr u64 DispatchWriteSlots = 8192;
     static constexpr u64 MaxDispatchScan = 2048;
@@ -2380,7 +2422,11 @@ private:
     std::atomic<u64> dispatches_bounded{};
     std::array<std::atomic<u64>, static_cast<size_t>(DispatchUnbounded::Count)>
         dispatches_unbounded{};
-    void AppendDispatchWrite(u64 begin, u64 end);
+    void AppendDispatchWrite(u64 begin, u64 end, DispatchWriteKind kind);
+    /// FRITCHII_DISPATCH_WAIT_CENSUS: classifies the records of one wait (gpu_split.cpp).
+    void CensusDispatchWait(u64 consumed_before, u64 count_before, u64 begin, u64 size,
+                            u64 wait_ns);
+    DispatchWaitCensus dispatch_census{};
     DispatchWalkStats dispatch_walk{};
     u64 last_sync_position{};
     u64 last_memory_write_position{};

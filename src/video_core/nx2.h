@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -575,7 +576,8 @@ public:
         std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
         const u32 seen =
             word != nullptr ? std::atomic_ref<u32>{*word}.load(std::memory_order_relaxed) : 0;
-        waiters.push_back({owner, device_address, value, operation, false, word, seen});
+        waiters.push_back({owner, device_address, value, operation, false, word, seen,
+                           std::chrono::steady_clock::now()});
         count.store(waiters.size(), std::memory_order_release);
     }
 
@@ -654,6 +656,26 @@ public:
         }
     }
 
+    /// The hang report (FRITCHII_HANG_REPORT_S): ForEach without blocking.
+    /// `f(address, value, operation, latched, word, seconds waiting)`. False, with nothing
+    /// visited, when the lock stayed held for 200 ms (a report must never hang on it).
+    template <typename F>
+    bool TryForEach(F&& f) {
+        std::unique_lock lk{mutex, std::defer_lock};
+        for (int attempt = 0; !lk.try_lock(); ++attempt) {
+            if (attempt >= 200) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto& w : waiters) {
+            f(w.address, w.value, w.operation, w.latched, w.word,
+              std::chrono::duration<double>(now - w.since).count());
+        }
+        return true;
+    }
+
 private:
     struct Waiter {
         const void* owner;
@@ -663,6 +685,7 @@ private:
         bool latched;
         u32* word;  ///< The semaphore in host memory, or null (EDEN_NX2_GPU_WAKE)
         u32 seen;   ///< *word when last looked at (WordStored)
+        std::chrono::steady_clock::time_point since; ///< When it was added (the hang report)
     };
 
     static bool Matches(const Waiter& w, u32 current) {

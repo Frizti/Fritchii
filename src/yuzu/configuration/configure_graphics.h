@@ -75,6 +75,7 @@ private:
     void UpdateAPILayout();
     void UpdateDeviceSelection(int device);
     void UpdateAmdFsr4Visibility();
+    void UpdateDlssVisibility();
     /// Fritchii builds: OoT's real sizes in the DLSS quality names, and the line under the
     /// resolution while DLSS or FSR sets OoT's resolution.
     void SetupOcarinaUpscalerLabels();
@@ -121,6 +122,7 @@ private:
     QComboBox* oot_aa_combobox{};          ///< The oot_anti_aliasing choice
     AmdFsr4Panel* amd_fsr4_panel{};       ///< Under it while AMD FSR 4 is picked
     QCheckBox* nvidia_dlss_checkbox{};     ///< The nvidia_dlss setting
+    QWidget* nvidia_dlss_group{};          ///< The DLSS checkbox and NVIDIA's panel under it
     QComboBox* dlss_quality_combobox{};    ///< The nvidia_dlss_quality choice
     QLabel* resolution_note{};             ///< Fritchii: under the resolution choice
 };

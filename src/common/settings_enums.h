@@ -169,7 +169,8 @@ ENUM(MeshShaderMode, Automatic, Native, Compute);
 // Ocarina of Time's movies: the game's own upscaler, or a bilinear copy (Settings oot_movie_upscale).
 ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
 // Ocarina of Time's frame rate cap with its high refresh rate mode on (Settings oot_high_refresh).
-ENUM(OotRefreshCap, Display, Hz90, Hz120, Hz144, Hz165);
+// New values go at the end: saved configs store the index.
+ENUM(OotRefreshCap, Display, Hz90, Hz120, Hz144, Hz165, Unlimited);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {

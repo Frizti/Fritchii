@@ -484,6 +484,11 @@ enum class FlagOwner : u8 { E, R, Both };
 
 /// Reads the switches (GpuSplit::MaybeStart, before the back thread exists). Boot ones stick.
 void ReadSwitches();
+/// The Vulkan device names its driver (Device's constructor, before ReadSwitches): on AMD's
+/// proprietary driver the one follower stays off unless FRITCHII_ONEF_AMD=1.
+void NoteAmdProprietaryDriver() noexcept;
+/// True once the Vulkan device said it runs AMD's proprietary driver (AMD safe defaults read it).
+[[nodiscard]] bool IsAmdProprietaryDriver() noexcept;
 /// FRITCHII_ONEF=1 at boot (R exists).
 [[nodiscard]] bool On() noexcept;
 /// The effective step after nesting (StepLevel), refreshed at frame ends and lent packets.
@@ -629,6 +634,11 @@ void MarkEngineThread() noexcept;
 /// GpuSplit::MaybeStart, before the back thread starts / GpuSplit::Stop, after it joined.
 void Start(Core::System& system);
 void Stop();
+
+/// The hang report (FRITCHII_HANG_REPORT_S, no frame for that long while the game runs): logs
+/// the front's wait and, with the one follower running, the watchdog's state line (positions,
+/// E and R, watched locks). Read only, from any thread: wakes and changes nothing.
+void ReportHangState();
 
 /// The hang watchdog (always on with FRITCHII_ONEF=1, one wake a second): a lock whose holder it
 /// names when E or R stop making progress (the rasterizer registers the buffer and texture

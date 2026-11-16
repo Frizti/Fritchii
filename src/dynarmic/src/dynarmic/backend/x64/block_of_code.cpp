@@ -203,7 +203,7 @@ bool IsUnderRosetta() {
 
 }  // anonymous namespace
 
-BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, PinConfig pins_)
+BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, PinConfig pins_, StateRefConfig state_refs_)
     : Xbyak::CodeGenerator(total_code_size
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
         , Xbyak::DontSetProtectRWE
@@ -215,6 +215,7 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
     , jsi(jsi)
     , cb(std::move(cb))
     , pins(std::move(pins_))
+    , state_refs(state_refs_)
 {
     EnableWriting();
     EnsureMemoryCommitted(PRELUDE_COMMIT_SIZE);

@@ -1315,6 +1315,9 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
       compute_pass_descriptor_queue{compute_pass_descriptor_queue_},
       resolution{Settings::values.resolution_info},
       image_free_queue{device_.IsAllocatorThreadSafe()} {
+    max_scaled_extent = (std::min)({device.GetMaxImageDimension2D(),
+                                    device.GetMaxFramebufferWidth(),
+                                    device.GetMaxFramebufferHeight()});
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
@@ -2866,6 +2869,14 @@ u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
 }
 
+u32 TextureCacheRuntime::GetMaxScaledExtent() const noexcept {
+    return max_scaled_extent;
+}
+
+void TextureCacheRuntime::LimitKeptBlocks(u64 budget, u64 critical) const {
+    device.LimitKeptBlocks(budget, critical);
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
@@ -3000,7 +3011,7 @@ void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u6
     if (rule_cap != 0) {
         TrimImagePoolByRule(rule_cap);
     } else {
-        TrimImagePool(ImagePoolCap());
+        TrimImagePool(FittedPoolCap());
     }
 }
 
@@ -3104,6 +3115,86 @@ u64 TextureCacheRuntime::ImagePoolCap() {
         return u64{static_cast<u32>(mib)} << 20;
     }
     return VideoCore::Nx2Debug::Experiment(42) >= 2 ? ImagePoolMaxBytesDedicated : ImagePoolMaxBytes;
+}
+
+void TextureCacheRuntime::UpdatePoolFitCap() {
+    // The texture cache counts pooled images as free memory, so its thresholds (set from the
+    // budget) leave the pool out: at its built-in cap (EXP66, 1 GiB) next to a full cache the
+    // process passed the budget of a small card (6 GB: budget ~5 GiB, critical ~4.2 GiB + the
+    // pool), and Windows moved memory to system RAM or an image failed and the whole pool was
+    // dropped at once. With FRITCHII_VRAM_POOL_FIT the pool holds at most what the rest of the
+    // process leaves under the budget less the cache's margin (1/8 of it, at most 1 GiB). Large
+    // cards keep the built-in cap: 16 GB card at the market, ~7.7 GiB of room for a 1 GiB cap.
+    const u64 budget = device.GetDeviceMemoryBudget();
+    if (budget == 0) {
+        pool_fit_cap = ~u64{0};
+        return;
+    }
+    // What the driver counts: the live usage (pool included) plus the kept blocks and the unused
+    // space in the allocators' blocks, which GetDeviceMemoryUsage leaves out.
+    const u64 usage = device.GetDeviceMemoryUsage() + device.KeptBlockBytes() +
+                      device.GetDeviceMemorySlack();
+    const u64 others = usage - (std::min)(usage, image_pool_bytes);
+    const u64 margin = (std::min)(budget / 8, u64{1} << 30);
+    const u64 ceiling = budget - (std::min)(budget, margin);
+    pool_fit_cap = ceiling > others ? ceiling - others : 0;
+    pool_fit_budget = budget;
+    pool_fit_others = others;
+    pool_fit_lowest = (std::min)(pool_fit_lowest, pool_fit_cap);
+}
+
+void TextureCacheRuntime::SampleVramReport() {
+    // FRITCHII_VRAM_REPORT (live, default 0): every 30 frames the main device-local heap's usage
+    // against its budget as the driver reports them (what decides whether Windows moves memory
+    // to system RAM, the fps cliff of a full card), one line every 600 frames.
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_report,
+                                         "FRITCHII_VRAM_REPORT") == 0) {
+        vram_report_frames = vram_report_samples = vram_report_over = 0;
+        vram_report_peak_usage = vram_report_peak_over = 0;
+        vram_report_seen_pressure = memory_allocator.MemoryPressureEvents();
+        vram_report_seen_failed = memory_allocator.FailedImages();
+        return;
+    }
+    const u32 frame = vram_report_frames++;
+    if (frame % 30 == 0) {
+        u64 usage{};
+        u64 budget{};
+        if (device.MainHeapUsage(usage, budget)) {
+            ++vram_report_samples;
+            vram_report_last_budget = budget;
+            vram_report_peak_usage = (std::max)(vram_report_peak_usage, usage);
+            if (usage > budget) {
+                ++vram_report_over;
+                vram_report_peak_over = (std::max)(vram_report_peak_over, usage - budget);
+            }
+        }
+    }
+    if (frame % 600 != 599) {
+        return;
+    }
+    u64 usage{};
+    u64 budget{};
+    device.MainHeapUsage(usage, budget);
+    const u32 pressure = memory_allocator.MemoryPressureEvents();
+    const u32 failed = memory_allocator.FailedImages();
+    LOG_INFO(Render_Vulkan,
+             "VRAM fit (FRITCHII_VRAM_REPORT) last 600 frames: main heap {} of {} MiB budget now, "
+             "peak {} MiB; over the budget in {} of {} samples (most {} MiB over); image pool {} "
+             "MiB (cap {} MiB), kept blocks {} MiB, block slack {} MiB; staging upload {} download "
+             "{} device {} MiB, stream {} MiB; {} memory pressure events, {} failed images",
+             usage >> 20, budget >> 20, vram_report_peak_usage >> 20, vram_report_over,
+             vram_report_samples, vram_report_peak_over >> 20, image_pool_bytes >> 20,
+             FittedPoolCap() >> 20, device.KeptBlockBytes() >> 20,
+             device.GetDeviceMemorySlack() >> 20,
+             staging_buffer_pool.CachedBytes(MemoryUsage::Upload) >> 20,
+             staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20,
+             staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20,
+             staging_buffer_pool.StreamBufferBytes() >> 20, pressure - vram_report_seen_pressure,
+             failed - vram_report_seen_failed);
+    vram_report_samples = vram_report_over = 0;
+    vram_report_peak_usage = vram_report_peak_over = 0;
+    vram_report_seen_pressure = pressure;
+    vram_report_seen_failed = failed;
 }
 
 void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
@@ -3292,6 +3383,22 @@ void TextureCacheRuntime::TickFrame() {
             pressure != image_pool_seen_pressure || failed != image_pool_seen_failed;
         image_pool_seen_pressure = pressure;
         image_pool_seen_failed = failed;
+        // FRITCHII_KEEP_BLOCKS: kept blocks go before any pooled image, then one is trimmed a
+        // frame while they hold more than the cap and the budget's limit allow.
+        if (short_of_memory) {
+            device.ReleaseKeptBlocks();
+        }
+        device.TickKeptBlocks();
+        // FRITCHII_VRAM_POOL_FIT (live, default 0): the pool's cap follows the room under the
+        // budget, re-read every 30 frames.
+        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_fit,
+                                             "FRITCHII_VRAM_POOL_FIT") == 0) {
+            pool_fit_cap = ~u64{0};
+            pool_fit_frames = 0;
+        } else if (pool_fit_frames++ % 30 == 0) {
+            UpdatePoolFitCap();
+        }
+        SampleVramReport();
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
         if (pool_switch == 0 || short_of_memory) {
             TrimImagePool(0);
@@ -3299,7 +3406,7 @@ void TextureCacheRuntime::TickFrame() {
                 ghost_pools->Clear();
             }
         } else {
-            TrimImagePool(ImagePoolCap()); // a lowered EXP66 applies at once
+            TrimImagePool(FittedPoolCap()); // a lowered EXP66 applies at once
         }
         // EDEN_NX2_EXP82 (live, frames, 0 = off; fable52_answer_after7778 1): proven entries (a
         // shape taken from the pool before) stay this many frames instead of ImagePoolMaxFrames.
@@ -3408,6 +3515,15 @@ void TextureCacheRuntime::TickFrame() {
                      VideoCore::Nx2Debug::Experiment(99), image_pool_dropped_idle,
                      image_pool_dropped_here, rule_text, VideoCore::Nx2Debug::Experiment(110),
                      IdleDestroyBytes() >> 20, image_pool_dropped_frame_end);
+            if (pool_fit_cap != ~u64{0}) {
+                LOG_INFO(Render_Vulkan,
+                         "Image pool fit (FRITCHII_VRAM_POOL_FIT) last 600 frames: cap {} MiB now "
+                         "(lowest {} MiB, built-in {} MiB); budget {} MiB, the rest of the "
+                         "process {} MiB",
+                         pool_fit_cap >> 20, pool_fit_lowest >> 20, ImagePoolCap() >> 20,
+                         pool_fit_budget >> 20, pool_fit_others >> 20);
+                pool_fit_lowest = pool_fit_cap;
+            }
             image_pool_taken = image_pool_missed = image_pool_given = image_pool_evicted = 0;
             image_pool_unproven_evicted = 0;
             image_pool_dropped_async = image_pool_dropped_here = image_pool_dropped_idle = 0;

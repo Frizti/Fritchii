@@ -19,6 +19,7 @@
 #include "common/common_types.h"
 #include "common/fiber.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/random.h"
@@ -1442,6 +1443,152 @@ namespace Kernel {
         }
         Common::Nx2Timeline::Instant("guest wait", {"tid", m_thread_id}, {"reason", code},
                                      {"key", key});
+    }
+
+    namespace {
+
+        // The hang report's table of guest waits (DescribeGuestWaits): a slot per thread id
+        // modulo the table size, written as each wait begins and ends (under the scheduler lock,
+        // so one writer at a time), read without a lock. Two live threads whose ids share a slot
+        // show only the later wait; a torn read mixes two waits in one diagnostic line.
+        struct HangWaitSlot {
+            std::atomic<u64> thread_id{};
+            std::atomic<u32> code{}; ///< 0 no wait; ThreadWaitReasonForDebugging, 7 a mutex
+            std::atomic<u64> key{};
+            std::atomic<const char*> object_type{}; ///< Synchronization: the first object's
+            std::atomic<s32> priority{};
+            std::atomic<s32> core{};
+            std::atomic<u64> since{}; ///< Nx2Hitch::StallTickNs
+        };
+        constexpr size_t HangWaitSlotCount = 512;
+        std::array<HangWaitSlot, HangWaitSlotCount> g_hang_waits;
+        constexpr u32 HangMutexWait = 7;
+
+    } // Anonymous namespace
+
+    void KThread::NoteWaitForHangReport(ThreadWaitReasonForDebugging reason,
+                                        const void* timeline_key) const {
+        if (m_thread_type == ThreadType::Dummy) {
+            return;
+        }
+        HangWaitSlot& slot = g_hang_waits[m_thread_id % HangWaitSlotCount];
+        if (reason == ThreadWaitReasonForDebugging::None) {
+            if (slot.code.load(std::memory_order_relaxed) != 0 &&
+                slot.thread_id.load(std::memory_order_relaxed) == m_thread_id) {
+                slot.code.store(0, std::memory_order_relaxed);
+            }
+            return;
+        }
+        // The same keys as the timeline's guest wait marker (RecordWaitForTimeline).
+        u32 code = static_cast<u32>(reason);
+        u64 key = 0;
+        const char* object_type = nullptr;
+        switch (reason) {
+        case ThreadWaitReasonForDebugging::Synchronization:
+            key = reinterpret_cast<uintptr_t>(timeline_key);
+            if (timeline_key != nullptr) {
+                object_type =
+                    static_cast<const KSynchronizationObject*>(timeline_key)->GetTypeName();
+            }
+            break;
+        case ThreadWaitReasonForDebugging::ConditionVar:
+            if (m_condvar_tree != nullptr) {
+                key = m_condvar_key;
+            } else {
+                code = HangMutexWait;
+                key = GetInteger(m_address_key);
+            }
+            break;
+        case ThreadWaitReasonForDebugging::Arbitration:
+            key = m_condvar_key;
+            break;
+        default:
+            break;
+        }
+        slot.code.store(0, std::memory_order_relaxed);
+        slot.thread_id.store(m_thread_id, std::memory_order_relaxed);
+        slot.key.store(key, std::memory_order_relaxed);
+        slot.object_type.store(object_type, std::memory_order_relaxed);
+        slot.priority.store(m_priority, std::memory_order_relaxed);
+        slot.core.store(m_core_id, std::memory_order_relaxed);
+        slot.since.store(Common::Nx2Hitch::StallTickNs(), std::memory_order_relaxed);
+        slot.code.store(code, std::memory_order_release);
+    }
+
+    std::string DescribeGuestWaits() {
+        struct Wait {
+            u64 thread_id;
+            u32 code;
+            u64 key;
+            const char* object_type;
+            s32 priority;
+            s32 core;
+            u64 since;
+        };
+        std::vector<Wait> waits;
+        for (const HangWaitSlot& slot : g_hang_waits) {
+            const u32 code = slot.code.load(std::memory_order_acquire);
+            if (code == 0) {
+                continue;
+            }
+            waits.push_back({slot.thread_id.load(std::memory_order_relaxed), code,
+                             slot.key.load(std::memory_order_relaxed),
+                             slot.object_type.load(std::memory_order_relaxed),
+                             slot.priority.load(std::memory_order_relaxed),
+                             slot.core.load(std::memory_order_relaxed),
+                             slot.since.load(std::memory_order_relaxed)});
+        }
+        std::ranges::sort(waits, [](const Wait& a, const Wait& b) { return a.since < b.since; });
+        const u64 now = Common::Nx2Hitch::StallTickNs();
+        std::string text;
+        for (size_t i = 0; i < (std::min)(waits.size(), size_t{32}); ++i) {
+            const Wait& wait = waits[i];
+            std::string what;
+            switch (wait.code) {
+            case static_cast<u32>(ThreadWaitReasonForDebugging::Sleep):
+                what = "in SleepThread";
+                break;
+            case static_cast<u32>(ThreadWaitReasonForDebugging::IPC):
+                what = "for an IPC reply";
+                break;
+            case static_cast<u32>(ThreadWaitReasonForDebugging::Synchronization):
+                what = fmt::format("in WaitSynchronization on a {} ({:#x})",
+                                   wait.object_type != nullptr ? wait.object_type : "object",
+                                   wait.key);
+                break;
+            case static_cast<u32>(ThreadWaitReasonForDebugging::ConditionVar):
+                what = fmt::format("on condition variable key {:#x}", wait.key);
+                break;
+            case static_cast<u32>(ThreadWaitReasonForDebugging::Arbitration):
+                what = fmt::format("on address {:#x} (WaitForAddress)", wait.key);
+                break;
+            case static_cast<u32>(ThreadWaitReasonForDebugging::Suspended):
+                what = "suspended";
+                break;
+            case HangMutexWait:
+                what = fmt::format("on a mutex (ArbitrateLock) at {:#x}", wait.key);
+                break;
+            default:
+                what = fmt::format("reason {}", wait.code);
+                break;
+            }
+            text += fmt::format("{}thread {} (priority {}, core {}) {} for {:.1f} s",
+                                text.empty() ? "" : "; ", wait.thread_id, wait.priority,
+                                wait.core, what,
+                                now > wait.since ? static_cast<double>(now - wait.since) / 1e9
+                                                 : 0.0);
+        }
+        if (waits.size() > 32) {
+            text += fmt::format("; {} more", waits.size() - 32);
+        }
+        return fmt::format("{} waiting{}{}", waits.size(), text.empty() ? "" : ", longest first: ",
+                           text);
+    }
+
+    void ClearGuestWaitsForHangReport() {
+        for (HangWaitSlot& slot : g_hang_waits) {
+            slot.code.store(0, std::memory_order_relaxed);
+        }
     }
 
     void KThread::NotifyAvailable(KernelCore& kernel, KSynchronizationObject* signaled_object, Result wait_result) {

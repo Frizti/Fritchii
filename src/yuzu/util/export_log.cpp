@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "yuzu/util/export_log.h"
+#include "yuzu/util/profiling_mode.h"
 
 #include <thread>
 #include <utility>
@@ -36,6 +37,7 @@
 #include "common/memory_detect.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
+#include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
 #include "qt_common/util/vk.h"
 
@@ -141,6 +143,18 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
     }
     text += Line(QStringLiteral("Portable"),
                  data_dir.filename() == "user" ? QStringLiteral("yes") : QStringLiteral("no"));
+    // Help > Profiling Mode: on in this start (with the switches it added), and the saved
+    // setting when the next start differs.
+    QString profiling = ProfilingMode::Active() ? QStringLiteral("on") : QStringLiteral("off");
+    if (ProfilingMode::Active() && !ProfilingMode::Applied().empty()) {
+        profiling += QStringLiteral(" (%1)").arg(QString::fromStdString(ProfilingMode::Applied()));
+    }
+    if (UISettings::values.profiling_mode.GetValue() != ProfilingMode::Active()) {
+        profiling += UISettings::values.profiling_mode.GetValue()
+                         ? QStringLiteral(", on from the next start")
+                         : QStringLiteral(", off from the next start");
+    }
+    text += Line(QStringLiteral("Profiling mode"), profiling);
 
     text += QStringLiteral("\n== PC ==\n");
     text += Line(QStringLiteral("OS"), QtCommon::PrettyProductName());

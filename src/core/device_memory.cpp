@@ -14,7 +14,12 @@
 #include "common/thread.h"
 #endif
 
+#include <algorithm>
+
+#include <fmt/format.h>
+
 #include "core/device_memory.h"
+#include "common/memory_detect.h"
 #include "common/nx2_hitch.h"
 #include "hle/kernel/board/nintendo/nx/k_system_control.h"
 
@@ -39,9 +44,37 @@ DeviceMemory::DeviceMemory()
         memory_probe_thread = std::jthread{[this](std::stop_token stop) { ProbeMemory(stop); }};
     }
 #endif
+    // FRITCHII_MEM_CENSUS (boot): the guest ranges named in the census, and the sampled guest
+    // residency (backing, views, pages resident through both) beside it.
+    if (Common::MemCensus::Mode() != 0) {
+        Common::MemCensus::Tag(
+            "guest backing", buffer.BackingBasePointer(),
+            Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize());
+        Common::MemCensus::Tag("guest views", buffer.VirtualBasePointer(), buffer.VirtualSize());
+#ifdef _WIN32
+        Common::MemCensus::SetGuestSampler([this] {
+            const auto sample = buffer.SampleResident();
+            const u64 unique = sample.backing_bytes + sample.view_bytes -
+                               (std::min)(sample.view_bytes, sample.both_bytes);
+            return fmt::format("guest sampled: backing {} + views {} - both {} = {} MiB of RAM "
+                               "(views map {} MiB, {} us)",
+                               sample.backing_bytes >> 20, sample.view_bytes >> 20,
+                               sample.both_bytes >> 20, unique >> 20,
+                               sample.view_mapped_bytes >> 20, sample.micros);
+        });
+#endif
+        Common::MemCensus::Start();
+    }
 }
 
-DeviceMemory::~DeviceMemory() = default;
+DeviceMemory::~DeviceMemory() {
+    if (Common::MemCensus::Mode() != 0) {
+        Common::MemCensus::Stop();
+        Common::MemCensus::SetGuestSampler(nullptr);
+        Common::MemCensus::Untag(buffer.BackingBasePointer());
+        Common::MemCensus::Untag(buffer.VirtualBasePointer());
+    }
+}
 
 #ifdef _WIN32
 // Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear

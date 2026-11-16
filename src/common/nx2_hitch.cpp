@@ -16,6 +16,7 @@
 
 #include "common/cpu_features.h"
 #include "common/fritchii_jit_list.h"
+#include "common/fs/path_util.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
 #include "common/nx2_hitch.h"
@@ -27,6 +28,8 @@
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <psapi.h>
+
+#include "common/windows/crash_handler.h"
 #endif
 
 namespace Common::Nx2Hitch {
@@ -44,7 +47,10 @@ long long ThresholdUs() {
     return threshold;
 }
 constexpr size_t Causes = static_cast<size_t>(Cause::Count);
-constexpr size_t MaxThreads = 48;
+constexpr size_t MaxThreads = 56;
+/// Threads registered in name order; the last MaxThreads - FirstThreads places are kept for the
+/// GPU threads with FRITCHII_HITCH_SPLIT=1 (they start after the first 48 and were never shown).
+constexpr size_t FirstThreads = 48;
 
 struct ThreadEntry {
     char name[32]{};
@@ -164,7 +170,41 @@ std::mutex g_compile_mutex;
 std::unordered_map<u64, u8> g_compiled_on; ///< key -> mask of the cores that compiled it
 u8 g_cores_seen{};
 std::array<std::vector<u64>, 8> g_warm_queues;
+// Blocks each core compiled, warm and on demand (FRITCHII_MEM_CENSUS reads them).
+std::array<std::atomic<u64>, 8> g_warm_compiles{};
+std::array<std::atomic<u64>, 8> g_demand_compiles{};
 } // Anonymous namespace
+
+bool SplitEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("FRITCHII_HITCH_SPLIT");
+        return value != nullptr && std::atoi(value) > 0;
+    }();
+    return enabled;
+}
+
+u32 JitWarmCoreMask() {
+    static const u32 mask = [] {
+        const char* const value = std::getenv("FRITCHII_JIT_WARM_CORES");
+        const u32 set = value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0;
+        return set != 0 ? (set & 0xff) : 0xffU;
+    }();
+    return mask;
+}
+
+std::string JitCompileCensus() {
+    std::string text = fmt::format("JIT blocks compiled per core, warm/on demand (warm cores mask "
+                                   "{:#x}):",
+                                   JitWarmCoreMask());
+    for (u32 core = 0; core < 8; ++core) {
+        const u64 warm = g_warm_compiles[core].load(std::memory_order_relaxed);
+        const u64 demand = g_demand_compiles[core].load(std::memory_order_relaxed);
+        if (warm != 0 || demand != 0) {
+            text += fmt::format(" core {} {}/{}", core, warm, demand);
+        }
+    }
+    return text;
+}
 
 bool JitWarmEnabled() {
     static const bool enabled = [] {
@@ -179,29 +219,42 @@ Cause CompileCause(u64 key, u32 core) {
         FritchiiJitList::Note(key); // FRITCHII_JIT_BLOCK_LIST: one relaxed load when off
     }
     const u8 bit = static_cast<u8>(1U << (core & 7));
+    (t_warming ? g_warm_compiles : g_demand_compiles)[core & 7].fetch_add(
+        1, std::memory_order_relaxed);
     std::scoped_lock lock{g_compile_mutex};
     g_cores_seen |= bit;
     u8& mask = g_compiled_on[key];
     const bool repeat = (mask & ~bit) != 0;
+    // FRITCHII_HITCH_SPLIT: this core compiled the block before, so it was dropped since.
+    const bool own = (mask & bit) != 0;
     mask |= bit;
     if (t_warming) {
         return Cause::WarmCompile;
     }
     // Single-stepping blocks (bit 57 of an A64 LocationDescriptor) are never worth warming.
+    // FRITCHII_JIT_WARM_CORES: only the cores in the mask get the copies.
     if (JitWarmEnabled() && ((key >> 57) & 1) == 0) {
+        const u32 warm_cores = JitWarmCoreMask();
         for (u32 other = 0; other < 8; ++other) {
             const u8 other_bit = static_cast<u8>(1U << other);
-            if ((g_cores_seen & other_bit) != 0 && (mask & other_bit) == 0 &&
-                g_warm_queues[other].size() < 400'000) {
+            if ((warm_cores & other_bit) != 0 && (g_cores_seen & other_bit) != 0 &&
+                (mask & other_bit) == 0 && g_warm_queues[other].size() < 400'000) {
                 g_warm_queues[other].push_back(key);
             }
         }
+    }
+    if (own && SplitEnabled()) {
+        return Cause::RecompileDropped;
     }
     return repeat ? Cause::RecompileRepeat : Cause::Recompile;
 }
 
 size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max) {
     out.clear();
+    // FRITCHII_JIT_WARM_CORES: a core outside the mask compiles only what it runs.
+    if ((JitWarmCoreMask() & (1U << (core & 7))) == 0) {
+        return 0;
+    }
     std::unique_lock lock{g_compile_mutex};
     auto& queue = g_warm_queues[core & 7];
     const u8 bit = static_cast<u8>(1U << (core & 7));
@@ -350,7 +403,128 @@ void StallResetGap() {
     g_stall_acquire_longest.store(0, std::memory_order_relaxed);
 }
 
+// Hang report (nx2_hitch.h). Presents are counted here whatever EDEN_NX2_HITCH_LOG says.
+std::atomic<u64> g_hang_presents{};
+std::atomic<u64> g_hang_last_present_ns{};
+std::mutex g_hang_mutex;
+HangHooks g_hang_hooks{}; ///< Under g_hang_mutex
+
+// FRITCHII_HANG_DUMP=1 (boot, default 0): the report also writes a minidump (Windows).
+bool HangDumpEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("FRITCHII_HANG_DUMP");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+/// Once a second, from the Pulse thread or the hang watch thread (one of them, never both).
+void HangTick() {
+    static u64 last_presents = ~u64{0};
+    static u64 counting_since = 0; ///< NowNs from which the frameless time counts
+    static bool reported = false;
+    const u64 now = NowNs();
+    const u64 presents = g_hang_presents.load(std::memory_order_relaxed);
+    if (presents != last_presents) {
+        if (reported) {
+            LOG_CRITICAL(Render, "Hang report: frames again after {:.1f} s without one (re-armed)",
+                         static_cast<double>(now - counting_since) / 1e9);
+            reported = false;
+        }
+        last_presents = presents;
+        counting_since = g_hang_last_present_ns.load(std::memory_order_relaxed);
+        return;
+    }
+    std::unique_lock lock{g_hang_mutex};
+    const int seconds =
+        g_hang_hooks.armed_seconds != nullptr ? g_hang_hooks.armed_seconds(g_hang_hooks.context) : 0;
+    if (seconds <= 0) {
+        // Paused, stalled, stopped or switched off: the time without frames counts from here.
+        counting_since = now;
+        return;
+    }
+    if (reported || now - counting_since < static_cast<u64>(seconds) * 1'000'000'000ULL) {
+        return;
+    }
+    reported = true;
+    const u64 last_present = g_hang_last_present_ns.load(std::memory_order_relaxed);
+    const long long gap_us =
+        last_present != 0 ? static_cast<long long>((now - last_present) / 1000) : 0;
+    LOG_CRITICAL(Render,
+                 "Hang report: no frame for {:.1f} s while the game runs ({:.1f} s since the last "
+                 "present, {} presents this process; FRITCHII_HANG_REPORT_S={}, 0 turns it off). "
+                 "One report per freeze, read only; the next frame re-arms it",
+                 static_cast<double>(now - counting_since) / 1e9,
+                 static_cast<double>(gap_us) / 1e6, presents, seconds);
+    LOG_CRITICAL(Render, "Hang report: {}",
+                 StallOn() ? StallSnapshotLine(gap_us)
+                           : std::string{"no stall snapshot (EDEN_NX2_STALL_SNAPSHOT=0)"});
+    if (g_hang_hooks.report != nullptr) {
+        g_hang_hooks.report(g_hang_hooks.context);
+    }
+    lock.unlock();
+    if (HangDumpEnabled()) {
+#ifdef _WIN32
+        LOG_CRITICAL(Render, "Hang report: minidump (FRITCHII_HANG_DUMP=1) {}",
+                     Common::Windows::WriteHangDump(
+                         Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir)));
+#else
+        LOG_CRITICAL(Render, "Hang report: no minidump on this system (FRITCHII_HANG_DUMP=1 is "
+                             "Windows only); attach a debugger or use gcore for one");
+#endif
+    }
+}
+
+/// The once-a-second hang check where the Pulse thread does not run (FRITCHII_PULSE=0,
+/// EDEN_NX2_HITCH_LOG=0, or not Windows).
+class HangWatchThread {
+public:
+    HangWatchThread() : thread{[this] { Run(); }} {}
+
+    ~HangWatchThread() {
+        {
+            std::scoped_lock lock{mutex};
+            stop = true;
+        }
+        cv.notify_all();
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    HangWatchThread(const HangWatchThread&) = delete;
+    HangWatchThread& operator=(const HangWatchThread&) = delete;
+
+private:
+    void Run() {
+        Common::SetCurrentThreadName("FritchiiHangWatch");
+        std::unique_lock lock{mutex};
+        while (!cv.wait_for(lock, std::chrono::seconds{1}, [this] { return stop; })) {
+            lock.unlock();
+            HangTick();
+            lock.lock();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stop{};
+    std::thread thread; ///< last: the members above exist before it runs
+};
+
 } // Anonymous namespace
+
+void SetHangHooks(const HangHooks& hooks) {
+    std::scoped_lock lock{g_hang_mutex};
+    g_hang_hooks = hooks;
+}
+
+void ClearHangHooks(const void* context) {
+    std::scoped_lock lock{g_hang_mutex};
+    if (g_hang_hooks.context == context) {
+        g_hang_hooks = {};
+    }
+}
 
 // Machine pulse (fable52_answer_dips section 4c): tells "the machine got slower" (another program,
 // a power or heat clock drop, a contended cache or memory bus) apart from the emulator's own work.
@@ -364,6 +538,7 @@ void StallResetGap() {
 namespace {
 
 std::atomic<u64> g_presents{};
+std::atomic<long long> g_longest_gap_us{}; ///< the longest present gap since the last Pulse line
 std::atomic<int> g_pulse_clock{-1}; ///< % Processor Performance over the last second; -1 unknown
 std::atomic<u64> g_pulse_probe_ns{}; ///< the last speed probe; 0 none yet
 std::atomic<u32> g_probe_sink{};     ///< keeps the probe's result alive
@@ -642,6 +817,7 @@ private:
 
         const MachineTimes now = ReadMachineTimes();
         const u64 presents = g_presents.load(std::memory_order_relaxed);
+        const long long longest_gap_us = g_longest_gap_us.exchange(0, std::memory_order_relaxed);
         if (now.ns > last.ns) {
             const double span_100ns = static_cast<double>(now.ns - last.ns) / 100.0;
             const s64 process = static_cast<s64>(now.process_busy_100ns - last.process_busy_100ns);
@@ -660,6 +836,11 @@ private:
             if (values.passive >= 0.0) {
                 extra += fmt::format(", passive limit {:.0f}%", values.passive);
             }
+            // Last, so readers of the fields before it keep working.
+            if (presents != last_presents) {
+                extra += fmt::format(", longest frame {:.1f} ms",
+                                     static_cast<double>(longest_gap_us) / 1e3);
+            }
             LOG_INFO(Render, "Pulse: {} frames, process {:.1f} CPUs, rest of the machine {:.1f} CPUs{}",
                      presents - last_presents, static_cast<double>(process) / span_100ns,
                      static_cast<double>((std::max)(system - process, s64{0})) / span_100ns,
@@ -667,6 +848,7 @@ private:
         }
         last = now;
         last_presents = presents;
+        HangTick();
     }
 
     std::mutex mutex;
@@ -676,6 +858,17 @@ private:
 };
 
 #endif // _WIN32
+
+/// Where the hang check runs: on the Pulse thread when it runs, else on its own small thread.
+bool StartHangWatch() {
+#ifdef _WIN32
+    if (Enabled() && PulseEnabled()) {
+        return true; // PulseThread::Sample calls HangTick
+    }
+#endif
+    static HangWatchThread watch;
+    return true;
+}
 
 } // Anonymous namespace
 
@@ -712,7 +905,9 @@ void RegisterThread(const char* name) {
 #ifdef _WIN32
     std::scoped_lock lock{g_thread_mutex};
     const size_t index = g_thread_count.load(std::memory_order_relaxed);
-    if (index >= MaxThreads) {
+    const bool gpu_thread = t_role == Role::GpuFront || t_role == Role::GpuBack ||
+                            t_role == Role::GpuMem || view == "GPUBackE2";
+    if (index >= (gpu_thread && SplitEnabled() ? MaxThreads : FirstThreads)) {
         return;
     }
     HANDLE handle{};
@@ -730,6 +925,9 @@ void RegisterThread(const char* name) {
 }
 
 void OnPresent(long long gap_us) {
+    g_hang_last_present_ns.store(NowNs(), std::memory_order_relaxed);
+    g_hang_presents.fetch_add(1, std::memory_order_relaxed);
+    [[maybe_unused]] static const bool hang_watch = StartHangWatch();
     static Snapshot last = Take();
     static u64 window_start_ns = NowNs();
     static int lines_in_window = 0;
@@ -738,6 +936,10 @@ void OnPresent(long long gap_us) {
         return;
     }
     g_presents.fetch_add(1, std::memory_order_relaxed);
+    // One writer (the present thread); the Pulse thread takes it once a second.
+    if (gap_us > g_longest_gap_us.load(std::memory_order_relaxed)) {
+        g_longest_gap_us.store(gap_us, std::memory_order_relaxed);
+    }
 #ifdef _WIN32
     if (PulseEnabled()) {
         static PulseThread pulse; // started at the first present

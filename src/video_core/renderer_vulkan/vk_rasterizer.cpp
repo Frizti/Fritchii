@@ -90,6 +90,7 @@
 #include "video_core/fritchii_delta_path.h"
 #include "video_core/fritchii_draw_kinds.h"
 #include "video_core/fritchii_fill_cuts.h"
+#include "video_core/fritchii_focus.h"
 #include "video_core/fritchii_report_runs.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/texture_handle_values.h"
@@ -398,8 +399,9 @@ void LogMemoryOwners(const Device& device, PipelineCache& pipeline_cache,
     LOG_INFO(Render_Vulkan,
              "Memory owners: working set {} = private {} + shared {}, private commit {}; guest "
              "{} committed, resident {} backing + {} views - {} both = {} (views map {}, "
-             "sampled in {} us); pipelines {} graphics built of {} + {} compute, {} awaiting "
-             "destruction, ~{} at 0.45 MB each, pipeline cache data {}; VMA host {} used of {} "
+             "sampled in {} us); pipelines {} graphics built of {} ({} never used) + {} compute "
+             "({} never dispatched), {} awaiting destruction, ~{} at 0.45 MB each, pipeline cache "
+             "data {}; VMA host {} used of {} "
              "({} in blocks), device-local {} of {}; staging upload {} download {} device {} "
              "stream {}; heaps CRT {} committed ({} allocated), {} others {} committed ({} "
              "allocated, {} us); residual {} (MiB)",
@@ -408,7 +410,8 @@ void LogMemoryOwners(const Device& device, PipelineCache& pipeline_cache,
              mib(process.private_bytes), mib(commit.committed_bytes),
              mib(resident.backing_bytes), mib(resident.view_bytes), mib(resident.both_bytes),
              mib(guest_unique), mib(resident.view_mapped_bytes), resident.micros,
-             pipelines.graphics_built, pipelines.graphics_entries, pipelines.compute,
+             pipelines.graphics_built, pipelines.graphics_entries, pipelines.graphics_never_used,
+             pipelines.compute, pipelines.compute_never_dispatched,
              pipelines.awaiting_destruction, mib(pipeline_estimate),
              mib(pipelines.cache_data_bytes), mib(heaps.host_usage), mib(heaps.host_budget),
              mib(heaps.host_blocks), mib(heaps.local_usage), mib(heaps.local_budget),
@@ -624,6 +627,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         // The memory stage's thread checks who requests from the cache's own pool.
         split_buffer_staging->MarkCacheSide();
     }
+    // FRITCHII_STAGING_RING: the texture cache's pool (texture uploads at area loads).
+    staging_pool.CreateUploadRing();
     VideoCommon::FritchiiDrawKinds::Init();
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,
@@ -2926,6 +2931,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 (!scene.IsRescaled() || VideoCommon::OcarinaScaledUpscale()) &&
                 scene.range == VideoCommon::SubresourceRange{}) {
                 oot_effects_scene = scene.Handle(Shader::TextureType::Color2D);
+                oot_effects_view = scene_id;
+                oot_effects_generation = texture_cache.ImageViewGeneration(scene_id);
                 oot_effects_address = scene.gpu_addr;
                 oot_effects_frame = render_trace_frame;
                 oot_live_dlss->SaveEffectsBase(oot_effects_scene, RealExtent(scene),
@@ -4489,7 +4496,8 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
             // range of the descriptor it binds (R compares the descriptor at its play).
             for (u32 k = 0; k < view.image_count; ++k) {
                 if (view.image_size[k] != 0) {
-                    split.RecordDispatchWrite(view.image_device[k], view.image_size[k]);
+                    split.RecordDispatchWrite(view.image_device[k], view.image_size[k],
+                                               VideoCommon::GpuSplit::DispatchWriteKind::Image);
                 }
             }
         } else if (writes_images) {
@@ -4497,7 +4505,8 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         }
         if (indirect_address) {
             if (const auto device_addr = gpu_memory->GpuToCpuAddress(*indirect_address)) {
-                split.RecordDispatchWrite(*device_addr, 12);
+                split.RecordDispatchWrite(*device_addr, 12,
+                                          VideoCommon::GpuSplit::DispatchWriteKind::Indirect);
             }
         }
         split.ConfirmDispatch();
@@ -4561,6 +4570,33 @@ void RasterizerVulkan::OneFollowerCheckGrids() {
         }
         std::array<u32, 3> grid{};
         std::memcpy(grid.data(), check.ref.mapped_span.data(), sizeof(grid));
+        if (check.audit) [[unlikely]] {
+            // FRITCHII_GRID_AUDIT: every indirect grid, counted; the first 16 bad ones and then
+            // every 256th logged.
+            static u64 audited{};
+            static u64 bad{};
+            ++audited;
+            const bool over = grid[0] > max_dim[0] || grid[1] > max_dim[1] || grid[2] > max_dim[2];
+            const bool high = grid[1] > 0xffff || grid[2] > 0xffff;
+            if (over || high) {
+                ++bad;
+                if (bad <= 16 || bad % 256 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Dispatch grid audit: indirect dispatch of {:016x} ran grid "
+                                "{}x{}x{} ({}{}), limit {}x{}x{}; {} bad of {} audited",
+                                check.shader, grid[0], grid[1], grid[2],
+                                over ? "over the device limit" : "",
+                                high ? (over ? ", y/z past 16 bits" : "y/z past 16 bits") : "",
+                                max_dim[0], max_dim[1], max_dim[2], bad, audited);
+                }
+            } else if ((audited & (audited - 1)) == 0 && audited >= 1024) {
+                LOG_INFO(Render_Vulkan,
+                         "Dispatch grid audit: {} indirect grids audited, {} bad (last {}x{}x{})",
+                         audited, bad, grid[0], grid[1], grid[2]);
+            }
+            staging_pool.FreeDeferred(check.ref);
+            return true;
+        }
         if (grid[0] > max_dim[0] || grid[1] > max_dim[1] || grid[2] > max_dim[2]) [[unlikely]] {
             thread_local std::string note;
             note = fmt::format("{} indirect dispatch of {:016x}: grid {}x{}x{}, limit {}x{}x{}",
@@ -5440,14 +5476,16 @@ void RasterizerVulkan::DispatchCompute() {
                 continue;
             }
             if (image->cpu_addr_end > image->cpu_addr) {
-                split.RecordDispatchWrite(image->cpu_addr, image->cpu_addr_end - image->cpu_addr);
+                split.RecordDispatchWrite(image->cpu_addr, image->cpu_addr_end - image->cpu_addr,
+                                          VideoCommon::GpuSplit::DispatchWriteKind::Image);
             } else {
                 split.RecordDispatchUnbounded(VideoCommon::GpuSplit::DispatchUnbounded::Image);
             }
         }
         if (const auto indirect = kepler_compute->GetIndirectComputeAddress()) {
             if (const auto device_addr = gpu_memory->GpuToCpuAddress(*indirect)) {
-                split.RecordDispatchWrite(*device_addr, 12);
+                split.RecordDispatchWrite(*device_addr, 12,
+                                          VideoCommon::GpuSplit::DispatchWriteKind::Indirect);
             }
         }
         split.ConfirmDispatch();
@@ -5515,9 +5553,20 @@ void RasterizerVulkan::DispatchCompute() {
         // FRITCHII_ONEF_OP_DISPATCH on (one follower, R): the grid words copied on the GPU right
         // before the dispatch, checked against the device limit once the submission is done
         // (OneFollowerCheckGrids). Lent ones too: the dry compare.
+        // FRITCHII_GRID_AUDIT (boot, default 0): the same copy and check for every indirect
+        // dispatch, one follower or not. The grid comes from GPU memory (list dispatches, GPU-sized
+        // grids), so the host never sees it before vkCmdDispatchIndirect: a grid past the device
+        // limit, or y/z above the 16 bits the console's QMD reads, is logged after the fact. A
+        // diagnostic for the AMD device losses: costs a copy and two barriers per indirect dispatch.
+        static const bool grid_audit = [] {
+            const char* value = std::getenv("FRITCHII_GRID_AUDIT");
+            return value != nullptr && value[0] == '1';
+        }();
         std::optional<StagingBufferRef> grid_copy;
-        if (VideoCommon::OneFollower::On() && VideoCommon::OneFollower::OnRenderThread() &&
-            VideoCommon::OneFollower::DispatchPostBits() != 0) [[unlikely]] {
+        const bool onef_grid = VideoCommon::OneFollower::On() &&
+                               VideoCommon::OneFollower::OnRenderThread() &&
+                               VideoCommon::OneFollower::DispatchPostBits() != 0;
+        if (onef_grid || grid_audit) [[unlikely]] {
             OneFollowerCheckGrids();
             if (onef_grid_checks.size() < 256) {
                 grid_copy = staging_pool.Request(16, MemoryUsage::Download, true);
@@ -5562,7 +5611,8 @@ void RasterizerVulkan::DispatchCompute() {
         });
         if (grid_copy) {
             onef_grid_checks.push_back({*grid_copy, scheduler.CurrentTick(),
-                                        pipeline->ShaderHash(), onef_play != nullptr});
+                                        pipeline->ShaderHash(), onef_play != nullptr,
+                                        !onef_grid});
         }
         // A played dispatch's probes and list page copies are E's (a lent tail after the post).
         if (onef_play == nullptr) {
@@ -5581,6 +5631,17 @@ void RasterizerVulkan::DispatchCompute() {
     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
     const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
     if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
+        // Never recorded (a grid past maxComputeWorkGroupCount is undefined in Vulkan); counted,
+        // the first 8 and then every 256th logged.
+        static std::atomic<u32> skipped{};
+        const u32 n = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || n % 256 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dispatch grid over the device limit, skipped: {}x{}x{} of {:016x}, limit "
+                        "{}x{}x{} ({} so far)",
+                        dim[0], dim[1], dim[2], pipeline->ShaderHash(), max_dim[0], max_dim[1],
+                        max_dim[2], n);
+        }
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
@@ -5596,7 +5657,19 @@ void RasterizerVulkan::DispatchCompute() {
         if (std::ranges::any_of(written, [this](VideoCommon::ImageViewId id) {
                 return id && texture_cache.GetImageView(id).gpu_addr == oot_effects_address;
             })) {
-            oot_live_dlss->MarkEffects(oot_effects_scene, render_trace_frame);
+            // Fritchii's free guard: oot_effects_scene is a raw view handle taken at the fog
+            // draw. A scene image deleted since (unmap, join, relocation) and made again at the
+            // same address passes the address test, but the saved view's image is destroyed
+            // once the GPU passes the delete: after a submit in between, this mark would sample
+            // freed memory. Its view generation moved then: no mark this frame.
+            if (texture_cache.ImageViewGeneration(oot_effects_view) == oot_effects_generation) {
+                oot_live_dlss->MarkEffects(oot_effects_scene, render_trace_frame);
+            } else if (oot_effects_stale++ < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "Free guard: OoT effects mark skipped, the scene view at {:#x} was "
+                            "destroyed since the fog draw ({} so far)",
+                            oot_effects_address, oot_effects_stale);
+            }
             oot_effects_frame.reset();
         }
     }
@@ -8637,6 +8710,8 @@ void RasterizerVulkan::TickFrame() {
             applied = wanted;
         }
     }
+    // FRITCHII_GPU_PRIORITY, FRITCHII_THREAD_QOS, FRITCHII_FOCUS_GRAB and the "Focus:" line.
+    VideoCommon::FritchiiFocus::Tick();
 #endif
     NoteDrawReuseProbeFrame();
     // The OoT trackers read the draw packet's record (fable_memstage_6b_plan.md 5.1): the fill

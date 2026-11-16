@@ -132,6 +132,14 @@ KProcess& GetCurrentProcess(KernelCore& kernel);
 s32 GetCurrentCoreId(KernelCore& kernel);
 Core::Memory::Memory& GetCurrentMemory(KernelCore& kernel);
 
+/// The hang report (FRITCHII_HANG_REPORT_S): the game's threads now in a kernel wait, longest
+/// first, each with what it waits on (a mutex or condition variable key, an arbitration address,
+/// the first object of a WaitSynchronization, an IPC reply, a sleep) and for how long. Read only,
+/// lock free; HLE service threads (dummy threads) are left out.
+[[nodiscard]] std::string DescribeGuestWaits();
+/// Forgets every recorded wait (the session's threads are gone).
+void ClearGuestWaitsForHangReport();
+
 class KThread final : public KAutoObjectWithSlabHeapAndContainer<KThread, KWorkerTask>,
                       public Common::IntrusiveListBaseNode<KThread>,
                       public KTimerTask {
@@ -611,6 +619,7 @@ public:
     void SetWaitReasonForDebugging(ThreadWaitReasonForDebugging reason,
                                    const void* timeline_key = nullptr) {
         m_wait_reason_for_debugging = reason;
+        NoteWaitForHangReport(reason, timeline_key);
         if (Common::Nx2Timeline::Guest() && reason != ThreadWaitReasonForDebugging::None)
             [[unlikely]] {
             RecordWaitForTimeline(reason, timeline_key);
@@ -921,6 +930,9 @@ private:
     /// SetWaitReasonForDebugging's "guest wait" marker: the thread, the reason and what it waits
     /// on (see k_thread.cpp).
     void RecordWaitForTimeline(ThreadWaitReasonForDebugging reason, const void* timeline_key) const;
+    /// DescribeGuestWaits' table: this thread's wait begins (or ends, reason None).
+    void NoteWaitForHangReport(ThreadWaitReasonForDebugging reason,
+                               const void* timeline_key) const;
 
     using LockWithPriorityInheritanceInfoList =
         Common::IntrusiveListBaseTraits<LockWithPriorityInheritanceInfo>::ListType;

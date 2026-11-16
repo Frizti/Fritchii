@@ -1328,7 +1328,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 if (VideoCommon::GpuSplit::RecordingDispatch()) {
                     // A payload release writes up to a report's 16 bytes, at a later fence.
                     if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                        split.RecordDispatchWrite(*device, 16);
+                        split.RecordDispatchWrite(
+                            *device, 16, VideoCommon::GpuSplit::DispatchWriteKind::Release);
                     }
                 }
                 // FRITCHII_ONEF_DRY_RELEASE (fable_b 19.5 step 3): E passes a callback release.
@@ -1489,6 +1490,12 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
                             .exec_address = upload_state.ExecTargetAddress(),
                             .copy_size = upload_state.GetUploadSize(),
                             .was_dirty = upload_dirty};
+            // Only the register launch below reads and clears this list, and a launch only
+            // looks at the uploads since the previous one: keep the newest, so a mode that never
+            // reaches the register launch cannot grow it all session.
+            if (uploads.size() >= MaxPendingUploads) {
+                uploads.erase(uploads.begin(), uploads.begin() + MaxPendingUploads / 2);
+            }
             uploads.push_back(info);
         }
         upload_state.ProcessExec(regs.exec_upload.linear != 0);
@@ -1571,6 +1578,8 @@ void KeplerCompute::CallMacroWords(Core::System& system, u32 method, const u32* 
 }
 
 bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
+    // A native launch consumes the uploads made for it (the register launch does the same).
+    uploads.clear();
     launch_description = {};
     launch_description.grid_dim_x.Assign(qmd[12]);
     launch_description.grid_dim_y.Assign(qmd[13] & 0xffff);
@@ -2206,6 +2215,10 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (!state) {
         return false;
     }
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_oot_bypass_sampled,
+                                         "FRITCHII_OOT_BYPASS_SAMPLED") != 0) {
+        return BypassOotNetworkSampled(*state, native_key);
+    }
     // The tonemap pass draws before the network every frame; until it has been seen (menus, the
     // first frame) the network runs as usual. Its first passes are skipped only while the output
     // pass is being replaced, so a failed replacement brings the whole network back next frame.
@@ -2282,6 +2295,118 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
                  "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{}",
                  copied ? "copy of the tonemapped image" : "copy failed", tonemapped.Address(),
                  output->Address(), width, height);
+    }
+    return copied;
+}
+
+/// FRITCHII_OOT_BYPASS_SAMPLED: No sharpening copies the image the output pass itself samples
+/// (cb0 + 0xc0) instead of render target 0 of the latest draw with a known tonemap shader. The game
+/// has more tonemap shaders than that list (a fourth in Zora's Domain, Lon Lon Ranch and Kakariko
+/// houses), and the copy then kept an old image: the 3D view froze while the HUD went on. A
+/// skipped prepass that no replacement followed also runs the network again, so a frame finished
+/// by an output program this does not replace never reads the skipped network's stale result.
+bool KeplerCompute::BypassOotNetworkSampled(VideoCommon::OotNetwork::BypassState& state,
+                                            u64 native_key) {
+    using namespace VideoCommon::OotNetwork;
+    if (native_key == PrepassProgramKey) {
+        if (state.output_pending.exchange(false, std::memory_order_relaxed) &&
+            state.output_replaced.exchange(false, std::memory_order_relaxed)) {
+            static bool logged = false;
+            if (!std::exchange(logged, true)) {
+                LOG_INFO(HW_GPU,
+                         "Ocarina of Time: the network's output pass was not replaced; running "
+                         "the network (first program after it: {:016x})",
+                         state.after_network.load(std::memory_order_relaxed));
+            }
+        }
+        const bool skip = state.output_replaced.load(std::memory_order_relaxed);
+        state.output_pending.store(skip, std::memory_order_relaxed);
+        return skip;
+    }
+    if (native_key == NetworkProgramKey) {
+        state.after_network.store(0, std::memory_order_relaxed);
+        return state.output_replaced.load(std::memory_order_relaxed);
+    }
+    if (native_key != OutputProgramKey) {
+        u64 none = 0;
+        state.after_network.compare_exchange_strong(none, native_key, std::memory_order_relaxed);
+        return false;
+    }
+    const auto tonemapped = ConstBuffer0Image(InputImageHandleOffset);
+    const auto output = ConstBuffer0Image(OutputImageHandleOffset);
+    const auto valid = [](const std::optional<Texture::TICEntry>& image) {
+        return image && image->Address() != 0 && image->IsBlockLinear() && image->Width() != 0 &&
+               image->Height() != 0;
+    };
+    // The tonemap pass renders B10G11R11; the output pass samples that memory through an
+    // E5B9G9R9 descriptor. The copy reads it as the tonemap rendered it.
+    const Texture::TextureFormat input_format =
+        tonemapped ? tonemapped->format.Value() : Texture::TextureFormat{};
+    if (!valid(tonemapped) || !valid(output) ||
+        (input_format != Texture::TextureFormat::B10G11R11 &&
+         input_format != Texture::TextureFormat::E5B9G9R9) ||
+        output->format != Texture::TextureFormat::B10G11R11 ||
+        output->Address() == tonemapped->Address() || tonemapped->Width() != output->Width() ||
+        tonemapped->Height() != output->Height()) {
+        state.output_replaced.store(false, std::memory_order_relaxed);
+        static bool warned = false;
+        if (!std::exchange(warned, true)) {
+            const auto size = [](const std::optional<Texture::TICEntry>& image) {
+                return image ? fmt::format("{}x{} format {:#x}", image->Width(), image->Height(),
+                                           static_cast<u32>(image->format.Value()))
+                             : std::string{"unreadable"};
+            };
+            LOG_WARNING(HW_GPU,
+                        "Ocarina of Time: unexpected network images; not replaced (sampled {}, "
+                        "output {})",
+                        size(tonemapped), size(output));
+        }
+        return false;
+    }
+    Fermi2D::Surface destination{};
+    destination.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    destination.linear = Fermi2D::MemoryLayout::BlockLinear;
+    destination.block_width.Assign(output->block_width);
+    destination.block_height.Assign(output->block_height);
+    destination.block_depth.Assign(output->block_depth);
+    destination.depth = 1;
+    destination.width = output->Width();
+    destination.height = output->Height();
+    destination.addr_upper = static_cast<u32>(output->Address() >> 32);
+    destination.addr_lower = static_cast<u32>(output->Address());
+    Fermi2D::Surface source = destination;
+    source.width = tonemapped->Width();
+    source.height = tonemapped->Height();
+    source.block_width.Assign(tonemapped->block_width);
+    source.block_height.Assign(tonemapped->block_height);
+    source.block_depth.Assign(tonemapped->block_depth);
+    source.addr_upper = static_cast<u32>(tonemapped->Address() >> 32);
+    source.addr_lower = static_cast<u32>(tonemapped->Address());
+    const s32 width = static_cast<s32>(output->Width());
+    const s32 height = static_cast<s32>(output->Height());
+    const Fermi2D::Config config{
+        .operation = Fermi2D::Operation::SrcCopy,
+        .filter = Fermi2D::Filter::Point,
+        .must_accelerate = true,
+        .dst_x0 = 0,
+        .dst_y0 = 0,
+        .dst_x1 = width,
+        .dst_y1 = height,
+        .src_x0 = 0,
+        .src_y0 = 0,
+        .src_x1 = width,
+        .src_y1 = height,
+    };
+    const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
+    state.output_replaced.store(copied, std::memory_order_relaxed);
+    state.output_pending.store(false, std::memory_order_relaxed);
+    static bool logged = false;
+    if (!std::exchange(logged, true)) {
+        LOG_INFO(HW_GPU,
+                 "Ocarina of Time: anti-aliasing network bypassed from the sampled image ({}): "
+                 "{:#x} {}x{} (format {:#x}) -> {:#x} {}x{}",
+                 copied ? "copy" : "copy failed", tonemapped->Address(), source.width,
+                 source.height, static_cast<u32>(input_format), output->Address(), width, height);
     }
     return copied;
 }

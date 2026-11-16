@@ -181,4 +181,22 @@ constexpr std::chrono::nanoseconds NextPollWindow(std::chrono::nanoseconds poll,
 /// (only Tegra::Nx2PendingWake uses it, under EDEN_NX2_GPU_WAKE.)
 bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_point deadline);
 
+/// FRITCHII_HWWAIT (boot, default 0), read once: 1 = spin waits that opt in wait in UMWAIT (Intel
+/// WAITPKG, the fast-wake C0.1 state), 2 = MWAITX on AMD too. Returns what this CPU runs: 0 off
+/// (also when it lacks the instruction or an invariant TSC), 1 UMWAIT, 2 MWAITX. Logged once.
+[[nodiscard]] int HardwareWaitMode();
+
+/// HardwareWaitMode() != 0: waits in hardware while `word` still holds `seen`, at most `cycles`
+/// TSC cycles. A store to the word's cache line or an interrupt ends it early. The word is checked
+/// again after the monitor is armed, so a store just before the wait is never missed.
+void HardwareWaitWhileEqual(const std::atomic<u64>& word, u64 seen, u32 cycles);
+
+/// TSC cycles one PAUSE takes on this CPU (measured once; 1 where there is no TSC).
+[[nodiscard]] u32 PauseCycles();
+
+/// Windows: one "CPU placement:" line with the CPU's performance, efficiency and low-power
+/// efficiency logical processors (by efficiency class and last-level cache) and what the hybrid
+/// placement does with them. Logging only; nothing elsewhere.
+void LogCpuPlacement();
+
 } // namespace Common

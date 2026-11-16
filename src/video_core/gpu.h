@@ -234,6 +234,11 @@ public:
     /// Whether a channel is suspended on a semaphore acquire (callable from any thread).
     [[nodiscard]] bool HasSuspendedChannels() const;
 
+    /// The hang report (FRITCHII_HANG_REPORT_S): logs the acquires channels are suspended on
+    /// (address, wait, value now, for how long), the syncpoint waits, and the GPU split / one
+    /// follower state. Read only, from any thread; never blocks on a lock for long.
+    void LogHangState();
+
     [[nodiscard]] bool UseNvdec() const;
 
     void RendererFrameEndNotify();

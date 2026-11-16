@@ -27,6 +27,10 @@ constexpr u64 PrepassProgramKey = 0x8475d671e6967428ULL;
 constexpr u64 NetworkProgramKey = 0x42593194bb0b2b32ULL;
 constexpr u64 OutputProgramKey = 0xda6df3e54c716df2ULL;
 
+/// Constant buffer 0 offset of the output pass's texture handle for the tonemapped image it
+/// samples (the network's input; FRITCHII_OOT_BYPASS_SAMPLED copies from it).
+constexpr u32 InputImageHandleOffset = 0xc0;
+
 /// Constant buffer 0 offset of the output pass's texture handle for the B10G11R11 image it writes
 /// (the scene image the rest of the frame uses).
 constexpr u32 OutputImageHandleOffset = 0xd0;
@@ -46,6 +50,12 @@ struct BypassState {
     /// Render target 0 of the latest tonemap draw (address 0 until one is seen), under mutex.
     Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig tonemapped{};
     std::atomic<bool> output_replaced{}; ///< the latest output pass was replaced
+    /// FRITCHII_OOT_BYPASS_SAMPLED: the prepass was skipped and no output pass has been replaced
+    /// since.
+    std::atomic<bool> output_pending{};
+    /// FRITCHII_OOT_BYPASS_SAMPLED: the first native program dispatched after the network, 0 until
+    /// one is seen.
+    std::atomic<u64> after_network{};
 };
 
 /// Set when one of the network's passes can't be built on this GPU (handheld PCs on RADV:

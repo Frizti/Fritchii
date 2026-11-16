@@ -73,6 +73,7 @@ public:
     void ClearFastDispatchTable();
     void GenMemory128Accessors();
     void GenFastmemFallbacks();
+    void GenCntpctFallback();
     void GenTerminalHandlers();
 
     // Microinstruction emitters
@@ -143,8 +144,42 @@ public:
     ::Common::unordered_set<DoNotFastmemMarker> do_not_fastmem;
     boost::container::stable_vector<Xbyak::Label> shared_labels;
     const void* terminal_handler_pop_rsb_hint = nullptr;
+    /// FRITCHII_JIT_INLINE_CNTPCT: calls GetCNTPCT, result in rdx, every other register kept.
+    const void* cntpct_fallback = nullptr;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
+    /// Fritchii (FRITCHII_JIT_STATE_REFS): the same lookup, the table passed in (instead of
+    /// fast_dispatch_table_lookup, which holds it as an immediate).
+    FastDispatchEntry& (*fast_dispatch_table_lookup_in)(u64, FastDispatchEntry*) = nullptr;
+
+    /// Fritchii: FRITCHII_JIT_STATE_REFS (boot, 0..2; helper BO's stage 0 of one code cache for
+    /// all cores). 1 = every per-core address generated code needs (BlockOfCode's CoreRef) is read
+    /// through the state register instead of being an immediate, so a block's bytes do not depend
+    /// on the core that compiled it; caches stay per core. 2 = 1, and each block's bytes are
+    /// scanned for any 8 bytes that point into this core's objects (must be 0). 0 = old code.
+    static int StateRefsMode();
+    /// Built before the emitter: BlockOfCode takes it. `jit` = the lookup's argument.
+    static StateRefConfig StateRefSetup(const A64::UserConfig& conf, const void* jit);
+    /// FRITCHII_JIT_STATE_REFS=2: an object of this core the scan looks for (from Jit::Impl).
+    void AddStateRefScanRange(const void* begin, size_t size, const char* name);
+    /// FRITCHII_JIT_STATE_REFS=2: count what in [begin, begin + size) points into this core's
+    /// objects; `what` names the part in the first hits' lines.
+    size_t ScanStateRefs(const u8* begin, size_t size, u64 pc, const char* what);
+    void LogStateRefs(const char* when);
+    struct StateRefScanRange {
+        u64 begin;
+        u64 size;
+        const char* name;
+    };
+    std::vector<StateRefScanRange> state_ref_ranges;
+    int state_refs = 0;
+    bool state_ref_prelude_scanned = false;
+    u64 state_ref_prelude_hits = 0;
+    u64 state_ref_blocks = 0;
+    u64 state_ref_hit_blocks = 0;
+    u64 state_ref_hits = 0;
+    u64 state_ref_hits_logged = 0;
+    u64 state_ref_next_log = 256;
 
     // Fritchii: FRITCHII_JIT_INDIRECT_CACHE (boot; fable_a_gameceiling_answer 12.2). 1 = dry: each
     // indirect branch and return site keeps its last target in a slot and the shared handlers
@@ -201,6 +236,20 @@ public:
     }
     /// A free slot, or nullptr when all are taken (the site then uses the shared handler).
     FastDispatchEntry* AllocateIndirectSlot();
+    /// A slot's byte offset in the slot array (under 4 MiB).
+    u32 IndirectSlotOffset(const FastDispatchEntry* slot) const {
+        return u32(size_t(slot - indirect_slots.get()) * sizeof(FastDispatchEntry));
+    }
+    /// Code emitter: reg = the slot's address (FRITCHII_JIT_STATE_REFS: the slot array from the
+    /// state block plus its offset, else the immediate).
+    void EmitIndirectSlotAddress(const Xbyak::Reg64& reg, const FastDispatchEntry* slot) {
+        if (state_refs != 0) {
+            code.mov(reg, code.qword[code.ABI_JIT_PTR + code.CoreRefOffset(CoreRef::IndirectSlots)]);
+            code.lea(reg, code.ptr[reg + IndirectSlotOffset(slot)]);
+        } else {
+            code.mov(reg, u64(slot));
+        }
+    }
     /// Every slot back to the empty entry; `release`: the sites are gone too (ClearCache).
     void ClearIndirectSlots(bool release);
     /// rbx = the location descriptor of the guest pc and fpcr (rdi, rcx clobbered), as the

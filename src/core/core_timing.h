@@ -61,6 +61,18 @@ enum class UnscheduleEventType {
  * inside callback:
  *   ScheduleEvent(period_in_ns - ns_late, callback, "whatever")
  */
+/// FRITCHII_JIT_INLINE_CNTPCT (boot, default 0; x86-64): the factor the JIT multiplies the TSC by
+/// for an inline CNTPCT_EL0 read, the wall clock's own; 0 whenever GetClockTicks would differ from
+/// the plain wall clock (CPU clock not Normal, core speed sync, guest thread stats), so the JIT
+/// calls GetCNTPCT then. Read by the JIT as a plain 64-bit load.
+extern std::atomic<u64> g_inline_cntpct_factor;
+
+/// Whether FRITCHII_JIT_INLINE_CNTPCT is set and the wall clock is the TSC (logged once).
+[[nodiscard]] bool InlineCntpctEnabled();
+
+/// Recomputes g_inline_cntpct_factor from the settings (MakeJit, System::ApplySettings).
+void RefreshInlineCntpct();
+
 class CoreTiming {
 public:
     CoreTiming();

@@ -189,6 +189,8 @@ set_source_files_properties(zbic_compression.cpp PROPERTIES
 if(WIN32)
     target_sources(common PRIVATE windows/crash_handler.cpp
         windows/crash_handler.h
+        windows/fritchii_focus.cpp
+        windows/fritchii_focus.h
         windows/timer_resolution.cpp
         windows/timer_resolution.h)
     # pdh: the machine pulse's clock and thermal counters (nx2_hitch.cpp)

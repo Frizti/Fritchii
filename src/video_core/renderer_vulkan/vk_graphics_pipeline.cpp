@@ -565,6 +565,14 @@ u32 SpecStages(const std::array<bool, NUM_STAGES>& stages,
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 std::atomic<std::chrono::nanoseconds::rep> hold_time_total_ns{};
 
+// Worker builds of kept SPIR-V (the precompiled fast path): how many the driver compiled again
+// instead of finding in its own cache. On an RX 7900 XT those took 0.2-1.1 s each and the draws
+// waiting for them froze the game (tester log t1858), while a cache hit takes a few ms.
+std::atomic<u64> kept_builds{};
+std::atomic<u64> kept_builds_slow{};
+std::atomic<std::chrono::nanoseconds::rep> kept_builds_slow_ns{};
+std::atomic<std::chrono::nanoseconds::rep> kept_builds_longest_ns{};
+
 // EXP87 draw templates on the drawing thread (ported), logged every 10 s
 // while EXP87 != 0.
 struct DrawTemplateStats {
@@ -640,6 +648,17 @@ std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
 
 std::chrono::nanoseconds GraphicsPipeline::HoldTimeTotal() noexcept {
     return std::chrono::nanoseconds{hold_time_total_ns.load(std::memory_order::relaxed)};
+}
+
+GraphicsPipeline::KeptBuildStats GraphicsPipeline::TakeKeptBuildStats() noexcept {
+    return KeptBuildStats{
+        .builds = kept_builds.exchange(0, std::memory_order::relaxed),
+        .slow = kept_builds_slow.exchange(0, std::memory_order::relaxed),
+        .slow_time = std::chrono::nanoseconds{
+            kept_builds_slow_ns.exchange(0, std::memory_order::relaxed)},
+        .longest = std::chrono::nanoseconds{
+            kept_builds_longest_ns.exchange(0, std::memory_order::relaxed)},
+    };
 }
 
 // TODO: This is the worst-formatted code I have EVER seen
@@ -912,6 +931,17 @@ GraphicsPipeline::GraphicsPipeline(
         }
         if (worker_only_build) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
+            kept_builds.fetch_add(1, std::memory_order::relaxed);
+            if (elapsed > KeptBuildSlow) {
+                const auto ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+                kept_builds_slow.fetch_add(1, std::memory_order::relaxed);
+                kept_builds_slow_ns.fetch_add(ns, std::memory_order::relaxed);
+                auto longest = kept_builds_longest_ns.load(std::memory_order::relaxed);
+                while (ns > longest && !kept_builds_longest_ns.compare_exchange_weak(
+                                           longest, ns, std::memory_order::relaxed)) {
+                }
+            }
             static std::atomic<u32> logged{};
             if (elapsed > std::chrono::milliseconds{100} ||
                 (elapsed > std::chrono::milliseconds{2} && logged.fetch_add(1) < 400)) {

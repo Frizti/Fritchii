@@ -186,6 +186,19 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     present_wait_enabled = use_present_thread && device.IsKhrPresentWaitSupported();
     LOG_INFO(Render_Vulkan, "Host pacing: present wait {}",
              present_wait_enabled ? "supported" : "unavailable, frames are not paced");
+    // What the driver offers for a pacer later (probe only, nothing uses them): AMD's Windows
+    // driver has no present wait; a present_wait2 there would let the host pacer run.
+    {
+        const auto& extensions = device.GetAvailableExtensions();
+        const auto has = [&extensions](std::string_view name) {
+            return extensions.contains(name) ? "yes" : "no";
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Host pacing: driver offers VK_KHR_present_wait {}, VK_KHR_present_wait2 {}, "
+                 "VK_KHR_present_id2 {}, VK_AMD_anti_lag {}",
+                 has(VK_KHR_PRESENT_WAIT_EXTENSION_NAME), has("VK_KHR_present_wait2"),
+                 has("VK_KHR_present_id2"), has("VK_AMD_anti_lag"));
+    }
     if (present_wait_enabled) {
         present_wait_thread =
             std::jthread([this](std::stop_token token) { PresentWaitThread(token); });
@@ -275,6 +288,7 @@ void PresentManager::Present(Frame* frame) {
         });
     } else {
         scheduler.WaitWorker();
+        NoteDisplayRefresh();
         CopyToSwapchain(frame);
         free_queue.push_back(frame);
     }
@@ -427,6 +441,8 @@ void PresentManager::PresentThread(std::stop_token token) {
                 lock.unlock();
                 held = PaceFrame(next, token);
                 lock.lock();
+            } else {
+                NoteDisplayRefresh();
             }
             // Take the frame and notify anyone waiting
             Frame* frame = present_queue.front();
@@ -487,10 +503,21 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     using Clock = std::chrono::steady_clock;
     pacer.NoteQueued(frame->queued_at);
     const VkPresentModeKHR mode = swapchain.PresentMode();
+    // Mailbox with a game faster than the display (Ocarina of Time's high refresh rate above the
+    // monitor's rate, or with no cap): hold nothing, Mailbox shows the newest frame at each
+    // refresh. Holding one frame per refresh capped the game at the display rate.
+    const long long guest_ns =
+        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed);
+    const long long display_ns =
+        VideoCommon::Nx2Perf::g_display_refresh_ns.load(std::memory_order_relaxed);
+    const bool faster_than_display =
+        mode == VK_PRESENT_MODE_MAILBOX_KHR &&
+        (VideoCommon::Nx2Perf::g_guest_unpaced.load(std::memory_order_relaxed) ||
+         (guest_ns > 0 && display_ns > 0 && guest_ns * 100 < display_ns * 98));
     const bool allowed =
         (mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_MAILBOX_KHR ||
          mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
-        !Settings::FrameGenActive() && Settings::SpeedLimitEnabled() &&
+        !faster_than_display && !Settings::FrameGenActive() && Settings::SpeedLimitEnabled() &&
         Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo;
     // The refresh rate of the display the window is on (the HWND on Windows).
     const auto& window_info = render_window.GetWindowInfo();
@@ -568,6 +595,15 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     }
     pacer.NoteHold(Clock::now() - start);
     return true;
+}
+
+void PresentManager::NoteDisplayRefresh() {
+    // Refresh queries the display at most every 2 s; with `allowed` false it never paces.
+    const auto& window_info = render_window.GetWindowInfo();
+    pacer.Refresh(std::chrono::steady_clock::now(), false,
+                  window_info.type == Core::Frontend::WindowSystemType::Windows
+                      ? window_info.render_surface
+                      : nullptr);
 }
 
 void PresentManager::PresentWaitThread(std::stop_token token) {

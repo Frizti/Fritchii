@@ -1419,6 +1419,58 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
         }
     }
     std::sort(backing_pages.begin(), backing_pages.end());
+    // A run can span two views, which VirtualUnlock refuses as a whole: then page by page.
+    const auto unlock = [](uintptr_t begin, uintptr_t end) {
+        if (VirtualUnlock(reinterpret_cast<void*>(begin), end - begin) ||
+            GetLastError() == ERROR_NOT_LOCKED) {
+            return;
+        }
+        for (uintptr_t page = begin; page < end; page += PageAlignment) {
+            VirtualUnlock(reinterpret_cast<void*>(page), PageAlignment);
+        }
+    };
+    u64 unlock_us = 0;
+    // Takes the pages in `pages` (sorted and deduplicated here) out of the working set, run by run.
+    const auto unlock_all = [&](std::vector<uintptr_t>& pages) {
+        const auto unlock_start = std::chrono::steady_clock::now();
+        std::sort(pages.begin(), pages.end());
+        pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+        for (size_t i = 0; i < pages.size();) {
+            size_t j = i + 1;
+            while (j < pages.size() && pages[j] == pages[j - 1] + PageAlignment) {
+                ++j;
+            }
+            // Give way to a guest map/unmap/protect under way (they share the address space lock
+            // with VirtualUnlock): at most 20 ms per run, so a game that maps nonstop does not
+            // hold the pass.
+            if (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0) {
+                const auto give_way_start = std::chrono::steady_clock::now();
+                while (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0 &&
+                       std::chrono::steady_clock::now() - give_way_start <
+                           std::chrono::milliseconds{20}) {
+                    SwitchToThread();
+                }
+            }
+            const auto run_start = std::chrono::steady_clock::now();
+            unlock(pages[i], pages[j - 1] + PageAlignment);
+            phases.longest_unlock_us =
+                (std::max)(phases.longest_unlock_us, MicrosSince(run_start));
+            ++phases.unlock_runs;
+            i = j;
+        }
+        unlock_us += MicrosSince(unlock_start);
+    };
+    // FRITCHII_ZERO_TRIM_BATCH (boot, default 0; docs/fritchii/switches.md): the backing pages a
+    // pass reads for resident view pages leave the working set again every 4096 pages instead of
+    // at the end. Reading them maps a second address of a page already in RAM (no new memory),
+    // but until the end of the pass the working set counted each twice: the market's working set
+    // peaks (12.2, 14.1 and 14.6 GB, 2026-11-16) each fell inside a pass.
+    static const bool batch_touched = [] {
+        const char* const value = std::getenv("FRITCHII_ZERO_TRIM_BATCH");
+        return value != nullptr && value[0] == '1';
+    }();
+    constexpr size_t TouchedBatch = 4096;
+    std::vector<uintptr_t> touched;
     // Pages are only ever read through the backing, which stays mapped and writable: a view page
     // can be unmapped or protected by a guest thread meanwhile. Trimming keeps the contents, so a
     // write that lands after the check costs a soft fault and nothing else.
@@ -1442,45 +1494,19 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
         }
         // Reading it put the backing page in the working set: take it out again.
         if (!std::binary_search(backing_pages.begin(), backing_pages.end(), backing_page)) {
-            trim.push_back(backing_page);
-        }
-    }
-    std::sort(trim.begin(), trim.end());
-    trim.erase(std::unique(trim.begin(), trim.end()), trim.end());
-    phases.scan_us = MicrosSince(phase_start);
-    phase_start = std::chrono::steady_clock::now();
-    // A run can span two views, which VirtualUnlock refuses as a whole: then page by page.
-    const auto unlock = [](uintptr_t begin, uintptr_t end) {
-        if (VirtualUnlock(reinterpret_cast<void*>(begin), end - begin) ||
-            GetLastError() == ERROR_NOT_LOCKED) {
-            return;
-        }
-        for (uintptr_t page = begin; page < end; page += PageAlignment) {
-            VirtualUnlock(reinterpret_cast<void*>(page), PageAlignment);
-        }
-    };
-    for (size_t i = 0; i < trim.size();) {
-        size_t j = i + 1;
-        while (j < trim.size() && trim[j] == trim[j - 1] + PageAlignment) {
-            ++j;
-        }
-        // Give way to a guest map/unmap/protect under way (they share the address space lock with
-        // VirtualUnlock): at most 20 ms per run, so a game that maps nonstop can't hold the pass.
-        if (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0) {
-            const auto give_way_start = std::chrono::steady_clock::now();
-            while (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0 &&
-                   std::chrono::steady_clock::now() - give_way_start <
-                       std::chrono::milliseconds{20}) {
-                SwitchToThread();
+            (batch_touched ? touched : trim).push_back(backing_page);
+            if (touched.size() >= TouchedBatch) {
+                unlock_all(touched);
+                touched.clear();
             }
         }
-        const auto run_start = std::chrono::steady_clock::now();
-        unlock(trim[i], trim[j - 1] + PageAlignment);
-        phases.longest_unlock_us = (std::max)(phases.longest_unlock_us, MicrosSince(run_start));
-        ++phases.unlock_runs;
-        i = j;
     }
-    phases.unlock_us = MicrosSince(phase_start);
+    if (!touched.empty()) {
+        unlock_all(touched);
+    }
+    phases.scan_us = MicrosSince(phase_start) - unlock_us;
+    unlock_all(trim);
+    phases.unlock_us = unlock_us;
     g_zero_trim_phases = phases;
     return {(backing_pages.size() + view_pages.size()) * PageAlignment, zero_bytes};
 #else

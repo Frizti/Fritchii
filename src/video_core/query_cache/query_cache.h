@@ -21,6 +21,7 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "video_core/fritchii_occlusion.h"
 #include "video_core/fritchii_report_runs.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_report_census.h"
@@ -580,6 +581,14 @@ void QueryCacheBase<Traits>::CounterEnable(QueryType counter_type, bool is_enabl
     if (!streamer) [[unlikely]] {
         UNREACHABLE();
         return;
+    }
+    // FRITCHII_OCCLUSION_VISIBLE (live): sample count reports are made up on the back
+    // (Maxwell3D::ProcessQueryGet), so the host counter stays stopped: no occlusion query around
+    // the draws. Asked at every draw, so the counter starts again at the first draw after the
+    // switch goes off; a report pair across that point reads as different, which is "visible".
+    if (is_enabled && counter_type == QueryType::ZPassPixelCount64 &&
+        VideoCommon::FritchiiOcclusion::Mode() != 0) [[unlikely]] {
+        is_enabled = false;
     }
     if (is_enabled) {
         streamer->StartCounter();

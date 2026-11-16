@@ -74,6 +74,13 @@ struct A64JitState {
     static constexpr u64 PinPoison(size_t index) {
         return 0xBAD0BAD000000000ull | u64(index);
     }
+    /// Fritchii (FRITCHII_JIT_STATE_REFS): this core's own addresses (callbacks object, JIT,
+    /// config, TPIDR registers, exclusive monitor slots, dispatch table, indirect slots and
+    /// counters), read by generated code through the state register instead of being written
+    /// into it as immediates. Indexed by BlockOfCode's CoreRef; set once by the JIT and kept
+    /// across Reset. Last in the struct, so no other field moves.
+    static constexpr size_t core_ref_count = 10;
+    std::array<u64, core_ref_count> core_refs{};
 
     u32 GetPstate() const {
         return NZCV::FromX64(cpsr_nzcv);

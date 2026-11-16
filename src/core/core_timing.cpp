@@ -15,11 +15,14 @@
 #include "common/windows/timer_resolution.h"
 #endif
 
+#include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "video_core/nx2_debug_control.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -47,6 +50,97 @@ void SpinPause() {
 #endif
 }
 
+/// FRITCHII_HOSTTIMING_SPIN_BUDGET (live, percent of the timer thread's time, 0 = no limit, as
+/// before): EXP75's spins are paid from a budget that grows by this share of the time that passes,
+/// holding at most SpinBurstNs. With less left than EXP75's window, the thread spins only what the
+/// budget holds and sleeps on the OS timer before that. Guest sleeps of a few hundred us back to
+/// back (OoT's present poll sleeps 250 us at a time while it waits for a frame) otherwise keep a
+/// whole core spinning: 2.3 s of CPU in a 2.5 s Castle Town load freeze. Idea from
+/// zortos293/Lichii #1733 (a fifth of the thread's time, 2 ms of burst).
+int SpinBudgetPercent() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_hosttiming_spin_budget,
+                                            "FRITCHII_HOSTTIMING_SPIN_BUDGET");
+}
+constexpr s64 SpinBurstNs = 2'000'000;
+
+/// What the timer thread did, logged every 10 s from it ("HostTiming in 10 s"). The spins and the
+/// callbacks of 1 ms or more also go to the hitch line, so a hitch where HostTiming is busy says
+/// which of the two it was. Thread local: Advance also runs on the CPU thread in single core mode.
+struct TimerStats {
+    s64 window_start{};
+    u64 waits{};          ///< OS waits (the high resolution timer or the event)
+    u64 spins{};          ///< EXP75 spins
+    s64 spin_ns{};        ///< time in them
+    s64 longest_spin{};   ///< the longest one
+    u64 budget_cuts{};    ///< spins the budget shortened or turned into an OS wait
+    u64 events{};         ///< callbacks run
+    s64 callback_ns{};    ///< time in them
+    s64 longest_callback{};
+    std::string longest_callback_name;
+    u64 slow_callbacks{}; ///< callbacks of 1 ms or more
+    u64 most_in_pass{};   ///< the most callbacks one Advance ran (a catch-up after a delay)
+    u64 late_1ms{};       ///< callbacks that ran 1 ms or more after their time
+    s64 worst_late{};
+    std::string worst_late_name;
+};
+thread_local TimerStats t_timer_stats;
+
+void NoteCallback(const EventType& type, s64 began, s64 ended, s64 late) {
+    TimerStats& s = t_timer_stats;
+    const s64 took = ended - began;
+    ++s.events;
+    s.callback_ns += took;
+    if (took > s.longest_callback) {
+        s.longest_callback = took;
+        s.longest_callback_name = type.name;
+    }
+    if (took >= 1'000'000) {
+        ++s.slow_callbacks;
+        Common::Nx2Hitch::Add(Common::Nx2Hitch::Cause::SlowTimerEvent, static_cast<u64>(took));
+    }
+    if (late >= 1'000'000) {
+        ++s.late_1ms;
+        if (late > s.worst_late) {
+            s.worst_late = late;
+            s.worst_late_name = type.name;
+        }
+    }
+}
+
+void NoteSpin(s64 ns) {
+    TimerStats& s = t_timer_stats;
+    ++s.spins;
+    s.spin_ns += ns;
+    s.longest_spin = (std::max)(s.longest_spin, ns);
+    Common::Nx2Hitch::Add(Common::Nx2Hitch::Cause::TimerSpin, static_cast<u64>((std::max)(ns, s64{0})));
+}
+
+void MaybeLogTimerStats(s64 now) {
+    TimerStats& s = t_timer_stats;
+    if (s.window_start == 0) {
+        s.window_start = now;
+        return;
+    }
+    if (now - s.window_start < 10'000'000'000) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - s.window_start) / 1e9;
+    LOG_INFO(Core_Timing,
+             "HostTiming in {:.0f} s: spun {:.1f} ms/s before guest timers ({} spins, longest {} us; "
+             "EXP75={} us, FRITCHII_HOSTTIMING_SPIN_BUDGET={}%: {} cut by it); {} OS waits; {} "
+             "events, callbacks {:.1f} ms/s, longest {} us ({}), {} of 1 ms or more; most in one "
+             "pass {}; {} ran 1 ms or more late (worst {:.1f} ms, {})",
+             seconds, static_cast<double>(s.spin_ns) / 1e6 / seconds, s.spins,
+             s.longest_spin / 1000, TimerSpinNs() / 1000, SpinBudgetPercent(), s.budget_cuts,
+             s.waits, s.events, static_cast<double>(s.callback_ns) / 1e6 / seconds,
+             s.longest_callback / 1000,
+             s.longest_callback_name.empty() ? "none" : s.longest_callback_name.c_str(),
+             s.slow_callbacks, s.most_in_pass, s.late_1ms, static_cast<double>(s.worst_late) / 1e6,
+             s.worst_late_name.empty() ? "none" : s.worst_late_name.c_str());
+    s = TimerStats{};
+    s.window_start = now;
+}
+
 } // Anonymous namespace
 
 constexpr s64 MAX_SLICE_LENGTH = 10000;
@@ -64,6 +158,44 @@ constexpr u32 CpuClockTargetMhz(Settings::CpuClock clock) {
     default:
         return CPU_CLOCK_BASE_MHZ;
     }
+}
+
+std::atomic<u64> g_inline_cntpct_factor{};
+static_assert(sizeof(std::atomic<u64>) == sizeof(u64) && std::atomic<u64>::is_always_lock_free);
+
+bool InlineCntpctEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("FRITCHII_JIT_INLINE_CNTPCT");
+        if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+            return false;
+        }
+#if defined(ARCHITECTURE_x86_64)
+        if (!Common::g_wall_clock.IsNative()) {
+            LOG_INFO(Core_Timing, "FRITCHII_JIT_INLINE_CNTPCT: off, the wall clock is not the TSC "
+                                  "(counter reads stay host calls)");
+            return false;
+        }
+        LOG_INFO(Core_Timing, "FRITCHII_JIT_INLINE_CNTPCT: guest counter reads computed in the "
+                              "JIT (host call while the CPU clock is not Normal, core speed sync "
+                              "or guest thread stats are on)");
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return enabled;
+}
+
+void RefreshInlineCntpct() {
+    u64 factor = 0;
+#if defined(ARCHITECTURE_x86_64)
+    if (InlineCntpctEnabled() &&
+        CpuClockTargetMhz(Settings::values.cpu_clock.GetValue()) == CPU_CLOCK_BASE_MHZ &&
+        !Settings::values.sync_core_speed.GetValue() && !Kernel::Nx2ThreadStats::g_enabled) {
+        factor = Common::g_wall_clock.cntpct_rdtsc_factor.load(std::memory_order_relaxed);
+    }
+#endif
+    g_inline_cntpct_factor.store(factor, std::memory_order_relaxed);
 }
 
 std::shared_ptr<EventType> CreateEvent(std::string name, TimedCallback&& callback) {
@@ -132,20 +264,42 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
 #endif
             has_started = true;
 
+            // FRITCHII_HOSTTIMING_SPIN_BUDGET: what is left to spin, and when it last grew.
+            s64 spin_budget_ns = SpinBurstNs;
+            s64 spin_budget_at = 0;
+
             // base frequency in MHz: 1ns (10^-9) = 1GHz (10^9)
             while (!stop_token.stop_requested()) {
                 while (!paused && !stop_token.stop_requested()) {
                     paused_set = false;
                     if (auto const next_time = Advance(); next_time) {
+                        const s64 now_ns = GetGlobalTimeNs().count();
+                        MaybeLogTimerStats(now_ns);
                         // There are more events left in the queue, wait until the next event.
-                        auto wait_time = *next_time - GetGlobalTimeNs().count();
+                        auto wait_time = *next_time - now_ns;
                         // EXP75: a precise event due within the spin window: spin to the next
                         // event (never later than that precise one), else wake on the OS timer
                         // that far ahead of it. A Wake (an earlier event scheduled) ends the spin.
-                        if (const s64 spin_ns = TimerSpinNs();
-                            spin_ns > 0 && wait_time > 0 &&
+                        if (const s64 spin_window = TimerSpinNs();
+                            spin_window > 0 && wait_time > 0 &&
                             next_precise_ns != (std::numeric_limits<s64>::max)()) {
-                            const s64 precise_in = next_precise_ns - GetGlobalTimeNs().count();
+                            const s64 precise_in = next_precise_ns - now_ns;
+                            s64 spin_ns = spin_window;
+                            if (const int budget = SpinBudgetPercent(); budget > 0) {
+                                if (spin_budget_at != 0) {
+                                    spin_budget_ns = (std::min)(
+                                        SpinBurstNs,
+                                        spin_budget_ns + (now_ns - spin_budget_at) * budget / 100);
+                                }
+                                spin_budget_at = now_ns;
+                                spin_ns = std::clamp<s64>(spin_budget_ns, 0, spin_window);
+                                if (precise_in <= spin_window && precise_in > spin_ns) {
+                                    ++t_timer_stats.budget_cuts;
+                                }
+                            } else {
+                                spin_budget_ns = SpinBurstNs;
+                                spin_budget_at = 0;
+                            }
                             if (precise_in <= spin_ns) {
                                 static bool placed = false;
                                 if (!placed) {
@@ -157,16 +311,20 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                                     }
                                 }
                                 const u32 seen = wake_count.load(std::memory_order_acquire);
-                                while (GetGlobalTimeNs().count() < *next_time &&
+                                s64 spun_until = now_ns;
+                                while ((spun_until = GetGlobalTimeNs().count()) < *next_time &&
                                        wake_count.load(std::memory_order_acquire) == seen &&
                                        !paused && !stop_token.stop_requested()) {
                                     SpinPause();
                                 }
+                                NoteSpin(spun_until - now_ns);
+                                spin_budget_ns -= spun_until - now_ns;
                                 continue;
                             }
                             wait_time = (std::min)(wait_time, precise_in - spin_ns);
                         }
                         if (wait_time > 0) {
+                            ++t_timer_stats.waits;
 #ifdef _WIN32
                             // A high resolution timer keeps the guest's events (vsync among them)
                             // on time even where Windows doesn't honour our timer resolution
@@ -334,6 +492,10 @@ u64 CoreTiming::GetGPUTicks() const {
 std::optional<s64> CoreTiming::Advance() {
     std::scoped_lock lock{advance_lock, basic_lock};
     global_timer = GetGlobalTimeNs().count();
+    u64 run_in_pass = 0;
+    SCOPE_EXIT {
+        t_timer_stats.most_in_pass = (std::max)(t_timer_stats.most_in_pass, run_in_pass);
+    };
 
     while (!event_queue.empty() && event_queue.top().time <= global_timer) {
         const Event& evt = event_queue.top();
@@ -341,14 +503,16 @@ std::optional<s64> CoreTiming::Advance() {
         if (const auto event_type{evt.type.lock()}) {
             const auto evt_time = evt.time;
             const auto evt_sequence_num = event_type->sequence_number;
+            ++run_in_pass;
 
             if (evt.reschedule_time == 0) {
                 event_queue.pop();
 
                 basic_lock.unlock();
 
-                event_type->callback(
-                    evt_time, std::chrono::nanoseconds{GetGlobalTimeNs().count() - evt_time});
+                const s64 began = GetGlobalTimeNs().count();
+                event_type->callback(evt_time, std::chrono::nanoseconds{began - evt_time});
+                NoteCallback(*event_type, began, GetGlobalTimeNs().count(), began - evt_time);
 
                 basic_lock.lock();
             } else {
@@ -362,6 +526,8 @@ std::optional<s64> CoreTiming::Advance() {
                     evt_time < pause_end_time ? (std::min)(late_ns, now_ns - pause_end_time)
                                               : late_ns};
                 const auto new_schedule_time{event_type->callback(evt_time, late_since_pause)};
+                NoteCallback(*event_type, now_ns, GetGlobalTimeNs().count(),
+                             late_since_pause.count());
 
                 basic_lock.lock();
 

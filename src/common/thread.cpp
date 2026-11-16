@@ -32,6 +32,7 @@
 #elif defined(_WIN32)
 #include <windows.h>
 #include "common/string_util.h"
+#include "common/windows/fritchii_focus.h"
 #include "common/windows/timer_resolution.h"
 #else
 #if defined(__FreeBSD__)
@@ -628,6 +629,10 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
         }
     }();
     SetThreadPriority(GetCurrentThread(), windows_priority);
+    // FRITCHII_THREAD_QOS tags these later (docs/fritchii/switches.md).
+    if (new_priority >= ThreadPriority::High) {
+        Windows::FritchiiFocus::RegisterHotThread();
+    }
 #elif defined(__HAIKU__)
     // TODO: We have priorities for 3D rendering applications - may help lavapipe?
     int priority = [&]() {
@@ -1135,6 +1140,167 @@ bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_
         std::this_thread::yield();
     }
     return flag.load(std::memory_order_acquire);
+}
+
+int HardwareWaitMode() {
+    static const int mode = [] {
+        const char* text = std::getenv("FRITCHII_HWWAIT");
+        const int requested = text == nullptr ? 0 : std::atoi(text);
+        if (requested <= 0) {
+            return 0;
+        }
+        int result = 0;
+#ifdef ARCHITECTURE_x86_64
+        const auto& caps = Common::g_cpu_caps;
+        if (Common::g_wall_clock.IsNative()) {
+            if (caps.waitpkg) {
+                result = 1;
+            } else if (requested >= 2 && caps.monitorx) {
+                result = 2;
+            }
+        }
+        LOG_INFO(Common, "FRITCHII_HWWAIT={}: {} (CPU: WAITPKG {}, MONITORX {}, TSC clock {})",
+                 requested,
+                 result == 1   ? "spin waits use UMWAIT (C0.1)"
+                 : result == 2 ? "spin waits use MWAITX"
+                               : "off, this CPU has no usable hardware wait",
+                 caps.waitpkg ? "yes" : "no", caps.monitorx ? "yes" : "no",
+                 Common::g_wall_clock.IsNative() ? "yes" : "no");
+#else
+        LOG_INFO(Common, "FRITCHII_HWWAIT={}: off, x86-64 only", requested);
+#endif
+        return result;
+    }();
+    return mode;
+}
+
+#if defined(ARCHITECTURE_x86_64) && defined(__clang__)
+__attribute__((target("waitpkg,mwaitx")))
+#endif
+void HardwareWaitWhileEqual(const std::atomic<u64>& word, u64 seen, u32 cycles) {
+#ifdef ARCHITECTURE_x86_64
+    const int mode = HardwareWaitMode();
+    if (mode == 0 || cycles == 0) {
+        return;
+    }
+    auto* const line = const_cast<std::atomic<u64>*>(std::addressof(word));
+    if (mode == 1) {
+        _umonitor(line);
+    } else {
+        _mm_monitorx(line, 0, 0);
+    }
+    if (word.load(std::memory_order_acquire) != seen) {
+        return;
+    }
+    if (mode == 1) {
+        // Control bit 0 set: C0.1, the faster wake (Event::WaitFor uses C0.2). Absolute deadline.
+        _umwait(1, Common::X64::FencedRDTSC() + cycles);
+    } else {
+        _mm_mwaitx(1 << 1, 0u, cycles);
+    }
+#else
+    (void)word;
+    (void)seen;
+    (void)cycles;
+#endif
+}
+
+void LogCpuPlacement() {
+#ifdef _WIN32
+    using PFN_GetSystemCpuSetInformation = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG,
+                                                         PULONG, HANDLE, ULONG);
+    const auto get = reinterpret_cast<PFN_GetSystemCpuSetInformation>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetSystemCpuSetInformation")));
+    ULONG length = 0;
+    if (get == nullptr) {
+        LOG_INFO(Common, "CPU placement: no CPU set information on this Windows");
+        return;
+    }
+    get(nullptr, 0, &length, GetCurrentProcess(), 0);
+    std::vector<u8> buffer(length);
+    if (length == 0 || !get(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), length,
+                            &length, GetCurrentProcess(), 0)) {
+        LOG_INFO(Common, "CPU placement: no CPU set information on this Windows");
+        return;
+    }
+    struct Set {
+        u8 efficiency_class;
+        u32 cache; ///< (group << 8) | last-level cache index
+    };
+    std::vector<Set> sets;
+    u8 best = 0;
+    for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
+        const auto* info =
+            reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+        if (info->Size == 0) {
+            break;
+        }
+        if (info->Type == CpuSetInformation) {
+            sets.push_back({info->CpuSet.EfficiencyClass,
+                            (u32{info->CpuSet.Group} << 8) | info->CpuSet.LastLevelCacheIndex});
+            best = (std::max)(best, static_cast<u8>(info->CpuSet.EfficiencyClass));
+        }
+        offset += info->Size;
+    }
+    std::vector<u32> top_caches;
+    for (const Set& set : sets) {
+        if (set.efficiency_class == best &&
+            std::find(top_caches.begin(), top_caches.end(), set.cache) == top_caches.end()) {
+            top_caches.push_back(set.cache);
+        }
+    }
+    size_t performance = 0;
+    size_t efficiency = 0;
+    size_t low_power = 0;
+    for (const Set& set : sets) {
+        if (set.efficiency_class == best) {
+            ++performance;
+        } else if (std::find(top_caches.begin(), top_caches.end(), set.cache) !=
+                   top_caches.end()) {
+            ++efficiency;
+        } else {
+            ++low_power; // shares no last-level cache with the performance cores
+        }
+    }
+    if (efficiency == 0) {
+        // Only an island of slower cores, no efficiency cores beside the performance ones:
+        // those are the efficiency cores.
+        efficiency = low_power;
+        low_power = 0;
+    }
+    const WindowsCpuSets& placement = CpuSets();
+    const char* hybrid_env = std::getenv("EDEN_HYBRID_CORES");
+    const bool forced_off = hybrid_env != nullptr && std::strtol(hybrid_env, nullptr, 10) == 0;
+    LOG_INFO(Common,
+             "CPU placement: {} logical processors, {} performance / {} efficiency / {} low-power "
+             "efficiency (efficiency class and last-level cache); hybrid placement {}",
+             sets.size(), performance, efficiency, low_power,
+             placement.hybrid ? fmt::format("on: time-critical threads on the {} performance, "
+                                            "background work on the {} others",
+                                            placement.performance.size(),
+                                            placement.efficiency.size())
+             : forced_off     ? std::string{"off (EDEN_HYBRID_CORES=0)"}
+                              : std::string{"off (not a hybrid CPU)"});
+#endif
+}
+
+u32 PauseCycles() {
+    static const u32 cycles = [] {
+#ifdef ARCHITECTURE_x86_64
+        u64 best = ~u64{0};
+        for (int run = 0; run < 3; ++run) {
+            const u64 start = Common::X64::FencedRDTSC();
+            for (int i = 0; i < 1024; ++i) {
+                _mm_pause();
+            }
+            best = (std::min)(best, Common::X64::FencedRDTSC() - start);
+        }
+        return static_cast<u32>((std::max<u64>)(best / 1024, 1));
+#else
+        return 1U;
+#endif
+    }();
+    return cycles;
 }
 
 #ifdef _WIN32

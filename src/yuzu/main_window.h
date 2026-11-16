@@ -419,6 +419,9 @@ private slots:
     void SetUpFritchiiUi();
     /// The "Preparing shaders" screen (both UIs of a Fritchii build).
     void SetUpPrecompileGate();
+    /// Help > Profiling Mode and, while it is on, its banner and status bar label
+    /// (util/profiling_mode).
+    void SetUpProfilingMode();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();

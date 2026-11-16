@@ -206,10 +206,30 @@ inline std::atomic<int> g_memstage_setup_keep{-1};
 inline std::atomic<int> g_front_ran_reads{-1};
 /// FRITCHII_DISPATCH_WALK_SUMMARY: docs/fritchii/switches.md.
 inline std::atomic<int> g_dispatch_walk_summary{-1};
+/// FRITCHII_DISPATCH_WAIT_CENSUS: docs/fritchii/switches.md.
+inline std::atomic<int> g_dispatch_wait_census{-1};
+/// FRITCHII_LAGGED_DEFER: docs/fritchii/switches.md.
+inline std::atomic<int> g_lagged_defer{-1};
 /// FRITCHII_ACQUIRE_TABLE_FIRST: docs/fritchii/switches.md.
 inline std::atomic<int> g_acquire_table_first{-1};
 /// FRITCHII_E2C_CENSUS: docs/fritchii/switches.md.
 inline std::atomic<int> g_e2c_census{-1};
+/// FRITCHII_KILL_RT_POOL: docs/fritchii/switches.md.
+inline std::atomic<int> g_kill_rt_pool{-1};
+/// FRITCHII_DEPTH_POOL_BIG: docs/fritchii/switches.md.
+inline std::atomic<int> g_depth_pool_big{-1};
+/// FRITCHII_HANG_REPORT_S: docs/fritchii/switches.md (default 5).
+inline std::atomic<int> g_hang_report_s{-1};
+/// FRITCHII_RAM_PREBUILT_KEEP: docs/fritchii/switches.md.
+inline std::atomic<int> g_ram_prebuilt_keep{-1};
+/// FRITCHII_DEPTH_POOL_RETRY: docs/fritchii/switches.md.
+inline std::atomic<int> g_depth_pool_retry{-1};
+/// FRITCHII_VRAM_POOL_FIT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vram_pool_fit{-1};
+/// FRITCHII_VRAM_CRITICAL_FIT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vram_critical_fit{-1};
+/// FRITCHII_VRAM_REPORT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vram_report{-1};
 /// FRITCHII_E2C_ON_E: docs/fritchii/switches.md.
 inline std::atomic<int> g_e2c_on_e{-1};
 /// FRITCHII_STAMP_READ_PAGES: docs/fritchii/switches.md.
@@ -224,6 +244,10 @@ inline std::atomic<int> g_acquire_met_by{-1};
 inline std::atomic<int> g_gather_one_lock{-1};
 /// FRITCHII_GATHER_EMPTY_TEST: docs/fritchii/switches.md.
 inline std::atomic<int> g_gather_empty_test{-1};
+/// FRITCHII_OOT_BYPASS_SAMPLED: docs/fritchii/switches.md.
+inline std::atomic<int> g_oot_bypass_sampled{-1};
+/// FRITCHII_SCALED_EXTENT_CAP: docs/fritchii/switches.md.
+inline std::atomic<int> g_scaled_extent_cap{-1};
 /// FRITCHII_FENCE_COMMIT_FAST: docs/fritchii/switches.md.
 inline std::atomic<int> g_fence_commit_fast{-1};
 /// FRITCHII_PIPELINE_KEY_HASH: docs/fritchii/switches.md.
@@ -248,8 +272,26 @@ inline std::atomic<int> g_store_memo{-1};
 inline std::atomic<int> g_write_remark{-1};
 /// FRITCHII_JIT_HOT_PACK: docs/fritchii/switches.md.
 inline std::atomic<int> g_jit_hot_pack{-1};
-/// FRITCHII_ASYNC_REDRAWN (live, default 0): docs/fritchii/switches.md.
+/// FRITCHII_ASYNC_REDRAWN (live, default 0, 1 on AMD's Windows driver): docs/fritchii/switches.md.
 inline std::atomic<int> g_async_redrawn{-1};
+/// FRITCHII_OCCLUSION_VISIBLE (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_occlusion_visible{-1};
+/// FRITCHII_UNSWIZZLE_IN_PLACE (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_unswizzle_in_place{-1};
+/// FRITCHII_KEEP_BLOCKS (live, MiB, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_keep_blocks{-1};
+/// FRITCHII_STAGING_RING (boot size, live use, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_staging_ring{-1};
+/// FRITCHII_HOSTTIMING_SPIN_BUDGET (live, percent, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_hosttiming_spin_budget{-1};
+/// FRITCHII_GPU_PRIORITY (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
+inline std::atomic<int> g_gpu_priority{-1};
+/// FRITCHII_THREAD_QOS (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
+inline std::atomic<int> g_thread_qos{-1};
+/// FRITCHII_FOCUS_GRAB (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
+inline std::atomic<int> g_focus_grab{-1};
+/// FRITCHII_ONEF_RAISE_AFTER_LEND (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_onef_raise_after_lend{-1};
 /// FRITCHII_ONEF (boot): one follower step 1, the render thread R (one_follower.h).
 inline std::atomic<int> g_onef{-1};
 /// FRITCHII_ONEF_VIEW (live): step 2, needs FRITCHII_ONEF=1.

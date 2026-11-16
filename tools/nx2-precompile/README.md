@@ -60,7 +60,7 @@ not stall while the driver compiles them.
 
 A native compute program's translation leaves out the accesses through a pointer slot that is null
 at the time, and the program is translated again once the game fills that slot
-(`PipelineCache::StaleNullPointerSlot`). Which slots are filled depends on the area: in Ocarina of
+(`PipelineCache::StaleUnboundPointerSlot`). Which slots are filled depends on the area: in Ocarina of
 Time, the foliage culling programs. Each such state is SPIR-V the driver compiles while the game
 waits, about 4 seconds for those programs. A state's translation depends only on its storage pointer
 answers, so the precompiled file holds every compute program in each pointer state the recorded

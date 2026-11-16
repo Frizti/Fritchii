@@ -6,12 +6,16 @@
 #pragma once
 
 #include <climits>
+#include <optional>
+#include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
 
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/renderer_vulkan/vk_buffer_recycler.h"
+#include "video_core/renderer_vulkan/vk_staging_ring.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -78,6 +82,12 @@ public:
         cache_side = true;
     }
 
+    /// FRITCHII_STAGING_RING (boot size, live use, default 0; 1 = 256 MiB, N = N MiB, 16-1024):
+    /// one host-memory upload buffer, made and written once at boot, that uploads too big for the
+    /// stream buffer take before a new staging buffer is made. Called once, for the texture
+    /// cache's pool.
+    void CreateUploadRing();
+
 private:
     bool cache_side{};
     struct StreamBufferCommit {
@@ -93,7 +103,6 @@ private:
         u32 log2_level;
         u64 index;
         u64 tick = 0;
-        bool deferred{};
 
         StagingBufferRef Ref() const noexcept {
             return {
@@ -110,6 +119,9 @@ private:
 
     struct StagingBuffers {
         std::vector<StagingBuffer> entries;
+        // Buffers handed out deferred, by index, until FreeDeferred gives them back: kept out of
+        // entries so lookups and FreeDeferred don't scan them.
+        std::unordered_map<u64, StagingBuffer> deferred;
         size_t delete_index = 0;
         size_t iterate_index = 0;
     };
@@ -119,6 +131,25 @@ private:
 
     StagingBufferRef GetStreamBuffer(size_t size,
                                      VideoCommon::BufferChurnStats::StagingCaller caller);
+
+    struct UploadRing {
+        vk::Buffer buffer;
+        VkDeviceAddress address{};
+        std::span<u8> mapped;
+        StagingRingRegions regions;
+        // The 10 s line.
+        u64 uploads{};
+        u64 bytes{};
+        u64 refused{};
+        u64 refused_behind_large{};
+        u64 large{};
+        u64 created_after_refusal{};
+        s64 last_log_ns{};
+    };
+
+    /// A slice of the upload ring, when the regions it needs are idle.
+    std::optional<StagingBufferRef> TryGetRingBuffer(size_t size);
+    void LogUploadRing();
 
     bool AreRegionsActive(size_t region_begin, size_t region_end) const;
 
@@ -168,6 +199,8 @@ private:
     size_t current_delete_level = 0;
     u64 buffer_index = 0;
     u64 unique_ids{};
+
+    std::optional<UploadRing> upload_ring;
 };
 
 } // namespace Vulkan

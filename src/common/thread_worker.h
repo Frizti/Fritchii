@@ -19,6 +19,13 @@
 #include "common/thread.h"
 #include "common/unique_function.h"
 
+#ifdef _WIN32
+namespace Common::Windows {
+// common/windows/crash_handler.h, declared here without its <filesystem>.
+void GuaranteeStackForCrashReport();
+} // namespace Common::Windows
+#endif
+
 namespace Common {
 
 template <class StateType = void>
@@ -41,6 +48,11 @@ public:
         : workers_queued{num_workers}, thread_name{std::move(name)} {
         const auto lambda = [this, func, placement](std::stop_token stop_token) {
             Common::SetCurrentThreadName(thread_name.c_str());
+#ifdef _WIN32
+            // The pipeline workers translate shaders and the driver compiles pipelines on them,
+            // deep enough to overflow: the crash handler still has to be reached then.
+            Common::Windows::GuaranteeStackForCrashReport();
+#endif
             if (placement != ThreadPlacement::Default) {
                 Common::SetCurrentThreadPriority(ThreadPriority::Low);
             }

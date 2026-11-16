@@ -1822,6 +1822,94 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
     }
 }
 
+namespace LaggedDefer {
+namespace {
+// FRITCHII_LAGGED_DEFER (front only): the lagged checks put off since the last Clear, and the
+// counters of the 10 s line.
+struct State {
+    bool pending{};
+    u64 target{~u64{0}};
+    /// One of them waits for R's position (DrainSite::LaggedCheck), the stricter of the two.
+    bool render{};
+    u64 polls{};       ///< Polls that put their check off (the back short of its target)
+    u64 acquires{};    ///< Acquires that put a check off at least once
+    u64 ran_after{};   ///< Checks that ran after being put off, the back there by then
+    u64 sleep_waits{}; ///< Waits made where the front would sleep
+    u64 sleep_wait_ns{};
+    u64 logged_ns{};
+    std::array<u64, 5> before{};
+};
+State g_defer;
+
+void MaybeLog() {
+    auto& d = g_defer;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (d.logged_ns == 0) {
+        d.logged_ns = now;
+        return;
+    }
+    if (now - d.logged_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - d.logged_ns) / 1e9;
+    const std::array<u64, 5> current{d.polls, d.acquires, d.ran_after, d.sleep_waits,
+                                     d.sleep_wait_ns};
+    const auto rate = [&](size_t i) {
+        return static_cast<double>(current[i] - d.before[i]) / seconds;
+    };
+    LOG_INFO(HW_GPU,
+             "Lagged check defer (FRITCHII_LAGGED_DEFER={}) 10 s, per second: polls that put "
+             "their check off {:.0f} ({:.0f} acquires), checks run later with the back there "
+             "(no wait) {:.0f}, waits where the front would sleep {:.0f} ({:.1f} ms/s)",
+             VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lagged_defer,
+                                              "FRITCHII_LAGGED_DEFER"),
+             rate(0), rate(1), rate(2), rate(3), rate(4) / 1e6);
+    d.before = current;
+    d.logged_ns = now;
+}
+
+void Note(u64 target, bool render, bool first) {
+    auto& d = g_defer;
+    d.pending = true;
+    d.target = (std::min)(d.target, target);
+    d.render |= render;
+    ++d.polls;
+    d.acquires += first ? 1 : 0;
+    MaybeLog();
+}
+} // Anonymous namespace
+
+void Clear() {
+    g_defer.pending = false;
+    g_defer.target = ~u64{0};
+    g_defer.render = false;
+}
+
+bool Pending() {
+    return g_defer.pending;
+}
+
+void WaitBeforeSleep() {
+    auto& d = g_defer;
+    const u64 target = d.target;
+    const bool render = d.render;
+    Clear();
+    if (target == ~u64{0}) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    const VideoCommon::OneFollower::DryStallScope dry_stall;
+    const u64 begin = Common::Nx2Hitch::NowNs();
+    // The site of the checks put off: R's position when any of them reads it (the later one).
+    if (split.WaitUntil(target, render ? VideoCommon::DrainSite::LaggedCheck
+                                       : VideoCommon::DrainSite::LaggedCheckEngine)) {
+        ++d.sleep_waits;
+        d.sleep_wait_ns += Common::Nx2Hitch::NowNs() - begin;
+    }
+    MaybeLog();
+}
+} // namespace LaggedDefer
+
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
@@ -1925,9 +2013,6 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             auto& stats = FenceWriterStats::Get();
             // ResumeAcquire asks again right after a met answer: not a check of its own.
             const bool repeat = pending_acquire->resume_route != PendingAcquire::RouteUnset;
-            stats.lagged_checks += repeat ? 0 : 1;
-            split.Publish();
-            const auto wait_begin = std::chrono::steady_clock::now();
             // FRITCHII_ONEF_SEM_E (fable_b 19.4): payload releases are written on E (or lent,
             // E parked until R ran them): a word whose newest release is one waits for E's
             // position.
@@ -1940,6 +2025,34 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                     lagged_site = VideoCommon::DrainSite::LaggedCheckEngine;
                 }
             }
+            // FRITCHII_LAGGED_DEFER (live, default 0): while the back is short of the target,
+            // the check (and its wait) is put off instead of blocking the front; the front
+            // goes on with other channels and new command lists, and waits only where it would
+            // otherwise sleep (LaggedDefer::WaitBeforeSleep, gpu_thread.cpp). The check itself
+            // is unchanged and runs at the first poll that finds the back there, so the same
+            // checks decide the resume; only how other channels' work interleaves with it
+            // changes (it already moved with the 1 ms timer). No hang: everything sent is
+            // published here, and the front waits for the target before any sleep.
+            if (!repeat && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lagged_defer,
+                                                            "FRITCHII_LAGGED_DEFER") != 0) {
+                if (!split.ReachedSite(pending_acquire->lagged_target, lagged_site)) {
+                    split.Publish();
+                    LaggedDefer::Note(pending_acquire->lagged_target,
+                                      lagged_site == VideoCommon::DrainSite::LaggedCheck,
+                                      !pending_acquire->lagged_deferred);
+                    pending_acquire->lagged_deferred = true;
+                    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast,
+                                                 1);
+                    return false;
+                }
+                if (pending_acquire->lagged_deferred) {
+                    pending_acquire->lagged_deferred = false;
+                    ++LaggedDefer::g_defer.ran_after;
+                }
+            }
+            stats.lagged_checks += repeat ? 0 : 1;
+            split.Publish();
+            const auto wait_begin = std::chrono::steady_clock::now();
             const VideoCommon::OneFollower::DryStallScope dry_stall;
             if (split.WaitUntil(pending_acquire->lagged_target, lagged_site)) {
                 ++stats.lagged_waits;

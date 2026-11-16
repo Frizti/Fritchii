@@ -76,6 +76,10 @@ private:
     // Idle sleeps on m_is_interrupted with an address wait instead of m_on_interrupt. Fixed for
     // the core's lifetime, so the two locks are never mixed.
     const bool m_core_lock;
+    // EDEN_NX2_IDLE_STATS=1 (with EXP79): every 10 s, each core logs how often it went idle, how
+    // many of those periods its poll caught, and how long blocked periods took to wake after the
+    // interrupt. Read when the core is made, after nx2_switches.txt was applied.
+    const bool m_idle_stats;
     std::mutex m_guard;
     KSpinLock m_fast_guard;
     std::condition_variable m_on_interrupt;

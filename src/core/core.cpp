@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <atomic>
@@ -45,6 +46,7 @@
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_memory_manager.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_scheduler.h"
@@ -78,7 +80,10 @@
 #include "core/tools/renderdoc.h"
 #include "hid_core/hid_core.h"
 #include "network/network.h"
+#include "core/hle/kernel/k_thread.h"
+#include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_precompile.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
@@ -328,14 +333,44 @@ struct System::Impl {
         std::unique_lock<std::mutex> lk(suspend_guard);
         kernel.SuspendEmulation(true);
         core_timing.SyncPause(true);
+        is_stalled.store(true, std::memory_order_relaxed);
         return lk;
     }
 
     void UnstallApplication() {
+        is_stalled.store(false, std::memory_order_relaxed);
         if (!IsPaused()) {
             core_timing.SyncPause(false);
             kernel.SuspendEmulation(false);
         }
+    }
+
+    // Hang report hooks (Common::Nx2Hitch::HangHooks), installed for a running session.
+    // FRITCHII_HANG_REPORT_S (live, default 5, 0 = off): seconds without a frame, while the game
+    // runs, before the one report of a freeze. Not running: powered off, shutting down, paused,
+    // stalled by the frontend, or held by the GDB stub.
+    static int HangArmedSeconds(void* context) {
+        const Impl& impl = *static_cast<const Impl*>(context);
+        if (!impl.is_powered_on.load(std::memory_order_relaxed) ||
+            impl.is_shutting_down.load(std::memory_order_relaxed) ||
+            impl.is_paused.load(std::memory_order_relaxed) ||
+            impl.is_stalled.load(std::memory_order_relaxed) || impl.debugger.has_value()) {
+            return 0;
+        }
+        return (std::max)(VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_hang_report_s,
+                                                           "FRITCHII_HANG_REPORT_S", 5),
+                          0);
+    }
+
+    static void HangReport(void* context) {
+        Impl& impl = *static_cast<Impl*>(context);
+        if (impl.gpu_core) {
+            impl.gpu_core->LogHangState();
+        }
+        LOG_CRITICAL(Core, "Hang report: service calls in flight: {}",
+                     Service::DescribeCallsInFlight());
+        LOG_CRITICAL(Core, "Hang report: game threads in kernel waits: {}",
+                     Kernel::DescribeGuestWaits());
     }
 
     void SetNVDECActive(bool is_nvdec_active) {
@@ -355,6 +390,8 @@ struct System::Impl {
 
         // Setting changes may require a full system reinitialization (e.g., disabling multicore).
         ReinitializeIfNecessary(system);
+        // Read after the frontend applied nx2_switches.txt (static initialization runs before).
+        Kernel::Nx2ThreadStats::ReadSwitch();
         kernel.Initialize();
     }
 
@@ -545,10 +582,13 @@ struct System::Impl {
         }
         debug_service = Nx2Debug::MaybeStartService(system, name, params.program_id);
         Nx2Sampler::StartFromEnvironment();
+        Common::Nx2Hitch::SetHangHooks({&HangArmedSeconds, &HangReport, this});
         return SystemResultStatus::Success;
     }
 
     void ShutdownMainProcess() {
+        // First: no hang report reads anything the teardown below frees.
+        Common::Nx2Hitch::ClearHangHooks(this);
         debug_service.reset();
         Common::FritchiiJitList::End(); // FRITCHII_JIT_BLOCK_LIST: writes what is left
         // Waits for a call in progress (it opens the RomFS, a quick step).
@@ -596,6 +636,7 @@ struct System::Impl {
         cpu_manager.Shutdown();
         debugger.reset();
         kernel.Shutdown();
+        Kernel::ClearGuestWaitsForHangReport();
         stop_event = {};
         Network::RestartSocketOperations();
 
@@ -685,6 +726,7 @@ struct System::Impl {
     mutable std::mutex suspend_guard;
     std::mutex general_channel_mutex;
     std::atomic_bool is_paused{};
+    std::atomic_bool is_stalled{}; ///< StallApplication until UnstallApplication (hang report)
     std::atomic_bool is_shutting_down{};
     std::atomic_bool is_powered_on{};
     bool is_multicore : 1 = false;
@@ -1185,6 +1227,9 @@ void System::NotifyApplicationChanged(u64 program_id) {
 
 void System::ApplySettings() {
     impl->RefreshTime(*this);
+    // FRITCHII_JIT_INLINE_CNTPCT: a changed CPU clock or core speed sync sends counter reads back
+    // to the host call.
+    Core::Timing::RefreshInlineCntpct();
 
     if (IsPoweredOn()) {
         Renderer().RefreshBaseSettings();

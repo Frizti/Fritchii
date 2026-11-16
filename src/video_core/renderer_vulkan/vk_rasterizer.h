@@ -364,6 +364,7 @@ private:
         u64 tick;
         u64 shader;
         bool posted;
+        bool audit; ///< FRITCHII_GRID_AUDIT's copy (not the one follower's)
     };
     std::vector<OneFollowerGridCheck> onef_grid_checks;
     /// R: checks the copies whose submission is done; the others wait for a later call.
@@ -618,6 +619,10 @@ private:
     std::optional<u64> oot_effects_frame;
     GPUVAddr oot_effects_address{};
     VkImageView oot_effects_scene{};
+    /// Fritchii's free guard: oot_effects_scene's view and its generation when taken.
+    VideoCommon::ImageViewId oot_effects_view{};
+    u32 oot_effects_generation{};
+    u32 oot_effects_stale{}; ///< marks skipped: that view was destroyed in between
     struct OcarinaActorPose {
         u64 frame{};
         const Tegra::MemoryManager* channel{};

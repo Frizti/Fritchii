@@ -3,7 +3,9 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <atomic>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <type_traits>
@@ -33,6 +35,33 @@
 namespace Core {
 
 namespace {
+
+// Fritchii: reads of unmapped device memory, one line a read. The per-page lines this replaces
+// shared one cap of 16 for the whole session, so a single 1 MiB read used it up on its first 16
+// pages (AMD tester t2057: "16 pages at a block start" was the cap, not the read) and every
+// later read went unlogged. Now: the read's size, how much of it was unmapped, the thread and
+// the write ring's site, and the session totals; the first 32 reads, then every 1024th.
+std::atomic<u64> g_unmapped_reads{};
+std::atomic<u64> g_unmapped_read_bytes{};
+
+void ReportUnmappedRead(const char* what, DAddr address, size_t size, DAddr first_unmapped,
+                        size_t unmapped_bytes) {
+    const u64 reads = g_unmapped_reads.fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 total = g_unmapped_read_bytes.fetch_add(unmapped_bytes, std::memory_order_relaxed) +
+                      unmapped_bytes;
+    if (reads > 32 && (reads & 1023) != 0) {
+        return;
+    }
+    std::array<char, 17> thread{};
+    std::memcpy(thread.data(), Common::WriteRing::t_thread.data(), 16);
+    const char* const site = Common::WriteRing::t_site;
+    LOG_ERROR(HW_Memory,
+              "Unmapped Device {} @ {:#016x} size {:#x}: {} KiB unmapped, first at {:#016x} "
+              "(read as zeros; thread {}, site {}); {} such reads, {} KiB unmapped this session",
+              what, address, size, unmapped_bytes >> 10, first_unmapped,
+              thread[0] != '\0' ? thread.data() : "?", site != nullptr ? site : "-", reads,
+              total >> 10);
+}
 
 class MultiAddressContainer {
 public:
@@ -540,16 +569,15 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
             return;
         }
     }
+    size_t unmapped_bytes = 0;
+    DAddr first_unmapped = 0;
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
-            static std::atomic<u32> reported{};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(
-                    HW_Memory,
-                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
-                    current_vaddr, address, size);
+            if (unmapped_bytes == 0) {
+                first_unmapped = current_vaddr;
             }
+            unmapped_bytes += copy_amount;
             std::memset(dest_pointer, 0, copy_amount);
         },
         [&](size_t copy_amount, const u8* const src_ptr) {
@@ -558,6 +586,9 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
         [&](const std::size_t copy_amount) {
             dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;
         });
+    if (unmapped_bytes != 0) [[unlikely]] {
+        ReportUnmappedRead(__func__, address, size, first_unmapped, unmapped_bytes);
+    }
 }
 
 template <typename Traits>
@@ -608,16 +639,15 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
             return;
         }
     }
+    size_t unmapped_bytes = 0;
+    DAddr first_unmapped = 0;
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
-            static std::atomic<u32> reported{};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_ERROR(
-                    HW_Memory,
-                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
-                    current_vaddr, address, size);
+            if (unmapped_bytes == 0) {
+                first_unmapped = current_vaddr;
             }
+            unmapped_bytes += copy_amount;
             std::memset(dest_pointer, 0, copy_amount);
         },
         [&](size_t copy_amount, const u8* const src_ptr) {
@@ -626,6 +656,9 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
         [&](const std::size_t copy_amount) {
             dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;
         });
+    if (unmapped_bytes != 0) [[unlikely]] {
+        ReportUnmappedRead(__func__, address, size, first_unmapped, unmapped_bytes);
+    }
 }
 
 template <typename Traits>

@@ -65,9 +65,32 @@ struct PinConfig {
     u32 store_missed_offset = 0;
 };
 
+/// Fritchii (FRITCHII_JIT_STATE_REFS): the per-core addresses generated code needs. Each has a
+/// qword in the state block (StateRefConfig::base_offset + 8 * index), so with the switch on a
+/// block reads them through ABI_JIT_PTR instead of holding them as immediates, and its bytes no
+/// longer depend on the core that compiled it.
+enum class CoreRef : u32 {
+    Callbacks,          ///< the UserCallbacks object (SVC, exceptions, cache ops, memory slow paths)
+    Jit,                ///< the JIT itself (the dispatcher's block lookup)
+    Conf,               ///< the emitter's config (exclusive accesses through the monitor in C++)
+    Tpidr,              ///< &tpidr_el0
+    Tpidrro,            ///< &tpidrro_el0
+    MonitorAddress,     ///< this core's exclusive monitor reservation address
+    MonitorValue,       ///< this core's exclusive monitor reservation value
+    FastDispatchTable,  ///< the fast dispatch table
+    IndirectSlots,      ///< FRITCHII_JIT_INDIRECT_CACHE's slot array
+    IndirectCounters,   ///< FRITCHII_JIT_INDIRECT_CACHE's counters
+    Count,
+};
+struct StateRefConfig {
+    int mode = 0;          ///< 0 = immediates (old code), 1 = loads from the state block, 2 = 1 + scan
+    u32 base_offset = 0;   ///< of the per-core qwords in the state block
+    std::array<u64, size_t(CoreRef::Count)> values{};  ///< what the state block holds (this core's)
+};
+
 class BlockOfCode final : public Xbyak::CodeGenerator {
 public:
-    BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, PinConfig pins = {});
+    BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, PinConfig pins = {}, StateRefConfig state_refs = {});
     BlockOfCode(const BlockOfCode&) = delete;
     // Fritchii (FRITCHII_JIT_FAR_CODE): Xbyak's limit is the near region's end while near code is
     // emitted; the base class frees the whole space.
@@ -133,6 +156,35 @@ public:
         PinsBeforeCall();
         ::Common::X64::CallFarFunction(*this, Common::FptrCast(l));
         PinsAfterCall();
+    }
+
+    /// Fritchii (FRITCHII_JIT_STATE_REFS): 0 = per-core addresses are immediates (old code).
+    int StateRefsMode() const { return state_refs.mode; }
+    const StateRefConfig& StateRefs() const { return state_refs; }
+    /// Set before anything that uses it is emitted; the state block gets the same value.
+    void SetCoreRef(CoreRef which, u64 value) { state_refs.values[size_t(which)] = value; }
+    u32 CoreRefOffset(CoreRef which) const { return state_refs.base_offset + u32(sizeof(u64) * size_t(which)); }
+    /// Code emitter: reg = this core's `value` for `which`. With the switch on (and `value` the
+    /// one the state block holds) a load through ABI_JIT_PTR, else the immediate.
+    void MovCoreRef(const Xbyak::Reg64& reg, CoreRef which, u64 value) {
+        if (state_refs.mode != 0 && value != 0 && state_refs.values[size_t(which)] == value) {
+            mov(reg, qword[ABI_JIT_PTR + CoreRefOffset(which)]);
+        } else {
+            mov(reg, value);
+        }
+    }
+    /// ArgCallback: the state block offset of an object argument (callbacks, JIT, config) when
+    /// the switch is on and `arg` is one of them, else 0 (the immediate).
+    u32 CoreRefArgOffset(u64 arg) const {
+        if (state_refs.mode == 0 || arg == 0) {
+            return 0;
+        }
+        for (const CoreRef which : {CoreRef::Callbacks, CoreRef::Jit, CoreRef::Conf}) {
+            if (state_refs.values[size_t(which)] == arg) {
+                return CoreRefOffset(which);
+            }
+        }
+        return 0;
     }
 
     /// Fritchii (FRITCHII_JIT_PIN): the pinned guest registers.
@@ -284,6 +336,7 @@ private:
     bool prelude_complete = false;
     PinConfig pins;
     bool pin_call_hook = false;
+    StateRefConfig state_refs; // Fritchii (FRITCHII_JIT_STATE_REFS); before GenRunCode runs
 
     void GenRunCode(std::function<void(BlockOfCode&)> rcp);
 };

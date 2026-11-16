@@ -69,6 +69,9 @@ enum class ImageFlagBits : u32 {
     NoPool = 1 << 25,
     /// EXP121: the collector recorded its download; deleted once the GPU has written it out.
     CollectPending = 1 << 26,
+    /// FRITCHII_SCALED_EXTENT_CAP: its scaled size would pass the device's limits, so it stays
+    /// native; logged once.
+    ScaleLimited = 1 << 27,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 

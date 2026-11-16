@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <mutex>
 #include <utility>
 
+#include "common/logging.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_seam_clock.h"
@@ -182,6 +185,25 @@ void MultiRangeBufferCache::RetireEntry(SeamClock& clock, Entry& entry) {
             if (item.tick < oldest) {
                 oldest = item.tick;
             }
+        }
+        // Counters (this path is rare): the list full after a drain, and the case where its
+        // oldest entry is the tick being recorded, whose Wait submits in the middle of a draw.
+        static std::atomic<u64> full_events{};
+        static std::atomic<u64> current_events{};
+        static std::atomic<s64> last_report_s{};
+        const u64 full = full_events.fetch_add(1, std::memory_order_relaxed) + 1;
+        const u64 current = oldest >= clock.Now()
+                                ? current_events.fetch_add(1, std::memory_order_relaxed) + 1
+                                : current_events.load(std::memory_order_relaxed);
+        const s64 now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+        if (full <= 4 || now_s - last_report_s.load(std::memory_order_relaxed) >= 60) {
+            last_report_s.store(now_s, std::memory_order_relaxed);
+            LOG_INFO(Render_Vulkan,
+                     "Multi-range retired list full ({} entries) {} times, {} of them on the tick "
+                     "being recorded (a submit mid-draw)",
+                     retired.capacity(), full, current);
         }
         clock.Wait(oldest);
         DrainRetired(clock);

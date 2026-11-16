@@ -137,8 +137,9 @@
 //     scheduler's read) goes through Qmd(), which opens the dispatch packet, reads into it and
 //     returns it. BeginDispatch adopts the open packet. The error path's 512-byte read stays a
 //     direct read.
-//   Null pointer slots: the compute pipeline lookup (PipelineCache::StaleNullPointerSlot) reads a
-//     pointer from a QMD constant buffer before the dispatch's fill can run; it reads through
+//   Unbound pointer slots: the compute pipeline lookup (PipelineCache::StaleUnboundPointerSlot)
+//     reads a pointer from a QMD constant buffer (and a pointer-table entry through it) before the
+//     dispatch's fill can run; it reads through
 //     ReadPointerSlot(), which keeps the value in the open dispatch packet (null_slot_values).
 // The handle values live in their own arrays beside the entry arena (draw_values,
 // dispatch_values), not in it: the arena is played as an entry stream. packet.handle_values spans
@@ -3961,6 +3962,24 @@ void MemStage::Note(SeamHook::Use use, const std::source_location& location, boo
 
 void MemStage::TickFrame() {
     int value = VideoCore::Nx2Debug::Experiment(123);
+    // AMD safe default (2026-11-16): SEAM 3 lost the device on an RX 7900 XT and an RX 9070 XT at
+    // the title screen (the ASTC decoder's submit inside a held fill); SEAM 1 ran clean on both.
+    // Held to 1 on AMD's proprietary driver; FRITCHII_SEAM_AMD=1 keeps the asked level (tests).
+    if (value >= 2 && VideoCommon::OneFollower::IsAmdProprietaryDriver()) [[unlikely]] {
+        static const bool keep = [] {
+            const char* const v = std::getenv("FRITCHII_SEAM_AMD");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (!keep) {
+            static bool logged = false;
+            if (!std::exchange(logged, true)) {
+                LOG_WARNING(Render_Vulkan, "Memory seam: EXP123={} held to 1 on AMD's proprietary "
+                                           "driver (device losses with 3); FRITCHII_SEAM_AMD=1 keeps it",
+                            value);
+            }
+            value = 1;
+        }
+    }
     if (value >= 2 && !ticks) [[unlikely]] {
         // The early fill needs packet ticks (the header comment): run SEAM 1.
         Bump(counters.seam_clamped);

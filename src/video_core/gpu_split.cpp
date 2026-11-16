@@ -2017,7 +2017,20 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
 }
 
 void GpuSplit::Backoff(u32 spins, u64 target, bool on_engine) {
-    if (spins < 16384) {
+    if (const int hardware_wait = Common::HardwareWaitMode(); hardware_wait != 0) [[unlikely]] {
+        // FRITCHII_HWWAIT: the pause phase as 256 hardware waits of 64 pauses' time each (the
+        // same wall time), on the position the wait reads first; a store to it ends the wait.
+        // A wait that turns on the other position ends at its time limit, like 64 pauses.
+        if (spins < 16384 / 64) {
+            static const u32 slice = Common::PauseCycles() * 64;
+            const std::atomic<u64>& word = on_engine || !two_positions ? consumed : played;
+            const u64 seen = word.load(std::memory_order_acquire);
+            if (seen < target) {
+                Common::HardwareWaitWhileEqual(word, seen, slice);
+            }
+            return;
+        }
+    } else if (spins < 16384) {
         Pause();
         return;
     }
@@ -3352,12 +3365,25 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
         if (!wait) {
             return DispatchCheck::Queued;
         }
+        // FRITCHII_DISPATCH_WAIT_CENSUS (live, default 0): what the dispatches this wait is for
+        // write, once they ran. Off: one relaxed load and a branch.
+        const bool census = VideoCore::Nx2Debug::SwitchValue(
+                                VideoCore::Nx2Debug::g_dispatch_wait_census,
+                                "FRITCHII_DISPATCH_WAIT_CENSUS") != 0;
+        const u64 census_consumed = census ? EngineConsumedNow() : 0;
+        const u64 census_count =
+            census ? dispatch_write_count.load(std::memory_order_acquire) : 0;
+        const u64 census_start = census ? Common::Nx2Hitch::NowNs() : 0;
         // FRITCHII_DELAY_FRONT_KIND=2 ("Q"): after this wait returned, or before it
         // (FRITCHII_DELAY_BEFORE=1). Off: one relaxed load and a branch each side.
         DelayFrontIf(FrontDelayKind::DispatchWait, true);
-        WaitFor(last_dispatch_position, DrainSite::DispatchWait);
+        const bool did_wait = WaitFor(last_dispatch_position, DrainSite::DispatchWait);
         DelayFrontIf(FrontDelayKind::DispatchWait, false);
         waited = true;
+        if (census && did_wait) [[unlikely]] {
+            CensusDispatchWait(census_consumed, census_count, begin, size,
+                               Common::Nx2Hitch::NowNs() - census_start);
+        }
     }
     // FRITCHII_DISPATCH_WALK_SUMMARY (live, default 0 = the walk alone; fable_b2 2.4): with
     // bounded records (FRITCHII_ONEF_DISPATCH_RANGES) a page's snapshot is never renewed, so
@@ -3464,12 +3490,108 @@ GpuSplit::DispatchStats GpuSplit::GetDispatchStats() const {
     return stats;
 }
 
-void GpuSplit::AppendDispatchWrite(u64 begin, u64 end) {
+void GpuSplit::CensusDispatchWait(u64 consumed_before, u64 count_before, u64 begin, u64 size,
+                                  u64 wait_ns) {
+    // The dispatches this wait was for are the ones E had not run when it began: their records
+    // are among those appended since (count_before), at positions from E's position then.
+    // Records made meanwhile for older work start below that position and are skipped.
+    using Class = DispatchWaitCensus::Class;
+    auto& census = dispatch_census;
+    const u64 count = dispatch_write_count.load(std::memory_order_acquire);
+    bool image = false;
+    bool indirect = false;
+    bool release = false;
+    bool buffer = false;
+    bool unknown = count - count_before > DispatchWriteSlots;
+    bool overlap = false;
+    const u64 end = begin + size;
+    for (u64 index = count; !unknown && index > count_before; --index) {
+        const DispatchWrite& write = dispatch_writes[(index - 1) % DispatchWriteSlots];
+        if (write.position.load(std::memory_order_relaxed) < consumed_before) {
+            continue;
+        }
+        ++census.records;
+        const u64 write_begin = write.begin.load(std::memory_order_relaxed);
+        const u64 write_end = write.end.load(std::memory_order_relaxed);
+        overlap |= write_begin < end && begin < write_end;
+        switch (static_cast<DispatchWriteKind>(write.kind.load(std::memory_order_relaxed))) {
+        case DispatchWriteKind::Buffer:
+            buffer = true;
+            break;
+        case DispatchWriteKind::Image:
+            image = true;
+            break;
+        case DispatchWriteKind::Indirect:
+            indirect = true;
+            break;
+        case DispatchWriteKind::Release:
+            release = true;
+            break;
+        default:
+            unknown = true;
+            break;
+        }
+    }
+    // A slot reused while it was read: the classes above may be a stray record's.
+    unknown |= dispatch_write_count.load(std::memory_order_acquire) - count_before >=
+               DispatchWriteSlots;
+    const Class kind = unknown    ? Class::Unknown
+                       : image    ? Class::WithImage
+                       : indirect ? Class::WithIndirect
+                       : release  ? Class::WithRelease
+                       : buffer   ? Class::BufferOnly
+                                  : Class::Nothing;
+    ++census.waits[kind];
+    census.wait_ns[kind] += wait_ns;
+    census.overlapping += overlap ? 1 : 0;
+    // The line, every 10 s of waits.
+    static u64 logged_ns = 0;
+    static DispatchWaitCensus before{};
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (logged_ns == 0) {
+        logged_ns = now;
+        return;
+    }
+    if (now - logged_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - logged_ns) / 1e9;
+    const auto rate = [&](Class c) {
+        return static_cast<double>(census.waits[c] - before.waits[c]) / seconds;
+    };
+    const auto ms = [&](Class c) {
+        return static_cast<double>(census.wait_ns[c] - before.wait_ns[c]) / 1e6 / seconds;
+    };
+    u64 waits = 0;
+    for (size_t c = 0; c < Class::Count; ++c) {
+        waits += census.waits[c] - before.waits[c];
+    }
+    LOG_INFO(HW_GPU,
+             "Dispatch wait census (FRITCHII_DISPATCH_WAIT_CENSUS=1) 10 s, per second, by what "
+             "the waited-for dispatches wrote: buffers only {:.0f}/s {:.1f} ms/s; buffers + QMD "
+             "releases {:.0f}/s {:.1f} ms/s; with indirect arguments {:.0f}/s {:.1f} ms/s; with "
+             "an image {:.0f}/s {:.1f} ms/s; anything or records lost {:.0f}/s {:.1f} ms/s; no "
+             "record {:.0f}/s {:.1f} ms/s; records per wait {:.1f}; waits whose dispatches wrote "
+             "the page read {:.0f}/s",
+             rate(Class::BufferOnly), ms(Class::BufferOnly), rate(Class::WithRelease),
+             ms(Class::WithRelease), rate(Class::WithIndirect), ms(Class::WithIndirect),
+             rate(Class::WithImage), ms(Class::WithImage), rate(Class::Unknown),
+             ms(Class::Unknown), rate(Class::Nothing), ms(Class::Nothing),
+             waits != 0 ? static_cast<double>(census.records - before.records) /
+                              static_cast<double>(waits)
+                        : 0.0,
+             static_cast<double>(census.overlapping - before.overlapping) / seconds);
+    before = census;
+    logged_ns = now;
+}
+
+void GpuSplit::AppendDispatchWrite(u64 begin, u64 end, DispatchWriteKind kind) {
     const u64 count = dispatch_write_count.load(std::memory_order_relaxed);
     DispatchWrite& write = dispatch_writes[count % DispatchWriteSlots];
     write.position.store(back_entry_position, std::memory_order_relaxed);
     write.begin.store(begin, std::memory_order_relaxed);
     write.end.store(end, std::memory_order_relaxed);
+    write.kind.store(static_cast<u8>(kind), std::memory_order_relaxed);
     // DispatchStampsMissSince: the stamps before the count, so a front that loaded the count
     // sees the stamps of every record below it. A max that holds even with two writers (the
     // back, and GPUMem in a fill it runs for the back).
@@ -3496,7 +3618,7 @@ void GpuSplit::AppendDispatchWrite(u64 begin, u64 end) {
 }
 
 void GpuSplit::RecordDispatchUnbounded(DispatchUnbounded reason) {
-    AppendDispatchWrite(0, ~u64{0});
+    AppendDispatchWrite(0, ~u64{0}, DispatchWriteKind::Unbounded);
     if (!dispatch_unbounded) {
         dispatch_unbounded = true;
         auto& counter = dispatches_unbounded[static_cast<size_t>(reason)];

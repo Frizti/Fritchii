@@ -47,6 +47,7 @@
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_runahead.h"
+#include "video_core/one_follower.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -852,6 +853,41 @@ bool GPU::IsAsync() const {
 
 bool GPU::HasSuspendedChannels() const {
     return impl->scheduler.HasPendingChannelsAnyThread();
+}
+
+void GPU::LogHangState() {
+    auto& host1x = impl->system.Host1x();
+    std::string acquires;
+    u32 count = 0;
+    // Every suspended acquire registers here (Puller::ProcessSemaphoreAcquire), the channel's own
+    // and the memory stage's watches alike. The word is read as the guest sees it now.
+    const bool listed = Nx2SemaphoreWaiters::Get().TryForEach(
+        [&](u64 address, u32 value, u32 operation, bool latched, const u32* word, double seconds) {
+            if (++count > 16) {
+                return;
+            }
+            const u32 now = word != nullptr
+                                ? std::atomic_ref<u32>{*const_cast<u32*>(word)}.load(
+                                      std::memory_order_relaxed)
+                                : host1x.MemoryManager().Read<u32>(address);
+            acquires += fmt::format(
+                "{}device {:#x} {} {:#x}, word now {:#x}{}, for {:.1f} s",
+                acquires.empty() ? "" : "; ", address,
+                operation == Nx2SemaphoreWaiters::AcquireEqual    ? "=="
+                : operation == Nx2SemaphoreWaiters::AcquireGequal ? ">="
+                : operation == Nx2SemaphoreWaiters::AcquireMask   ? "&"
+                                                                  : "?",
+                value, now, latched ? " (latched by a GPU write)" : "", seconds);
+        });
+    LOG_CRITICAL(HW_GPU,
+                 "Hang report: channels suspended on an acquire: {}; acquires waiting ({}): {}",
+                 HasSuspendedChannels() ? "yes" : "no", count,
+                 !listed            ? std::string{"not read: their lock stayed held for 200 ms"}
+                 : acquires.empty() ? std::string{"none"}
+                                    : acquires);
+    LOG_CRITICAL(HW_GPU, "Hang report: syncpoint waits: {}",
+                 host1x.GetSyncpointManager().DescribeWaits());
+    VideoCommon::OneFollower::ReportHangState();
 }
 
 bool GPU::UseNvdec() const {

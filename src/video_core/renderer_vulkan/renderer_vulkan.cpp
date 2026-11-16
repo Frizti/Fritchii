@@ -188,9 +188,25 @@ try
 #endif
 {
 
-    if (Settings::values.renderer_force_max_clock.GetValue() && device.ShouldBoostClocks()) {
-        turbo_mode.emplace(instance, dld);
-        scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
+    // Force maximum clocks (off by default): a second device keeps the GPU busy. Its device
+    // failing to start skips it instead of failing the whole renderer ("Vulkan initialization
+    // error" and no boot).
+    if (!Settings::values.renderer_force_max_clock.GetValue()) {
+        LOG_INFO(Render_Vulkan, "Force maximum clocks: off");
+    } else if (!device.ShouldBoostClocks()) {
+        LOG_INFO(Render_Vulkan, "Force maximum clocks: skipped (driver not on the list, Steam "
+                                "Deck, or a debugging tool attached)");
+    } else {
+        try {
+            turbo_mode.emplace(instance, dld);
+            scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
+            LOG_INFO(Render_Vulkan, "Force maximum clocks: running (costs power; not for laptops "
+                                    "on battery)");
+        } catch (const std::exception& exception) {
+            turbo_mode.reset();
+            LOG_WARNING(Render_Vulkan, "Force maximum clocks: skipped (its device failed: {})",
+                        exception.what());
+        }
     }
 
 #ifdef HAS_RESHADE
@@ -306,7 +322,29 @@ void RendererVulkan::Report() const {
     LOG_INFO(Render_Vulkan, "Driver: {}", driver_name);
     LOG_INFO(Render_Vulkan, "Device: {}", model_name);
     LOG_INFO(Render_Vulkan, "Vulkan: {}", api_version);
-    LOG_INFO(Render_Vulkan, "Available VRAM: {:.2f} GiB", available_vram);
+    // The caches' memory limit, not the card's size: with Conservative VRAM use it is capped at
+    // 6 GiB + 1 GiB per resolution scale step, so a 16 GB card reads 7.00 GiB at 1x.
+    std::string vram_limit;
+    if (device.IsIntegrated()) {
+        vram_limit = "integrated GPU: a share of system memory";
+    } else if (Settings::values.vram_usage_mode.GetValue() ==
+               Settings::VramUsageMode::Aggressive) {
+        vram_limit = "Aggressive: the driver's budget less up to 1 GiB";
+    } else {
+        vram_limit = fmt::format("Conservative cap: 6 GiB + 1 GiB x {}",
+                                 Settings::values.resolution_info.ScaleUp(1));
+    }
+    u64 main_usage = 0;
+    u64 main_budget = 0;
+    const std::string main_heap =
+        device.MainHeapUsage(main_usage, main_budget)
+            ? fmt::format("main heap {}: budget {:.2f} GiB, usage {:.2f} GiB",
+                          device.GetMainHeap(), static_cast<f64>(main_budget) / f64{1_GiB},
+                          static_cast<f64>(main_usage) / f64{1_GiB})
+            : fmt::format("main heap {}", device.GetMainHeap());
+    LOG_INFO(Render_Vulkan, "Available VRAM: {:.2f} GiB (memory limit for the caches; {}; {})",
+             available_vram, vram_limit, main_heap);
+    device.LogMemoryHeaps();
     if (VideoCommon::RenderTrace::Enabled()) {
         LOG_INFO(Render_Vulkan, "Render trace enabled: interval=600 frames, log_filter={}",
                  Settings::values.log_filter.GetValue());

@@ -46,6 +46,7 @@
 #include "video_core/nx2.h"
 #include "video_core/churn_counters.h"
 #include "video_core/nx2_profile.h"
+#include "common/nx2_hitch.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/nx2_report_census.h"
 #include "video_core/one_follower_hooks.h"
@@ -692,6 +693,17 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
         // a 24 ms texture stall every ~3 s. Keep 2.5 GiB of the budget for everything else instead.
         if (budget >= 10_GiB) {
             max_critical = (std::max)(max_critical, budget - 2560_MiB);
+        } else if (budget > 4_GiB &&
+                   VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_critical_fit,
+                                                    "FRITCHII_VRAM_CRITICAL_FIT") != 0) {
+            // FRITCHII_VRAM_CRITICAL_FIT (live, default 0; with FRITCHII_VRAM_POOL_FIT): an 8 GB
+            // card (budget ~7.1 GiB with Windows and other programs) stopped at the fixed 5 GiB
+            // and its last ~2 GiB of budget went to the image pool and margins while OoT's market
+            // (~5.1-5.3 GiB in the cache's view on a 16 GB card) evicted and re-made textures.
+            // Here the cap is the budget less the cache's margin (1/8 of it, at most 1 GiB) and
+            // 512 MiB for deleted images still in flight; the fitted pool yields the rest.
+            const u64 margin = (std::min)(budget / 8, u64{1_GiB});
+            max_critical = (std::max)(max_critical, budget - margin - 512_MiB);
         }
     }
     critical_memory = (std::min)(critical_memory, max_critical);
@@ -812,6 +824,11 @@ void TextureCache<P>::TickFrame() {
                     critical_memory = (std::min)(critical_memory, host_critical);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     ApplyThresholdOverrides(false);
+                    // FRITCHII_KEEP_BLOCKS: the kept blocks get what the live usage leaves under
+                    // the critical use and half the room above it.
+                    if constexpr (requires { runtime.LimitKeptBlocks(u64{}, u64{}); }) {
+                        runtime.LimitKeptBlocks(budget, critical_memory);
+                    }
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time). Compared after the overrides: the value before them is above
                     // the 5/8-of-budget cap on large cards, so every check looked like a change
@@ -856,6 +873,27 @@ void TextureCache<P>::TickFrame() {
             }
             gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
             gpu_sentenced_images.pop_front();
+        }
+        // Fritchii's free guard: images deleted with a download queued. The download records
+        // may still hold them (then the landing destroys them, the GPU being past this tick).
+        while (!retained_image_keepers.empty() &&
+               runtime.IsFree(retained_image_keepers.front().tick)) {
+            retained_image_keepers.pop_front();
+        }
+        if (frame_tick % 600 == 0) {
+            const u64 total = free_guard.retained_held + free_guard.landed_early +
+                              free_guard.freed_early + free_guard.unswizzle_dropped;
+            if (total != free_guard.logged_total) {
+                free_guard.logged_total = total;
+                LOG_INFO(HW_GPU,
+                         "Free guard (session): {} images deleted with a download queued held "
+                         "until the GPU passed their delete ({} of those downloads landed "
+                         "before it: freed in use without the guard), {} held now, {} destroyed "
+                         "early anyway (must be 0); {} async unswizzles dropped with their image",
+                         free_guard.retained_held, free_guard.landed_early,
+                         retained_image_keepers.size(), free_guard.freed_early,
+                         free_guard.unswizzle_dropped);
+            }
         }
         if constexpr (requires { runtime.SubmitImageFrees(); }) {
             runtime.SubmitImageFrees();
@@ -3452,6 +3490,25 @@ void TextureCache<P>::PopAsyncFlushes() {
             auto& download_buffer = download_map[download_info.async_buffer_id];
             if (download_info.is_swizzle) {
                 const ImageBase& image = download_info.GetImage(slot_images);
+                if constexpr (requires { runtime.IsFree(u64{}); }) {
+                    // Fritchii's free guard: the old code destroyed a retired image when its
+                    // download landed (the pop below). Counted when the GPU is not known past
+                    // its delete yet; retained_image_keepers holds it now.
+                    if (download_info.retired_image && !runtime.IsFree(download_info.retired_tick)) {
+                        // The pop below drops this reference: the last one destroys the image.
+                        if (download_info.retired_image.use_count() == 1) {
+                            ++free_guard.freed_early;
+                        }
+                        if (free_guard.landed_early++ < 8) {
+                            LOG_WARNING(HW_GPU,
+                                        "Free guard: image {:#x} ({}x{}) deleted with a download "
+                                        "queued; the download landed before the GPU passed the "
+                                        "delete (tick {}), kept until it does",
+                                        image.gpu_addr, image.info.size.width,
+                                        image.info.size.height, download_info.retired_tick);
+                        }
+                    }
+                }
                 const auto copies = FullDownloadCopies(image.info);
                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
                 std::span<u8> download_span =
@@ -3797,6 +3854,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         if (upload_trace) [[unlikely]] {
             staging_end = std::chrono::steady_clock::now();
         }
+        // FRITCHII_HITCH_SPLIT: the CPU side of texture uploads in the hitch line.
+        const Common::Nx2Hitch::SplitScope hitch_timed{Common::Nx2Hitch::Cause::TextureUpload,
+                                                       MapSizeBytes(image)};
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
     }
@@ -4062,6 +4122,18 @@ std::vector<u32> TextureCache<P>::BindSparseLayers(Image& image, std::span<const
 template <class P>
 void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
     if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
+        // At most 32 MiB of layers per staging buffer, as UploadInChunks: all of a sparse array's
+        // bound layers at once took a 128 MiB one that an 8 GB laptop had no memory for.
+        constexpr u64 ChunkBytes = 32_MiB;
+        const size_t chunk_layers = static_cast<size_t>(
+            (std::max<u64>)(1, ChunkBytes / (std::max<u64>)(image.info.layer_stride, 1)));
+        if (layers.size() > chunk_layers) {
+            for (size_t first = 0; first < layers.size(); first += chunk_layers) {
+                UploadLayers(image, layers.subspan(first, (std::min)(chunk_layers,
+                                                                     layers.size() - first)));
+            }
+            return;
+        }
         if (False(image.flags & ImageFlagBits::AcceleratedUpload)) {
             // Plain formats: each layer unswizzled on its own into its layer of the image.
             ImageInfo layer_info = image.info;
@@ -4353,6 +4425,30 @@ template <class P>
 bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
+    }
+    if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
+        // FRITCHII_SCALED_EXTENT_CAP (default 1): past the device's limits the scaled image is
+        // invalid. OoT's 12288x12288 sun shadow map is 18432 wide at 1.5x and 24576 at 2x, over
+        // AMD's 16384, and drawing into it hangs the GPU (device loss entering Castle Town on
+        // AMD). Before the cached IsRescalable answer, so a scale changed in game is checked too.
+        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_scaled_extent_cap,
+                                             "FRITCHII_SCALED_EXTENT_CAP", 1) != 0 &&
+            !ScaledImageFits(image.info, Settings::values.resolution_info,
+                             runtime.GetMaxScaledExtent())) {
+            if (False(image.flags & ImageFlagBits::ScaleLimited)) {
+                image.flags |= ImageFlagBits::ScaleLimited;
+                LOG_INFO(HW_GPU,
+                         "Image {}x{} (format {}, {} samples) stays at native size: scaled it "
+                         "would be {}x{}, past the device's limit of {} "
+                         "(FRITCHII_SCALED_EXTENT_CAP)",
+                         image.info.size.width, image.info.size.height,
+                         static_cast<u32>(image.info.format), image.info.num_samples,
+                         Settings::values.resolution_info.ScaleUp(image.info.size.width),
+                         Settings::values.resolution_info.ScaleUp(image.info.size.height),
+                         runtime.GetMaxScaledExtent());
+            }
+            return false;
+        }
     }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
@@ -6614,6 +6710,28 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
             async_decode->cancelled = true;
         }
     }
+    // Fritchii's free guard: an async unswizzle still queued for it (GPU unswizzle, 3D BCn) went
+    // on reading and uploading through this slot in later frames, when the slot is gone or holds
+    // another image: compute writes into a destroyed or wrong-sized image. Only the collector
+    // skipped decoding images; unmaps, joins and the sweeps did not. Dropped here with its
+    // staging buffer, which the copies it recorded so far (older than this delete) still use:
+    // FreeDeferredStagingBuffer stamps it with the current tick.
+    for (auto it = unswizzle_queue.begin(); it != unswizzle_queue.end();) {
+        if (it->image_id != image_id) {
+            ++it;
+            continue;
+        }
+        if (it->initialized) {
+            runtime.FreeDeferredStagingBuffer(it->staging_buffer);
+        }
+        if (free_guard.unswizzle_dropped++ < 8) {
+            LOG_WARNING(HW_GPU,
+                        "Free guard: async unswizzle of image {:#x} dropped with the image ({} of "
+                        "{} bytes read)",
+                        image.gpu_addr, it->current_offset, it->total_size);
+        }
+        it = unswizzle_queue.erase(it);
+    }
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);
     }
@@ -6674,10 +6792,21 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         BumpImageViewGeneration(image_view_id);
         Churn::Add(Churn::ImageViewsDestroyed);
     }
-    const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
-                                                       uncommitted_downloads, committed_downloads);
+    u64 delete_tick = 0;
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        delete_tick = runtime.CurrentTick();
+    }
+    std::shared_ptr<Image> retained =
+        RetainPendingImageDownloads(image_id, slot_images[image_id], uncommitted_downloads,
+                                    committed_downloads, delete_tick);
     if (retained) {
         LOG_INFO(Render_Vulkan, "Retained image for queued download: id={}", image_id.Value());
+        // Fritchii's free guard: the download's landing must not be what frees it while the
+        // GPU still runs work recorded before this delete (TickFrame lets go at IsFree).
+        if constexpr (requires { runtime.CurrentTick(); }) {
+            retained_image_keepers.push_back({delete_tick, std::move(retained)});
+            ++free_guard.retained_held;
+        }
     } else if (!immediate_delete) {
         if constexpr (requires { runtime.CurrentTick(); }) {
             gpu_sentenced_images.push_back(

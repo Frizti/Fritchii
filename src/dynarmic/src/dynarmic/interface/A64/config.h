@@ -309,6 +309,17 @@ struct UserConfig {
     /// to avoid writting certain unnecessary code only needed for cycle timers.
     bool wall_clock_cntpct = false;
 
+    /// Fritchii (FRITCHII_JIT_INLINE_CNTPCT, x86-64 backend, with wall_clock_cntpct): CNTPCT_EL0
+    /// reads are computed in the block as the high 64 bits of lfence; rdtsc; lfence times
+    /// *inline_cntpct_factor, the same as the host's WallClock::GetCNTPCT. A factor of 0 (read at
+    /// run time) calls GetCNTPCT through a thunk that keeps every register. nullptr = always the
+    /// host call, as before.
+    const std::uint64_t* inline_cntpct_factor = nullptr;
+    /// With inline_cntpct_factor: the previous read (shared with the host callback). Two reads
+    /// closer than inline_cntpct_spin_ticks pause twice, as GetCNTPCT does. nullptr = no pause.
+    std::uint64_t* inline_cntpct_last = nullptr;
+    std::uint32_t inline_cntpct_spin_ticks = 0;
+
     /// This allows accurately emulating protection fault handlers. If true, we check
     /// for exit after every data memory access by the emulated program.
     bool check_halt_on_memory_access = false;
