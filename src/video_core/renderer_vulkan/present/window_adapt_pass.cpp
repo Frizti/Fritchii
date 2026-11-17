@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/present/window_adapt_pass.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/test_watermark.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
@@ -68,6 +69,27 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
         layer_it++;
     }
 
+    // Stamped test copies: their mark, inside the game picture (video_core/test_watermark.cpp).
+    std::vector<VkClearRect> mark_shadow;
+    std::vector<VkClearRect> mark_text;
+    {
+        const auto& mark = VideoCore::TestWatermark::Build(layout.screen, dst->width, dst->height);
+        const auto to_rects = [](const std::vector<VideoCore::TestWatermark::Block>& blocks,
+                                 std::vector<VkClearRect>& out) {
+            out.reserve(blocks.size());
+            for (const auto& b : blocks) {
+                out.push_back(VkClearRect{
+                    .rect = {.offset = {static_cast<s32>(b.x), static_cast<s32>(b.y)},
+                             .extent = {b.width, b.height}},
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                });
+            }
+        };
+        to_rects(mark.shadow, mark_shadow);
+        to_rects(mark.text, mark_text);
+    }
+
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const f32 bg_red = Settings::values.bg_red.GetValue() / 255.0f;
         const f32 bg_green = Settings::values.bg_green.GetValue() / 255.0f;
@@ -100,6 +122,19 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline_layout, 0,
                                       descriptor_sets[i], {});
             cmdbuf.Draw(4, 1, 0, 0);
+        }
+
+        if (!mark_text.empty()) {
+            const auto attachment = [](const float (&c)[4]) {
+                return VkClearAttachment{
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .colorAttachment = 0,
+                    .clearValue = {.color = {.float32 = {c[0], c[1], c[2], c[3]}}},
+                };
+            };
+            cmdbuf.ClearAttachments({attachment(VideoCore::TestWatermark::ShadowColor)},
+                                    mark_shadow);
+            cmdbuf.ClearAttachments({attachment(VideoCore::TestWatermark::TextColor)}, mark_text);
         }
 
         cmdbuf.EndRenderPass();

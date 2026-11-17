@@ -264,6 +264,9 @@ public:
     void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
     void RefreshDeferredEntries(CommandList& list);
+    /// One entry's words copied again from memory (FRITCHII_REFRESH_LEAN: `lean_mode` and the
+    /// refresh's page cache, dma_pusher.cpp).
+    void RefreshEntryWords(CommandList& list, size_t i, int lean_mode, void* page_cache);
 
     /// EDEN_NX2_RESNAPSHOT=0 turns snapshot refreshes off.
     static bool ResnapshotEnabled() {

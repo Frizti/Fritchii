@@ -303,10 +303,17 @@ public:
         DeviceBuffers,
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+    /// Block size of the DeviceBuffers pools; allocations over half of it take the default
+    /// blocks. FRITCHII_BUFFER_POOL_BLOCK_MB (boot, default 0 = SeparatePoolBlockSize): buffer
+    /// cache buffers live a few per block, so 16 MiB blocks can stay pinned mostly empty.
+    static VkDeviceSize DeviceBufferBlockSize() noexcept;
 
     /// The pool of that kind for a memory type in `owner` (GetAllocator or GetBufferAllocator),
     /// created on first use (null if that failed).
     VmaPool GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const;
+
+    /// That pool if it was made already, else null (never makes one).
+    VmaPool PeekSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const;
 
     /// Returns the logical device.
     const vk::Device& GetLogical() const {
@@ -337,6 +344,19 @@ public:
         return present_queue;
     }
 
+    /// FRITCHII_READ_SIDE_COPY >= 2 (boot): a second queue of the graphics family (its index 1),
+    /// for read downloads that wait only for their writer. Null without one.
+    vk::Queue GetSideQueue() const {
+        return side_queue;
+    }
+    bool HasSideQueue() const {
+        return has_side_queue;
+    }
+
+    /// Whether the device is made with the side queue (the switch, and a graphics family of two
+    /// queues or more). Decided once, before the device is made.
+    bool WantsSideQueue() const;
+
     /// Returns main graphics queue family index.
     u32 GetGraphicsFamily() const {
         return graphics_family;
@@ -360,6 +380,16 @@ public:
     /// Returns the PCI device ID of the physical device.
     u32 GetDeviceID() const {
         return properties.properties.deviceID;
+    }
+
+    /// Returns the PCI vendor ID of the physical device.
+    u32 GetVendorID() const {
+        return properties.properties.vendorID;
+    }
+
+    /// Returns the pipeline cache UUID (it names the driver build that compiles pipelines).
+    std::span<const u8> GetPipelineCacheUUID() const {
+        return properties.properties.pipelineCacheUUID;
     }
 
     /// Returns the device name.
@@ -812,6 +842,17 @@ FN_MAX_LIMIT_LIST
         return extensions.present_id && extensions.present_wait;
     }
 
+    /// FRITCHII_PIPELINE_BINARY is on and the device has VK_KHR_pipeline_binary (with
+    /// maintenance5): Fritchii keeps the compiled pipelines itself (vk_pipeline_binary.h).
+    bool IsKhrPipelineBinaryEnabled() const {
+        return pipeline_binary_enabled;
+    }
+
+    /// The driver's VK_KHR_pipeline_binary properties (zero when it doesn't offer it).
+    const VkPhysicalDevicePipelineBinaryPropertiesKHR& PipelineBinaryProperties() const {
+        return pipeline_binary_properties;
+    }
+
     /// EDEN_NX2_GPL=1 and the device has VK_EXT_graphics_pipeline_library with fast linking:
     /// graphics pipelines are linked from per-stage libraries.
     bool IsExtGraphicsPipelineLibrarySupported() const {
@@ -1237,6 +1278,14 @@ FN_MAX_LIMIT_LIST
     /// at most the EDEN_NX2_VRAM_LIMIT_MIB limit. False without VK_EXT_memory_budget.
     bool MainHeapUsage(u64& usage, u64& budget) const;
 
+    /// FRITCHII_VRAM_BUDGET_MODE: MainHeapUsage plus the main heap's size (at most the
+    /// EDEN_NX2_VRAM_LIMIT_MIB limit). False without VK_EXT_memory_budget.
+    bool MainHeapNumbers(u64& size, u64& usage, u64& budget) const;
+
+    /// FRITCHII_VRAM_BUDGET_MODE=os: the adapter's LUID, to find its OS counters. False when the
+    /// driver gives none.
+    bool GetDeviceLuid(u32& low, s32& high) const;
+
     /// The largest device-local heap, where images live.
     size_t GetMainHeap() const {
         return main_heap;
@@ -1452,6 +1501,8 @@ private:
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
+    vk::Queue side_queue;        ///< FRITCHII_READ_SIDE_COPY >= 2: graphics family, index 1.
+    bool has_side_queue{};
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
@@ -1520,6 +1571,14 @@ private:
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library_features{};
     bool graphics_pipeline_library_enabled{};
 
+    /// FRITCHII_PIPELINE_BINARY: kept out of the extension tables like EDEN_NX2_GPL, so a run
+    /// without the switch creates the device exactly as before.
+    bool pipeline_binary_offered{};
+    bool pipeline_binary_requested{};
+    VkPhysicalDevicePipelineBinaryFeaturesKHR pipeline_binary_features{};
+    VkPhysicalDevicePipelineBinaryPropertiesKHR pipeline_binary_properties{};
+    bool pipeline_binary_enabled{};
+
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
     VkPhysicalDeviceProperties2 properties2{};
@@ -1582,5 +1641,29 @@ private:
     void CreateKeptBlocks();
     std::unique_ptr<KeptBlocks> kept_blocks;
 };
+
+/// What the graphics card pick looks at for one Vulkan physical device.
+struct PhysicalDeviceSummary {
+    std::string name;     ///< VkPhysicalDeviceProperties::deviceName
+    VkPhysicalDeviceType type{};
+    u64 local_memory{};   ///< Largest device-local heap, in bytes
+};
+
+/// The card a game runs on, and why (for the log).
+struct PhysicalDevicePick {
+    size_t index{};
+    std::string_view reason;
+};
+
+std::vector<PhysicalDeviceSummary> SummarizePhysicalDevices(
+    const vk::InstanceDispatch& dld, std::span<const VkPhysicalDevice> devices);
+
+/// Fritchii's graphics card pick. A saved name (vulkan_device_name) is the player's choice and
+/// is found again by name when the device order changes. Without one, a saved index other than
+/// 0 is an earlier choice too; index 0 is the default, and there the discrete card with the most
+/// device-local memory wins over an integrated GPU (a 5600G + Arc B580 PC landed on the 5600G's
+/// iGPU). A saved card that is gone falls back to the same automatic pick.
+PhysicalDevicePick PickPhysicalDevice(std::span<const PhysicalDeviceSummary> devices,
+                                      u32 saved_index, std::string_view saved_name);
 
 } // namespace Vulkan

@@ -72,6 +72,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/renderer_vulkan/vk_pipeline_translate_queue.h"
@@ -1295,6 +1296,46 @@ bool CanonicalKeys() {
     return enabled;
 }
 
+/// FRITCHII_MESH_KEY_VERTEX_INPUT=1 (read on first use): native task/mesh keys keep the vertex
+/// input the registers hold, as before. Off by default: see ClearVertexInput.
+bool MeshKeysDropVertexInput() {
+    static const bool drop = [] {
+        const char* value = std::getenv("FRITCHII_MESH_KEY_VERTEX_INPUT");
+        return value == nullptr || value[0] == '0';
+    }();
+    return drop;
+}
+
+/// A native task/mesh pipeline is built without vertex input state, yet Refresh keys the vertex
+/// input the last vertex draw left in the registers (attribute types with dynamic vertex input;
+/// attributes, divisors and strides without it). Without dynamic vertex input that split the
+/// same task, mesh and pixel programs into one key per leftover vertex format, each a driver
+/// compile the draw waits for (an idea from zortos293/Lichii#2012). Draws and the loader clear it
+/// for those keys. Only without dynamic vertex input: with it the key's only hashed vertex input
+/// is the attribute types, which a task/mesh key already holds none of (the programs' attribute
+/// mask is empty), so those keys and their lookup are unchanged.
+void ClearVertexInput(FixedPipelineState& state) noexcept {
+    state.attribute_types = 0; // enabled_divisors too
+    for (auto& attribute : state.attributes) {
+        attribute.raw = 0;
+    }
+    state.binding_divisors.fill(0);
+    state.vertex_strides.fill(0);
+}
+
+/// Whether a cached record's programs are a native task/mesh pipeline's (drawn while
+/// Maxwell3D::Regs::IsMeshEnabled: the first program is the task or mesh program).
+bool IsNativeMeshRecord(std::span<const FileEnvironment> envs) {
+    if (envs.empty()) {
+        return false;
+    }
+    const Shader::Stage first = envs.front().ShaderStage();
+    return (first == Shader::Stage::Task || first == Shader::Stage::Mesh) &&
+           std::ranges::all_of(envs, [](const FileEnvironment& env) {
+               return env.IsNativeProgram();
+           });
+}
+
 /// EDEN_NX2_PRECOMPILED_FAST (off by default, read on first use): 0 off; 1
 /// the precompiled preparation (EDEN_NX2_PRECOMPILE) keeps each pipeline's shader infos and
 /// SPIR-V, and a draw of a precompiled pipeline whose recorded answers hold is created from them
@@ -1398,6 +1439,10 @@ std::optional<std::string> ReadPipelineRecordKey(std::ifstream& file, std::strea
     file.read(reinterpret_cast<char*>(&key), sizeof(key));
     if (key.state.dynamic_vertex_input != 0) {
         MaskKeyedAttributeTypes(key, envs);
+    }
+    if (key.state.dynamic_vertex_input == 0 && MeshKeysDropVertexInput() &&
+        IsNativeMeshRecord(envs)) {
+        ClearVertexInput(key.state);
     }
     // Loading puts every record under this driver (see load_graphics): a pipeline cached by
     // another driver is the same pipeline.
@@ -1690,6 +1735,125 @@ void PlacePrecompileThread(bool full) {
         Common::SetCurrentThreadToEfficiencyCores();
         Common::SetCurrentThreadCpuMask(Common::BackgroundWorkCpuMask());
     }
+}
+
+int ReadSwitch(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && *value != '\0' ? std::atoi(value) : 0;
+}
+
+// FRITCHII_PREP_ORDER (boot, default 0): 1 = the preparation takes the records recent sessions
+// drew first (the used list, newest first), then those of the disk cache, then the compute
+// records (a missed compute pointer state stalls ~4 s; they sit at the end of the file), then the
+// rest in file order (recorded pipelines, then predicted ones). The file carries no hit counts:
+// recorded pipelines already come first in it (build_precompiled.py). An Arc B580 prepared only
+// the first 4,732 of 120,461 records in a session (2026-11-16).
+// 1 by default on Intel's Windows driver (helper CZ): there the preparation runs only on the
+// Preparing shaders screen (~18 a second on a 6-core CPU), so what it covers first is what play
+// hits; FRITCHII_PREP_ORDER=0 keeps the file's order there too.
+int PrepOrderMode(const Device& device) {
+    static const int mode = [&device] {
+        const char* value = std::getenv("FRITCHII_PREP_ORDER");
+        if (value != nullptr && *value != '\0') {
+            return std::atoi(value);
+        }
+        const bool intel = device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+        if (intel) {
+            LOG_INFO(Render_Vulkan, "FRITCHII_PREP_ORDER=1 by default on Intel's driver: the "
+                                    "shader preparation takes recently used pipelines first "
+                                    "(FRITCHII_PREP_ORDER=0 keeps the file's order)");
+        }
+        return intel ? 1 : 0;
+    }();
+    return mode;
+}
+
+// FRITCHII_PREP_THROTTLE (boot, default 0): beside the game (not at full speed, not paused),
+// 1 = the preparation parks for 3 s after a frame over 50 ms or a draw held for an unbuilt
+// pipeline, so the runtime builds get the driver's compiler; 2 = as 1, and half the threads
+// (at least one), and on Intel one thread instead of none.
+int PrepThrottleMode() {
+    static const int mode = ReadSwitch("FRITCHII_PREP_THROTTLE");
+    return mode;
+}
+
+// Until when (steady clock, ns) the throttled preparation stays parked; set by TickFrame.
+std::atomic<s64> prep_quiet_until{0};
+
+s64 SteadyNanoseconds(std::chrono::steady_clock::time_point time) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
+}
+
+void NotePrepFrame(std::chrono::steady_clock::time_point now,
+                   std::chrono::steady_clock::duration frame_time,
+                   std::chrono::nanoseconds held) {
+    if (PrepThrottleMode() == 0) {
+        return;
+    }
+    if (frame_time > std::chrono::milliseconds{50} || held > std::chrono::nanoseconds{0}) {
+        prep_quiet_until.store(SteadyNanoseconds(now + std::chrono::seconds{3}),
+                               std::memory_order_relaxed);
+    }
+}
+
+bool PrepShouldYield() {
+    return SteadyNanoseconds(std::chrono::steady_clock::now()) <
+           prep_quiet_until.load(std::memory_order_relaxed);
+}
+
+std::string DurationText(double seconds) {
+    if (seconds < 60.0) {
+        return "under a minute";
+    }
+    const long minutes = static_cast<long>(seconds / 60.0 + 0.5);
+    if (minutes < 60) {
+        return fmt::format("{} min", minutes);
+    }
+    return fmt::format("{} h {} min", minutes / 60, minutes % 60);
+}
+
+// precompiled_order.fork-v<N>.bin: the order a FRITCHII_PREP_ORDER preparation takes the records
+// in, so its checkpoint (a position in that order) resumes the same order.
+constexpr u32 PrepOrderMagic = 0x314F5046; // "FPO1"
+
+std::vector<u32> LoadPrepOrder(const std::filesystem::path& path, const std::string& stamp,
+                               size_t total) {
+    std::ifstream in(path, std::ios::binary);
+    u32 magic{}, count{}, stamp_size{};
+    if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) || magic != PrepOrderMagic ||
+        !in.read(reinterpret_cast<char*>(&count), sizeof(count)) || count != total ||
+        !in.read(reinterpret_cast<char*>(&stamp_size), sizeof(stamp_size)) ||
+        stamp_size != stamp.size()) {
+        return {};
+    }
+    std::string saved(stamp_size, '\0');
+    std::vector<u32> order(total);
+    if (!in.read(saved.data(), stamp_size) || saved != stamp ||
+        !in.read(reinterpret_cast<char*>(order.data()),
+                 static_cast<std::streamsize>(total * sizeof(u32)))) {
+        return {};
+    }
+    std::vector<u8> seen(total, 0);
+    for (const u32 index : order) {
+        if (index >= total || seen[index]) {
+            return {};
+        }
+        seen[index] = 1;
+    }
+    return order;
+}
+
+void SavePrepOrder(const std::filesystem::path& path, const std::string& stamp,
+                   std::span<const u32> order) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const u32 count = static_cast<u32>(order.size());
+    const u32 stamp_size = static_cast<u32>(stamp.size());
+    out.write(reinterpret_cast<const char*>(&PrepOrderMagic), sizeof(PrepOrderMagic));
+    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    out.write(reinterpret_cast<const char*>(&stamp_size), sizeof(stamp_size));
+    out.write(stamp.data(), stamp_size);
+    out.write(reinterpret_cast<const char*>(order.data()),
+              static_cast<std::streamsize>(order.size() * sizeof(u32)));
 }
 
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
@@ -2187,6 +2351,7 @@ PipelineCache::~PipelineCache() {
     Common::NoteShutdownProgress();
     // The caches are written before anything slow is torn down, so a teardown cut short still
     // leaves them on disk.
+    PipelineBinary::Close("at exit");
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -2817,6 +2982,12 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
             clean.miss_reasons = {};
         }
     }
+    if (clean.pipeline != nullptr && mesh_vertex_input_cleared &&
+        (patch_blending || patch_vertex_input || patch_blend_value || programs_only)) {
+        // The patches edit a task/mesh key, which holds no vertex input (RefreshGraphicsKey):
+        // new programs may read the registers' one, so the key is refreshed instead.
+        clean.pipeline = nullptr;
+    }
     if (clean.pipeline != nullptr) {
         const bool patching = patch_blending || patch_vertex_input || patch_blend_value;
         if (!patching && !programs_only) {
@@ -2985,6 +3156,31 @@ GraphicsPipeline* PipelineCache::NextGraphicsPipeline() {
 }
 
 void PipelineCache::RefreshGraphicsKey() {
+    if (mesh_vertex_input_cleared) {
+        // The registers' vertex input, which the last (task/mesh) key did not keep: Refresh
+        // rewrites it only under a raised Dirty::VertexInput.
+        mesh_vertex_input_cleared = false;
+        graphics_key.state.attribute_types = mesh_vertex_input_saved.attribute_types;
+        graphics_key.state.attributes = mesh_vertex_input_saved.attributes;
+        graphics_key.state.binding_divisors = mesh_vertex_input_saved.binding_divisors;
+        graphics_key.state.vertex_strides = mesh_vertex_input_saved.vertex_strides;
+    }
+    RefreshGraphicsKeyState();
+    if (!dynamic_features.has_dynamic_vertex_input && MeshKeysDropVertexInput() &&
+        maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled()) {
+        // ClearVertexInput, kept aside for the next Refresh.
+        mesh_vertex_input_saved = {
+            .attribute_types = graphics_key.state.attribute_types,
+            .attributes = graphics_key.state.attributes,
+            .binding_divisors = graphics_key.state.binding_divisors,
+            .vertex_strides = graphics_key.state.vertex_strides,
+        };
+        ClearVertexInput(graphics_key.state);
+        mesh_vertex_input_cleared = true;
+    }
+}
+
+void PipelineCache::RefreshGraphicsKeyState() {
     if (!dynamic_features.has_dynamic_vertex_input) {
         graphics_key.state.Refresh(*maxwell3d, dynamic_features);
     } else {
@@ -3039,6 +3235,9 @@ u32 PipelineCache::OneFollowerLookupCheck(bool shaders_clear, bool blending_clea
         if (canonical) {
             CanonicalizeKeyState(fresh, dynamic_features);
         }
+        if (mesh_vertex_input_cleared) {
+            ClearVertexInput(fresh); // As RefreshGraphicsKey keys a task/mesh draw
+        }
         if (std::memcmp(fresh.attributes.data(), graphics_key.state.attributes.data(),
                         sizeof(fresh.attributes)) != 0 ||
             std::memcmp(fresh.binding_divisors.data(), graphics_key.state.binding_divisors.data(),
@@ -3084,6 +3283,255 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         }
     }
     return CurrentGraphicsPipelineSlowPath();
+}
+
+namespace {
+/// FRITCHII_OCCL_LEAN: a pipeline named in its log lines (vertex/pixel program hashes).
+std::string OcclShaders(const GraphicsPipelineCacheKey& key) {
+    return fmt::format("vertex {:016x} pixel {:016x}", key.unique_hashes[1], key.unique_hashes[5]);
+}
+
+/// FRITCHII_OCCL_LEAN: why `pipeline`'s pixel program must stay for a draw that writes no
+/// colour (Lean: it cannot change depth, stencil, the counted samples or memory). Fixed per
+/// pipeline: the key and the programs' infos never change.
+VideoCommon::OcclLean::PipelineClass ClassifyOcclPipeline(const GraphicsPipeline& pipeline) {
+    using VideoCommon::OcclLean::PipelineClass;
+    const GraphicsPipelineCacheKey& key = pipeline.Key();
+    if (key.unique_hashes[5] == 0) {
+        return PipelineClass::NoPixel;
+    }
+    const auto& infos = pipeline.StageInfos();
+    if (pipeline.IsEmulatedMesh() ||
+        std::ranges::any_of(infos, [](const Shader::Info& info) {
+            return info.is_mesh || info.is_task;
+        })) {
+        return PipelineClass::Mesh;
+    }
+    // The alpha test is emulated in the pixel program (MakeRuntimeInfo); dual source blending
+    // names the pixel program's second output.
+    if (key.state.alpha_test_func.Value() !=
+            FixedPipelineState::PackComparisonOp(Maxwell::ComparisonOp::Always_GL) ||
+        key.state.attachment0_dual_source_blend != 0) {
+        return PipelineClass::KeyState;
+    }
+    const Shader::Info& pixel = infos[infos.size() - 1];
+    if (pixel.uses_demote_to_helper_invocation) {
+        return PipelineClass::Discards;
+    }
+    if (pixel.stores_frag_depth || pixel.stores_sample_mask) {
+        return PipelineClass::DepthOrMask;
+    }
+    const bool writes_storage = std::ranges::any_of(
+        pixel.storage_buffers_descriptors, [](const auto& desc) { return desc.is_written; });
+    const bool writes_images =
+        std::ranges::any_of(pixel.image_descriptors,
+                            [](const auto& desc) { return desc.is_written; }) ||
+        std::ranges::any_of(pixel.image_buffer_descriptors,
+                            [](const auto& desc) { return desc.is_written; });
+    const bool atomics =
+        pixel.uses_global_increment || pixel.uses_global_decrement ||
+        pixel.uses_shared_increment || pixel.uses_shared_decrement || pixel.uses_atomic_f32_add ||
+        pixel.uses_atomic_f16x2_add || pixel.uses_atomic_f16x2_min ||
+        pixel.uses_atomic_f16x2_max || pixel.uses_atomic_f32x2_add ||
+        pixel.uses_atomic_f32x2_min || pixel.uses_atomic_f32x2_max || pixel.uses_atomic_s32_min ||
+        pixel.uses_atomic_s32_max || pixel.uses_int64_bit_atomics || pixel.uses_atomic_image_u32;
+    if (writes_storage || writes_images || atomics || pixel.stores_global_memory ||
+        pixel.uses_typeless_image_writes) {
+        return PipelineClass::Stores;
+    }
+    return PipelineClass::Lean;
+}
+
+/// FRITCHII_OCCL_LEAN: what E's fill and R's configure take from stages 0 to 3 (vertex side),
+/// equal in `full` and its sibling. A difference (a translation that fit texture arrays or
+/// storage pointers otherwise) refuses the sibling: only a pixel-less copy of the same vertex
+/// side is the cut.
+bool OcclVertexSideSame(const GraphicsPipeline& full, const GraphicsPipeline& sibling) {
+    const auto a = full.MemFacts();
+    const auto b = sibling.MemFacts();
+    if ((a.stages & 0xFU) != b.stages || a.has_texel_buffers != b.has_texel_buffers ||
+        a.uses_descriptor_buffer != b.uses_descriptor_buffer || a.hashes[0] != b.hashes[0] ||
+        full.HasDynamicVertexInput() != sibling.HasDynamicVertexInput()) {
+        return false;
+    }
+    const auto& full_infos = full.StageInfos();
+    const auto& sibling_infos = sibling.StageInfos();
+    for (size_t stage = 0; stage + 1 < full_infos.size(); ++stage) {
+        if ((*a.uniform_masks)[stage] != (*b.uniform_masks)[stage] ||
+            (*a.uniform_sizes)[stage] != (*b.uniform_sizes)[stage]) {
+            return false;
+        }
+        const Shader::Info& x = full_infos[stage];
+        const Shader::Info& y = sibling_infos[stage];
+        if (x.storage_buffers_descriptors.size() != y.storage_buffers_descriptors.size() ||
+            Shader::NumDescriptors(x.texture_descriptors) !=
+                Shader::NumDescriptors(y.texture_descriptors) ||
+            Shader::NumDescriptors(x.image_descriptors) !=
+                Shader::NumDescriptors(y.image_descriptors) ||
+            Shader::NumDescriptors(x.texture_buffer_descriptors) !=
+                Shader::NumDescriptors(y.texture_buffer_descriptors) ||
+            Shader::NumDescriptors(x.image_buffer_descriptors) !=
+                Shader::NumDescriptors(y.image_buffer_descriptors) ||
+            x.handle_programs != y.handle_programs ||
+            x.constant_buffer_mask != y.constant_buffer_mask) {
+            return false;
+        }
+        for (size_t i = 0; i < x.storage_buffers_descriptors.size(); ++i) {
+            const auto& p = x.storage_buffers_descriptors[i];
+            const auto& q = y.storage_buffers_descriptors[i];
+            if (p.cbuf_index != q.cbuf_index || p.cbuf_offset != q.cbuf_offset ||
+                p.is_written != q.is_written || p.indirect_offset != q.indirect_offset) {
+                return false;
+            }
+        }
+        for (size_t i = 0; i < x.texture_descriptors.size(); ++i) {
+            const auto& p = x.texture_descriptors[i];
+            const auto& q = y.texture_descriptors[i];
+            if (p.cbuf_index != q.cbuf_index || p.cbuf_offset != q.cbuf_offset ||
+                p.count != q.count || p.handle_program != q.handle_program ||
+                p.type != q.type) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+} // Anonymous namespace
+
+GraphicsPipeline* PipelineCache::OcclLeanPipeline(GraphicsPipeline* full, const Maxwell& regs,
+                                                  int mode, VideoCommon::OcclLean::DrawNote& note) {
+    namespace OcclLean = VideoCommon::OcclLean;
+    using OcclLean::PipelineClass;
+    OcclLean::Stats& stats = OcclLean::g_stats;
+    OcclLean::MaybeReport(mode);
+    OcclLean::Add(stats.draws);
+    const OcclLean::RegsVerdict verdict = OcclLean::ClassifyRegs(regs);
+    if (verdict.counting) {
+        OcclLean::Add(stats.counting);
+    }
+    if (!verdict.colour_off) {
+        return full;
+    }
+    OcclLean::Add(stats.colour_off);
+    if (verdict.counting) {
+        OcclLean::Add(stats.tests);
+    }
+    if (verdict.refused) {
+        OcclLean::Add(stats.regs_refused);
+        return full;
+    }
+    if (full->occl_class == 0) {
+        full->occl_class = static_cast<u8>(static_cast<u8>(ClassifyOcclPipeline(*full)) + 1);
+    }
+    const auto pipeline_class = static_cast<PipelineClass>(full->occl_class - 1);
+    if (pipeline_class != PipelineClass::Lean) {
+        OcclLean::Add(stats.by_class[static_cast<size_t>(pipeline_class)]);
+        return full;
+    }
+    // What the sibling leaves out: the pixel stage's uniform buffers, storage binds and texture
+    // handle values (E), its textures and images (R).
+    OcclLean::Add(stats.by_class[static_cast<size_t>(PipelineClass::Lean)]);
+    const Shader::Info& pixel = full->StageInfos().back();
+    OcclLean::Add(stats.pixel_uniforms,
+                  static_cast<u64>(std::popcount((*full->MemFacts().uniform_masks)[4])));
+    OcclLean::Add(stats.pixel_textures, Shader::NumDescriptors(pixel.texture_descriptors) +
+                                            Shader::NumDescriptors(pixel.image_descriptors));
+    OcclLean::Add(stats.pixel_storage, pixel.storage_buffers_descriptors.size());
+    OcclLean::Add(stats.pixel_programs, pixel.handle_programs.size());
+    if (stats.last_lean_full == full) {
+        OcclLean::Add(stats.same_pipeline);
+    }
+    stats.last_lean_full = full;
+    note.timed = (++stats.sample & 15U) == 0;
+    if (mode == OcclLean::Dry) {
+        return full;
+    }
+    GraphicsPipeline* sibling = full->occl_sibling;
+    if (sibling == nullptr) {
+        sibling = FindOrMakeOcclSibling(*full);
+        if (sibling == nullptr) {
+            OcclLean::Add(stats.not_ready);
+            return full;
+        }
+        OcclLean::Add(stats.compared);
+        if (!OcclVertexSideSame(*full, *sibling)) {
+            OcclLean::Add(stats.differ);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "Occlusion lean (FRITCHII_OCCL_LEAN): the pixel-less pipeline of {} "
+                            "has another vertex side; the full one keeps drawing",
+                            OcclShaders(full->Key()));
+            }
+            full->occl_class = static_cast<u8>(static_cast<u8>(PipelineClass::VertexDiffers) + 1);
+            return full;
+        }
+        full->occl_sibling = sibling;
+    }
+    if (sibling->Failed()) [[unlikely]] {
+        OcclLean::Add(stats.failed);
+        full->occl_sibling = nullptr;
+        full->occl_class = static_cast<u8>(static_cast<u8>(PipelineClass::Failed) + 1);
+        return full;
+    }
+    if (!sibling->IsBuilt()) {
+        OcclLean::Add(stats.not_ready);
+        return full;
+    }
+    sibling->MarkUsed(frame_count); // the full one is marked by the lookup
+    if (mode != OcclLean::On) {
+        OcclLean::Add(stats.ready_unused); // verify: the full pipeline still draws
+        return full;
+    }
+    OcclLean::Add(stats.lean);
+    note.lean = true;
+    return sibling;
+}
+
+GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
+    namespace OcclLean = VideoCommon::OcclLean;
+    OcclLean::Stats& stats = OcclLean::g_stats;
+    GraphicsPipelineCacheKey key = full.Key();
+    key.unique_hashes[5] = 0;
+    if (const auto it = graphics_cache.find(key); it != graphics_cache.end()) {
+        if (it->second) {
+            OcclLean::Add(stats.found);
+        }
+        return it->second.get(); // null while its translation is queued: later
+    }
+    // The environments come from the registers of this draw (shader_infos from the lookup that
+    // gave `full`): only while the current key names full's programs.
+    if (graphics_key.unique_hashes != full.Key().unique_hashes || occl_made_frame == frame_count) {
+        return nullptr;
+    }
+    occl_made_frame = frame_count; // one translation on E a frame
+    const u64 start = OcclLean::NowNs();
+    const GraphicsPipelineCacheKey saved = graphics_key;
+    std::unique_ptr<GraphicsPipeline> made;
+    {
+        graphics_key = key;
+        SCOPE_EXIT {
+            graphics_key = saved;
+        };
+        try {
+            made = CreateGraphicsPipeline(nullptr, false);
+        } catch (const std::exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Occlusion lean (FRITCHII_OCCL_LEAN): {}: {}",
+                      OcclShaders(key), exception.what());
+            made.reset();
+        }
+    }
+    OcclLean::Add(stats.made_ns, OcclLean::NowNs() - start);
+    if (!made) {
+        OcclLean::Add(stats.failed);
+        full.occl_class =
+            static_cast<u8>(static_cast<u8>(OcclLean::PipelineClass::Failed) + 1);
+        return nullptr;
+    }
+    OcclLean::Add(stats.made);
+    GraphicsPipeline* const pointer = made.get();
+    graphics_cache.emplace(key, std::move(made));
+    return pointer;
 }
 
 ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
@@ -3438,6 +3886,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
         return;
     }
+    // Fritchii's own store of compiled pipelines (FRITCHII_PIPELINE_BINARY), before anything of
+    // this game is built: the boot rebuilds and the preparation build through it.
+    PipelineBinary::Open(device, base_dir);
     // This fork's files: its records carry task/mesh state other builds of the same cache version
     // cannot read, and their loader deletes a file it fails to read. The shared files of earlier
     // builds are copied once.
@@ -3512,6 +3963,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     std::unordered_set<u64> native_pipelines;
     size_t foreign_records = 0;
     size_t canonical_rekeyed = 0; ///< EDEN_NX2_CANONICAL_KEYS=1: records whose key hash changed
+    size_t mesh_rekeyed = 0;      ///< Native task/mesh records keyed without their vertex input
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
@@ -3688,6 +4140,24 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
         }
 
+        // Native task/mesh records are looked up without vertex input, as draws key them now
+        // (ClearVertexInput). Records stored with a leftover vertex format share one key and are
+        // tried newest first; the used-list age moves to it as above.
+        if (key.state.dynamic_vertex_input == 0 && MeshKeysDropVertexInput() &&
+            IsNativeMeshRecord(envs)) {
+            const u64 stored_hash = key.Hash();
+            ClearVertexInput(key.state);
+            if (const u64 hash = key.Hash(); hash != stored_hash) {
+                ++mesh_rekeyed;
+                if (const auto used = used_pipelines.find(stored_hash);
+                    used != used_pipelines.end()) {
+                    const u8 age = used->second;
+                    const auto [entry, inserted] = used_pipelines.try_emplace(hash, age);
+                    entry->second = (std::min)(entry->second, age);
+                }
+            }
+        }
+
         // EDEN_NX2_CANONICAL_KEYS=1: native records are looked up as draws key them now. Records
         // stored before (or while the switch was off) are rekeyed here and their used-list age
         // moves to the canonical key, as for the masking above; records stored with it on are
@@ -3825,6 +4295,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                  "EDEN_NX2_CANONICAL_KEYS: {} cached graphics pipeline records loaded under a new "
                  "(canonical) key",
                  canonical_rekeyed);
+    }
+    if (mesh_rekeyed != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "{} cached task/mesh pipeline records loaded under a key without vertex input "
+                 "(FRITCHII_MESH_KEY_VERTEX_INPUT=1 keeps it)",
+                 mesh_rekeyed);
     }
     if (PreloadAllPipelines() && queued_graphics > 10000) {
         LOG_WARNING(Render_Vulkan,
@@ -4612,6 +5088,7 @@ void PipelineCache::StartPrecompiled(u64 title_id, const std::filesystem::path& 
     }
     // Taken here, before the GPU thread starts adding to it.
     precompile_disk_keys = std::make_shared<const std::unordered_set<u64>>(disk_pipelines);
+    precompile_used_keys = std::make_shared<const std::unordered_map<u64, u8>>(used_pipelines);
     // Pending until the first preparation ends (or there is nothing to prepare); set before the
     // thread starts so a frontend asking right after loading sees it.
     shader_notify.SetPrecompilePending(true);
@@ -4721,15 +5198,17 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // recompiler, pipeline creation and the precompile step (CMakeModules/Nx2ShaderStamp.cmake).
     const auto stamp_path =
         base_dir / fmt::format("precompiled_prepared.fork-v{}.txt", CACHE_VERSION);
+    // With the pipeline binary store saving, its file id too: a new (or started over) store is
+    // filled by one more preparation (FRITCHII_PIPELINE_BINARY). On Linux, Mesa's cache id too.
 #ifdef _WIN32
-    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}\n", file_size, modified,
-                                          device.GetDriverVersion(), NX2_SHADER_STAMP,
-                                          device.GetModelName());
+    const std::string mesa_identity;
 #else
-    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}\n", file_size, modified,
-                                          device.GetDriverVersion(), NX2_SHADER_STAMP,
-                                          device.GetModelName(), MesaCacheIdentity(device));
+    const std::string mesa_identity = MesaCacheIdentity(device);
 #endif
+    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}{}\n", file_size, modified,
+                                          device.GetDriverVersion(), NX2_SHADER_STAMP,
+                                          device.GetModelName(), mesa_identity,
+                                          PipelineBinary::StampSuffix());
     // EDEN_NX2_PRECOMPILED_FAST: the preparation keeps each pipeline's infos and SPIR-V too
     // (vk_precompiled_kept.h), for this release, its settings and GPU. Whether this build
     // translates them the same is checked on a sample at boot (CheckKeptSample), not stamped.
@@ -4763,6 +5242,14 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // The environment index and where each record starts; records are read again when built.
     std::vector<std::pair<u64, u64>> env_index;
     std::vector<u64> record_offsets;
+    // FRITCHII_PREP_ORDER: each record's rank (lower first): the used list's age, then the disk
+    // cache, compute, the rest.
+    const int order_mode = PrepOrderMode(device);
+    constexpr u8 RankDisk = 32;
+    constexpr u8 RankCompute = 33;
+    constexpr u8 RankRest = 34;
+    std::vector<u8> record_rank;
+    const auto used_keys = precompile_used_keys;
     try {
         std::ifstream in(path, std::ios::binary);
         in.exceptions(std::ifstream::failbit);
@@ -4812,8 +5299,32 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged", path_text);
                 return;
             }
-            in.seekg(compute ? sizeof(ComputePipelineCacheKey) : sizeof(GraphicsPipelineCacheKey),
-                     std::ios::cur);
+            if (order_mode == 0) {
+                in.seekg(compute ? sizeof(ComputePipelineCacheKey)
+                                 : sizeof(GraphicsPipelineCacheKey),
+                         std::ios::cur);
+                continue;
+            }
+            if (compute) {
+                in.seekg(sizeof(ComputePipelineCacheKey), std::ios::cur);
+                record_rank.push_back(RankCompute);
+                continue;
+            }
+            GraphicsPipelineCacheKey key{};
+            in.read(reinterpret_cast<char*>(&key), sizeof(key));
+            RecordedKeyForThisDevice(key);
+            const u64 hash = key.Hash();
+            u8 rank = RankRest;
+            if (used_keys) {
+                if (const auto used = used_keys->find(hash); used != used_keys->end()) {
+                    rank = (std::min)(used->second, static_cast<u8>(RankDisk - 1));
+                }
+            }
+            if (rank == RankRest && precompile_disk_keys &&
+                precompile_disk_keys->contains(hash)) {
+                rank = RankDisk;
+            }
+            record_rank.push_back(rank);
         }
     } catch (const std::ios_base::failure& e) {
         LOG_ERROR(Render_Vulkan, "Cannot read precompiled pipelines: {}", e.what());
@@ -4829,6 +5340,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         CapLegacyAmdBuildThreads(device, VideoCommon::Nx2Precompile::Threads());
     size_t start_index = 0;
     u32 restarts = 0;
+    // The checkpoint is a position in the order the records are taken in: the file's order, or
+    // with FRITCHII_PREP_ORDER the one saved beside it (a third number, 1, in the progress file).
+    u32 saved_order_mode = 0;
     if (!force) {
         std::ifstream progress_file(progress_path, std::ios::binary);
         std::string line;
@@ -4838,6 +5352,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             (progress_file >> next >> count)) {
             start_index = std::min(next, total);
             restarts = count + 1;
+            if (!(progress_file >> saved_order_mode)) {
+                saved_order_mode = 0;
+            }
+        }
+    }
+    const auto order_path =
+        base_dir / fmt::format("precompiled_order.fork-v{}.bin", CACHE_VERSION);
+    std::vector<u32> saved_order;
+    if (start_index > 0 && saved_order_mode != 0) {
+        saved_order = LoadPrepOrder(order_path, stamp, total);
+        if (saved_order.empty()) {
+            LOG_INFO(Render_Vulkan, "Precompiled pipelines: the order of the checkpoint at {} is "
+                                    "gone, starting from the first record",
+                     start_index);
+            start_index = 0;
+            restarts = 0;
         }
     }
     if (restarts >= 2) {
@@ -4900,13 +5430,64 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             }
         }
     }
+    // The order: positions before the checkpoint as the earlier run took them, then the rest by
+    // rank (FRITCHII_PREP_ORDER) or as the earlier run would have. Empty: the file's order.
+    std::vector<u32> order;
+    if (!record_rank.empty() || !saved_order.empty()) {
+        order.reserve(total);
+        std::vector<u8> taken(total, 0);
+        for (size_t position = 0; position < start_index; ++position) {
+            const u32 index =
+                saved_order.empty() ? static_cast<u32>(position) : saved_order[position];
+            order.push_back(index);
+            taken[index] = 1;
+        }
+        if (record_rank.size() == total) {
+            std::vector<u32> rest;
+            rest.reserve(total - start_index);
+            for (u32 index = 0; index < total; ++index) {
+                if (!taken[index]) {
+                    rest.push_back(index);
+                }
+            }
+            std::ranges::stable_sort(rest, [&](u32 lhs, u32 rhs) {
+                return record_rank[lhs] < record_rank[rhs];
+            });
+            order.insert(order.end(), rest.begin(), rest.end());
+            std::array<size_t, 4> counts{};
+            for (const u32 index : rest) {
+                const u8 rank = record_rank[index];
+                ++counts[rank < RankDisk ? 0 : rank - RankDisk + 1];
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled pipelines in order of likely use (FRITCHII_PREP_ORDER=1): {} "
+                     "the used list holds ({} keys in it), {} the disk cache holds, {} compute, "
+                     "then {} in file order; {} taken before the checkpoint",
+                     counts[0], used_keys ? used_keys->size() : 0, counts[1], counts[2], counts[3],
+                     start_index);
+        } else {
+            for (size_t position = start_index; position < total; ++position) {
+                order.push_back(saved_order[position]);
+            }
+        }
+        bool identity = true;
+        for (size_t position = 0; position < total && identity; ++position) {
+            identity = order[position] == position;
+        }
+        if (identity) {
+            order.clear();
+        } else {
+            SavePrepOrder(order_path, stamp, order);
+        }
+    }
+    const u32 order_saved = order.empty() ? 0 : 1;
     const auto write_progress = [&](size_t next, u32 count) {
         if (keeping) {
             // The kept entries of every record before the checkpoint are on disk first.
             writer.Flush();
         }
         std::ofstream progress_file(progress_path, std::ios::binary | std::ios::trunc);
-        progress_file << stamp << next << ' ' << count << '\n';
+        progress_file << stamp << next << ' ' << count << ' ' << order_saved << '\n';
     };
     write_progress(start_index, restarts);
 
@@ -4936,15 +5517,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         std::atomic<size_t> compute_programs_proven{};
         std::atomic<size_t> graphics_storage{};
         std::atomic<size_t> graphics_storage_proven{};
-        size_t low_water{};              ///< first record not finished yet (under mutex)
+        size_t low_water{};              ///< first position not finished yet (under mutex)
         size_t checkpoint{};
-        std::vector<u8> done;
+        std::vector<u8> done;            ///< By position in the order
         WarmProgressThrottle throttle;
+        /// The minute's rate and time left (under mutex): since when, finished then.
+        std::chrono::steady_clock::time_point rate_since{};
+        size_t rate_finished{};
+        /// FRITCHII_PREP_THROTTLE: ms worker 0 stayed parked for frame spikes.
+        std::atomic<u64> yielded_ms{};
     } state;
     state.done.assign(total, 0);
     state.next = start_index;
     state.finished = start_index;
     state.low_water = state.checkpoint = start_index;
+    state.rate_since = std::chrono::steady_clock::now();
+    state.rate_finished = start_index;
     // A pipeline the driver finds in its cache builds in a few ms here (translation included);
     // a compile takes tens to hundreds.
     constexpr auto FastBuild = std::chrono::milliseconds{20};
@@ -4984,23 +5572,57 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
          device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) &&
         !while_playing;
 #endif
+    // FRITCHII_PREP_THROTTLE=2: fewer threads beside the game, and on Intel one instead of none.
+    const int throttle_mode = PrepThrottleMode();
     const auto allowed_threads = [&](bool full) -> size_t {
         if (full) {
             return full_threads;
         }
-        return hold_beside_game && !shader_notify.WarmMayBuild() ? 0 : threads;
+        if (shader_notify.WarmMayBuild()) {
+            return threads;
+        }
+        if (hold_beside_game) {
+            return throttle_mode >= 2 ? 1 : 0;
+        }
+        return throttle_mode >= 2 ? (std::max<size_t>)(1, threads / 2) : threads;
     };
-    const auto complete = [&](size_t index) {
+    const auto complete = [&](size_t position) {
         const size_t finished = state.finished.fetch_add(1) + 1;
         {
             std::scoped_lock lock{state.mutex};
-            state.done[index] = 1;
+            state.done[position] = 1;
             while (state.low_water < total && state.done[state.low_water]) {
                 ++state.low_water;
             }
             if (state.low_water >= state.checkpoint + 512) {
                 state.checkpoint = state.low_water;
                 write_progress(state.low_water, 0);
+            }
+            // Once a minute: the rate and the time left at it (a slow driver's preparation can
+            // take hours; the log said nothing until 5,000 were done).
+            const auto now = std::chrono::steady_clock::now();
+            const double window =
+                std::chrono::duration<double>(now - state.rate_since).count();
+            if (window >= 60.0) {
+                const double rate =
+                    static_cast<double>(finished - state.rate_finished) / window;
+                const bool full = shader_notify.PrecompileFullSpeed();
+                const bool asked = !full && shader_notify.WarmMayBuild();
+                LOG_INFO(Render_Vulkan,
+                         "Precompiled pipelines: {} of {} ({:.1f}%), {:.1f} a second in the last "
+                         "{:.0f} s ({}, {} threads, {:.0f} s parked for frame spikes); {} left at "
+                         "this rate",
+                         finished, total, 100.0 * static_cast<double>(finished) / total, rate,
+                         window,
+                         full    ? "full speed"
+                         : asked ? "paused or Prepare Shaders Now"
+                                 : "beside the game",
+                         allowed_threads(full),
+                         static_cast<double>(state.yielded_ms.exchange(0)) / 1000.0,
+                         rate > 0.0 ? DurationText(static_cast<double>(total - finished) / rate)
+                                    : std::string{"no estimate"});
+                state.rate_since = now;
+                state.rate_finished = finished;
             }
         }
         if (state.throttle.Due()) {
@@ -5042,14 +5664,28 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 std::this_thread::sleep_for(std::chrono::milliseconds{100});
                 continue;
             }
+            // FRITCHII_PREP_THROTTLE: beside the game, parked for 3 s after a frame spike or a
+            // draw held for an unbuilt pipeline (the game's own builds need the compiler then).
+            if (throttle_mode != 0 && !full && !shader_notify.WarmMayBuild() &&
+                PrepShouldYield()) {
+                if (state.next.load() >= total) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                if (worker == 0) {
+                    state.yielded_ms += 100;
+                }
+                continue;
+            }
             if (placed_full != full) {
                 PlacePrecompileThread(full);
                 placed_full = full;
             }
-            const size_t index = state.next.fetch_add(1);
-            if (index >= total) {
+            const size_t position = state.next.fetch_add(1);
+            if (position >= total) {
                 break;
             }
+            const size_t index = order.empty() ? position : order[position];
             bool ok = false;
             bool skipped = false;
             const auto build_begin = std::chrono::steady_clock::now();
@@ -5219,13 +5855,14 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     ++state.fast;
                 }
             }
-            complete(index);
+            complete(position);
         }
     };
     LOG_INFO(Render_Vulkan,
              "Preparing {} precompiled pipelines from {}, from record {}, on {} idle threads ({} "
-             "at full speed)",
-             total, path_text, start_index, threads, full_threads);
+             "at full speed), FRITCHII_PREP_ORDER={} FRITCHII_PREP_THROTTLE={}",
+             total, path_text, start_index, threads, full_threads, order.empty() ? 0 : 1,
+             throttle_mode);
     shader_notify.SetWarmProgress(3, start_index, total);
     if (callback) {
         callback(VideoCore::LoadCallbackStage::Build, start_index, total);
@@ -5251,6 +5888,13 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
              state.built.load(), state.fast.load(), FastBuild.count(), state.failed.load(),
              state.known.load() + state.other_device.load(), state.known.load(),
              state.other_device.load(), total - reached, seconds);
+    if (reached < total && reached > start_index && seconds > 0.0) {
+        const double rate = static_cast<double>(reached - start_index) / seconds;
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled pipelines: {:.1f} a second over this run (held and parked time "
+                 "included), the {} left take about {} more at that rate",
+                 rate, total - reached, DurationText(static_cast<double>(total - reached) / rate));
+    }
     LogDriverCacheFolder(device, "after the preparation");
 #ifndef _WIN32
     if (state.failed.load() != 0) {
@@ -5260,6 +5904,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                  state.failed.load(), state.exceptions.load());
     }
 #endif
+    PipelineBinary::LogCounts("after the preparation");
     if (state.other_device.load() != 0) {
         // Which dynamic states made records "for another device" (recorded on a GPU that has
         // them dynamic and this one static, or the reverse): AMD players skipped most of the
@@ -6170,6 +6815,7 @@ void PipelineCache::ReportPrecompiled() {
     const u64 bytes = bytes_total - stats.bytes_at_window;
     const u32 built = precompiled_worker_builds.exchange(0, std::memory_order_relaxed);
     ReportKeptDriverCompiles();
+    PipelineBinary::ReportPeriodic();
     if (stats.graphics + stats.compute + stats.failed + stats.not_precompiled + built != 0 ||
         !stats.misses.empty()) {
         const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
@@ -6392,20 +7038,24 @@ void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Pr
             others += fmt::format(" {}", line);
         }
     }
+    std::string primitive_attributes;
+    for (const u32 line : info.primitive_lines) {
+        primitive_attributes += fmt::format(" {}", line);
+    }
     with_task += task != nullptr;
     per_primitive += !info.primitive_lines.empty();
     non_triangle += info.topology != 4;
     LOG_WARNING(Render_Vulkan,
                 "Mesh emulation survey #{}: task={} (payload {} words, wg {}x{}x{}) mesh wg "
                 "{}x{}x{} max_vertices={} max_primitives={} topology={} vertex_lines={} "
-                "(position {} generic {} other {}:{}) primitive_lines={} pixel={} | totals: "
+                "(position {} generic {} other {}:{}) primitive_lines={}:{} pixel={} | totals: "
                 "task {} per-primitive {} non-triangle {}",
                 total, task != nullptr, info.payload_words, task ? task->workgroup_size[0] : 0,
                 task ? task->workgroup_size[1] : 0, task ? task->workgroup_size[2] : 0,
                 mesh->workgroup_size[0], mesh->workgroup_size[1], mesh->workgroup_size[2],
                 info.max_vertices, info.max_primitives, info.topology, info.vertex_lines.size(),
-                position, generic, other, others, info.primitive_lines.size(), has_pixel,
-                with_task, per_primitive, non_triangle);
+                position, generic, other, others, info.primitive_lines.size(), primitive_attributes,
+                has_pixel, with_task, per_primitive, non_triangle);
 }
 } // Anonymous namespace
 
@@ -6555,6 +7205,7 @@ void ReportWorstFrame() {
         if (frame.time > worst.time) {
             worst = frame;
         }
+        NotePrepFrame(now, frame.time, frame.held);
     }
     last_tick = now;
     last_held = held_total;
@@ -6930,8 +7581,106 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     const bool discard = DrawMayBeSkipped();
     if (discard) {
         NoteSkippedLookup();
+        return nullptr;
     }
-    return discard ? nullptr : pipeline;
+    if (WaitBudgetSkips(*pipeline)) {
+        // LastLookupSkipped: the draw is skipped for an unbuilt pipeline, as above.
+        discard_decision.skip = true;
+        NoteSkippedLookup();
+        return nullptr;
+    }
+    return pipeline;
+}
+
+bool PipelineCache::WaitBudgetSkips(const GraphicsPipeline& pipeline) const {
+    // FRITCHII_PIPELINE_WAIT_BUDGET (helper CZ, tester log t0815): a draw EDEN_NX2_ASYNC_DISCARD=2
+    // keeps waiting for its unbuilt pipeline (first-time or persistent target) waits here, on
+    // the GPU thread, at most what is left of the frame's budget; built by then, it draws as
+    // before, else it is skipped until the pipeline is built (the build goes on). On an Arc B580
+    // a new pipeline took ~1 s of Intel's compiler and one ~11 s, and the frame held all of it:
+    // two freezes of 11-13 s, 54 waits into a 1280x720 depth target and new targets. Driver
+    // cache hits (a few ms) still make it into their frame.
+    //   Waits as before: draws without a depth test (text, UI, chat bubbles, full-screen passes,
+    // layers drawn once without depth), draws counting samples for a query, and every draw with
+    // EDEN_NX2_ASYNC_DISCARD=0. A depth-tested draw into a layer the game renders once (a probe)
+    // can be missing from it for good; the first 16 such targets are listed.
+    const auto budget = PipelineWaitBudget();
+    if (budget.count() == 0 || AsyncDiscardMode() == 0) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    if (regs.zeta_enable == 0 || regs.depth_test_enable == 0 || regs.zpass_pixel_count_enable != 0) {
+        return false;
+    }
+    auto& state = wait_budget;
+    if (state.frame != frame_count) {
+        state.frame = frame_count;
+        state.used = {};
+    }
+    const auto& targets = discard_decision.targets;
+    const size_t kind = static_cast<size_t>(targets.kind);
+    const auto skip = [&](bool at_once) {
+        ++state.skipped[kind];
+        if (at_once) {
+            ++state.skipped_at_once;
+        }
+        if (targets.kind == VideoCommon::DrawTargetClass::Persistent && state.listed < 16 &&
+            !at_once) {
+            ++state.listed;
+            LOG_INFO(Render_Vulkan,
+                     "Wait budget: draw into persistent target {:#x} {}x{} {} skipped for its "
+                     "pipeline {:016x} (FRITCHII_PIPELINE_WAIT_BUDGET; {} of 16 listed)",
+                     targets.gpu_addr, targets.width, targets.height, targets.format,
+                     graphics_key.Hash(), state.listed);
+        }
+        return true;
+    };
+    if (state.timed_out.contains(&pipeline)) {
+        return skip(true);
+    }
+    const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(budget) - state.used;
+    if (left.count() <= 0) {
+        state.timed_out.insert(&pipeline);
+        return skip(true);
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const bool built = pipeline.WaitBuiltFor(left);
+    const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin);
+    state.used += waited;
+    state.wait_time += waited;
+    state.longest_frame = (std::max)(state.longest_frame, state.used);
+    if (built) {
+        ++state.waited_built;
+        return false;
+    }
+    state.timed_out.insert(&pipeline);
+    return skip(false);
+}
+
+bool PipelineCache::WaitComputeWithinBudget(ComputePipeline& pipeline) {
+    // The draws' frame budget (WaitBudgetSkips): a dispatch the driver compiles in a few ms
+    // still runs in its frame. The build was kicked to a spare thread first.
+    const auto budget = PipelineWaitBudget();
+    if (budget.count() == 0) {
+        return false;
+    }
+    auto& state = wait_budget;
+    if (state.frame != frame_count) {
+        state.frame = frame_count;
+        state.used = {};
+    }
+    const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(budget) - state.used;
+    if (left.count() <= 0) {
+        return false;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const bool built = pipeline.WaitBuiltFor(left);
+    const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin);
+    state.used += waited;
+    state.longest_frame = (std::max)(state.longest_frame, state.used);
+    return built;
 }
 
 int AsyncDiscardMode() {
@@ -6974,6 +7723,14 @@ bool IsDepthTestedColorDraw(const Maxwell& regs) noexcept {
     }
     return false;
 }
+
+/// FRITCHII_ASYNC_REDRAWN_DEPTH: a depth pre-pass draw (depth test and depth write on, no colour
+/// target written, not counting samples for a query).
+bool IsDepthOnlyPrepassDraw(const Maxwell& regs) noexcept {
+    return regs.zeta_enable != 0 && regs.depth_test_enable != 0 &&
+           regs.depth_write_enabled != 0 && regs.zpass_pixel_count_enable == 0 &&
+           !IsDepthTestedColorDraw(regs);
+}
 } // Anonymous namespace
 
 bool PipelineCache::AsyncRedrawnOn() const {
@@ -7002,16 +7759,56 @@ bool PipelineCache::AsyncRedrawnOn() const {
 }
 
 int PipelineCache::AsyncRedrawnDefault() const {
-    // FRITCHII_ASYNC_REDRAWN's value when unset: 1 on AMD's Windows driver (see DrawMayBeSkipped).
-    static const int value = [this] {
-        const bool amd = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
-        if (amd && std::getenv("FRITCHII_ASYNC_REDRAWN") == nullptr) {
-            LOG_INFO(Render_Vulkan, "FRITCHII_ASYNC_REDRAWN=1 by default on AMD's driver: new "
-                                    "objects drawn into the scene skip a frame or more while "
-                                    "their pipeline compiles instead of freezing the game "
-                                    "(FRITCHII_ASYNC_REDRAWN=0 waits)");
+    // FRITCHII_ASYNC_REDRAWN's value when unset: 1 on every driver since 2026-11-18 (owner: a
+    // briefly late object beats a freeze; RTX 4080 market toggle 0/1 x4: 70.1 / 71.3 fps, 1% low
+    // 50.0 / 51.9, no cost). It was 1 on AMD's and Intel's Windows drivers first (see
+    // DrawMayBeSkipped). Intel's compiler is the slowest: an Arc B580 (101.9150) held 11.9 s and
+    // 11.2 s of draws for runtime pipelines, one of them ~11 s alone (tester log t0815).
+    static const int value = [] {
+        if (std::getenv("FRITCHII_ASYNC_REDRAWN") == nullptr) {
+            LOG_INFO(Render_Vulkan, "FRITCHII_ASYNC_REDRAWN=1 by default: new objects drawn into "
+                                    "the scene skip a frame or more while their pipeline compiles "
+                                    "instead of freezing the game (FRITCHII_ASYNC_REDRAWN=0 waits)");
         }
-        return amd ? 1 : 0;
+        return 1;
+    }();
+    return value;
+}
+
+int PipelineCache::AsyncRedrawnDepthMode() const {
+    // FRITCHII_ASYNC_REDRAWN_DEPTH (boot): 1 = with FRITCHII_ASYNC_REDRAWN on, depth-tested draws
+    // that write no colour (a depth pre-pass) into targets redrawn every frame count as recurring
+    // too. Default 1 on Intel's Windows driver, 0 elsewhere. A skipped one is missing from the
+    // depth for a frame or more; a colour pass that tests against it then draws the object late
+    // too (pop-in), never wrong. Shadow maps and layers drawn once are never redrawn targets.
+    static const int value = [this] {
+        const char* env = std::getenv("FRITCHII_ASYNC_REDRAWN_DEPTH");
+        if (env != nullptr && *env != '\0') {
+            return std::atoi(env);
+        }
+        return device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ? 1 : 0;
+    }();
+    return value;
+}
+
+std::chrono::milliseconds PipelineCache::PipelineWaitBudget() const {
+    // FRITCHII_PIPELINE_WAIT_BUDGET (boot, ms): see BuiltPipeline. Default 50 on Intel's Windows
+    // driver, 0 (off) elsewhere.
+    static const std::chrono::milliseconds value = [this] {
+        const char* env = std::getenv("FRITCHII_PIPELINE_WAIT_BUDGET");
+        int ms = device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ? 50 : 0;
+        if (env != nullptr && *env != '\0') {
+            ms = (std::max)(std::atoi(env), 0);
+        }
+        if (ms > 0) {
+            LOG_INFO(Render_Vulkan,
+                     "FRITCHII_PIPELINE_WAIT_BUDGET={}: depth-tested draws that would wait for an "
+                     "unbuilt pipeline wait at most {} ms a frame together, then are skipped until "
+                     "it is built; draws without a depth test (text, UI, full-screen passes) still "
+                     "wait",
+                     ms, ms);
+        }
+        return std::chrono::milliseconds{ms};
     }();
     return value;
 }
@@ -7055,18 +7852,30 @@ bool PipelineCache::DrawMayBeSkipped() const {
     // log t1858). The object is missing for that time instead. FRITCHII_ASYNC_REDRAWN=0 waits.
     // Also on for the session on any driver once it compiles prepared pipelines again
     // (MaybeAutoAsyncRedrawn).
+    // FRITCHII_ASYNC_REDRAWN_DEPTH (default on Intel's Windows driver): depth pre-pass draws
+    // into such targets too.
     bool redrawn = false;
+    bool redrawn_depth = false;
     if (!recurring && targets.kind_if_redrawn == VideoCommon::DrawTargetClass::Recurring &&
-        AsyncRedrawnOn() && IsDepthTestedColorDraw(maxwell3d->regs)) {
-        recurring = true;
-        redrawn = true;
+        AsyncRedrawnOn()) {
+        if (IsDepthTestedColorDraw(maxwell3d->regs)) {
+            recurring = true;
+            redrawn = true;
+        } else if (AsyncRedrawnDepthMode() > 0 && IsDepthOnlyPrepassDraw(maxwell3d->regs)) {
+            recurring = true;
+            redrawn = true;
+            redrawn_depth = true;
+        }
     }
     const bool skip = CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
                                             draw_state.draw_element_count,
                                             draw_state.draw_element_count, mode != 0, recurring);
-    discard_decision = DiscardDecision{.serial = lookup_serial, .skip = skip};
+    discard_decision = DiscardDecision{.serial = lookup_serial, .skip = skip, .targets = targets};
     if (skip && redrawn) {
         ++discard_stats.skipped_redrawn;
+        if (redrawn_depth) {
+            ++discard_stats.skipped_redrawn_depth;
+        }
     }
     NoteDiscardDecision(skip, targets);
     return skip;
@@ -7126,8 +7935,35 @@ void PipelineCache::ReportAsyncDiscard() {
                  "{:.1f} ms of GPU thread waiting for translations",
                  AsyncDiscardMode(), skipped[0], skipped[1], skipped[2], stats.skipped_redrawn,
                  waited[0], waited[1], waited[2], ms(held), ms(stats.queue_wait));
+        if (stats.skipped_redrawn_depth != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Async discard: {} of the redrawn-target skips were depth pre-pass draws "
+                     "(FRITCHII_ASYNC_REDRAWN_DEPTH)",
+                     stats.skipped_redrawn_depth);
+        }
     }
+    auto& budget = wait_budget;
+    const u32 budget_skips = budget.skipped[0] + budget.skipped[1] + budget.skipped[2];
+    if (budget.waited_built + budget_skips != 0) {
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+        LOG_INFO(Render_Vulkan,
+                 "Wait budget in the last 10 s (FRITCHII_PIPELINE_WAIT_BUDGET={}): {} draws got "
+                 "their pipeline within the budget, {} skipped after it ({} first-time, {} "
+                 "persistent, {} recurring; {} at once: pipeline already timed out or budget "
+                 "spent); {:.1f} ms waited, most in one frame {:.1f} ms (the waited column above "
+                 "counts these lookups too)",
+                 PipelineWaitBudget().count(), budget.waited_built, budget_skips,
+                 budget.skipped[1], budget.skipped[2], budget.skipped[0], budget.skipped_at_once,
+                 ms(budget.wait_time), ms(budget.longest_frame));
+    }
+    budget.waited_built = 0;
+    budget.skipped = {};
+    budget.skipped_at_once = 0;
+    budget.wait_time = {};
+    budget.longest_frame = {};
+    budget.timed_out.clear();
     stats.skipped_redrawn = 0;
+    stats.skipped_redrawn_depth = 0;
     stats.skipped = {};
     stats.waited = {};
     stats.queue_wait = {};
@@ -7311,8 +8147,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             std::span{stages.data(), num_stages}, host_info);
     }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional
-    // task program, drawing triangles, lines or points without per-primitive outputs, before a
-    // pixel program only.
+    // task program, drawing triangles, lines or points (per-primitive outputs reach the pixel
+    // program flat through the vertex shader), before a pixel program only.
     std::optional<MeshEmulationSetup> mesh_emulation;
     size_t mesh_index{};
     if (mesh_unsupported) {
@@ -7338,8 +8174,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         } else if (mesh.mesh.topology != 0 && mesh.mesh.topology != 1 &&
                    mesh.mesh.topology != 4) {
             refused = "output topology";
-        } else if (!mesh.mesh.primitive_lines.empty()) {
-            refused = "per-primitive outputs";
         } else if (mesh.mesh.vertex_lines.empty() || mesh.mesh.max_vertices == 0 ||
                    mesh.mesh.max_primitives == 0) {
             refused = "empty output";
@@ -7349,6 +8183,57 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             if (!emulated && key.unique_hashes[index] != 0 &&
                 programs[index].stage != Shader::Stage::Fragment) {
                 refused = "a stage besides task, mesh and pixel";
+            }
+        }
+        u32 primitive_id_location{~0U};
+        if (refused == nullptr) {
+            // Per-primitive outputs reach the pixel program flat through the vertex shader. A
+            // vertex shader writes Layer and ViewportIndex only with
+            // VK_EXT_shader_viewport_index_layer, and PrimitiveId goes through a generic
+            // location nothing else uses (zortos293/Lichii#1940).
+            std::bitset<Shader::IR::NUM_GENERICS> vertex_generics, primitive_generics;
+            for (const u32 line : mesh.mesh.vertex_lines) {
+                const auto attribute{static_cast<Shader::IR::Attribute>(line)};
+                if (Shader::IR::IsGeneric(attribute)) {
+                    vertex_generics.set(Shader::IR::GenericAttributeIndex(attribute));
+                }
+            }
+            bool writes_primitive_id{};
+            const char* primitive_reason{};
+            for (const u32 line : mesh.mesh.primitive_lines) {
+                const auto attribute{static_cast<Shader::IR::Attribute>(line)};
+                if (Shader::IR::IsGeneric(attribute)) {
+                    primitive_generics.set(Shader::IR::GenericAttributeIndex(attribute));
+                } else if (attribute == Shader::IR::Attribute::PrimitiveId) {
+                    writes_primitive_id = true;
+                } else if ((attribute == Shader::IR::Attribute::Layer ||
+                            attribute == Shader::IR::Attribute::ViewportIndex) &&
+                           !profile.support_viewport_index_layer_non_geometry) {
+                    primitive_reason =
+                        "Layer or ViewportIndex without VK_EXT_shader_viewport_index_layer";
+                }
+            }
+            if ((vertex_generics & primitive_generics).any()) {
+                primitive_reason = "a generic written both per vertex and per primitive";
+            }
+            const size_t pixel_index{static_cast<size_t>(Maxwell::ShaderType::Pixel)};
+            const Shader::Info* const pixel{
+                key.unique_hashes[pixel_index] != 0 ? &programs[pixel_index].info : nullptr};
+            if (writes_primitive_id && pixel && pixel->loads[Shader::IR::Attribute::PrimitiveId]) {
+                const auto used{vertex_generics | primitive_generics};
+                for (u32 index = 0; index < Shader::IR::NUM_GENERICS && !pixel->loads.Legacy();
+                     ++index) {
+                    if (!used[index] && !pixel->loads.Generic(index)) {
+                        primitive_id_location = index;
+                        break;
+                    }
+                }
+                if (primitive_id_location == ~0U) {
+                    primitive_reason = "no free generic location for PrimitiveId";
+                }
+            }
+            if (primitive_reason != nullptr) {
+                refused = primitive_reason;
             }
         }
         if (refused != nullptr) {
@@ -7432,6 +8317,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         mesh_emulation.emplace();
         mesh_emulation->output_binding = output_binding;
+        mesh_emulation->primitive_id_location = primitive_id_location;
         if (has_task) {
             // After the output: the task payload, offset and argument buffers.
             mesh_emulation->has_task = true;
@@ -7612,8 +8498,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     profile, program.mesh, mesh_emulation->output_binding,
                     mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
                     runtime_info.convert_depth_mode && !profile.support_native_ndc,
-                    runtime_info.fixed_state_point_size.value_or(1.0f));
+                    runtime_info.fixed_state_point_size.value_or(1.0f),
+                    mesh_emulation->primitive_id_location);
             }
+        }
+        if (mesh_emulation && program.stage == Shader::Stage::Fragment) {
+            runtime_info.per_primitive_flat = true;
+            runtime_info.primitive_id_location = mesh_emulation->primitive_id_location;
         }
         ConvertLegacyToGeneric(program, runtime_info);
         if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry) && device.IsAmdDriver()) {
@@ -7977,7 +8868,7 @@ void PipelineCache::WarnKeptPointer(size_t program, u64 slot) const {
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
-    const VideoCommon::EvictedPointerSlots::Slots* keep_pointers) {
+    const VideoCommon::EvictedPointerSlots::Slots* keep_pointers, bool store) {
     const auto begin = std::chrono::steady_clock::now();
     t_runtime_build = true;
     t_build_split = {};
@@ -8020,7 +8911,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools = emit_pools ? *emit_pools : main_pools;
     auto pipeline{CreateGraphicsPipeline(pools, graphics_key, environments.Span(), nullptr, true,
                                          std::move(emit_pools), std::move(reservation))};
-    if (!pipeline || pipeline_cache_filename.empty()) {
+    if (!pipeline || pipeline_cache_filename.empty() || !store) {
         return pipeline;
     }
     StoreRuntimeGraphicsPipeline(graphics_key, environments.envs);

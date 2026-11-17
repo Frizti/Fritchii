@@ -372,6 +372,19 @@ struct System::Impl {
                      Service::DescribeCallsInFlight());
         LOG_CRITICAL(Core, "Hang report: game threads in kernel waits: {}",
                      Kernel::DescribeGuestWaits());
+        // The cores that run game code now (a spin on a word, a loop): each core's thread logs
+        // its guest backtrace when its JIT next returns ("Guest backtrace (hang report)" lines
+        // right after this; Damage's second Jabu-Jabu freeze had one core in JIT code).
+        std::string cores;
+        for (std::size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+            const u64 thread_id = impl.kernel.PhysicalCore(core).RequestBacktrace("hang report");
+            cores += fmt::format("{}core {} {}", cores.empty() ? "" : ", ", core,
+                                 thread_id == ~u64{0} ? std::string{"idle"}
+                                                      : fmt::format("runs guest thread {}",
+                                                                    thread_id));
+        }
+        LOG_CRITICAL(Core, "Hang report: cores: {} (backtraces of the running ones follow)",
+                     cores);
     }
 
     void SetNVDECActive(bool is_nvdec_active) {
@@ -604,6 +617,12 @@ struct System::Impl {
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
 
+        // The cheat VM runs on the timer thread, which keeps running through the teardown, and
+        // reads keys through the service manager and memory through the process. Freed below,
+        // they crashed it (a null ServiceManager at a stop, #1950). Its destructor waits for a
+        // run in progress.
+        cheat_engine.reset();
+
         // Once powered off, services stop writing replies, so a guest thread whose IPC call
         // completes would read its own request back and abort (2010-0212, a Userspace PANIC on
         // every stop). Keep guest threads from running again first; the wait for running ones
@@ -632,7 +651,6 @@ struct System::Impl {
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
-        cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
         Common::NoteShutdownProgress();

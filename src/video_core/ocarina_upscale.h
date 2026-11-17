@@ -60,6 +60,28 @@ inline bool OcarinaFsr4LinearColor() {
     return on;
 }
 
+/// FRITCHII_FSR_OUTPUT (boot, 0 = as before): the size OoT's FSR (3.1 and 4) draws at when the
+/// game's own pass would make its 2560x1440 picture. 0: 3840x2160, then composited with the
+/// game's interface at 4K and scaled to the window (on a 1440p screen that 4K picture is scaled
+/// back down). 1: the game's own 2560x1440 picture (FSR as anti-aliasing at 1x, no 4K
+/// composite), 4/9 of the pixels FSR outputs at 4K: FSR 4 on Radeon RX 7000 cards runs its
+/// network on the shader cores and spends several ms a frame there. 2: 1 when the primary
+/// display is at most 1440 pixels tall, else 0. DLSS is unchanged.
+inline int OcarinaFsrOutputMode() {
+    static const int mode = OcarinaSwitch::Read("FRITCHII_FSR_OUTPUT", 0);
+    return mode;
+}
+
+/// Whether FSR draws the game's own 2560x1440 picture instead of a 4K one (FRITCHII_FSR_OUTPUT);
+/// `display_height` 0 = unknown.
+constexpr bool OcarinaFsrOutputsGameSize(int mode, OcarinaUpscaleBackend backend,
+                                         unsigned display_height) {
+    if (backend != OcarinaUpscaleBackend::Fsr) {
+        return false;
+    }
+    return mode == 1 || (mode == 2 && display_height != 0 && display_height <= 1440);
+}
+
 /// FRITCHII_OOT_CAMERA_GUEST (boot, 0 = off): the camera tracker reads vertex uniform slot 3 as
 /// the game bound it, not as the draw's shader sees it. The shader's view leaves out slots it does
 /// not use and stops at the last byte it reads, so draws that read less than the camera block gave

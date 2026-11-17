@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <vector>
 #include <boost/container/deque.hpp>
 
@@ -81,7 +82,8 @@ private:
     void PresentThread(std::stop_token token);
 
     /// Host frame pacer (vk_host_pacer.h): collects when earlier frames were shown and holds
-    /// `frame` until its target. Returns whether it was held.
+    /// `frame` until its target (FRITCHII_PACE_FIX 2: leaves the hold to CopyToSwapchainImpl).
+    /// Returns whether it was held.
     bool PaceFrame(Frame* frame, std::stop_token token);
 
     /// Without present wait (no pacing): still reads the display's refresh rate now and then,
@@ -143,6 +145,12 @@ private:
     };
     bool present_wait_enabled{};
     HostPacer pacer;
+    /// FRITCHII_PACE_FIX 2: PaceFrame's hold, taken in CopyToSwapchainImpl before the present.
+    struct DeferredHold {
+        std::chrono::steady_clock::time_point start;
+        std::chrono::steady_clock::time_point target;
+    };
+    std::optional<DeferredHold> deferred_hold;
     u64 last_present_id{};
     std::mutex present_wait_mutex; ///< Held while waiting on a swapchain; recreation takes it
     std::mutex wait_queue_mutex;

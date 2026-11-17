@@ -17,6 +17,7 @@
 #include "common/windows/crash_handler.h"
 #endif
 #include "common/scm_rev.h"
+#include "common/build_stamp.h"
 #include "common/cpu_features.h"
 #include "core/memory.h"
 
@@ -259,6 +260,9 @@ void Init(QWidget* root) {
 
     // info logging
     LOG_INFO(Frontend, "Fritchii Version: {}", BuildVersionString());
+    if (const auto stamp = Common::BuildStamp(); !stamp.empty()) {
+        LOG_INFO(Frontend, "Build hash: {}", stamp);
+    }
     LogRuntimes();
 #ifdef ARCHITECTURE_x86_64
     const auto& caps = Common::g_cpu_caps;

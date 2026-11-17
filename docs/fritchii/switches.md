@@ -159,6 +159,19 @@ size, and the 16 exact sizes holding the most bytes, so owners can be told apart
 The walk holds the CRT heap's lock: every thread that allocates waits for it (~0.3-1 s); one
 hitch, early in the run.
 
+Added 2026-11-16 (helper CI, after the CENSUS=4 run b5-census4-log): the two ~1 GiB rw regions are
+not CRT heap segments (the heap segment check found 64 segments, 833 MiB; the heap walk at 2 s saw
+638 MiB busy). They are page tables: one existed at 2 s (27 MiB, 539 at 7.3 s, 1022 at 12.6 s, before
+the GPU address space was made at 8.1 s), the other appeared after the GPU address space ("small
+pages up to 0xc000000000") and grew with play (319 -> 986). New tags: "guest page table" (each
+process's, 8 bytes per 4 KiB page, 1 GiB for 39 bits), "GPU page table" (the small-page table, 4
+bytes per page, 1 GiB for 40 bits), "GPU big page table", "SMMU address map", "SMMU page entries".
+The "more" line adds a row per table: reserved, committed, resident, and how much of the resident
+part is all zero (guest) or has no mapped page (GPU): what FRITCHII_RAM_PT_TRIM or _LAZY can give
+back. "Page table commit (n): <table> by <caller> committed K KiB of entries for a..b" lines log
+every call that commits 1 MiB or more of a table at once (the first 64, then every 64th): they name
+the caller that filled it (protect, walk, mark debug, mark cached, map; the GPU table's maps).
+
 ### FRITCHII_RAM_GPU_ENTRIES
 
 TEST, off by default (helper BE, 2026-11-16). Boot. Each GPU address space (Tegra::MemoryManager)
@@ -169,6 +182,69 @@ zero-filled std::vector, so all of it was resident (the first census run: two 64
 ~60 MiB less resident per address space (~120 MiB at the market, two spaces), minus the few MiB
 of pages the game's GPU mappings touch. Judge: the census tag "GPU page entries" (resident) and
 the private working set; nothing else changes.
+
+### FRITCHII_RAM_PT_LAZY
+
+TEST, off by default (helper CI, 2026-11-16). Boot. The guest page table is a 1 GiB reservation
+(8 bytes per 4 KiB page of a 39-bit address space), committed a page at a time. Walks that only
+read it (page protection, block reads and writes, cache operations, the debug and cached marks)
+committed every table page of their whole range first, so a walk over unmapped address space left
+zero pages in RAM. The census run at the market (b5) showed a 1 GiB private region 1022 MiB
+committed / 871 resident by 12.6 s, while the guest had mapped only ~10 GB (~20 MiB of entries);
+it was already 539 MiB at 7.3 s with 96 MiB of guest views. With 1 these walks read through the
+committed bits instead (an uncommitted page is unmapped: same result) and commit nothing. Maps
+still commit what they map. Expected: up to ~850 MiB less resident (and committed) if the walks are
+what committed it; the census's "Page table commit" lines say which caller did ("protect", "walk",
+"mark debug", "mark cached", "map").
+
+### FRITCHII_RAM_PT_TRIM
+
+TEST, off by default (helper CI, 2026-11-16). Boot. Unmaps give back the RAM of page table pages
+they leave without a mapped entry: the guest page table's 4 KiB pages that hold only zeros after
+the unmap, and the GPU small-page table's pages (1,024 entries, 4 MiB of GPU address space) with no
+mapped page left. MEM_RESET + VirtualUnlock (madvise DONTNEED on Linux): still committed, no page
+file write, a zero page reads zero again, and the GPU entries are read only for mapped pages. Done
+under the lock every map of that table takes (the kernel page table lock, page_table_lock), so no
+map lands between the check and the discard. The GPU small-page table is a 1 GiB reservation (4
+bytes per 4 KiB page of 40 bits; Switch 2 asks for small pages up to 768 GiB) committed 64 KiB per
+64 MiB of address space a map reaches and never decommitted; b5 had it at 986 committed / 859
+resident. Expected: what the census reports as "all zero" (guest) and "without a mapped page"
+(GPU), if the tables filled by maps that were unmapped since. Nothing to judge but the census rows
+and that nothing breaks (a wrong discard would show as garbage GPU reads or guest crashes at once).
+
+Added 2026-11-16 (helper CM, b12 Castle Town runs): with the page tables tagged (guest 22 MiB, GPU
+12), the 1 GiB rw regions are still there, so they are not page tables. Region A exists at 2 s (28
+MiB, before the Vulkan device), fills to 1021 by 12.5 s during the boot pipeline builds; B appears
+by 12.5 s and grows to ~900 while the background prebuild runs (done at ~17.8 s), then barely moves;
+a third appears at the area load (~45 s). They fill one after another like an allocator's arenas.
+Nothing in our code reserves 1 GiB, and they carry no heap segment header. New census line "owner
+hints" (any mode but 3): for the 4 biggest unnamed allocations (32 MiB or more resident) and for
+the 16-64 MiB reservations together, up to 512 resident pages are read and counted: non-zero words
+per page, words pointing into the allocation itself (allocator free lists), and words pointing into
+each loaded image (vtables and callbacks: the driver's objects point into nvoglv64.dll or
+nvgpucomp64.dll, ours into the exe), plus the first six words of the allocation. Read-only, a few
+ms per census.
+
+### FRITCHII_RAM_VK_HOST_ALLOC
+
+TEST, off by default (helper CM, 2026-11-16). Boot. The Vulkan instance and device are created
+(and destroyed) with allocation callbacks, so the driver's host allocations come from a heap of
+our own (HeapCreate, low-fragmentation) instead of the driver's own reservations. Their children
+(pipelines, descriptor pools, command pools...) are still created with null callbacks, which
+drivers serve from the parent's allocator; nothing else changes, the game sees the same. Every
+block is counted. Why: the census's two to three 1 GiB arenas (~1.75 GB resident at Castle Town)
+fill during pipeline builds, like a driver allocator that keeps what it once used. If they are
+the driver's, they move into our heap ("other heaps" in census line 1), the census names them,
+and what the driver frees goes back to the heap (and from there to Windows) instead of staying
+resident. Expected: between 0 (the driver ignores the callbacks for children, or uses all it
+holds) and several hundred MiB; FRITCHII_RAM_PREBUILT_KEEP + EXP51=2 freed only ~170 MiB for
+2,300 destroyed pipelines, which fits a driver arena that keeps freed memory. Census "more" line
+(FRITCHII_MEM_CENSUS on): "Vulkan host allocations (FRITCHII_RAM_VK_HOST_ALLOC=1, ...): L MiB
+live in N blocks (peak P), by scope command / object / cache / device / instance; the driver's own
+(notified) M MiB; F failed, X foreign frees". Object scope near 0 = the driver does not route
+pipelines through the device's callbacks (then the switch only names device memory). F and X
+must be 0. Risk: a driver bug with callbacks (rare; Mesa and NVIDIA both support them); a small
+cost per driver allocation (one heap call, as the driver's own). Logged once when on.
 
 ### FRITCHII_JIT_WARM_CORES
 
@@ -212,6 +288,24 @@ pages instead of at the end. What is trimmed stays the same; the unlock calls ar
 in more batches. Expected: the peak working set ~2 GB lower (no RAM is freed: the pages were RAM
 already; but Windows and the owner's tools stop seeing a 14.6 GB process). Judge: "Memory:" peak and
 "Zero-page pass" lines (same MiB trimmed, similar ms), hitch score unchanged.
+
+### FRITCHII_ZERO_TRIM_CHUNK
+
+TEST, off by default (helper CR, 2026-11-16). Live (debug server `switch`), Windows; read once at
+the start of each zero-page pass. The first big pass after the first area load (~530 MiB trimmed,
+~88 s after boot, ~48 s into play) takes each run of zero pages out of the working set with one
+VirtualUnlock call, and its longest runs take 30-46 ms. A guest VirtualProtect (the GPU cache's
+write traps) that lands in that call waits for it: host protect longest 21.6, 19.1 and 45.7 ms in
+the market, Castle Town and night market hitches of 62, 53 and 71 ms (b18-reg logs, the only long
+frames of steady play there, and the frame behind their 0.1% low). 0 = as before. 1 = a run goes
+in calls of at most 256 pages (1 MiB); N >= 2 = N pages a call. The same pages leave the working
+set and their contents are untouched (no verify mode: nothing differs). The pass lines ("Trimmed
+... MiB of all-zero guest pages" / "Zero-page pass") end with the mode, the unlock calls and the
+longest one, and the guest map/protect calls made while the pass unlocked and the longest one (the
+number to judge, with either value). Expected with 1: longest call ~1 ms, longest guest call a few
+ms at most, no Hitch: line at the pass. Test: fresh launches (the big pass comes once), market pin,
+with the flash watcher on (where it shows) and --noflash.
+
 ### FRITCHII_FORMATLESS_13
 
 TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1874 by KevinLny, open
@@ -232,6 +326,38 @@ records)", each fault address with its kind (invalid read/write/execute, instruc
 range, and the vendor fault codes. A driver without it logs "Device fault info: not supported by
 the driver". Only the loss report reads it; nothing is drawn differently. FRITCHII_DEVICE_FAULT=0
 leaves the extension off, as before. Why: two AMD testers hit device losses with no clue in the log.
+
+### FRITCHII_PIPELINE_BINARY, FRITCHII_PIPELINE_BINARY_MAX_MB, FRITCHII_PIPELINE_BINARY_HARVEST, FRITCHII_PIPELINE_BINARY_SHARED_MB
+
+Off by default, except 1 on AMD's Windows driver (helper CE, 2026-11-16; AMD default helper CW).
+Boot. Fritchii keeps the compiled pipelines itself through
+VK_KHR_pipeline_binary instead of trusting the driver's cache: 1 load and save, 2 load only, 3 load,
+save and verify (every 16th pipeline built from the store is also compiled normally and the driver's
+binary keys compared). The store is <shader dir>/<title id>/pipeline_binaries.fritchii.bin (+ .idx),
+one per GPU and driver (vendor, device, driver id, driver version, pipeline cache UUID); another GPU
+or driver starts it over. Entries are found by the driver's key of each create info
+(vkGetPipelineKeyKHR), checked by hash when read, zstd-compressed. A saving store adds its id to the
+Prepare Shaders stamp, so the first boot with it (or after it starts over) prepares once more and
+fills it. FRITCHII_PIPELINE_BINARY_MAX_MB (6144) caps the file; FRITCHII_PIPELINE_BINARY_HARVEST=0
+stops taking pipelines the driver's own cache still holds (otherwise taken from there, no compile).
+A device loss in a session that used the store starts it over at the next boot. Graphics pipeline
+libraries (EDEN_NX2_GPL) are left to the driver: only whole pipelines go through the store. Log:
+"Pipeline binaries (...)" at boot, "Pipeline binaries so far/after the preparation/at exit: N hits
+(ms each), M misses (ms each, K taken from the driver's cache), ~S s of compiles saved ...".
+RAM cost (batch 14, 2026-11-16, RTX 4080, castletown 90 s): working set 10.7 -> 16.0 GB with =1 (620-931 pipelines stored, ~1.4 MiB each, 880-1293 MiB file); the driver's three 1 GiB arenas did not shrink.
+What held it (helper CW): NVIDIA gives every pipeline one 2048 KiB binary with the same key, besides
+its own 4-110 KiB ones (97% of every entry). Each pipeline built from binaries got its own copy of
+that blob in the driver's arenas (two extra 2 GiB and one extra 1 GiB arena in the census, 2,369
+pipelines x ~2.2 MiB). FRITCHII_PIPELINE_BINARY_SHARED_MB (64; 0 = as before) makes a binary that a
+second pipeline names once and keeps it for the session, so every later pipeline names the same
+handle (from the store, from the driver's cache or from a capture). Log every 10 s and at exit:
+"Pipeline binaries RAM: store index X MiB, blobs held Y MiB (peak P), queued for the file Q MiB,
+binaries alive N (K kept shared, S MiB, R reuses), captured data unreleased M". AMD's binaries are
+~35 KB per pipeline (no shared blob seen), so its cost is the index (~7 MiB for 120k) plus the
+writer queue (256 MiB cap, only while saving). The file still holds the blob in every entry (same
+format): ~4,400 NVIDIA pipelines fit the 6 GiB cap.
+Why: AMD's Windows driver keeps ~30% of the 120k prepared pipelines and compiles the rest again at first use
+(0.2-1.1 s each, the 1 s stalls); NVIDIA on Linux prunes its cache.
 
 ### FRITCHII_SCALED_EXTENT_CAP
 
@@ -256,6 +382,22 @@ scales. Check: an AMD tester at 1.5x enters Castle Town with the switch at 1.
   device's limit of L (FRITCHII_SCALED_EXTENT_CAP)" (HW_GPU, Info), once per image. At 1.5x/2x on
   AMD, expect it once for the 12288x12288 D16 sun shadow map.
 
+### FRITCHII_SCALE_DEPTH_MAX
+
+On by default (helper DA, 2026-11-17), value 8192; 0 = as before (the A/B and kill switch). Live,
+read whenever a render target set is checked for scaling. A depth/stencil image (any format that
+is not a colour format) whose scaled width or height would pass N stays at native size, on the
+same path as FRITCHII_SCALED_EXTENT_CAP (that pass's render target set stays native, the rest of
+the frame scales). Why: OoT's 12288x12288 D16 sun shadow map (288 MiB, made on every Castle Town
+load) costs 648 MiB at 1.5x and 1.15 GiB at 2x on NVIDIA, where the extent cap (32768) lets it
+scale, and 450 MiB at 1.25x on AMD; a shadow map that size gains nothing visible from scaling.
+Only scales that enlarge images are affected: at 1x and the downscales nothing changes. Main
+scene depth (1920x1080 or 2560x1440 native) stays far under 8192 up to 3x.
+- Log: "Depth image WxH (format F, N samples) stays at native size: scaled it would be ..., past
+  N (FRITCHII_SCALE_DEPTH_MAX, k so far)" (HW_GPU, Info), first 16 images; then "Scale depth max
+  (FRITCHII_SCALE_DEPTH_MAX=N): x depth images kept at native size in the last 10 s, y this
+  session" at most every 10 s while new ones appear.
+
 ### FRITCHII_OOT_BYPASS_SAMPLED
 
 TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1875 by zortos293). Live;
@@ -273,7 +415,7 @@ Zora's Domain facing King Zora, the view must follow the camera.
 
 ### FRITCHII_PROTECT_UNLOCKED
 
-TEST, off by default (helper AK, 2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live,
+On by default on every driver since 2026-11-18 (owner: a briefly late object beats a freeze; RTX 4080 market toggle 70.1 / 71.3 fps, no cost); first AMD/Intel only. (Helper AK, 2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live,
 FRITCHII_PROTECT_UNLOCKED=1 turns it on (Windows only). HostMemory's Protect (the write traps on
 GPU-cached guest memory, 12,000-28,000 calls a second in OoT) took the placeholder lock before every
 VirtualProtect, and Map/Unmap hold that lock across their kernel calls, which slow from ~10 us to
@@ -317,7 +459,67 @@ this driver (n so far, longest t ms): new objects pop in instead of waiting (FRI
 auto)". A value in the environment (nx2_switches.txt) or set live wins; storing -1 live gives it back
 to the default and the auto rule. Only prepared (kept SPIR-V) builds count now; runtime pipelines a
 worker emits are new to every driver and no longer mix into the count. Compute dispatches still wait
-for their pipeline (skipping one would lose its results).
+for their pipeline (skipping one would lose its results), unless FRITCHII_ASYNC_COMPUTE_SKIP below
+is on.
+
+### FRITCHII_ASYNC_COMPUTE_SKIP, FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS
+
+TEST, off by default (helper DU, 2026-11-17; idea and rules from zortos293/Lichii #2104, 75fb0b527e,
+ffd0ebe246 and ce937db2d0, by zortos293). Live. A native dispatch whose compute pipeline is not built
+yet records a wait on the Vulkan worker, and every GPU channel waits behind it: 0.6-5.5 s freezes on
+cold shader caches, 21-55 s per session in tester logs t0357, t0419 and t1858 (grep "Compute dispatch
+waited N ms for pipeline X"; the "Worst frame" line does not see them). Runtime-translated compute
+programs (the sword-swing foliage culling variant 59c1699f529e7c08 and friends) are not covered by
+Prepare Shaders.
+
+- 0: waits as before.
+- 1: such a dispatch is skipped while its pipeline builds, as if the guest had not run it this frame,
+  when all four guards hold; otherwise it waits as before. On the first skip the build is handed to
+  a spare thread ("VkComputeKick"), since the pipeline workers are first in, first out. Within
+  FRITCHII_PIPELINE_WAIT_BUDGET (shared with the draws; 0 except on Intel) it waits for the build
+  first.
+- 2: dry. Every dispatch waits; the line counts what 1 would skip.
+
+The guards, all on what the dispatch would mark written (its native storage write marks and the
+guest ranges of its written storage images):
+- G1, GPU data: every byte holds GPU writes (gpu_modified_ranges, full coverage) and no CPU write
+  waits for upload; images: every image there GpuModified, not CpuModified, one covering the range.
+- G2, every frame: each buffer range (exact address and size) was written by a dispatch in each of
+  the last 8 frames; images by ImageBase::write_streak (as FRITCHII_ASYNC_REDRAWN). A pass the game
+  runs once (a LUT at a scene change, a pool init) never qualifies. A range the same pipeline
+  skipped in the frame before keeps qualifying (a skip writes nothing, so the streak it passed is
+  kept, never extended).
+- G3, no read-back: no page Preflushable, in cpu_read_ranges or a read download, and no guest read
+  ever seen on its pages (GetFlushArea, sticky for the session). Feeders whose results the game
+  logic reads (collision, the c0[0x150] binding writers) always wait.
+- G4, shape: native, direct (no indirect grid), no texel buffers, no global stores, no packed R16
+  image, not an OoT upscaler or effects pass, no frame dump, and known write extents: a 16 MiB
+  (unproven) or capped mark, several device ranges or an image without one device range waits.
+
+The decision comes before the dispatch's fill (MemStage::FillDispatch) and, with the one follower,
+before E posts it (an unbuilt pipeline's dispatch is lent: "lent: unbuilt pipeline"), so a skipped
+dispatch leaves no marks, uploads, image changes or EXP10 records (it confirms an empty record). Its
+QMD releases and semaphores are the engine's (KeplerCompute, after DispatchCompute returns) and still
+happen. A dispatch that runs takes Configure's own path instead of the seam's fill.
+
+What the player sees for the length of a compile (not one frame): per-frame compute outputs stay as
+last written (foliage culled for an older view, particles or poses frozen), or what a skipped append
+pass draws is missing; the frame after the build ends is right again.
+
+Log, every 10 s while anything happened: "Async compute skip (FRITCHII_ASYNC_COMPUTE_SKIP=n) in the
+last 10 s: x dispatches/s skipped, y/s would skip (dry), p new programs, t ms of waits avoided;
+unbuilt dispatches that waited: a shape, b unknown extent, c read back, d no GPU data, e not every
+frame; must be 0: s programs still skipping 10 s after their first skip, r guest reads of skipped
+output". Once per program (first 64): "pipeline X is still building, its dispatches are skipped" and
+"pipeline X skipped N dispatches over T ms (frames f-g), ran at frame h; W ms of wait avoided" (the
+wait avoided runs from the first skip to the build's end).
+
+FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS (boot, ms, default 0; test only): every compute program counts as
+unbuilt for that long after its first dispatch, to test the skip on a PC with warm caches (2000 =
+a cold compile for each). Its pipelines are built, so there is no budget wait; the log says it is on.
+Test: one session at a pinned save, mode 2 first (no visual change, read the refusal split), then
+mode 1 with the delay; screenshot at 1 s and 10 s, compare the 10 s shot with mode 0; both must-be-0
+counts 0.
 
 ### FRITCHII_OCCLUSION_VISIBLE
 
@@ -571,6 +773,53 @@ outside the allocators MiB; small card profile ...". Judge under EDEN_NX2_VRAM_L
 not lower; with no limit on a 16 GB card, FRITCHII_SMALL_CARD=2 must log "not a small card" and
 change nothing.
 
+### FRITCHII_IMAGE_DEVICE_LOCAL
+
+TEST, off by default (helper DQ, 2026-11-17; port of a low-VRAM fork's fix). Boot: 0 off, 1 on, 2
+dry. Discrete GPUs only (integrated: logged and ignored). An image's first try in the default heaps
+is "within the budget, prefer device memory" with nothing required, so once the device heap is over
+its budget VMA moves on to a host memory type still within its budget and succeeds silently: the
+image lives in system RAM, the GPU samples it over PCIe (the other fork measured 9.4 GB of images
+there in the market, 150 ms frames), and the texture cache never sees pressure because the device
+heap's usage does not count it. =1: the tries within the budget in the default heaps (the plain
+first try, the depth pool refusal retry, the kept-blocks retry) require DEVICE_LOCAL; custom pools
+keep their own memory type. A full device heap then refuses the image: that is a pressure event
+like any refused image (with the native thresholds the texture cache keeps 512 MiB more free, "Out
+of device memory: keeping N MiB more free"; the budget control and FRITCHII_TC_CRITICAL_ENFORCE
+work as before), and
+the old fallbacks place it as before (without the budget check, device memory first; host memory
+only when the device really is out). =2: placement unchanged, only counts. Logs: at boot
+"FRITCHII_IMAGE_DEVICE_LOCAL=N: ..."; then "Image device-local (FRITCHII_IMAGE_DEVICE_LOCAL=N,
+event): first tries refused R, of those placed over budget in device memory D; host memory images
+H (M MiB), by the first try F" each time R or H reaches a power of two, then every 1024. With =2, F
+is the silent spill =1 removes. Test: 8 GB simulation (EDEN_NX2_VRAM_LIMIT_MIB=8192 +
+FRITCHII_VRAM_SIM_OTHERS=1) at the market, first =2 (is F above 0 at all?), then =1 vs 0 fresh
+(boot switch): host images and hitch lines down, pressure events up, fps and 1% lows not lower.
+On a 16 GB card without a limit both modes must log nothing after boot.
+
+### FRITCHII_BUFFER_POOL_BLOCK_MB
+
+TEST, off by default (helper DQ, 2026-11-17; port of a low-VRAM fork's change). Boot: 0 = 16 MiB
+blocks (as before); n = n MiB blocks (1-64) for the buffer cache's device-local VMA pool
+(Device::SeparatePool::DeviceBuffers, both allocators when they are split), and buffers over half
+a block take the default blocks. The other fork uses 4 (2 MiB cut-off): buffer cache buffers live
+a few per 16 MiB block, and a block stays while any of them does, mostly empty. Not the same as
+FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB (the buffer allocator's default blocks). Log at boot:
+"FRITCHII_BUFFER_POOL_BLOCK_MB: device buffer pool blocks N MiB, buffers over K KiB take the
+default blocks". Judge by the "buffer pool" slack in FRITCHII_VRAM_OWNERS / FRITCHII_VRAM_REPORT
+and the Churn line's device allocations (smaller blocks = more vkAllocateMemory calls), fresh
+launches.
+
+### FRITCHII_BC1_KEEPS_ALPHA
+
+Off by default (helper DQ, 2026-11-17; port of a low-VRAM fork's fix). Boot: 1 on. Only does
+something when the player picked ASTC recompression BC1 (our default is BC3) on a GPU without
+native ASTC: BC1 for every ASTC image turns alpha into a 1-bit cutout (dark faces and banding in
+OoT). With 1 the session runs the BC3 path instead, whose opaque scan already sends the fully
+opaque images to BC1 (EDEN_NX2_ASTC_BC1, on by default) and keeps the others in BC3. Log at boot:
+"FRITCHII_BC1_KEEPS_ALPHA: ASTC recompression BC1 runs the BC3 path ...". A candidate for default 1:
+it changes nothing for a player on BC3 or Uncompressed.
+
 ### FRITCHII_VRAM_POOL_FIT
 
 TEST, off by default (helper BF, 2026-11-16; 8 GB cards). Live: 1 = EXP42's image pool (pooled
@@ -642,6 +891,133 @@ download / device, stream MiB; memory pressure events, failed images". Over the 
 real card starts moving memory to system RAM: on an 8 GB card that is the fps cliff. One driver
 memory query per 30 frames.
 
+### FRITCHII_VRAM_BUDGET_MODE
+
+On by default as vk (helper CX, 2026-11-16; zortos tester report test 4, VRAM). Live: where the
+texture cache's live budget cap comes from. fixed (0) = today's thresholds only; vk (1, default) =
+the driver's budget for the process (VK_EXT_memory_budget); os (2) = the same, but at most the main
+heap less what the other processes hold on the adapter (PDH's GPU Adapter Memory less GPU Process
+Memory, sampled once a second on a low priority thread of its own, started on first use). The
+environment takes the name or the number, the debug server's `switch` the number. Once a second the
+driver's count of the main heap for the whole process (pool, frees in flight, block slack and the
+driver's own memory included) is held under the budget less FRITCHII_VRAM_HEADROOM_MIB: past it the
+cache's critical memory comes down by the excess (at most 1 GiB a second, never under half the
+budget; expected keeps its distance), with room again it goes back up 256 MiB a second (dead band
+half the headroom) until the base thresholds rule again. While the usage is past the target or the
+cap binds ("pressure"): the collector deletes past critical as with FRITCHII_TC_COLLECT_OVER, the
+image pool fits the room as with FRITCHII_VRAM_POOL_FIT, kept blocks go back, and
+FRITCHII_TC_CRITICAL_ENFORCE=1 acts. Why: the thresholds followed the budget only below Fritchii's
+7,680 MiB ceiling and in the cache's view of the usage; a 16 GB RX 9070 XT at 4K reached the budget
+with the cache at 7-10 GB, the driver lowered the budget and moved ~10 GB to system RAM (two 15-16 s
+freezes); a 5-7 GiB VRAM hog dropped the budget to ~11.6 GB and nothing followed. Costs nothing
+while the usage stays under the target (RTX 4080 at 1080p: ~7 GB under it). Log: "VRAM budget
+control (vk|os): driver usage U MiB of budget B MiB (vk, os, other processes), headroom H MiB:
+pressure on|off, cap on|moved|off; texture cache T MiB, expected, critical (base)". Under
+EDEN_NX2_VRAM_LIMIT_MIB + FRITCHII_VRAM_SIM_OTHERS use vk: os would count the other programs twice.
+
+### FRITCHII_VRAM_HEADROOM_MIB
+
+Default 0 = auto (helper CX, 2026-11-16). Live: the margin under the budget where
+FRITCHII_VRAM_BUDGET_MODE starts shrinking the caches. Auto: 1/16 of the budget, 256 MiB to 1 GiB
+(~950 MiB on a 16 GB card, ~450 MiB on an 8 GB one).
+
+### FRITCHII_TC_CRITICAL_ENFORCE
+
+Default 1 (helper CX, 2026-11-16). Live: before an image is made with the texture cache past its
+critical memory, clean images (no GPU writes: no download, no wait) idle for 10+ frames and not
+bound as render targets are deleted until the cache is back under critical with room for the new
+one (at most 32 a pass, 256 a frame, the 512 oldest looked at). 0 = off; 1 = only while
+FRITCHII_VRAM_BUDGET_MODE reports pressure; 2 = whenever past critical. Why: the collector runs once
+a frame with a bounded number of deletes; an area load makes dozens of images in one frame on a card
+already at its budget (a 1365^2 image create took 11.9 s while the driver made room). Counted in the
+FRITCHII_VRAM_OWNERS line: "evictions before creates P passes, N images, M MiB, S short, C at the
+frame cap".
+
+### FRITCHII_VRAM_OWNERS
+
+On by default every 10 s (helper CX, 2026-11-16). Live: seconds between lines, 0 = off. One line
+with who holds device memory next to the budget: "VRAM owners: main heap U of B MiB budget (S MiB
+heap): texture cache images, deleted images still allocated, image pool, frees in flight, buffers
+and the rest (buffer allocator), unused space in allocator blocks, kept blocks, outside the
+allocators (the driver's: pipelines, descriptors, swapchain, its own); staging pool (any heap);
+texture cache N images (GPU-written, unbacked), its view, expected, critical (base, budget cap on);
+budget mode, budget (vk, os, other processes), headroom, last 10 s: peak usage, lowest budget,
+seconds over budget less headroom, seconds over the budget; evictions before creates". Costs a walk
+of the live images every 10 s.
+
+Since helper DC (2026-11-17) the staging part ends in "block slack by pool: main allocator default
+D MiB (B MiB in N memory objects, H holes, largest on the heap L MiB), depth pool (type T) ...,
+colour pool ..., sparse pool ..., buffer pool ...; buffer allocator default ..., buffer pool ...":
+the unused space of each allocator's block vectors on the main heap (a pool shows only once it has
+blocks). "default" is each memory type's own blocks plus dedicated allocations (which add no unused
+space). A pool whose largest hole equals its block size (64 MiB depth/colour, 16 MiB sparse/buffer)
+holds an empty block. The buffer allocator is walked only when the back is its user ("not walked
+(the memory stage holds it)" otherwise). Costs one walk of every block (VMA's statistics) of each
+allocator every 10 s.
+
+### FRITCHII_VRAM_TRIM
+
+Helper DC, 2026-11-17. Live: 0 off, 1 auto (default: 90 with the small card profile on, otherwise
+off), 2-100 = percent of the budget, on any card. Every 60 frames, while the main heap's usage is
+at or above that share of its budget, each allocator gives back the empty block VMA keeps in each
+block vector (each memory type's default blocks, the depth, colour, sparse and buffer pools; up to
+32-64 MiB each). VMA keeps one empty block per vector and frees it itself only once the usage is
+past the budget, when Windows may already move memory to system RAM. How: a 256-byte allocation in
+the fullest block with room (NEVER_ALLOCATE, best fit), freed at once: VMA then deletes the last,
+empty block (VmaBlockVector::Free). Memory that held nothing; the cost is a driver allocation when
+that vector needs a block again. The buffer allocator is trimmed only when the back is its user.
+Log: "VRAM trim (FRITCHII_VRAM_TRIM at P% of the budget): main heap U of B MiB, gave back X MiB of
+empty blocks (main allocator M MiB, buffer allocator N MiB); session S MiB in K trims" (the first
+8 trims, then at most every 10 s). Test: FRITCHII_VRAM_TRIM=40 on the 16 GB card makes it act at
+the market (usage ~7.5 of ~15.3 GiB).
+
+### FRITCHII_DEPTH_POOL_FIT, FRITCHII_DEPTH_POOL_SMALL_BLOCK_MIB
+
+TEST, off by default (helper DC round 2, 2026-11-17). FRITCHII_DEPTH_POOL_FIT (live, bits): how
+depth targets are placed in the depth pool (EDEN_NX2_DEPTH_POOL). Why: batch 29 at the market had
+the depth pool at 1152-1280 MiB in 18-20 blocks of 64 MiB with 529-727 MiB of it in 76-177 holes
+(largest 33-62 MiB): OoT makes depth targets sized by screen bounds (per-NPC D32 targets, shadow
+cascades) next to large long-lived ones, so a freed target's hole rarely fits the next one, and a
+small long-lived target pins a whole 64 MiB block.
+- 1 = size classes: the allocation is rounded up to one of four classes per power of two (at most
+  a quarter more, ~1/8 on average), so the hole a freed target leaves fits the next target of its
+  class. The padding counts as allocated to VMA; the owners line shows it ("depth fit ... padding
+  of live images P MiB"): compare slack + padding, not slack alone.
+- 2 = small depth targets (rounded size at most a quarter of FRITCHII_DEPTH_POOL_SMALL_BLOCK_MIB,
+  boot, default 16, 4-64) go to a depth pool of their own with blocks of that size: they no longer
+  fill holes large targets need, and a long-lived small one pins 16 MiB instead of 64. The owners
+  line's split shows it as "small depth pool".
+- 3 = both.
+Images made before a change stay where they are. A depth image the driver requires in memory of
+its own, or larger than a pool block, goes the old way ("handed back" in the owners line). Only
+where the memory sits changes; the image, its contents and its layouts are the same. Cost: none
+expected (the same requirement queries VMA makes); the small pool makes a 16 MiB block more often
+early on (a driver allocation each), so read Hitch lines and EDEN_NX2_IMAGE_ALLOC_TIMING.
+
+### FRITCHII_VRAM_HOLES
+
+Diagnostic, off by default (helper DC round 2, 2026-11-17). Live: 1 = every owners line
+(FRITCHII_VRAM_OWNERS) ends in "holes (FRITCHII_VRAM_HOLES) main allocator: <vector>: N blocks M
+MiB; holes <64K a/b MiB, <256K ..., ...; allocations by the same classes; blocks at least half
+free K (S MiB) held by A allocations B MiB: depth, colour, other images, buffers and untyped; their
+sizes ...; their ages <10 s, <1 min, <5 min, older, unknown" for each block vector of the main
+allocator on the main heap ("default (type T)", "depth (type T)", "depth small", "colour",
+"sparse", "buffer"). The half-free blocks' allocations are what keeps unused memory from going
+back: their kind, size and age say which images to move or separate. Ages come from a stamp every
+image allocation carries in its VMA user data. Images placed by FRITCHII_DEPTH_POOL_FIT or the
+colour pool count as "untyped" (made with vmaAllocateMemory); their pool label says what they are.
+Cost: builds VMA's detailed map (JSON of every allocation) each line: several ms on the GPU back
+thread every 10 s. Only for measuring.
+
+### FRITCHII_VRAM_PACK
+
+Helper DC, 2026-11-17. Live: 0 off, 1 on, 2 auto (default: on with the small card profile on).
+Buffers (both allocators, the separate buffer pool included) and memory commits take the
+best-fitting hole of a block (VMA's MIN_MEMORY strategy, which images always use) instead of VMA's
+default, which cuts them from a hole of the next larger size class and so splits the big holes the
+next large buffer needs. Only the place in a block changes; the search is CPU time (no new device
+memory). Read the owners line's "buffer allocator default / buffer pool" slack with 0 and 1.
+
 ### FRITCHII_VRAM_SIM_OTHERS
 
 TEST, off by default (helper BF, 2026-11-16; boot, with EDEN_NX2_VRAM_LIMIT_MIB). 1 = the simulated
@@ -682,6 +1058,442 @@ request). Log: "Staging ring in 10 s (FRITCHII_STAGING_RING=N): U uploads (X MiB
 ring; R refused (B while an upload over half the ring was in flight), C staging buffers made after a
 refusal".
 
+### FRITCHII_ZERO_UPLOAD
+
+TEST, off by default (helper CJ, 2026-11-16, Castle Town load burst). Live. 1 = a whole texture
+upload whose guest bytes are all zero becomes a GPU clear to zero; 2 = count only (the check runs,
+the upload runs as before). Exact: zero bytes untile to zero texels, and the clear writes zero in
+every level and layer, as the upload's copies do. Only plain uncompressed single-sample images of
+256 KiB or more whose host image is the guest image (not converted, GPU-decoded, sparse, scaled,
+padded, or with trimmed levels); a slice of a deep 3D texture (guest footprint over 2x its texels)
+is not checked. The check reads the bytes the upload would read and stops at the first non-zero
+4 KiB. Why: every Castle Town load made a 12288x12288 D16 target whose 288 MiB of never-written
+guest memory was uploaded (102 ms on the front, 9 new 32 MiB staging buffers, 132k page faults),
+plus fresh render targets uploaded from zero memory. The clear saves the staging buffers, their
+first-touch faults, the untiling and the GPU copy; the read of the guest pages stays (their own
+faults included). Log: "Zero uploads in 10 s (FRITCHII_ZERO_UPLOAD=N): Z uploads all zero (X MiB
+guest, checked in T ms), cleared on the GPU; D had data (Y MiB looked at before the first non-zero
+byte, T2 ms); S not checked (3D slices)", a "Zero upload:" line for each of the first 40 zero
+images of 4 MiB or more, and "zero checks of texture uploads" in the hitch line.
+
+### FRITCHII_STALE_ZERO
+
+On by default (helper CV, 2026-11-16, dialogue text corruption, zortos293/Lichii #1310). Live. An
+image made where a GPU-written image was dropped without a write-back skips its upload (the stale
+skip, EXP78 / EDEN_NX2_TC_SKIP_STALE): the guest bytes there are older than the GPU's writes. It
+started undefined, which in practice is whatever its device memory held last: with the EXP42 pool,
+another deleted target's texels (other text, symbols, noise). With 1 it is cleared to zero in every
+level and layer instead (uncompressed, unconverted, single-sample images; others stay undefined).
+Still not the GPU's data (that was dropped; see FRITCHII_LOST_WRITEBACK), but transparent black
+instead of another image, and it no longer changes between re-creations. Cost: one transfer clear
+per skipped upload, which replaced a full upload. 0 = undefined as before.
+
+### FRITCHII_LOST_WRITEBACK
+
+On by default at 1024 (images up to 1 MiB; helper CV, 2026-11-16, round 2; zortos293/Lichii #1501's
+idea). The default was 1 (every size) for one build: the market toggle 0/1 measured 72.1 -> 68.9 fps,
+1% 54.1 -> 42.6, up to 6.1 GiB written back per 10 s (big targets the cold sweep drops); 0/1024 measured
+73.2 / 73.6, 1% 54.8 / 56.3, and still covers the text targets (~0.5 MiB). Live. A correctness
+fix: a GPU-written image that the cold sweep (EXP58's superseded deletes included),
+FRITCHII_SWEEP_SUPERSEDED, EXP64's slot retire or the collector (bad overlaps) is about to delete
+is written back to guest memory first, on the collector's download queue (EXP121's): the landing
+deletes it and clears its stale marks, so an image made there later uploads the GPU's pixels
+instead of skipping the upload (the stale skip) and showing nothing or other memory. The owner's
+gallery session (build 21): OoT draws each dialogue/choice button's text once into a 1136x120 target
+and samples it as 1133x120; hidden UI (left stick) left it untouched for 4 frames, the cold sweep
+dropped it, and on unhide the text was junk (FRITCHII_STALE_ZERO=0) or blank (=1).
+Used again before the landing (bound, sampled, drawn), the image simply stays. With no room in the
+queue (64 entries, 256 MiB) the image is kept for a later pass. Deleted as before: images the CPU
+wrote since (nothing GPU-only in them), allocation failures, a newer write-back over some of its
+bytes (recent ring of 256), or an overlap downloaded since its queueing (refused). Relocation
+(EXP43) is not written back (the image moves, ~10 a frame while the camera moves); instead a loss
+the counter blames on a relocation guards that shape and address from relocating again.
+1 = every image; N > 1 = only images up to N KiB (a cost cap for A/B: 1024 covers the text
+targets); 0 = off (drops as before). Cost: one GPU copy plus a CPU swizzle per written-back image,
+on the GPU thread at the landing; the "Lost contents" line gives MiB per path.
+
+Lost contents counter (always on, needs the stale page marks, i.e. EXP78 on, the default): every
+10 s with anything to say, "Lost contents in 10 s (FRITCHII_STALE_ZERO=Z, FRITCHII_LOST_WRITEBACK=W):
+images made over memory whose GPU data was dropped: S upload skipped (C cleared to zero), U uploaded
+stale guest bytes; O overwritten whole first; SAMPLED with lost contents: N (A not drawn into, B
+drawn over; K KiB; G were read in a later frame before the drop) by drop: collector, cold sweep,
+superseded sweep, slot retire, join, relocation, unmap/unmap sweep, other, not recorded; relocation
+guards R; write-backs queued/landed: collector Q/L (M MiB) refused F kept K over cap C; cold sweep
+...; superseded sweep ...; slot retire ...". SAMPLED is the number that shows on screen: an image
+sampled before anything overwrote it whole. The first 40 get a "Lost contents sampled:" line with
+the image (format, size, address) and the drop that left its memory stale (path, the dropped
+image's format, size and address, frames since, its guard bits).
+
+### FRITCHII_SIBLING_CENSUS, FRITCHII_GPU_SIBLINGS_FREE
+
+TEST, off by default (helper DE, 2026-11-17). The pinned GPU threads own a whole physical core each
+(front 0xc, back 0x30 on a 7800X3D) and use one of its two logical processors. The other one is in
+no thread's mask, so it is often the only idle logical processor, and unpinned busy threads
+(VulkanWorker ~400 ms/s at Critical priority, GPUFencingThread, VulkanPresent) land on it and share
+the GPU thread's core.
+
+- FRITCHII_SIBLING_CENSUS=1 (boot, a dry counter, changes nothing): the Pulse line (once a second)
+  ends with "; GPU cores (FRITCHII_SIBLING_CENSUS): front core 0xc busy B, GPU T, others O ms/s; back
+  core 0x30 busy B, GPUBack T, others O ms/s; R core ... ; VulkanWorker N/s on front/back/R cores
+  a/b/c%; GPUFencingThread ...; VulkanPresent ...; FRITCHII_GPU_SIBLINGS_FREE=V". busy = both logical
+  processors of the core (NtQuerySystemInformation, DPCs and interrupts included), T = the pinned
+  thread's own CPU time, others = what else ran on the core. The noted threads count where they woke
+  up for each unit of work (a worker chunk, a fence batch, a present).
+- FRITCHII_GPU_SIBLINGS_FREE (live, default 0): 1 = VulkanWorker, GPUFencingThread and VulkanPresent
+  keep off the pinned GPU threads' cores (BackgroundWorkCpuMask, as HostTiming's spin and the
+  pipeline workers already do); back to 0 = every CPU the process may use. Applied by each thread at
+  its next unit of work. Judge it on the back's and front's ms/s and us a draw (2 cycles), then fps.
+  2 (round 2) = 1, and once a second the Pulse thread also moves every other thread of the process
+  that nobody placed (still on the whole process mask: driver threads, audio, VSync, image frees,
+  the Pulse thread...) to the same mask; the pinned GPU threads, anything with a narrower mask
+  (guest cores, E2) and the threads that place themselves (HostTiming, VkPipelinePrebuild,
+  VkPrecompile, the three above) are left alone. Back to 0 or 1 gives the moved threads their old
+  mask (unless something changed it since). Needs the Pulse thread (on by default). 1 and 2 are
+  refused (one log line, nothing changes) when the mask would leave fewer than 8 fast logical
+  processors (MinAutoGuestProcessors + 2): a 7800X3D keeps 11 (on), a 6-core with SMT 7 (off), 8
+  cores without SMT 5 (off).
+- Round 2 census: each core also shows "(DPC+ISR D)" (that core's DPC and interrupt time, part of
+  others) and ", own threads allowed there T ms/s in N: name a, name b, name c": the process's
+  busiest threads whose mask lets them onto the core's free hardware thread (named by their
+  description, else "tid N module.dll" from their start routine). Windows does not say where a
+  thread ran without a kernel trace, so these are the candidates, not a split. The pinned threads
+  are read by thread id, the latest thread pinned to a role (round 1 read the first: R showed 0).
+
+### FRITCHII_CB_MERGE
+
+TEST, off by default (helper DE, 2026-11-17). Live, 1 = dry count (changes nothing). The game
+writes constant buffer data as an offset write plus 1-4 words, so FRITCHII_CB_WORDS_BLOCK's blocks
+hold ~1.9 words: ~1M blocks a second, each run by E on its own. When a block opens, the front looks
+at the ring words since the previous block (at most 32): joinable when they are only constant buffer
+offset (or address/size) writes. E times 1 block in 16 by size and the offset-only Pairs entries.
+Line every ~10 s after the CB words block line: "CB merge (FRITCHII_CB_MERGE=1, dry) S s: blocks
+opened after a block N/s: joinable J/s (offset only, with address/size; W writes between), nothing
+between, blocked by other entries; E: blocks of 1/2/3-4/5+ words a/b/c/d ns, offset-only pair
+entries P/s at G ns; fixed part a block F ns; E saving if joined L to H ms/s". F = 2a - b (the
+per-block cost a merged entry would pay once), L = J x F, H = J x (F + G). Gate 1 needs L >= 5 ms/s.
+
+Round 3 (the lever itself): 2 = verify, 3 = on. A constant buffer size/address/offset register
+write that would go as a Pairs entry right after an open CbWords block (the block still the ring's
+last entry, same engine, no CB_WORDS_BLOCK=2) goes into the block instead, as a Sink-tagged Method
+word; the block's header gets CbJoined. E runs a joined block as runs of constant buffer words
+(exactly as ExecuteCbWords runs them) and each joined write as its Pairs entry ran (ConsumeSink,
+ApplyPairs), in ring order. Same words, same values, same order, same registers: only the entry
+boundaries move. 2 also puts a marker and the front's address of each joined run's first word in
+the block; E compares it with where that word goes on its registers (const_buffer address +
+offset after the joined writes): "differ" must stay 0, as must "bad words" (anything else in a
+joined block). Not joined (sent as before) while the memory stage's ring or the E split runs:
+their readers take every block word as a constant buffer word. At 3 the dry counters stay off.
+Line every ~10 s: "CB merge (FRITCHII_CB_MERGE=N) S s: front joined writes J/s, refused R/s, run
+marks M/s (not marked K/s); E: joined blocks B/s, joined writes W/s; session: runs checked C, must
+be 0: differ D, bad words X". Judge on E's ms/s ("method" and "cb upload") and us a draw.
+
+### FRITCHII_QUERY_FLUSH_DRY
+
+TEST, off by default (helper DE, 2026-11-17). Live, a dry timer that changes nothing. The front's
+report DMA flush (QueryDma::FlushPending in a split Run, the 0xe2c path) lends
+RasterizerVulkan::FlushQueryResults to R: E parks until R reaches it and asks its query cache
+(SemiFlushRegion). kaksample2 (unprofiled CPU sample, Kakariko): ~30 ms/s of E parked there,
+while R finds reports to wait for under once a second; the profile's lends line misses these.
+Per lend: E's parked time, whether R found reports in the range, and whether E's own
+report-landing pages (POST_FENCE, OneFollower::ReportLandingClear) call the range clear. Line every
+10 s: "Query flush lends (FRITCHII_QUERY_FLUSH_DRY=1) S s: N/s, E parked T ms/s (U us each); R found
+reports in F/s; E's landing pages clear for C/s (ms/s), R found reports in X/s of them (must be 0
+to skip on it; total since boot); ceiling (clear, nothing found) Y ms/s". Gate 1: Y >= 5 and X = 0.
+
+### FRITCHII_QUERY_LEND_DRY
+
+TEST, off by default (helper DE, 2026-11-17, round 5). Live, a dry timer that changes nothing.
+kaksample2 (unprofiled CPU sample, Kakariko): E parked ~23 ms/s in Query lends. Per lent Query on
+E: why it was lent (which rule kept it from the posted paths: fence payload with SEM_E's path off
+or not clean, fence counter report with POST_FENCE_REPORT off, of a type that lands at once, or
+not clean, plain payload release, plain report, report on a registered buffer page), E's parked
+time, and whether the report's page is one the front's DMA reads snapshot (FrontReadPagesAny; a
+posted report there is read stale by the front unless the front also waits for R). Line every 10
+s: "Query lends (FRITCHII_QUERY_LEND_DRY=1) S s: N/s, E parked T ms/s by why lent; <why> n/s t ms/s
+(front read page f/s); ...". Gate 1 per kind: t >= 5 ms/s; f must be 0 for that kind to be posted
+without a front wait.
+
+Round 5 also adds to EDEN_NX2_PROTECT_STATS=1 (boot) a line "Page protection on GPUBack (E, 5 s,
+per second): protect N calls T ms, unprotect ...; protects of a page E unprotected 0-1 frames
+before R calls T ms, with their unprotects ~P ms": E's share of the protect/unprotect cycle and
+EXP89=1's (lingering protection, live) ceiling on E. EXP89 changes nothing the guest reads (page
+contents are never touched; a guest store to a lingering page traps and goes through the
+handler, then the page is released at the frame's sweep): its cost is in the Store memo line's
+trapped stores, and "left after unmap" must stay 0.
+
+### FRITCHII_EXTENT_CENSUS
+
+TEST, off by default (helper DK, 2026-11-17; design: helper DJ, flower read-back dip). Live, log
+only. A native compute program's storage pointer has no size, so a dispatch whose store extent is
+unknown marks the whole FRITCHII_BARE_SSBO_MIB window (16 MiB) GPU-written. The store analysis
+(StoreExtentAnalysis) now keeps its first exit per buffer (Shader::ExtentUnknownWhy, not stored
+with the info: programs from the precompiled cache have "not recorded", so boot with
+EDEN_NX2_PRECOMPILED_FAST=0 for the reasons). Set at boot it also turns the read ring on
+(FRITCHII_READ_RUNS=1's) to rank by read-back waits; live it only ranks by bytes. Every 10 s:
+"Extent census (FRITCHII_EXTENT_CENSUS) last S s: N native written bindings a second, F of them
+marked in full (M MiB/s) over B program bindings; extent unknown U/s, X/s of those with no reason
+recorded (must be 0 with EDEN_NX2_PRECOMPILED_FAST=0) | read-back waits W ms a frame over K
+writers", then the top 8 writers by read-back wait ms a frame ("Extent census read-back i/n: ...",
+any writer: a bare native binding gets the full line below, others a short line naming their kind),
+then the top 8 others by bytes marked in full ("Extent census marked i/n: ..."). Full line:
+"program <hash> binding <ssbo> (pointer cX[0xY]) | read-back R reads, W ms a frame | D
+dispatches/s, F full-marked/s, M MiB marked/s (K KiB binding) | why unknown: <reason> | full mark
+because: unknown, indirect grid, 16-bit guard or dims, distrusted, checking new dims, proof covers
+the binding | cbuf extent: <terms or none> | shared extent: <FRITCHII_EXTENT_SHARED's proof, not
+tried or refused: reason> | guard extent: <FRITCHII_EXTENT_GUARD's proof, not tried or refused:
+reason>". Reasons: "index from a constant buffer word cI[0xO]" (which word),
+"index loaded from memory (<opcode>)", "loop-carried index", "index from an atomic", "signed or
+64-bit math (<opcode>)", "variable times variable", "instruction not bounded (<opcode>)", "a store
+stays global", "pointer picked at run time", and the analysis' other exits by name. "cbuf extent"
+is what FRITCHII_EXTENT_CBUF would use (each word with its stride). Cost off: two atomic loads per
+native written binding.
+
+### FRITCHII_EXTENT_CBUF
+
+TEST, off by default (helper DK, 2026-11-17; design: helper_dj_answer.md fix 1). Live for the
+marks; =3's read counts need it at boot (the read ring turns on at its first use, as
+FRITCHII_READ_RUNS=1 does, and logs its own lines too). For written native buffers whose store
+extent is unknown, a second store analysis (terms mode, translation only, plain extents unchanged)
+takes constant buffer words read at an immediate offset as terms: offset <= ids bound + sum(stride
+x word). At bind the words are read from game memory like the pointer word; a word on a GPU-written
+page is "fallback" (full mark, as today); a 16-bit guard past 2^16 or an indirect grid is
+"unresolved". Not stored with the info: boot with EDEN_NX2_PRECOMPILED_FAST=0.
+- =3 dry: marks stay full; each write mark carries where the proof would end it. Reads that go to
+  the back are sorted by their newest mark: inside the proof, would be freed (past it and no older
+  mark in the ring covers the bytes, marks with a proof cut at their proof), or past it but under an
+  older mark (same writer / another). Must be 0: "freed reads whose bytes changed at landing" (the
+  read's own bytes, before the wait against after it: a change means the GPU wrote there and the
+  proof would have served stale bytes).
+- =1 live: the proof becomes the mark through the ExtentTrust checks (each program marked in full
+  and checked at new dims, distrusted for the session on a write past it: "Compute write extent too
+  small" in the log, "distrusted" in the census). Must be 0 there, then the flash watch and the
+  white-leaves spot.
+Line every 10 s per top program binding: "Extent cbuf (FRITCHII_EXTENT_CBUF=M) i/n last S s:
+program <hash> binding <ssbo> | cbuf extent <terms> | dispatches/s: proof P, fallback F,
+unresolved U, marked by the proof (=1) L | proven K KiB of B KiB on average | reads to the back by
+its marks (=3): inside the proof I (ms a frame), would be freed R (ms a frame), past the proof but
+under an older mark of the same writer / another writer | must be 0: freed reads whose bytes
+changed at landing X of Y compared (inside: ...)". The freed ms a frame is the ceiling of =1 for
+that program. With no binding to try: "Extent cbuf (...) last S s: no native written binding had a
+cbuf extent; extent unknown U dispatches/s, X/s of them with no reason recorded".
+
+### FRITCHII_EXTENT_SHARED
+
+TEST, off by default (helper DO, 2026-11-17; design: helper_dn_answer.md section 3, the flower
+writer 989e109982cb409b). Live for the marks; =3's read counts need it at boot (as
+FRITCHII_EXTENT_CBUF=3). Some programs park an offset they computed from their ids (a record
+offset) in their own shared memory slot and load it back before storing through it; the store
+analysis saw "index loaded from memory (LoadSharedU32)" and the dispatch marked the whole 16 MiB
+window. For written native buffers whose plain and cbuf extents both stayed unknown, a third store
+analysis (translation only, plain and cbuf extents unchanged) follows such a load to the values
+stored there, when (SharedSlots, global_memory_to_storage_buffer_pass.cpp):
+- every shared write and atomic of the program has an exact address c . tid + k (no 32-bit wrap
+  for any invocation), all with the same non-negative coefficients (multiples of 4), and the slots
+  never overlap: widened to whole words, with `span` from the lowest to the highest byte, the
+  dimensions of more than one invocation sorted by coefficient each step past what the smaller ones
+  reach (c1 >= span, c2 >= c1 (w1 - 1) + span, ...) and the last slot ends inside the program's
+  shared memory. Else "shared memory not one slot per invocation";
+- the load (32-bit) has the same coefficients, and only 32-bit stores of exactly that word write
+  it (else "loaded shared word also written another way": another width or an atomic), one of
+  them before the load on every path (else "loaded shared word not stored before the load").
+Then the loaded value is the newest of those stores' values on the invocation's own path (no other
+invocation writes the slot, an invocation sees its own writes in order), so it is bounded by the
+largest of them. The result is a cbuf extent flagged via_shared: this switch, not
+FRITCHII_EXTENT_CBUF, decides whether it is used. Not stored with the info: boot with
+EDEN_NX2_PRECOMPILED_FAST=0. FRITCHII_STORE_FOOTPRINT's footprints follow the same loads (always:
+the footprint is only used under that switch).
+- =3 dry: as FRITCHII_EXTENT_CBUF=3 (marks stay full, the read ring counts the reads the proof
+  would free). Must be 0: "freed reads whose bytes changed at landing".
+- =1 live: the proof becomes the mark through the ExtentTrust checks (new dims marked in full and
+  checked, a write past the proof distrusts the program: "Compute write extent too small" in the
+  log, "distrusted" in the census). Must be 0 there; then the flash watch and the flower spot.
+Lines every 10 s per top program binding: "Extent shared (FRITCHII_EXTENT_SHARED=M) i/n last S s:
+program <hash> binding <ssbo> | shared extent ids only (end E + local X/Y/Z + group X/Y/Z) | ..."
+(the rest as the "Extent cbuf" line). With none to try: "Extent shared (...) last S s: no native
+written binding had an extent proven through shared memory slots; refused R dispatches/s (the
+census' shared extent says why); ...". The census lines end in "| shared extent: <proof>", "not
+tried" or "refused: <reason>". 989e's expected proof: end 0x138 + local 0x140 + group 0x5000, so
+0x5000 x grid_x - 8 bytes past the pointer (20 KiB a workgroup) instead of 16 MiB.
+Test block (nx2_switches.txt): EDEN_NX2_PRECOMPILED_FAST=0, FRITCHII_EXTENT_CENSUS=1,
+FRITCHII_EXTENT_SHARED=3 at boot (flower save, a few cuts), then live 0/1 with profile_toggle.
+=3 at boot also turns on the write marks' ticks (FRITCHII_READ_RUNS=2's, counter only: a read's
+host wait is split at older ticks, the total stays). For the reads past a proof but under an older
+mark, each such "Extent shared"/"Extent cbuf" line is followed by "Extent ... i/n with the proof:
+its reads would wait X ms a frame instead of Y (freed reads as 0, covered reads until their cover
+ran: timed T, untimed U kept as waited; the timed ones A instead of B) | covered by N writers:
+<kind> <program> binding <b>: R reads, W ms a frame, timed T would wait A ms a frame instead of B
+(why unknown: <census reason>, F full-marked/s, pointer cI[0xO])" for the top 4 covers. The cover
+is the newest mark still over the read's bytes once marks with a proof are cut at their proof;
+"would wait" ends the read's host wait when that mark's submission ran (an older tick of the same
+queue, timed on the reading thread before its own wait). With FRITCHII_EXTENT_CBUF=3 alone the
+covers are named but untimed unless FRITCHII_READ_RUNS=2 is on at boot.
+
+### FRITCHII_EXTENT_GUARD
+
+TEST, off by default (helper DT, 2026-11-17; design: helper_do_answer.md round 2, the 8 covering
+writers of the flower reads). Live for the marks; =3's read counts need it at boot (as
+FRITCHII_EXTENT_SHARED=3, write ticks included). GPU append lists (ballot, popc, the leader's
+atomic on a counter, a shuffle broadcasting the old count, index = old + the lane's place) store
+behind a capacity check (`if (index < cap) store [list + index * 4]`, or an early exit), so the
+index has no bound of its own ("index from an atomic", "instruction not bounded (ShuffleIndex)")
+and the dispatch marked the whole 16 MiB window. For written native buffers whose plain, cbuf and
+shared extents all stayed unknown, a fourth store analysis (terms mode, translation only, the
+other extents unchanged; GuardFacts in global_memory_to_storage_buffer_pass.cpp) adds:
+- path facts: the structured control flow's conditional edges (If, Break, Repeat, each checked
+  against its header's two successors). An edge H -> T holds for a store when T dominates the
+  store's block and every other predecessor of T is dominated by T, so every path to the store
+  entered T through H -> T and the condition held there. `x < K`, `x <= K`, `K > x`, `!(x >= K)`,
+  `x == K` (unsigned) bound x by K - 1 (or K) when x is defined outside every loop (one value per
+  invocation, the one compared) and K is bounded (an immediate, a constant buffer word read at
+  bind time, ...). `x - d < K` bounds x by K - 1 + d (a wrap makes the compare fail). Refused:
+  signed compares ("signed guard on a possibly negative index"), `x + c < K` with c > 0 or a
+  variable ("guard on the index plus a value that may wrap"), a limit loaded from memory ("guard
+  limit not bounded (LoadGlobal32)"), x defined in a loop ("guarded index redefined in a loop"),
+  a compare whose edge does not cover the store ("a branch compares the index but the store is
+  reachable around it");
+- phi pruning: a phi's incoming edge that needs an atom (a compare, ...) to have the other value
+  than one of the store's path facts is dropped when that atom has one value per invocation
+  (predicated `@!P mov` before `@!P st`: the old register value never reaches the store);
+- a subgroup shuffle is bounded by its operand's bound at the largest local ids (operand evaluated
+  without the path facts: the source lane may not run the store; a shuffle from an inactive lane
+  is undefined, as in the guest program); a bit count is at most 32;
+- clamps: word - v (also -v + word) is at most the constant buffer word while the word is at least
+  v's largest value (a floor, checked at bind: below it the extent is unknown), as in
+  min(atomic, capacity - count).
+The result is a cbuf extent flagged via_guard: this switch, not FRITCHII_EXTENT_CBUF, decides
+whether it is used. Not stored with the info: boot with EDEN_NX2_PRECOMPILED_FAST=0.
+- =3 dry, =1 live: as FRITCHII_EXTENT_SHARED (ExtentTrust checks for =1, must be 0: "Compute write
+  extent too small", "distrusted" in the census, "freed reads whose bytes changed at landing").
+Lines every 10 s per top program binding: "Extent guard (FRITCHII_EXTENT_GUARD=M) i/n last S s:
+program <hash> binding <ssbo> | guard extent end E + local X/Y/Z + group X/Y/Z + words: <terms>
+(needs cI[0xO] >= min) | ..." (the rest as the "Extent cbuf" line, then the "with the proof" line).
+With none to try: "Extent guard (...) last S s: no native written binding had an extent proven
+with its stores' path facts; refused R dispatches/s (the census' guard extent says why); ...".
+The census lines end in "| guard extent: <proof>", "not tried" or "refused: <reason>".
+Test block (nx2_switches.txt): EDEN_NX2_PRECOMPILED_FAST=0, FRITCHII_EXTENT_CENSUS=1,
+FRITCHII_EXTENT_SHARED=3, FRITCHII_EXTENT_GUARD=3 at boot (flower save, a few cuts).
+
+### FRITCHII_STORE_FOOTPRINT
+
+TEST, off by default (helper DM, 2026-11-17; design: helper_dl_answer.md item 1; live modes:
+helper_dm_answer.md round 2). Arm at boot, then live:
+- Arm: any non-zero value at boot (read at the first native written dispatch). Armed, the buffer
+  cache keeps a shadow of gpu_modified_ranges (store_footprint_live.h FootprintShadow, told about
+  every Add, Subtract and Clear of the set): `unclaimed` = bytes some mark without a footprint made
+  GPU-modified since they were last clean; one entry per footprint (program binding + pointer
+  phase) = bytes its marks made GPU-modified. Only 3 at boot turns the read ring on (the dry lines
+  below, and FRITCHII_READ_RUNS=1's); 1 or 2 at boot arm without the ring. Not armed: nothing
+  changes, whatever the live value.
+- Live (debug-server switch FRITCHII_STORE_FOOTPRINT, read at each guest read; starts at the boot
+  value): 0 = as before; 1 = a guest read whose GPU-modified bytes are all held only by entries
+  whose footprints exclude them (none unclaimed) is answered from guest memory at once: no GPU
+  write since those bytes were last clean touches them. Nothing else changes (sets, downloads,
+  fences as before the read); the read's pages get their read traps back (the core took them for
+  this read) so a later read of a GPU-written byte there still traps; the core may keep only the
+  read's own bytes as its read area. 2 = as 1, plus every 16th such read waits as before and
+  compares its bytes before the wait with after the landing (must be 0: "would have differed"),
+  plus every locked download landing compares what it writes over claimed-outside bytes with guest
+  memory (first 256 KiB of each landing; must be 0). 3 = dry count only (needs 3 at boot).
+- A/B in one session: boot 1 (or 2), then live 1 <-> 0 (no ring on either side); or boot 3 and
+  live 1 <-> 3 (ring on both sides, the dry lines too).
+- Footprints with a modulus that isn't a power of two (0x110, 0x120 records) are used as they are
+  only when every store offset comes from the ids alone and the plain store extent at the
+  dispatch's dims keeps pointer offset + extent within 4 GiB (no 32-bit wrap); otherwise the bind
+  uses the footprint modulo the modulus' power-of-two part (counted "reduced").
+- Line every 10 s while armed: "Store footprint live (FRITCHII_STORE_FOOTPRINT=M, armed) last S s:
+  reads asked A | answered from guest memory N (n a frame) | waited as before: inside a footprint,
+  a byte no footprint claims, own bytes not GPU-modified | read trap pages armed again | binds:
+  footprint, reduced to its power-of-two part (wrap not ruled out), none | shadow entries | =2
+  verify: sampled, compared, would have differed (must be 0) | =2 landings: checked (KiB), would
+  overwrite guest bytes outside a footprint (bytes, must be 0)". Errors for each must-be-0 hit (16
+  at most each).
+Dry part (3; waiting and marking unchanged; the marks carry the same footprint the live part
+uses). At translation
+every written storage buffer gets a store footprint (Shader::StorageStoreFootprint, kept with the
+extras: not stored with the info, so boot with EDEN_NX2_PRECOMPILED_FAST=0): each store's offset
+from the pointer word is followed as an exact congruence c + k*m (ExactCongruence in
+global_memory_to_storage_buffer_pass.cpp). Adds, subtractions, products and shifts by constants keep
+it; an unknown value (loaded from memory, a cbuf word, a loop counter, an id) is "anything", and
+times a stride K it is a multiple of K; and/or/xor/shift right/bit fields keep the known low bits;
+select, phi and min/max join both sides. The modulus is the gcd over the buffer's stores, the
+footprint the set of byte residues they hit (up to 8 intervals, gaps filled past that). A modulus
+that is not a power of two (0x330 records) holds only while the 32-bit offset doesn't wrap: the
+landing check below catches it. No footprint when a store stays global, the pointer is picked at
+run time, the program stores to global memory, or a store's address doesn't add the pointer once.
+At bind, every native written binding (one device range) carries its footprint and the pointer's
+device address into its write marks. A read that goes to the back is classed by the newest mark
+over its bytes: inside its footprint; outside it with no older mark in the ring covering the bytes
+(would be answered from guest memory); outside it but under an older mark (inside that one's
+footprint / without one); or a newest mark without a footprint. Must be 0: outside reads whose own
+bytes (up to 64) changed between before the wait and the landing. Lines every 10 s: "Store
+footprint (FRITCHII_STORE_FOOTPRINT=3, dry) last S s: R reads to the back with a write mark over
+their bytes, waited W ms a frame | outside ... (would be answered from guest memory) O (ms a frame)
+| inside I | outside, but an older mark covers them: inside its footprint / without a footprint |
+newest mark without a footprint N | must be 0: outside reads whose bytes changed at landing X of Y
+compared (inside: ...) | program bindings bound B: with a footprint F (claim nothing, power-of-two
+moduli, ids only), without: <reasons>", then the top 8 writers by wait ms: "Store footprint i/n:
+<writer kind> program <hash> binding <b> | waited W ms a frame | outside, inside, covered (inside
+its footprint / without one), no footprint (each with ms a frame) | must be 0: ... | read offsets
+mod the modulus: +0x10 (n), ... | footprint: modulus 0x100, stored bytes +0x20..+0x2f ... | S
+stores, ids only / with loaded/cbuf/loop multiples". The outside ms a frame is the ceiling of a live
+mode for that writer. Cost off (not armed): one atomic load per native written binding, a bool test
+per guest read of GPU-modified pages and per marked binding, a null test per change of
+gpu_modified_ranges.
+
+### FRITCHII_FEEDER_LANE
+
+TEST, off by default (helper DM, 2026-11-17; design: helper_dl_answer.md item 2). Boot (read at
+first use). =1 dry; 2-9 are not built and count as 1. Turns FRITCHII_EARLY_COMPUTE=1's dry count,
+its rings and FRITCHII_READ_RUNS=2's write stamps on (their lines show up too). Would a feeder
+dispatch (a program whose writes the guest reads back) on a second lane, started after its real
+dependencies, finish sooner than on the main queue? At each feeder's bind JudgeEarlyCompute also
+works out D, the newest unrun main-queue work it depends on: the newest unrun write mark over its
+inputs (uniform and texture buffers whole; a native storage binding up to its proven read extent,
+Shader::Info::storage_read_extents, plus its write mark when written; the whole binding when the
+read extent is unknown), the newest unrun use of the ranges it writes (write after read), and its
+own chunk when its bind uploads CPU data (D_copy leaves the upload out: the lane would take the
+copy too). A mark or use of an earlier judged feeder gives that feeder's D, not its tick (chains
+stay on the lane in order). If either ring wrapped before a run entry, D is its own chunk ("ring
+wrapped", not eligible). Images are not in D (a compute-family lane can't take them; counted per
+program). The marks carry D; a read whose pages' newest mark is such a feeder's waits for D_copy,
+then D, then the writer (older ticks of the same queue: the total wait is unchanged). "Predicted
+saving" = from D having run until the writer ran, for reads whose D tick is before the writer's
+(eligible). Lines every 10 s: "Feeder lane (FRITCHII_FEEDER_LANE=1, dry) last S s: P feeder
+programs, J dispatches judged (... uploaded; storage bindings narrowed to a proven read extent k of
+n) | D at the bind: nothing unrun, draw-written buffer, earlier dispatch on the main queue, earlier
+feeder on the lane, copy/query/other, unrun use of its written range, its own upload, ring wrapped
+| reads that waited for them R (W ms a frame), cut at the writer's tick C | eligible E = f% of the
+cut reads | predicted saving X ms a frame (x a read), with the upload on the lane too Y ms a frame |
+D not submitted when waited U | must be 0: D after the writer Z", then the top 6 feeders by wait:
+"Feeder lane i/n: program <hash> | reads waited, cut | eligible share f, predicted saving (and with
+the upload on the lane) | D set by (cut reads): <kinds as above> | D k submissions before the
+writer | binds (uploaded, read extents) | images (not in D): configured, with images, an image's
+last write unrun | D not submitted, must be 0: D after the writer". Uses noted while the bind
+uploads keep D without the upload (a small under-count of chains that upload). Cost off: one atomic
+load per native storage binding.
+
+### FRITCHII_HOSTTIMING_OFF_GPU
+
+TEST, off by default (helper DE, 2026-11-17). Live. 0 (as before): the timer thread's spin goes to
+BackgroundWorkCpuMask at the first spin after any GPU thread pinned, and never again; the GPU
+threads pin one after another at boot, so a spin between the front's pin and the back's leaves it
+allowed on the back's core (b37 census: HostTiming 295-496 ms/s allowed on E's core 0x30). 1: every
+logical processor except the physical cores (both hardware threads) of the pinned front, back and
+R, placed again whenever another GPU thread pins; refused (one log line) when that would leave
+fewer than MinAutoGuestProcessors + 2 fast logical processors (7800X3D: 10 left, on; 6 cores with
+SMT, 8 cores without: off). Back to 0 restores 0's placement. Each placement logs "HostTiming placed
+(why): mask M, GPU threads' cores G, running on processor P" (0's first placement too).
+
+### FRITCHII_FRAME_END_TIMES
+
+TEST, off by default (helper DE, 2026-11-17). Boot, a dry timer that changes nothing. Where
+RasterizerVulkan::TickFrame's time goes (with one follower it runs on R in a lend while E is parked:
+"TickFrame (frame end)" in the lends line, 5 ms/s at Kakariko, 7-31 ms/s at the market). Line every
+10 s: "Frame end times (FRITCHII_FRAME_END_TIMES=1) 10 s: N calls/s (P% on GPURender), T ms/s, U us
+each, longest L us; by part ms/s: head, pipeline cache, descriptor queues, fence manager, staging,
+texture cache, memory seam, buffer cache (E's)". Everything but the buffer cache part is what a
+posted frame end could take off E's parked time.
+
 ### FRITCHII_HOSTTIMING_SPIN_BUDGET
 
 TEST, off by default (helper AS, 2026-11-15; idea from zortos293/Lichii #1733). Live, a percent of
@@ -697,6 +1509,21 @@ cut by it); W OS waits; E events, callbacks M ms/s, longest T us (event name), K
 most in one pass P; J ran 1 ms or more late (worst Z ms, event name)". The hitch line also gets
 "timer thread spin" and "timer events over 1 ms" (callbacks of 1 ms or more), so a hitch where
 HostTiming is busy says whether it spun or ran a slow callback.
+
+### FRITCHII_HOSTTIMING_PRIORITY
+
+TEST, off by default (helper CG, 2026-11-16). Live. 0 = the HostTiming thread at highest (as
+before), 1 = time critical, the priority the guest cores and the GPU threads already run at. The
+timer thread answers guest sleeps and timeouts (KHardwareTimer) and the syncpoint polls the game's
+GPU waits end on (nx2:gsv:SyncptPoll, SyncptPollNow). In market logs of 2026-11-16 (b10, b8),
+10 s windows where other processes took 2.5+ CPUs had 400-900 callbacks run 1 ms or more late
+(worst 8-14 ms, mostly SyncptPoll) and single callbacks of 4-9 ms of wall time, against 0-150
+late in quiet windows; per window, late callbacks and fps correlate at -0.4 to -0.6. Only the
+thread's OS priority changes, applied by the thread itself at its next pass (one relaxed load a
+pass while off); a line "HostTiming priority (FRITCHII_HOSTTIMING_PRIORITY=n): ..." says when.
+The "HostTiming in 10 s" line ends with "FRITCHII_HOSTTIMING_PRIORITY=n". Judge it on that
+line's "ran 1 ms or more late" and "longest" (expected: the busy windows' counts drop toward the
+quiet ones'), then on fps.
 
 ### FRITCHII_ONEF_RAISE_AFTER_LEND
 
@@ -726,6 +1553,19 @@ before the value is published and before the actions it meets run; the session s
 to the page's host memory, only ever forward (wrap-aware), and the poll stores forward too, so it
 cannot put the page back. Cost: guest increments take the manager's lock before the add instead of
 after it (it was taken right after anyway) plus one host store.
+
+### FRITCHII_SYNCPT_REARM_NOTIFY
+
+Fix, on by default (helper DF, 2026-11-17, port of zortos293/Lichii #2052); read once,
+FRITCHII_SYNCPT_REARM_NOTIFY=0 turns it off. The nx2:gsv syncpoint poll signalled the client's
+notify event only when an armed bit changed. A client that wakes, finds its threshold not reached
+and rearms leaves its armed bit as it was, so its next wake-up had to come from another syncpoint's
+bit changing or from its own timeout (zortos's reported one-second OoT pause). Now the poll keeps
+its own snapshot of every value (the page itself is already current through
+FRITCHII_SYNCPT_MIRROR, so it shows no change) and also signals when an armed syncpoint's value
+moved since the previous poll. The log says "nx2:gsv rearmed syncpoint waits notified" at 1, 2, 4,
+8... polls that only this answered. Cost: a 192-entry compare per poll (500 us, or EXP37's
+poll-now), and a client wake-up per such poll.
 
 ### FRITCHII_SPARSE_RESERVE
 
@@ -1557,6 +2397,169 @@ not worth turning on), then 2 (must be 0), then 1.
     is read every time and a fit by the kept value that the real one refuses counts (must be 0).
   - The fill bracket itself (fable_b 14.4 cut 3) is already lean on E: its brackets leave the
     shared watch count alone (MemStage::Fill::Open). Nothing more is cut there.
+### FRITCHII_REPORT_WAIT (the "Report waits" line)
+
+Helper CN (work\helper_cn_answer.md). Live, default 0. The wait a macro DMA read of report
+memory makes for query results the host GPU still owes (RasterizerVulkan::FlushQueryResults,
+reached through QueryDma::FlushPending from FrontDmaRead: the front's "macro dma flush" site).
+With one follower it is lent: R waits, E is parked, the front is stopped, so every millisecond of
+it is lost on all three threads. Kakariko (unprofiled): 25 to 30 waits a second of ~1.8 ms,
+~48 ms/s; the market ~11 a second, ~28 ms/s.
+
+- 0 = as before: EXP30 decides (EXP30 off = the old wait: an operation queued behind a new
+  fence, i.e. every piece of GPU work sent so far, including what was sent after the reports).
+- 1 = the lean wait (what EXP30=1 does): a fence for the reports that still wait for one, then
+  Tegra::Nx2WaitAsyncReportsSettled over the read's range (from 12 bytes before it). Every
+  counter report is issued and completed through those slot counters (QueryCacheBase::
+  CounterReport: run entries and fence operations alike), so a settled range holds the words
+  the old wait would leave there. A slot shared with another address only waits longer.
+- 2 = verify: the lean wait (polled; a range that has not settled after 200 ms counts as a
+  difference and goes on to the old wait instead of hanging), the read's words, then the old
+  wait, the words again. "words changed in the old wait's rest" must be 0; the first 16 are
+  logged as errors. Both waits are timed: "lean ... ms/s" against "old wait ... ms/s" is the
+  saving 1 gives, measured in one session.
+
+"Report waits (FRITCHII_REPORT_WAIT=n)" (HW_GPU, Info): every 10 s, and at the first wait after
+the switch changes (so profile_toggle windows hold one value each), when there were waits:
+waits/s, ms/s, us each, longest, lean waits/s; with 2 the verify numbers. Every value times its
+waits (two clock reads a wait, ~30 a second), so 0 and 1 windows compare directly.
+
+Risk to watch: the #215 family (white flashes on leaves and walls, a read that returned before
+its report landed). Verify first; the flash watch in the 1 windows.
+
+### FRITCHII_LOCK_CENSUS (the "Lock census" lines)
+
+Helper CP (work\helper_cp_answer.md). Live, default 0. Who holds a cache lock when a thread has
+to wait for it. The drain sites line already times the waits per role ("cache lock waits: ... GPU
+back 18 ms/s (2,900/s)" at Kakariko); this names the holder. Only the two cache locks (the
+buffer cache's and the texture cache's SpinRecursiveMutex) and only contended waits are seen
+(common/fritchii_lock_census.cpp).
+
+- 0 = off: one relaxed load in the contended path, nothing on an uncontended lock.
+- 1 = every contended wait counted by waiter thread, holder thread (the owner when the wait
+  starts, by its thread name) and lock. "Lock census (FRITCHII_LOCK_CENSUS=1) 10 s, contended
+  cache lock waits, waiter <- holder (lock): GPUBack <- GPUFencingThread (buffer cache) x ms/s
+  (n/s, y us each); ..." (top 12 pairs), plus the waits whose holder had let go before the
+  waiter looked.
+- 2 = as 1, plus the holder's stack for GPUBack's (E's) waits: the holder is paused (at most 40
+  a second, 20-50 us each, added to that one wait), its stack read if it still holds the lock,
+  then resumed. Second line "Lock census holder stacks": where the holders were (thread and
+  first 5 functions, % of the stacks and E's wait in those waits) and the functions on their
+  stacks (% of stacks). The first report loads the exe's symbols (DbgHelp, the .pdb next to the
+  exe) on the census thread: a few seconds and a few hundred MiB. Windows only.
+- 3 = as 2, for every waiter.
+
+Run 2 for one short session (60 s is plenty); it perturbs E by at most ~1-2 ms/s.
+
+### FRITCHII_FENCE_YIELD_E (the "Fence yield to E" line)
+
+Helper CP. Live, default 0. The fencing thread releases fences in batches and lands each
+batch's buffer downloads (PopAsyncFlushes) and image downloads with the cache lock held for the
+whole batch (FenceManager::ReleaseThreadFunc's pop_all). E takes the buffer cache's lock at every
+draw fill and counter report (~330,000 a second at Kakariko), so a pop under way stops E.
+
+- 0 = as before.
+- 1 = while E (GPUBack) waits for the lock it marks it (SpinRecursiveMutex::BackWaiting); between
+  two pops of a batch the fencing thread then lets the lock go, waits until E has taken it (E's
+  mark gone, at most 50 us) and takes it back for the next pop. The same pops in the same order,
+  each whole under the lock, as EXP74's hand-back, which only lets go after a time; between two
+  pops any other thread could already take the lock. The batch's operations and query pops run
+  after all its pops, as before.
+- 3 = dry: E marks, the fencing thread only counts the chances.
+- "Fence yield to E (FRITCHII_FENCE_YIELD_E=n)" every 10 s from the fencing thread: pop batches
+  and pops a second; the pops E waited behind with pops left (the cut's chances: yielded at 1,
+  counted at 3); E waiting at the batch's last pop (out of the cut's reach: a single pop, or the
+  last one); the time handed to E.
+- Not on the EDEN_NX2_FENCE_RELEASE_STATS path (that one is left as it was).
+
+Read with FRITCHII_LOCK_CENSUS=1: only worth turning on if the census names the fencing thread
+as E's holder and the dry line shows chances at a good share of E's waits.
+
+### FRITCHII_FENCE_COPY_UNLOCKED (the "Fence copy unlocked" line)
+
+Helper CQ. Live, default 0. At Kakariko E waited ~17 ms/s behind the fencing thread, which held
+the buffer cache's lock while it copied finished buffer downloads into game memory
+(PopAsyncBuffers: the copies, the set of collected CPU writes, the frees). With it, each pop
+(BufferCache::PopAsyncBuffersUnlocked) does under the lock what reads the cache's state: the
+landing, the collected CPU writes over the landing's range only, the ranges the fence still
+writes. It lets the lock go for the copy (marks after the bytes), takes it back, clears the
+GPU-modified state where the fence still writes and marks the download landed. The ordering
+argument is in work/helper_cq_answer.md. Landings under 512 bytes are copied under the lock as
+before.
+
+While such a copy is under way: another landing waits for it (one landing at a time, as before);
+ClearFenceDownloads waits if it overlaps (a writer that takes ranges from the fence downloads
+writes newer bytes next); a device unmap waits if it overlaps.
+
+- 0 = as before.
+- 1 = on.
+- 2 = on and verify: every landing copied outside the lock, then compared under the lock (in a
+  landing of its own) with what the locked pop would have written. Must be 0.
+- "Fence copy unlocked (FRITCHII_FENCE_COPY_UNLOCKED=n)" every 10 s from the fencing thread: pop
+  batches and pops a second; landings copied outside the lock and small ones under it; copies,
+  MB/s and ms/s out of the lock; the fencing thread's hold of the buffer lock and its wait to take
+  it back (1 and 2 only); lock holders that waited for a copy; E's cache lock waits that began
+  behind the fencing thread (ms/s, count, us each); at 2 the verify counts. Once the switch is set
+  (in the environment, or turned on live) the line runs at 0 too, so both arms of a toggle have
+  E's number.
+- Not on the EDEN_NX2_FENCE_RELEASE_STATS path; EXP74 and FRITCHII_FENCE_YIELD_E do nothing while
+  it is on (the lock is let go at every landing anyway).
+
+### FRITCHII_OCCL_LEAN (the "Occlusion lean" line)
+
+Helper CS (work\helper_cs_answer.md). Live, default 0. Needs one follower with E's pipeline
+lookup (FRITCHII_ONEF_E_PIPELINE=1, the default under FRITCHII_ONEF_LEAN); does nothing else.
+
+Kakariko sends ~2,570 occlusion test draws a frame (sample counting on, every colour write off)
+of ~3,420, and E fills each in full. For a draw that writes no colour, the pixel program can only
+change depth, stencil, the counted samples or memory through a discard, a depth or sample mask
+write, a store or atomic, or its alpha (alpha to coverage, the alpha test emulated in it). When it
+has none of them, E swaps the pipeline it looked up for the same key with the pixel program hash 0
+(the pipeline a draw with the pixel program disabled gets). E's fill then has no pixel stage (no
+pixel uniform buffers, storage binds or texture handle values) and R binds no pixel textures;
+depth, stencil and the samples counted are the same (Vulkan runs the per-fragment tests and the
+query count on the rasterized coverage and interpolated depth with no fragment shader).
+
+- 0 = off (one relaxed load a draw).
+- 1 = on. A draw is taken when: no render target with a format has a colour mask bit on (by
+  target index and by rt_control slot, both readings), alpha to coverage off, the alpha test off
+  or Always (registers), and the pipeline (classed once): has a pixel program, no task/mesh, key
+  alpha test Always, no dual source blending, and a pixel program without demote, depth or
+  sample mask writes, storage/image/global writes or atomics. The pixel-less pipeline
+  ("sibling") is translated on E from the draw's own environments, at most one a frame, kept
+  out of the disk cache, and used only when built and its vertex side (stages 0-3: uniform masks
+  and sizes, storage, texture, image and texel descriptors, handle programs, the vertex program)
+  equals the full pipeline's. A difference refuses that pipeline for the session.
+- 2 = verify: as 1, but the full pipeline still draws (picture unchanged); the siblings are made
+  and compared. "differs" must be 0 for the cut to cover everything it counts.
+- 3 = dry: the census and the timer only, no sibling made.
+
+"Occlusion lean (FRITCHII_OCCL_LEAN=n)" (HW_GPU, Info) every 10 s and at a switch change (a gap
+of half a second ends a 1 window, so 0/1 toggles keep one value a line): E draws, counting,
+colour off and test draws a second; colour off but alpha to coverage or alpha test; draws the
+cut can take (and how often the same pipeline as the previous one), with the pixel uniform
+buffers, textures, storage buffers and handle programs each one skips; draws kept full by reason
+(no pixel program, discard, depth or sample mask, stores, mesh, alpha test or dual source key,
+vertex side differs, failed); drawn lean a second, sibling not ready, verify ready; siblings made
+(and E's ms translating them), found, failed, compared, differs; E's fill and push time of a
+timed draw (1 in 16 of the takeable ones), lean vs full. Use 3/1 for the thread metric (both
+timed), 0/1 for fps.
+
+Costs: the register test (~30-50 ns) on every E draw while on; a sibling translation on E (a few
+ms, once per pipeline a session) when a takeable pipeline first shows up, at most one a frame.
+Lent draws keep R's own lookup (full pipeline). Not compatible with the one-follower build
+compares (step 3 BuildPipeline would see the sibling); FRITCHII_ONEF_LEAN=1 turns those off.
+
+### EDEN_NX2_GPU_PROFILE=2: E's draw method zones (helper CP)
+
+E's draw method outside the fill (0x585's "method" share, ~1.1 us a draw at Kakariko, 218 ms/s
+profiled) is split into fine zones on E: "draw route" (UnlentBlocker), "draw flush caching"
+(FlushCaching before the fill), "pipeline lookup" (E's CurrentGraphicsPipeline, rule 3),
+"draw fill setup" (FillRing's own work: facts, room tests, the buffer cache lock, the repack
+layout, the record), "draw handle values" (the raw handle values read), "draw push" (R's
+packet packed and pushed), "tick work" (TickWork after the push). Exclusive times as all zones;
+"memory fill" and its fine zones stay nested inside "draw fill setup". Profile 2 only.
+
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the
@@ -1787,6 +2790,25 @@ before invalidating it, 16 = fences wait for the GPU work before them.
 
 EDEN_NX2_HOST_PACE: the host frame pacer (vk_host_pacer.h). 1 = on (default), 0 = only
 measure how long each frame was shown.
+
+### FRITCHII_PACE_FIX
+
+FRITCHII_PACE_FIX (live, default 0; bits): fixes for the capped 60 FPS judder at 120 Hz (~1.5% of
+frames shown 3 refreshes, 25 ms; capped 1% low 40). The pacer's lead (how long before the
+intended refresh a held frame is presented) adapts +0.5 ms per miss and -0.01 ms per hit, which
+settles where ~2% of frames miss by design; every miss is a 25 ms frame and moves the schedule a
+refresh later (the backlog that the catch-up and EXP70's drops then clear).
+- 1 = present early: hold a frame only until just after the refresh before its intended one
+  (lead = a refresh minus a guard of 15% of a refresh, 1-3 ms, raised 0.25 ms whenever a frame
+  shows a refresh early). The frame is still shown at the same refresh (no extra input lag), but
+  the copy and the compositor get ~7 ms instead of ~3. The catch-up looks at when the frame
+  reached the present thread instead of when the thread woke.
+- 2 = copy before the hold: the present thread copies the frame to the swapchain image and
+  submits that before the hold and holds only vkQueuePresentKHR, so the copy's GPU time and
+  the submit lock are out of the lead.
+The "Host pacing" line ends with the proof: "misses: catch-up / woke late / slow copy / after
+present (time left at present)", "copy to present" mean/max, "game late" (frames that reached
+the present thread after their refresh) and "early" (shown a refresh early).
 
 ### EDEN_NX2_ARB_SPIN
 
@@ -2178,6 +3200,17 @@ tiles around Link in water, waterfalls and river mist). Port of CheezyEmu 6aaf9f
 bindings past 8 MiB synchronize up to twice the range per bind (clean ranges are skipped by
 EDEN_NX2_STORAGE_SYNC_MEMO); a written graphics binding is marked GPU-modified in full; a
 written compute binding only over its proven write extent. Measure 8 vs 16 live.
+
+FRITCHII_BARE_SSBO_CLAMP=1 (live, default 0): a bare pointer's binding stops at the first device
+page with no host backing (pages the unmapped device read lines report "read as zeros"); none
+backed at its start makes it the null binding. The answer then also holds only until the device
+backing changes. The first 24 are logged ("Bare compute storage binding at ...: host-backed ...:
+clamped / null binding"). Not exact for written bindings (writes past the end are dropped, and
+reads past it are robust-access values instead of the zeros the host buffer held): a test for
+the AMD tester's market load, which read a 16 MiB bare compute window of unbacked pages
+(0x1aeaf4000) on every load. The unmapped device read lines now name the read's site and context
+("buffer upload in compute storage bind", "extent probe", "immediate buffer") and its caller
+(exe+offset, for the PDB or map).
 
 ### FRITCHII_MEMSTAGE_SPLIT_ALLOC
 
@@ -2763,6 +3796,24 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   with E's commit, lent because POST_FENCE is off, fences delayed, stopped, a sync owed, or
   marks ahead due; and the samples sync targets R did not need because E's mirror was ahead
   (no longer "sync target unused").
+- FRITCHII_ONEF_SIGNAL_ON_R (live, default 0; with FRITCHII_ONEF_SEM_E): SEM_E's
+  game-visible signals happen at R's played place, not E's (AMD tester, test 4 §5c: POST_FENCE
+  plus SEM_E lost the device at the market fountain load on an RX 9070 XT, POST_FENCE alone did
+  not). A payload release is a posted op (E goes on) whose write R makes when it plays it; the
+  front's E-position waits wait for it (a guest-writing op) and E's reads of its page wait until
+  R played it. A synced fence-flagged payload is written by R inside its posted fence. A sync
+  point is posted as without SEM_E (R increments both). A SignalFence with a callback is lent
+  (the callback may touch E's caches). The fence decisions line gives SIGNAL_ON_R and "signals
+  made on R for E" per second.
+- FRITCHII_ONEF_WAITS_R (live, default 0): every front wait ends at R's played position: it
+  overrides FRITCHII_ONEF_WAITS_E (a preset turns it on) and SEM_E's lagged acquire check
+  ("lagged check (E)"). The same as WAITS_E=0 with SEM_E's lagged check on R.
+- FRITCHII_ONEF_MIRROR_STOP (live, default 0): the must-be-0 "sync mirror: a samples report: E's
+  mirror started, R's counter not" (R skipped a draw E's mirror counted: no pipeline, configure
+  failed). 1 = FRITCHII_ONEF_POST_FENCE stops for the session, as the opposite case does
+  (logged at Critical); 2 = counted as explained, no note, when R skipped a draw with the samples
+  count on since its last samples report ("E's mirror ahead after a skipped draw" in the fence
+  decisions line). The superset itself is harmless: E lists a sync R then does not need.
 - FRITCHII_ONEF_SOFT_RELEASE_E (live, default 0; fable_b 22.3): a non-forced ReleaseFences
   (GPU::OnCommandListEnd, about 1,400 a second, the lent "ReleaseFences" site: the forced ones
   are posted by POST_FENCE) is answered on E: with the fencing thread WaitPendingFences(false)
@@ -3133,6 +4184,20 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   (emptied, capacity kept). Storage finding no free slot is freed as before; over 16 MiB of
   words is never kept. Off: one relaxed load per list entry check and per list popped, one call
   and a relaxed load per list submitted.
+- FRITCHII_REFRESH_LEAN (live, default 0; helper CG, 2026-11-16): the command words a list
+  refresh copies again from memory (DmaPusher::RefreshSnapshot after a channel resumes from a
+  semaphore acquire, RefreshDeferredEntries after a GPU map). Old: ReadBlockUnsafe per entry,
+  which translates the entry's page every time (GPU page table, then device to host); the v4
+  sample had RefreshSnapshot at 3.7% of the front, 0.9% of it in that translation. 1 = each
+  4 KiB GPU page is translated once per refresh (the entries of a list mostly sit side by side)
+  and each entry copied from that host pointer plus its offset, which is what ReadBlockUnsafe's
+  own one-page path reads; a page without a host pointer (unmapped, sparse without memory,
+  outside the address space) sends the entry the old way. Off while the back read audit runs.
+  2 = verify: the cached copy into a scratch buffer, then the old copy into the list (the words
+  used stay the old path's), every byte compared. Line every 10 s while on: "Refresh lean
+  (FRITCHII_REFRESH_LEAN=n) 10 s: refreshes R/s, entries E/s, K KiB/s; pages translated T/s,
+  reused U/s, entries the old way O/s; verify: C entries compared/s, D differ (must be 0, S this
+  session)". The saving is about U x 20-30 ns a second. Off: one relaxed load per refresh.
 - FRITCHII_ONEF_NULL_FILL (live, default 0; test only, the picture breaks): 1 = E skips
   FlushCaching, FillRing and PushDraw for every draw it would fill (no packet, R draws nothing;
   TickWork as after a push). The front-wall probe of work/FRONT_SPLIT_DESIGN.md 4.3. Line every
@@ -5255,6 +6320,80 @@ preemptive answer). Every 600 frames these lines:
   Costs with it on: a lock and a ring slot per write mark ("marks a frame"), a scan of up
   to 16,384 marks and a 64-byte copy per read; off: one test of a constant at each site.
 
+FRITCHII_READ_RUNS=2 (helper_cu_answer.md): all of the above, plus each write mark carries the
+runtime's stamp (CurrentTick) and one "Read writer ticks" line per read kind every 600 frames:
+the newest mark over the read's pages (the bytes its download takes) and its writer kind; where
+that write's submission was when the read asked (not submitted, submitted and not run, run, from
+BufferCacheRuntime::ReadWriterTicks: TickOf the stamp, the current tick, the refreshed known
+tick); how many submissions the read's tick is after the writer's and how many of those had not
+run; and every reader host wait (FinishReadDownloads for EXP49, WaitFenceDownload for EXP72) cut
+at the writer's tick: the reader first waits for the writer's submission alone (only if it is
+submitted; no flush is asked for), then the rest as before. Same timeline, so the wait's total is
+unchanged; "then until the download was there" is what a copy ordered right after the writer
+(async kind) or a faster landing (fence kind) could save. The EXP49 "on the host GPU" figure
+keeps both parts. One semaphore refresh more per read. FRITCHII_READ_RUNS (and the two switches
+below) are read at their first test, so nx2_switches.txt sets them (before, only a real
+environment variable did: the static initializer ran before main() applied the file).
+
+### FRITCHII_EARLY_COMPUTE
+
+FRITCHII_EARLY_COMPUTE=1 (read at first use, dry count, default 0; early_compute.h,
+helper_cu_answer.md Round 2): turns FRITCHII_READ_RUNS=2 on and asks, for every dispatch of a
+program whose writes the guest reads back (learned from the reads' writers), whether it could run
+at once on a second queue: its bound buffer ranges (uniform, storage with multi-range segments,
+texture buffers; BufferCache::JudgeEarlyCompute before its own binds) have no unrun GPU write
+mark over them (RAW, WAW) and the ranges it writes have no unrun use (WAR; every
+Buffer::MarkUsage goes into a 65,536-entry use ring). Its write marks keep the verdict; each
+read of those bytes adds its "until the writer ran" time to the saving of its writer's verdict.
+Images are judged in ComputePipeline::Configure (the back or R): a sampled or storage image whose
+last GPU write (TextureCache::MarkModification's scheduler tick) is not run. Lines every 600
+frames: "Early compute" (verdicts, images, reads by verdict, predicted saving in ms a frame) and
+up to 6 "Early compute feeder" lines. 2 (verify) and 3 (on) are designed, not built: they count
+as 1. Off: a relaxed load at each bind and buffer use.
+
+### FRITCHII_READ_SIDE_COPY
+
+FRITCHII_READ_SIDE_COPY=1 (read at first use, dry count, default 0): turns FRITCHII_READ_RUNS=2
+on; at each new read download (EXP49 RecordReadDownload) the newest write mark over all the
+copied bytes gives that write's scheduler tick: eligible when it is already submitted (a copy on
+a second queue could wait for it alone), else in the chunk the download closes (today's path is
+as good). An eligible download's reader wait is cut at that tick; the part after it is the
+saving. "Read side copy" line every 600 frames.
+
+2 (verify) and 3 (on) need the value at boot: the device is then made with a second queue of the
+graphics family (Device::WantsSideQueue; a family of one queue logs it and counts dry). An
+eligible download's copy is recorded on that queue (vk_side_queue.h), after the master timeline
+reached the writer's tick, with a host-read barrier, signalling its own timeline value; every main
+submission with a tick after the writer's waits for that value until the side semaphore reports
+it (MasterSemaphore::RequireSide: never one up to the writer's, which the copy itself waits for).
+The download's main tick (its SubmitForHostRead) is such a submission, so a landing that waited
+for it finds the side copy done too. Two rules keep the queues from waiting on each other (build
+26 hung without the first, helper_cu_answer.md Round 4): the main ticks the side submissions wait
+for never go down (a later copy whose writer is older waits for the previous copy's tick: the side
+queue runs in order), and a side copy is made only once its tick was given to vkQueueSubmit, not
+only to the worker (else the main queue copies it). "Read side queue" line: main submissions that
+waited, waits for a side value never submitted (must be 0, dropped and logged), refusals, raised
+waits, host waits over 2 s (must be 0; each logged every 2 s with both queues' ticks).
+- 2: both copies, the main one into the download's staging and the side one into a second staging
+  buffer. The reader waits for the side copy, then the main one; the landing compares the two
+  byte for byte ("copies differ", must be 0, each one an error line) and lands the main bytes.
+  The line gives when each was there.
+- 3: the side copy alone. The reader waits for the side value only and lands that download at
+  once, out of order (read downloads never overlap: RecordReadDownload copies only the gaps),
+  when no other download covers the read's range; any other landing waits for the main tick as
+  before. Off (0 or 1): nothing changes, one load per read download.
+
+### FRITCHII_SUBMIT_TIMES
+
+FRITCHII_SUBMIT_TIMES=1 (read at first use, diagnostic, default 0; vk_submit_times.h): turns
+FRITCHII_READ_RUNS=2 on; a GPU timestamp at the top of every main submission's upload command
+buffer and at the bottom of its command buffer (4,096 slots). After each read's whole wait, the
+submissions from the one after the tick known done at the read to the writer's (at most 64, the
+newest) are looked up: their GPU busy time, the gaps between one's end and the next one's start,
+and overlaps. "Read writer run-up" line per read kind every 600 frames, next to "Read writer
+ticks", with the same reads' "until the writer ran". Costs two timestamps and a query reset per
+submission and up to 64 query reads per cut read.
+
 The GPU-written ranges are what the cache marks: for a dispatch or draw that is the bound
 writable buffer range (cut only by the native store bound, or by EDEN_NX2_WRITTEN_SSBO_MARK_KIB,
 which must be unset for this), not only the bytes the shader stored. So "page only" is as exact
@@ -6096,3 +7235,20 @@ src/common/fritchii_switch_defaults.cpp); each section below still says how it w
 FRITCHII_GATHER_ONE_LOCK=1, FRITCHII_GATHER_EMPTY_TEST=1, FRITCHII_FENCE_COMMIT_FAST=1, FRITCHII_FRONT_RAN_READS=1,
 FRITCHII_VERTEX_INPUT_COMPACT=1, FRITCHII_BIND_ADDR_MEMO=1, FRITCHII_WORKER_SPIN=80, FRITCHII_CB_WORDS_BLOCK=1,
 EDEN_NX2_EXP52=1, EDEN_NX2_EXP55=1. Combined toggle at the market (one session): 62.7 -> 64.1 fps, 1% low 44.4 -> 45.5.
+
+### EDEN_NX2_SPIRV_INLINE_GLOBALS
+
+Boot (shader translation). How the SPIR-V helper functions that route global memory accesses to a
+storage buffer are emitted. 1 (default): inlined at every call site (+2.6 fps walking Hyrule Field on
+an RTX 4080, 2026-11). 0: DontInline everywhere (NVIDIA compiles big compute shaders in a fraction of
+the time: up to 7.6 s each inlined). 2: DontInline for compute programs only, graphics inlined
+(player report 2026-11-18, 5.8.4: a 7.6 s freeze mid-combat on an RTX 3070 when the driver had not cached a
+compute shader). 3: compute programs only, graphics as with 1: the search for the storage buffer
+that holds the address is one DontInline function per program (same comparisons and order as the
+helpers, returns the buffer index and base or not found), and the load/store/atomic helpers stay
+inlinable: each access calls the search once and then switches on the returned index to do the
+access on that buffer; an address no buffer holds gets the same fallback as before. Aims at the
+compile time of =2 with less of its runtime cost (=2 measured ~1.7 fps lower at the market, ~0 in
+fights); idea from tasarren/Lichii (compute compile 1.5-1.75 s -> 0.26-0.52 s on their path).
+Not measured on Fritchii yet. Changing it changes the SPIR-V, so the driver compiles those shaders
+again once.

@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -225,5 +226,26 @@ namespace Vulkan {
         u64 local_blocks{};
     };
     [[nodiscard]] HeapTotals GetHeapTotals(const Device& device);
+
+    /// FRITCHII_VRAM_OWNERS: where the unused space in `owner`'s blocks on `heap` lies: the
+    /// memory types' default blocks, then each custom pool (depth, colour, sparse, buffer), each
+    /// with its blocks, holes and largest hole. Walks every block: only the allocator's user may
+    /// call it (the back for the main allocator; MemoryStageLink::IsCacheUser for the buffer one).
+    [[nodiscard]] std::string VramSlackText(const Device& device, VmaAllocator owner, u32 heap);
+
+    /// FRITCHII_VRAM_TRIM: gives back the empty block VMA keeps in each of `owner`'s block
+    /// vectors on `heap` (default blocks and custom pools). Returns the bytes given back. Only the
+    /// allocator's user may call it.
+    u64 TrimEmptyBlocks(const Device& device, VmaAllocator owner, u32 heap);
+
+    /// FRITCHII_DEPTH_POOL_FIT: what it placed and the padding its live images hold; empty while
+    /// it is off and placed nothing.
+    [[nodiscard]] std::string DepthFitText();
+
+    /// FRITCHII_VRAM_HOLES: per block vector of `owner` on `heap` (default blocks per memory type,
+    /// each named pool), the holes and the allocations by size, and what holds the blocks that
+    /// are at least half free (kind, size, age). Builds VMA's detailed map: several ms with
+    /// thousands of allocations, so only on request; only the allocator's user may call it.
+    [[nodiscard]] std::string VramHolesText(VmaAllocator owner, u32 heap);
 
 } // namespace Vulkan

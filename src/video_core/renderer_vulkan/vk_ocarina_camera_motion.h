@@ -24,6 +24,10 @@ class StagingBufferPool;
 /// DLSS availability, and native when FSR 3.1 is unsupported on the device.
 [[nodiscard]] VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device);
 
+/// Whether OoT's FSR draws the game's own 2560x1440 picture instead of a 4K one this session
+/// (FRITCHII_FSR_OUTPUT; the display is looked at once).
+[[nodiscard]] bool OcarinaFsrOutputsGameSize(VideoCommon::OcarinaUpscaleBackend backend);
+
 struct OcarinaActorMesh {
     std::vector<u8> vertices;
     std::vector<u16> indices;

@@ -139,6 +139,10 @@ Core::Memory::Memory& GetCurrentMemory(KernelCore& kernel);
 [[nodiscard]] std::string DescribeGuestWaits();
 /// Forgets every recorded wait (the session's threads are gone).
 void ClearGuestWaitsForHangReport();
+/// A guest thread stopped for good (a prefetch abort or breakpoint without a debugger): the hang
+/// report's "game threads in kernel waits" line names the newest, as a freeze after it is the
+/// game's crash, not a lost wake-up. `what` must be a string literal.
+void NoteGuestCrashForHangReport(u64 thread_id, u64 pc, const char* what);
 
 class KThread final : public KAutoObjectWithSlabHeapAndContainer<KThread, KWorkerTask>,
                       public Common::IntrusiveListBaseNode<KThread>,

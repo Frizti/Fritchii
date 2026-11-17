@@ -5,6 +5,8 @@
 #include <windows.h>
 #include <sysinfoapi.h>
 #include <psapi.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 // clang-format on
 #else
 #include <sys/mman.h>
@@ -21,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <condition_variable>
@@ -224,6 +227,146 @@ std::optional<u64> GetSystemCommitRoom() {
     return std::nullopt;
 }
 
+#ifdef _WIN32
+namespace {
+/// FRITCHII_VRAM_BUDGET_MODE=os: the last sample of the OS's dedicated video memory counters.
+struct AdapterVideoMemorySample {
+    std::atomic<u64> adapter{};
+    std::atomic<u64> process{};
+    std::atomic<s64> time_ms{}; ///< steady clock ms of the last good sample, 0 before it
+};
+AdapterVideoMemorySample g_adapter_video_memory;
+
+s64 SteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::string LowerAscii(const wchar_t* text) {
+    std::string out;
+    for (; text != nullptr && *text != L'\0'; ++text) {
+        const wchar_t c = *text;
+        out.push_back(c < 128 ? static_cast<char>(c >= L'A' && c <= L'Z' ? c - L'A' + L'a' : c)
+                              : '?');
+    }
+    return out;
+}
+
+/// Sums a wildcard counter's instances whose names contain `luid` (and start with `prefix`).
+std::optional<u64> SumInstances(PDH_HCOUNTER counter, const std::string& luid,
+                                const std::string& prefix, std::vector<u8>& scratch) {
+    DWORD bytes = 0;
+    DWORD count = 0;
+    PDH_STATUS status =
+        PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, &bytes, &count, nullptr);
+    if (status != static_cast<PDH_STATUS>(PDH_MORE_DATA) || bytes == 0) {
+        return std::nullopt;
+    }
+    scratch.resize(bytes);
+    auto* const items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(scratch.data());
+    status = PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, &bytes, &count, items);
+    if (status != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+    u64 sum = 0;
+    bool found = false;
+    for (DWORD i = 0; i < count; ++i) {
+        const std::string name = LowerAscii(items[i].szName);
+        if (name.find(luid) == std::string::npos ||
+            (!prefix.empty() && name.rfind(prefix, 0) != 0)) {
+            continue;
+        }
+        if (items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA ||
+            items[i].FmtValue.CStatus == PDH_CSTATUS_NEW_DATA) {
+            sum += static_cast<u64>((std::max)(items[i].FmtValue.largeValue, LONGLONG{0}));
+            found = true;
+        }
+    }
+    return found ? std::optional<u64>{sum} : std::nullopt;
+}
+
+void AdapterVideoMemoryLoop(u32 luid_low, s32 luid_high) {
+    Common::SetCurrentThreadName("Fritchii:VramOS");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    PDH_HQUERY query{};
+    if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) {
+        LOG_WARNING(Common_Memory, "FRITCHII_VRAM_BUDGET_MODE=os: no PDH query; vk budget only");
+        return;
+    }
+    PDH_HCOUNTER adapter_counter{};
+    PDH_HCOUNTER process_counter{};
+    const bool have_adapter =
+        PdhAddEnglishCounterW(query, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0,
+                              &adapter_counter) == ERROR_SUCCESS;
+    const bool have_process =
+        PdhAddEnglishCounterW(query, L"\\GPU Process Memory(*)\\Dedicated Usage", 0,
+                              &process_counter) == ERROR_SUCCESS;
+    if (!have_adapter || !have_process) {
+        LOG_WARNING(Common_Memory,
+                    "FRITCHII_VRAM_BUDGET_MODE=os: the GPU memory counters are missing "
+                    "(adapter {}, process {}); vk budget only",
+                    have_adapter, have_process);
+        PdhCloseQuery(query);
+        return;
+    }
+    // Instance names: "luid_0x00000000_0x0000D1E3_phys_0" and "pid_1234_luid_..._phys_0".
+    const std::string luid =
+        fmt::format("luid_0x{:08x}_0x{:08x}", static_cast<u32>(luid_high), luid_low);
+    const std::string pid = fmt::format("pid_{}_", GetCurrentProcessId());
+    std::vector<u8> scratch;
+    bool logged = false;
+    u32 misses = 0;
+    for (;;) {
+        if (PdhCollectQueryData(query) == ERROR_SUCCESS) {
+            const auto adapter = SumInstances(adapter_counter, luid, {}, scratch);
+            const auto process = SumInstances(process_counter, luid, pid, scratch);
+            if (adapter && process) {
+                g_adapter_video_memory.adapter.store(*adapter, std::memory_order_relaxed);
+                g_adapter_video_memory.process.store(*process, std::memory_order_relaxed);
+                g_adapter_video_memory.time_ms.store(SteadyMs(), std::memory_order_release);
+                if (!logged) {
+                    logged = true;
+                    LOG_INFO(Common_Memory,
+                             "FRITCHII_VRAM_BUDGET_MODE=os: adapter {} dedicated use {} MiB (all "
+                             "processes), this process {} MiB",
+                             luid, *adapter >> 20, *process >> 20);
+                }
+            } else if (++misses == 5 && !logged) {
+                LOG_WARNING(Common_Memory,
+                            "FRITCHII_VRAM_BUDGET_MODE=os: no counter instance for {} (adapter "
+                            "{}, process {}); vk budget only",
+                            luid, adapter.has_value(), process.has_value());
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::seconds{1});
+    }
+}
+} // Anonymous namespace
+#endif
+
+std::optional<AdapterVideoMemory> GetAdapterVideoMemory(u32 luid_low, s32 luid_high) {
+#ifdef _WIN32
+    static std::once_flag started;
+    std::call_once(started, [luid_low, luid_high] {
+        // Detached: it only sleeps and reads counters, and lives as long as the process.
+        std::thread(AdapterVideoMemoryLoop, luid_low, luid_high).detach();
+    });
+    const s64 time = g_adapter_video_memory.time_ms.load(std::memory_order_acquire);
+    if (time == 0 || SteadyMs() - time > 5000) {
+        return std::nullopt;
+    }
+    return AdapterVideoMemory{
+        .adapter_dedicated = g_adapter_video_memory.adapter.load(std::memory_order_relaxed),
+        .process_dedicated = g_adapter_video_memory.process.load(std::memory_order_relaxed),
+    };
+#else
+    static_cast<void>(luid_low);
+    static_cast<void>(luid_high);
+    return std::nullopt;
+#endif
+}
+
 void* AllocateZeroPages(u64 bytes) {
 #ifdef _WIN32
     return VirtualAlloc(nullptr, static_cast<SIZE_T>(bytes), MEM_RESERVE | MEM_COMMIT,
@@ -262,6 +405,8 @@ std::mutex g_tag_mutex;
 std::vector<TagEntry> g_tags;             ///< Sorted by base
 std::function<std::string()> g_sampler;   ///< Under g_tag_mutex
 std::vector<std::pair<const char*, std::function<std::vector<u64>()>>> g_size_sources; ///< Same
+std::mutex g_reporter_mutex; ///< Held while the reporters run, so RemoveReporter waits for them
+std::vector<std::pair<const void*, std::function<std::string()>>> g_reporters; ///< Under it
 std::mutex g_thread_mutex;
 std::jthread g_thread;
 
@@ -306,6 +451,7 @@ struct Result {
     u32 walk_ms{};
     u32 query_ms{};
     std::string heap_text;
+    std::string hint_text; ///< Owner hints of the biggest unnamed allocations (Windows)
 };
 
 constexpr std::array<const char*, 6> BucketNames{"<64 KiB",  "64 KiB-1 MiB", "1-16 MiB",
@@ -535,6 +681,146 @@ std::string CrtHeapHistogram(HANDLE heap) {
     return text;
 }
 
+/// Owner hints: what the biggest unnamed allocations point at. Objects with a vtable or a
+/// callback hold pointers into the image whose code made them (the driver's objects into
+/// nvoglv64.dll / nvgpucomp64.dll, ours into the exe), and allocator free lists point into their
+/// own allocation. Reads up to 512 resident pages of each (ReadProcessMemory, so a page freed
+/// meanwhile fails the read instead of faulting), never a page that is not in the working set.
+std::string OwnerHints(const Result& result, const std::vector<uintptr_t>& pages) {
+    if (pages.empty()) {
+        return {};
+    }
+    struct Range {
+        uintptr_t begin;
+        uintptr_t end;
+        const std::string* name;
+    };
+    std::vector<Range> images;
+    for (const Allocation& a : result.images) {
+        images.push_back({a.base, a.base + a.span, &a.name});
+    }
+    std::sort(images.begin(), images.end(),
+              [](const Range& a, const Range& b) { return a.begin < b.begin; });
+    struct Group {
+        std::string label;
+        std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+        u64 resident{};
+    };
+    std::vector<Group> groups;
+    std::vector<const Allocation*> big;
+    Group bucket{"16-64 MiB reservations", {}, 0};
+    for (const Allocation& a : result.other) {
+        if (a.resident >= (u64{32} << 20)) {
+            big.push_back(&a);
+        } else if (BucketOf(a.span) == 3) {
+            bucket.ranges.emplace_back(a.base, a.base + a.span);
+            bucket.resident += a.resident;
+        }
+    }
+    std::sort(big.begin(), big.end(),
+              [](const Allocation* a, const Allocation* b) { return a->resident > b->resident; });
+    for (size_t i = 0; i < big.size() && i < 4; ++i) {
+        groups.push_back({fmt::format("{:x} span {}", big[i]->base, MiBOf(big[i]->span)),
+                          {{big[i]->base, big[i]->base + big[i]->span}},
+                          big[i]->resident});
+    }
+    if (bucket.resident >= (u64{32} << 20)) {
+        groups.push_back(std::move(bucket));
+    }
+    const auto image_of = [&images](u64 value) -> const std::string* {
+        auto it = std::upper_bound(images.begin(), images.end(), value,
+                                   [](u64 v, const Range& r) { return v < r.begin; });
+        if (it == images.begin()) {
+            return nullptr;
+        }
+        --it;
+        return value < it->end ? it->name : nullptr;
+    };
+    std::string text;
+    std::array<u64, 512> words{};
+    for (const Group& group : groups) {
+        std::vector<uintptr_t> sample;
+        for (const auto& [begin, end] : group.ranges) {
+            const auto low = std::lower_bound(pages.begin(), pages.end(), begin);
+            const auto high = std::lower_bound(low, pages.end(), end);
+            sample.insert(sample.end(), low, high);
+        }
+        if (sample.empty()) {
+            continue;
+        }
+        const size_t step = (std::max)(size_t{1}, sample.size() / 512);
+        std::map<const std::string*, u64> hits;
+        u64 read_pages = 0;
+        u64 zero_pages = 0;
+        u64 nonzero = 0;
+        u64 inside = 0;
+        for (size_t i = 0; i < sample.size(); i += step) {
+            SIZE_T read = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(sample[i]),
+                                   words.data(), sizeof(words), &read) ||
+                read != sizeof(words)) {
+                continue;
+            }
+            ++read_pages;
+            bool any = false;
+            for (const u64 word : words) {
+                if (word == 0) {
+                    continue;
+                }
+                any = true;
+                ++nonzero;
+                bool own = false;
+                for (const auto& [begin, end] : group.ranges) {
+                    if (word >= begin && word < end) {
+                        own = true;
+                        break;
+                    }
+                }
+                if (own) {
+                    ++inside;
+                } else if (const std::string* name = image_of(word)) {
+                    ++hits[name];
+                }
+            }
+            zero_pages += any ? 0 : 1;
+        }
+        if (read_pages == 0) {
+            continue;
+        }
+        std::vector<std::pair<u64, const std::string*>> ranked;
+        for (const auto& [name, count] : hits) {
+            ranked.emplace_back(count, name);
+        }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::string top;
+        for (size_t i = 0; i < ranked.size() && i < 4; ++i) {
+            top += fmt::format("{}{} {:.1f}", i == 0 ? "" : ", ", *ranked[i].second,
+                               static_cast<double>(ranked[i].first) /
+                                   static_cast<double>(read_pages));
+        }
+        std::array<u64, 6> head{};
+        SIZE_T head_read = 0;
+        std::string head_text = "unreadable";
+        if (ReadProcessMemory(GetCurrentProcess(),
+                              reinterpret_cast<const void*>(group.ranges.front().first),
+                              head.data(), sizeof(head), &head_read) &&
+            head_read == sizeof(head)) {
+            head_text = fmt::format("{:x} {:x} {:x} {:x} {:x} {:x}", head[0], head[1], head[2],
+                                    head[3], head[4], head[5]);
+        }
+        text += fmt::format(
+            "{}{} ({} resident, {} allocations): {} pages read, {} all zero; per page {:.0f} "
+            "non-zero words, {:.1f} into itself, into images {}; first words {}",
+            text.empty() ? "" : "; ", group.label, MiBOf(group.resident), group.ranges.size(),
+            read_pages, zero_pages,
+            static_cast<double>(nonzero) / static_cast<double>(read_pages),
+            static_cast<double>(inside) / static_cast<double>(read_pages),
+            top.empty() ? "none" : top, head_text);
+    }
+    return text;
+}
+
 void Walk(int mode, Result& result) {
     const auto start = std::chrono::steady_clock::now();
     std::vector<uintptr_t> pages;
@@ -738,6 +1024,7 @@ void Walk(int mode, Result& result) {
     result.walk_ms = static_cast<u32>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                           std::chrono::steady_clock::now() - start)
                                           .count());
+    result.hint_text = OwnerHints(result, pages);
 
     if (mode == 2) {
         // Locks each heap for its summary (EDEN_NX2_MEM_HEAPS measured ~250 ms for a 2.5 GB CRT
@@ -967,6 +1254,9 @@ void Census(int mode, const char* reason) {
              "reservation size {}; largest other: {}; largest heap big blocks: {}",
              reason, Top(result.exec, 10, true), buckets, Top(result.other, 10, true),
              Top(result.big_blocks, 8, true));
+    if (!result.hint_text.empty()) {
+        LOG_INFO(HW_Memory, "Memory census ({}) owner hints: {}", reason, result.hint_text);
+    }
     std::string extra = Nx2Hitch::JitCompileCensus();
     std::function<std::string()> sampler;
     {
@@ -975,6 +1265,14 @@ void Census(int mode, const char* reason) {
     }
     if (sampler) {
         extra += "; " + sampler();
+    }
+    {
+        std::scoped_lock lock{g_reporter_mutex};
+        for (const auto& [key, reporter] : g_reporters) {
+            if (std::string text = reporter(); !text.empty()) {
+                extra += "; " + text;
+            }
+        }
     }
     if (!result.heap_text.empty()) {
         extra += "; heaps (committed/allocated MiB, or the CRT heap walk): " + result.heap_text;
@@ -1080,6 +1378,48 @@ void SetSizeSource(const char* label, std::function<std::vector<u64>()> source) 
     if (source) {
         g_size_sources.emplace_back(label, std::move(source));
     }
+}
+
+void AddReporter(const void* key, std::function<std::string()> reporter) {
+    if (Mode() == 0 || key == nullptr || !reporter) {
+        return;
+    }
+    std::scoped_lock lock{g_reporter_mutex};
+    std::erase_if(g_reporters, [key](const auto& entry) { return entry.first == key; });
+    g_reporters.emplace_back(key, std::move(reporter));
+}
+
+void RemoveReporter(const void* key) {
+    if (Mode() == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_reporter_mutex};
+    std::erase_if(g_reporters, [key](const auto& entry) { return entry.first == key; });
+}
+
+std::vector<u8> ResidentPages(const void* base, u64 bytes) {
+    const size_t count = static_cast<size_t>((bytes + 4095) / 4096);
+    std::vector<u8> resident(count, 1);
+#ifdef _WIN32
+    constexpr size_t Batch = size_t{1} << 16;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info((std::min)(count, Batch));
+    const auto first = reinterpret_cast<uintptr_t>(base) & ~uintptr_t{0xfff};
+    for (size_t done = 0; done < count; done += Batch) {
+        const size_t n = (std::min)(Batch, count - done);
+        for (size_t i = 0; i < n; ++i) {
+            info[i] = {};
+            info[i].VirtualAddress = reinterpret_cast<void*>(first + (done + i) * 4096);
+        }
+        if (!K32QueryWorkingSetEx(GetCurrentProcess(), info.data(),
+                                  static_cast<DWORD>(n * sizeof(info[0])))) {
+            continue; // left as resident
+        }
+        for (size_t i = 0; i < n; ++i) {
+            resident[done + i] = info[i].VirtualAttributes.Valid ? 1 : 0;
+        }
+    }
+#endif
+    return resident;
 }
 
 void Start() {

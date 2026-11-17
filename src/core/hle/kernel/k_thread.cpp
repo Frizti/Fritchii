@@ -447,14 +447,16 @@ namespace Kernel {
             }
         }
 
-        // Acquire the scheduler lock.
-        KScopedSchedulerLock sl{kernel};
-
         // Signal.
-        m_signaled = true;
-        KSynchronizationObject::NotifyAvailable(kernel);
+        {
+            KScopedSchedulerLock sl{kernel};
+            m_signaled = true;
+            KSynchronizationObject::NotifyAvailable(kernel);
+        }
 
-        // Close the thread.
+        // Close the thread outside the scheduler lock: objects are destroyed on their last Close
+        // here (HOS defers that), and if this one is the last, Finalize takes the process's light
+        // locks, which can't block while the scheduler lock is held.
         this->Close(kernel);
     }
 
@@ -1464,7 +1466,22 @@ namespace Kernel {
         std::array<HangWaitSlot, HangWaitSlotCount> g_hang_waits;
         constexpr u32 HangMutexWait = 7;
 
+        // NoteGuestCrashForHangReport: the newest stopped thread (torn reads possible, read only).
+        std::atomic<u64> g_crash_count{};
+        std::atomic<u64> g_crash_thread{};
+        std::atomic<u64> g_crash_pc{};
+        std::atomic<u64> g_crash_since{};
+        std::atomic<const char*> g_crash_what{};
+
     } // Anonymous namespace
+
+    void NoteGuestCrashForHangReport(u64 thread_id, u64 pc, const char* what) {
+        g_crash_thread.store(thread_id, std::memory_order_relaxed);
+        g_crash_pc.store(pc, std::memory_order_relaxed);
+        g_crash_what.store(what, std::memory_order_relaxed);
+        g_crash_since.store(Common::Nx2Hitch::StallTickNs(), std::memory_order_relaxed);
+        g_crash_count.fetch_add(1, std::memory_order_release);
+    }
 
     void KThread::NoteWaitForHangReport(ThreadWaitReasonForDebugging reason,
                                         const void* timeline_key) const {
@@ -1540,9 +1557,24 @@ namespace Kernel {
         }
         std::ranges::sort(waits, [](const Wait& a, const Wait& b) { return a.since < b.since; });
         const u64 now = Common::Nx2Hitch::StallTickNs();
+        // The longest 8, then the newest 24 (newest first): the long ones are the game's idle
+        // workers (Damage's Jabu-Jabu freeze 2026-11-17: 137 waits, the first 32 all workers
+        // parked since the boot); what the game's main loop waits on began just before the freeze.
+        std::vector<size_t> shown;
+        for (size_t i = 0; i < (std::min)(waits.size(), size_t{8}); ++i) {
+            shown.push_back(i);
+        }
+        const size_t newest_from = (std::max)(shown.size(), waits.size() > 24 ? waits.size() - 24 : 0);
+        for (size_t i = waits.size(); i > newest_from; --i) {
+            shown.push_back(i - 1);
+        }
         std::string text;
-        for (size_t i = 0; i < (std::min)(waits.size(), size_t{32}); ++i) {
-            const Wait& wait = waits[i];
+        for (size_t n = 0; n < shown.size(); ++n) {
+            const Wait& wait = waits[shown[n]];
+            if (n == 8 && shown.size() > 8) {
+                text += fmt::format("; ... {} more ...; newest first: ",
+                                    waits.size() - shown.size());
+            }
             std::string what;
             switch (wait.code) {
             case static_cast<u32>(ThreadWaitReasonForDebugging::Sleep):
@@ -1573,22 +1605,31 @@ namespace Kernel {
                 break;
             }
             text += fmt::format("{}thread {} (priority {}, core {}) {} for {:.1f} s",
-                                text.empty() ? "" : "; ", wait.thread_id, wait.priority,
-                                wait.core, what,
+                                text.empty() || text.ends_with(": ") ? "" : "; ", wait.thread_id,
+                                wait.priority, wait.core, what,
                                 now > wait.since ? static_cast<double>(now - wait.since) / 1e9
                                                  : 0.0);
         }
-        if (waits.size() > 32) {
-            text += fmt::format("; {} more", waits.size() - 32);
+        std::string crashed;
+        if (const u64 crashes = g_crash_count.load(std::memory_order_acquire); crashes != 0) {
+            const u64 since = g_crash_since.load(std::memory_order_relaxed);
+            const char* const what = g_crash_what.load(std::memory_order_relaxed);
+            crashed = fmt::format(
+                "; GAME THREAD STOPPED FOR GOOD: thread {} after {} at pc {:#x}, {:.1f} s ago ({} "
+                "this session; the freeze is the game's crash, see its backtrace in the log)",
+                g_crash_thread.load(std::memory_order_relaxed), what != nullptr ? what : "?",
+                g_crash_pc.load(std::memory_order_relaxed),
+                now > since ? static_cast<double>(now - since) / 1e9 : 0.0, crashes);
         }
-        return fmt::format("{} waiting{}{}", waits.size(), text.empty() ? "" : ", longest first: ",
-                           text);
+        return fmt::format("{} waiting{}{}{}", waits.size(),
+                           text.empty() ? "" : ", longest first: ", text, crashed);
     }
 
     void ClearGuestWaitsForHangReport() {
         for (HangWaitSlot& slot : g_hang_waits) {
             slot.code.store(0, std::memory_order_relaxed);
         }
+        g_crash_count.store(0, std::memory_order_relaxed);
     }
 
     void KThread::NotifyAvailable(KernelCore& kernel, KSynchronizationObject* signaled_object, Result wait_result) {

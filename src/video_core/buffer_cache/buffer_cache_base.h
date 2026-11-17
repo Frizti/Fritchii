@@ -14,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -46,6 +47,7 @@
 #include "video_core/buffer_cache/gpu_written_mirror.h"
 #include "video_core/buffer_cache/read_run_stats.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
+#include "video_core/buffer_cache/store_footprint_live.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -318,6 +320,15 @@ public:
     /// CPU writes collected but not yet applied (SetPendingCpuWrites).
     [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
 
+    /// FRITCHII_FENCE_COPY_UNLOCKED: PendingCpuWriteRanges' writes that overlap [begin, end)
+    /// into `out` (cleared first), for questions inside that range only. True if any.
+    bool PendingCpuWritesIn(DAddr begin, DAddr end, Common::RangeSet<DAddr>& out);
+
+    /// FRITCHII_FENCE_COPY_UNLOCKED: WriteDownloadedMemory without the lock (inside a landing
+    /// published by DownloadLanding::PublishUnlocked), its page marks after the bytes.
+    void WriteDownloadedMemoryUnlocked(const Common::RangeSet<DAddr>* cpu_written,
+                                       DAddr device_addr, const u8* data, u64 size);
+
     /// Writes downloaded bytes to guest memory, except over `cpu_written`. Callers take
     /// `cpu_written` inside a VideoCore::DownloadLanding over the bytes and write in it: the CPU
     /// writes collected after it store their bytes once the landing has ended.
@@ -384,6 +395,14 @@ public:
 
     void BindHostComputeBuffers();
 
+    /// FRITCHII_EARLY_COMPUTE (dry): sets EarlyCompute::t_verdict for the dispatch being bound.
+    void JudgeEarlyCompute();
+    /// FRITCHII_FEEDER_LANE (dry): sets EarlyCompute::t_lane (D) for the feeder being bound.
+    template <typename IsFree>
+    void JudgeFeederLane(IsFree&& is_free);
+    /// FRITCHII_FEEDER_LANE (dry): after a judged feeder's binds (its upload, the counts).
+    void NoteFeederLaneBound();
+
     void SetUniformBuffersState(const std::array<u32, NUM_STAGES>& mask,
                                 const UniformBufferSizes* sizes);
 
@@ -427,9 +446,14 @@ public:
     }
 
     /// write_extent: how far the program's stores reach past the pointer (native programs).
+    /// extra: FRITCHII_EXTENT_CENSUS, FRITCHII_EXTENT_CBUF and FRITCHII_STORE_FOOTPRINT
+    /// (Shader::Info::storage_write_extras, null when the program has none).
+    /// read_extent: FRITCHII_FEEDER_LANE (Shader::Info::storage_read_extents, null when none).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                   bool is_written, u32 indirect_offset = ~0U,
-                                  const Shader::StorageWriteExtent& write_extent = {});
+                                  const Shader::StorageWriteExtent& write_extent = {},
+                                  const Shader::StorageWriteExtra* extra = nullptr,
+                                  const Shader::StorageWriteExtent* read_extent = nullptr);
 
     void UnbindComputeTextureBuffers();
 
@@ -473,6 +497,12 @@ public:
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
+    /// Committed fence downloads not landed in guest memory yet (under the lock).
+    /// FRITCHII_ONEF_SEM_E_LANDED: a sync point's host increment then waits for them.
+    [[nodiscard]] bool HasPendingDownloads() const noexcept {
+        return !pending_downloads.empty();
+    }
+
     /// FRITCHII_FENCE_COMMIT_FAST: false only when HasUncommittedFlushes was false at the last
     /// refresh (under the lock) and no fence download was queued since (QueueFenceDownload
     /// raises it, under the lock). Any thread, no lock.
@@ -505,6 +535,14 @@ public:
     /// Pop asynchronous downloads
     void PopAsyncFlushes();
     void PopAsyncBuffers();
+
+    /// FRITCHII_FENCE_COPY_UNLOCKED (helper CQ; common/fritchii_lock_census.h): `pops` of
+    /// PopAsyncFlushes for the fencing thread, called without `mutex`. Each pop reads what it
+    /// writes under the lock, lets it go to copy a landing's bytes into guest memory, and takes
+    /// it back to clear the GPU-modified state and mark the download landed (why the result is
+    /// the locked pop's: work/helper_cq_answer.md). `mode` 2 compares guest memory with the
+    /// download after each copy. Fencing thread only.
+    void PopAsyncBuffersUnlocked(size_t pops, int mode, Common::LockCensus::FenceCopyBatch& batch);
 
     /// EDEN_NX2_FENCE_RELEASE_STATS (`mutex` held): what the next PopAsyncFlushes copies to guest
     /// memory (EXP49's read downloads it also lands are not included).
@@ -569,6 +607,23 @@ public:
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
+
+    // --- FRITCHII_ASYNC_COMPUTE_SKIP (renderer_vulkan/vk_async_compute_skip.h), the lock held ---
+
+    /// After the compute storage pointer binds, before UpdateComputeBuffers: calls
+    /// `func(device_addr, size)` for every range BindHostComputeStorageBuffers would mark
+    /// GPU-written. False when a written binding's writes are not bounded by its mark: not a
+    /// native pointer, a mark as large as the binding (no proven write extent, the 16 MiB mark),
+    /// a mark the EDEN_NX2_WRITTEN_SSBO_MARK_KIB cap shortened, or several device ranges.
+    template <typename Func>
+    [[nodiscard]] bool ForEachComputeWriteMark(Func&& func) const;
+    struct SkipRangeFacts {
+        bool all_gpu_written{}; ///< every byte held in gpu_modified_ranges (as GPUMem sees it)
+        bool cpu_modified{};    ///< a byte the guest CPU wrote that is not uploaded yet
+        bool read_back{};       ///< a page Preflushable, read by the CPU after a GPU write, or
+                                ///< on its way back in a read download
+    };
+    [[nodiscard]] SkipRangeFacts ComputeSkipRangeFacts(DAddr addr, u64 size);
 
     // --- FRITCHII_MEMSTAGE_MARKS_AHEAD (memory stage compute, part 1): GPU-written marks made
     // ahead of the back. The real sets (gpu_modified_ranges, the fence and read downloads) stay
@@ -1464,6 +1519,104 @@ private:
     void CheckExtentProbes();
     void ProbeExtentTail(u32 index, const Binding& binding);
 
+    /// FRITCHII_EXTENT_CENSUS (live): why native compute bindings are marked in full, per program
+    /// and binding; FRITCHII_EXTENT_CBUF (live): the store extents proven with constant buffer
+    /// words (=1 marks by them, =3 only counts). One line each every 10 s (LogExtentCensus).
+    enum class FullMarkWhy : u8 {
+        Analysis,     ///< the store analysis left the extent unknown (ExtentUnknownWhy says why)
+        IndirectGrid, ///< proven, but the dispatch is indirect (its group count is the GPU's)
+        GuardOrDims,  ///< proven, but the 16-bit guard fails (or a block size is 0) at these dims
+        Distrusted,   ///< an extent check caught the program writing past its proof
+        Checking,     ///< marked in full while a dispatch at new dims is checked
+        WholeBinding, ///< the proof covers the whole binding
+        Count,
+    };
+    enum class CbufOutcome : u8 {
+        None,       ///< no cbuf extent, or its switch (FRITCHII_EXTENT_CBUF, _SHARED, _GUARD) off
+        Resolved,   ///< the words were read and the bound holds
+        Fallback,   ///< a word's page is GPU-written (guest memory may be stale): full mark
+        Unresolved, ///< a word not readable, the guard fails, or an indirect grid
+    };
+    struct ExtentCensusEntry {
+        u64 dispatches{};          ///< every bind of it while the census or the cbuf switch is on
+        u64 marked_bytes{};        ///< what they marked
+        u64 unknown_dispatches{};  ///< with the store extent unknown
+        u64 no_extra_dispatches{}; ///< of them, with no Shader::StorageWriteExtra (no reason)
+        u64 full_dispatches{};
+        u64 full_bytes{};
+        std::array<u64, static_cast<size_t>(FullMarkWhy::Count)> whys{};
+        Shader::ExtentUnknownWhy analysis{};
+        u32 pointer_cbuf_index{};
+        u32 pointer_cbuf_offset{};
+        u64 binding_bytes{}; ///< the latest binding's size
+        Shader::StorageCbufExtent cbuf_extent{};
+        // FRITCHII_EXTENT_CBUF
+        u64 cbuf_resolved{};
+        u64 cbuf_fallback{};
+        u64 cbuf_unresolved{};
+        u64 cbuf_proven_bytes{};  ///< summed over the resolved dispatches
+        u64 cbuf_binding_bytes{}; ///< the same dispatches' binding sizes
+        u64 cbuf_marked{};        ///< =1: dispatches marked by the cbuf proof
+        /// FRITCHII_EXTENT_SHARED: Known when cbuf_extent came through shared memory slots
+        /// (cbuf_extent.via_shared; the counts above then follow FRITCHII_EXTENT_SHARED), else
+        /// why that failed (Unrecorded: not tried)
+        Shader::ExtentUnknownWhy shared_why{};
+        /// FRITCHII_EXTENT_GUARD: Known when cbuf_extent was proven with the branch conditions on
+        /// the stores' paths (cbuf_extent.via_guard; the counts then follow
+        /// FRITCHII_EXTENT_GUARD), else why that failed (Unrecorded: not tried)
+        Shader::ExtentUnknownWhy guard_why{};
+    };
+    std::map<std::pair<u64, u32>, ExtentCensusEntry> extent_census;
+    std::chrono::steady_clock::time_point extent_census_start{};
+    u64 extent_census_frames{};
+    /// FRITCHII_EXTENT_CBUF=3: per storage binding of the dispatch being bound, the bytes from the
+    /// binding's start its cbuf proof would mark (0: none); BindHostComputeStorageBuffers hands it
+    /// to the read ring's write marks (ReadRunStats::t_proven_end).
+    std::array<u32, NUM_STORAGE_BUFFERS> cbuf_dry_proven{};
+    /// FRITCHII_STORE_FOOTPRINT: per storage binding of the dispatch being bound, its footprint
+    /// (an id of ReadRunStats' footprint table, 0: none) and the pointer's device address;
+    /// BindHostComputeStorageBuffers hands it to the write marks (ReadRunStats::t_footprint).
+    std::array<ReadRunStats::FootprintRef, NUM_STORAGE_BUFFERS> footprint_dry{};
+    /// FRITCHII_FEEDER_LANE: per storage binding of the dispatch being bound, the bytes from the
+    /// binding's start its loads and atomics can reach (its proven read extent), ~0: unknown
+    /// (the whole binding). JudgeEarlyCompute narrows the feeder's inputs with it.
+    std::array<u64, NUM_STORAGE_BUFFERS> lane_read_end{};
+    /// FRITCHII_STORE_FOOTPRINT (armed: non-zero at boot): who made gpu_modified_ranges' bytes
+    /// GPU-modified (it follows the set from the first armed bind on), the footprint of the mark
+    /// MarkWrittenBuffer is making (BindHostComputeStorageBuffers sets it around the call), and
+    /// =2's sampling count.
+    StoreFootprintLive::FootprintShadow footprint_shadow;
+    bool footprint_following{};
+    ReadRunStats::FootprintRef mark_footprint{};
+    u32 footprint_skip_count{};
+    /// GetFlushArea, live 1 or 2: answers the read from guest memory when the shadow says no mark
+    /// since its GPU-modified bytes were last clean writes them (re-arming its pages' traps).
+    bool FootprintAnswersRead(DAddr device_addr, u64 size, DAddr page_begin, DAddr page_end,
+                              int live);
+    /// BindComputeStorageBuffer (armed): the binding's footprint for its marks (footprint_dry):
+    /// as recorded, or reduced to its power-of-two part when its modulus isn't one and a 32-bit
+    /// wrap of the stores' offsets isn't ruled out at these dims.
+    void NoteBindFootprint(size_t ssbo_index, const Binding& binding,
+                           const Shader::StorageWriteExtent& write_extent,
+                           const Shader::StorageWriteExtra* extra,
+                           const std::array<u32, 3>& block,
+                           const std::optional<std::array<u32, 3>>& grid, GPUVAddr pointer);
+    /// =2: a download landing's bytes over claimed-outside places against guest memory.
+    void FootprintCheckLanding(const Common::RangeSet<DAddr>* cpu_written, DAddr device_addr,
+                               const u8* data, u64 size);
+
+    std::optional<u64> ResolveCbufExtent(const Shader::StorageCbufExtent& extent,
+                                         const std::array<u32, 3>& block,
+                                         const std::optional<std::array<u32, 3>>& grid,
+                                         CbufOutcome& outcome);
+    void NoteExtentCensus(u32 ssbo_index, const Binding& binding, u32 cbuf_index, u32 cbuf_offset,
+                          u64 mark, FullMarkWhy why, const Shader::ExtentUnknownWhy& write_unknown,
+                          const Shader::StorageCbufExtent& cbuf_extent, CbufOutcome cbuf_outcome,
+                          u64 cbuf_proven, bool cbuf_marked, bool extent_unknown,
+                          bool has_extra, const Shader::ExtentUnknownWhy& shared_why,
+                          const Shader::ExtentUnknownWhy& guard_why);
+    void LogExtentCensus();
+
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
     /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
     /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
@@ -1561,11 +1714,23 @@ public:
     /// behind everything since (11-17 fences at the night market). No cache lock held.
     bool WaitFenceDownload(u64 sequence, std::chrono::milliseconds timeout) {
         const auto start = std::chrono::steady_clock::now();
+        // FRITCHII_READ_RUNS=2: first the writer's submission alone (counter only).
+        const u64 writer_ns =
+            fence_downloads_landed.load(std::memory_order_acquire) < sequence ? WaitReadWriter()
+                                                                               : 0;
         std::unique_lock lock{fence_landed_mutex};
         const bool done = fence_landed_cv.wait_for(lock, timeout, [&] {
             return fence_downloads_landed.load(std::memory_order_acquire) >= sequence;
         });
         lock.unlock();
+        if (ReadRunStats::t_writer_answer.cut) [[unlikely]] {
+            const u64 total = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count());
+            ReadRunStats::t_writer_answer.rest_wait_ns = total > writer_ns ? total - writer_ns : 0;
+            MeasureRunUp();
+        }
         fence_waits.fetch_add(1, std::memory_order_relaxed);
         fence_wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                      std::chrono::steady_clock::now() - start)
@@ -1575,6 +1740,99 @@ public:
             fence_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
         }
         return done;
+    }
+
+    /// FRITCHII_READ_RUNS=2 (counter only): the stamp a write mark carries.
+    [[nodiscard]] u64 ReadWriteStamp() {
+        if constexpr (!IS_OPENGL) {
+            if (ReadRunStats::g_writer_ticks) [[unlikely]] {
+                return runtime.CurrentTick();
+            }
+        }
+        return 0;
+    }
+
+    /// FRITCHII_READ_RUNS=2 (counter only), on the reading thread before its host wait: waits for
+    /// the submission of the newest write over the read's pages (GetFlushArea found it) and
+    /// returns how long. The read's own wait follows on the same timeline, so the total is
+    /// unchanged. Only a submitted tick is waited for (no flush is asked for here); 0 = no cut.
+    /// FRITCHII_SUBMIT_TIMES (diagnostic), on the reading thread after its whole wait (so the
+    /// look-ups add nothing to the wait's parts): what the card ran from the submission after the
+    /// one known done at the read to the writer's, from the per-submission GPU timestamps.
+    void MeasureRunUp() {
+        if constexpr (!IS_OPENGL) {
+            ReadRunStats::WriterAnswer& a = ReadRunStats::t_writer_answer;
+            if (!EarlyCompute::g_submit_times || !a.cut || a.cut_tick == 0) {
+                return;
+            }
+            const auto ahead = runtime.MeasureSubmissions(a.known_tick + 1, a.cut_tick);
+            a.ahead_submissions = ahead.submissions;
+            a.ahead_resolved = ahead.resolved;
+            a.ahead_busy_ns = ahead.busy_ns;
+            a.ahead_gap_ns = ahead.gap_ns;
+            a.ahead_overlap_ns = ahead.overlap_ns;
+            a.ahead_span_ns = ahead.span_ns;
+        }
+    }
+
+    /// `side_tick` (FRITCHII_READ_SIDE_COPY): this scheduler tick instead of the area mark's.
+    u64 WaitReadWriter(std::optional<u64> side_tick = std::nullopt) {
+        if constexpr (!IS_OPENGL) {
+            ReadRunStats::WriterAnswer& a = ReadRunStats::t_writer_answer;
+            if (!ReadRunStats::g_writer_ticks || a.cut || (!side_tick && !a.area_found)) {
+                return 0;
+            }
+            const u64 start = ReadRunStats::NowNs();
+            // Older ticks of the same queue first, oldest first, so the reader's whole wait is
+            // what it was: FRITCHII_FEEDER_LANE (dry) the feeder's D (and D with its upload on
+            // the lane); FRITCHII_EXTENT_CBUF / _SHARED =3 the mark the proof leaves over the
+            // read's bytes (dry_cover).
+            struct Step {
+                u64 tick;
+                u64* ns;
+                bool* unsubmitted;
+            };
+            std::array<Step, 3> steps{};
+            size_t num_steps = 0;
+            bool cover_unsubmitted = false;
+            if (EarlyCompute::g_lane && !side_tick && a.area_mark.lane.judged) [[unlikely]] {
+                steps[num_steps++] = {a.lane_copy_tick, &a.lane_copy_ns, &a.lane_unsubmitted};
+                steps[num_steps++] = {a.lane_tick, &a.lane_ns, &a.lane_unsubmitted};
+            }
+            if (!side_tick && a.dry_cover_found && a.dry_cover_tick != 0) [[unlikely]] {
+                steps[num_steps++] = {a.dry_cover_tick, &a.dry_cover_ns, &cover_unsubmitted};
+            }
+            std::sort(steps.begin(), steps.begin() + num_steps,
+                      [](const Step& lhs, const Step& rhs) { return lhs.tick < rhs.tick; });
+            for (size_t i = 0; i < num_steps; ++i) {
+                const Step& step = steps[i];
+                if (step.tick == 0 || step.tick >= a.write_tick) {
+                    continue;
+                }
+                if (!runtime.WaitTickIfSubmitted(step.tick)) {
+                    *step.unsubmitted = true;
+                    continue;
+                }
+                *step.ns = ReadRunStats::NowNs() - start;
+                if (step.ns == &a.dry_cover_ns) {
+                    a.dry_cover_timed = true;
+                }
+            }
+            if (!runtime.WaitTickIfSubmitted(side_tick ? *side_tick : a.write_tick)) {
+                return 0;
+            }
+            a.cut = true;
+            a.writer_wait_ns = ReadRunStats::NowNs() - start;
+            a.cut_tick = side_tick ? *side_tick : a.write_tick;
+            // The cover in the area mark's submission (or later: not before it): it ran with it
+            if (!side_tick && a.dry_cover_found && a.dry_cover_tick >= a.write_tick &&
+                !cover_unsubmitted) [[unlikely]] {
+                a.dry_cover_ns = a.writer_wait_ns;
+                a.dry_cover_timed = true;
+            }
+            return a.writer_wait_ns;
+        }
+        return 0;
     }
 
 private:
@@ -1591,8 +1849,76 @@ private:
     /// fence pops. A write to a range after a download was taken removes it from that download
     /// (and every other pending one): its bytes are older than the write.
     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
+
+    /// FRITCHII_LANDING_CHECK (boot; 0 off, 1 count and log, 2 also keep the guest's bytes):
+    /// at each fence download's commit the guest bytes under its copies; at its landing, the bytes
+    /// the guest changed since then (a write no tracking saw) that the landing would overwrite.
+    /// Damage's Jabu-Jabu freezes (2026-11-17): game objects read as null or float bits
+    /// (0xbf7fffff..., 0x80000000...) right after area loads, the game's assert, then a stopped
+    /// thread; with FRITCHII_ONEF_SEM_E the game's sync point wait ends before the fence's
+    /// downloads land, so memory it frees and reuses after the wait can take an old landing.
+    struct LandingSnapshot {
+        u64 committed_ns{};
+        u64 landing_seq{};            ///< landing_check_seq at the commit
+        std::vector<u64> copy_offsets; ///< Each copy's bytes in `bytes`
+        std::vector<u8> bytes;
+    };
+    std::deque<LandingSnapshot> landing_snapshots; ///< One per pending_downloads entry, when on
+    /// Pages a landing wrote, with landing_check_seq then: a later landing on them is skipped by
+    /// the check (the bytes changed by a download, not by the guest). Under landing_check_mutex.
+    std::unordered_map<u64, u64> landing_check_pages;
+    u64 landing_check_seq{}; ///< Under landing_check_mutex
+    std::mutex landing_check_mutex;
+    struct LandingCheckTotals {
+        u64 landings{};
+        u64 bytes{};
+        u64 changed_landings{};
+        u64 changed_bytes{};
+        u64 kept_bytes{};
+        u64 skipped_bytes{}; ///< On pages an earlier landing wrote after the commit
+        u64 last_log_ns{};
+    } landing_check_totals; ///< The landing thread's (under the buffer cache lock)
+    /// The fence pop in progress on this thread (its landing_check_seq), 0: none.
+    static inline thread_local u64 t_landing_check_pop_seq = 0;
+    /// FRITCHII_LANDING_CHECK's mode, read once.
+    static int LandingCheckMode();
+    /// A fence pop with a download begins (`begin`) or ends on this thread.
+    void LandingCheckPop(bool begin);
+    /// The snapshot of the fence download just committed (`copies`, device addresses).
+    void LandingCheckCommit(std::span<const BufferCopy> copies);
+    /// Before `index`'s copy lands [start, start + size) from `data` (the staging bytes, which
+    /// mode 2 patches with the guest's changed bytes). Under the buffer cache lock.
+    /// `cpu_written`: collected CPU writes the landing leaves alone (not counted).
+    void LandingCheckPiece(const LandingSnapshot& snapshot, const BufferCopy& copy, size_t index,
+                           DAddr start, u8* data, u64 size,
+                           const Common::RangeSet<DAddr>* cpu_written);
+    /// PopOneUnlocked: each unlocked_pieces entry's copy index (with the check on).
+    std::vector<size_t> landing_check_piece_copies;
+    /// Notes the pages a download landing wrote (any landing path).
+    void LandingCheckNoteLanded(DAddr device_addr, u64 size);
     PendingCpuWrites pending_cpu_writes;
     std::optional<Async_Buffer> current_buffer;
+
+    /// FRITCHII_FENCE_COPY_UNLOCKED (PopAsyncBuffersUnlocked): the fencing thread's own scratch,
+    /// touched by it alone (with or without the lock).
+    struct UnlockedPiece {
+        DAddr addr;
+        u64 size;
+        const u8* data; ///< In the download's staging memory
+    };
+    std::vector<UnlockedPiece> unlocked_pieces;
+    Common::RangeSet<DAddr> unlocked_cpu_written;
+    Common::RangeSet<DAddr> unlocked_parts;
+    Common::RangeSet<DAddr> unlocked_verify_cpu;
+    Common::RangeSet<DAddr> unlocked_verify_parts;
+    std::vector<u8> unlocked_verify_bytes;
+    std::vector<Common::RangeSet<DAddr>> unlocked_trash_ranges;
+    std::vector<boost::container::small_vector<BufferCopy, 4>> unlocked_trash_copies;
+    void PopOneUnlocked(std::unique_lock<Common::SpinRecursiveMutex>& lock, int mode,
+                        Common::LockCensus::FenceCopyBatch& batch, u64& held_since);
+    void VerifyUnlockedLanding(DAddr landing_begin, DAddr landing_end,
+                               const Common::RangeSet<DAddr>& live,
+                               Common::LockCensus::FenceCopyBatch& batch);
 
     /// EDEN_NX2_EXP49: a DownloadMemoryForRead, its copies, and what is left of them to do once
     /// the host GPU has run them.
@@ -1608,9 +1934,23 @@ private:
         /// No longer GPU-modified once written: a newer GPU write (OutdateReadDownloads) or value
         /// in guest memory takes its bytes out.
         Common::RangeSet<DAddr> clean_ranges;
+        /// FRITCHII_READ_SIDE_COPY (dry): the newest write over the copied bytes was in an
+        /// already submitted scheduler tick, `side_tick`: a side copy could wait for it alone.
+        bool side_eligible{};
+        u64 side_tick{};
+        /// FRITCHII_READ_SIDE_COPY >= 2: the side copy's value (0: none). With 2 (verify) its
+        /// bytes go to `verify_staging`, compared with `staging` at the landing; with 3 they are
+        /// the download (no main-queue copy was recorded).
+        u64 side_value{};
+        bool side_verify{};
+        Async_Buffer verify_staging{};
+        u64 id{}; ///< numbered from 1, to find it again after a wait without the lock
     };
     /// Oldest first, and written to guest memory in that order: none lands over newer bytes.
     std::deque<ReadDownload> read_downloads;
+    /// Writes one read download to guest memory (WriteReadDownloads' body, and the side copy's
+    /// landing out of order: read downloads never overlap, see RecordReadDownload's gaps).
+    void LandReadDownload(ReadDownload& download);
     /// All the read downloads' clean_ranges (they don't overlap): GPU-modified bytes already on
     /// their way, which later reads wait for rather than download again.
     Common::RangeSet<DAddr> read_download_ranges;
@@ -1624,6 +1964,8 @@ private:
         u32 size;
         bool capped;
         bool ampere;
+        /// FRITCHII_STORE_FOOTPRINT: the mark's footprint (id 0: none), claimed at the promotion
+        ReadRunStats::FootprintRef footprint{};
     };
     static constexpr size_t AheadBound = 4096;
     /// In fill order (= packet order), under `mutex`.
@@ -1702,6 +2044,7 @@ private:
     void LogMarksAhead();
 
     std::deque<Async_Buffer> async_buffers_death_ring;
+    u64 read_download_ids{}; ///< ReadDownload::id
 
     size_t immediate_buffer_capacity = 0;
     Common::ScratchBuffer<u8> immediate_buffer_alloc;

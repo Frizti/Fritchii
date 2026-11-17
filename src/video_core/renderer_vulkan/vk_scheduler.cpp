@@ -733,6 +733,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
         return true;
     }};
 
+    int siblings_free_applied = 0; ///< FRITCHII_GPU_SIBLINGS_FREE as this thread applied it
     while (!stop_token.stop_requested()) {
         std::unique_ptr<CommandChunk> work;
 
@@ -780,6 +781,11 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // the queue lock goes out of scope. This allows us to force execution
             // to complete in the next step.
             void(std::exchange(lk, std::unique_lock{execution_mutex}));
+
+            // FRITCHII_SIBLING_CENSUS (dry) and FRITCHII_GPU_SIBLINGS_FREE (live, off the GPU
+            // threads' cores): one flag test and one relaxed load while both are off.
+            Common::NoteCensusCpu(Common::CensusThread::VulkanWorker);
+            Common::KeepOffGpuCores(siblings_free_applied);
 
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
@@ -838,6 +844,10 @@ void Scheduler::AllocateWorkerCommandBuffer() {
     });
     if (trace_query_pool && !trace_gpu_failed) {
         TraceGpuSubmission();
+    }
+    // FRITCHII_SUBMIT_TIMES (diagnostic): the next submission's start stamp. Off: one load.
+    if (SubmitTimes::Enabled()) [[unlikely]] {
+        submit_times.Begin(device, current_upload_cmdbuf);
     }
     // Performance overlay time rows (common/frame_budget.h); off: one relaxed load.
     if ((budget_pending != 0 || Common::FrameBudget::Wanted()) && !budget_failed) [[unlikely]] {
@@ -1210,6 +1220,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         if (trace_query_pool) {
             trace_work = {};
         }
+        submit_times.End(cmdbuf, signal_value); // FRITCHII_SUBMIT_TIMES; nothing when off
         const auto end_start = std::chrono::steady_clock::now();
         cmdbuf.End();
         const auto end_done = std::chrono::steady_clock::now();

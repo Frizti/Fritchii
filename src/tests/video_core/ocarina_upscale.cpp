@@ -144,3 +144,17 @@ TEST_CASE("OoT scaled upscale picks an output the upscaler can reach", "[video_c
     CHECK(choice.output == OcarinaExtent{5120, 2880});
     CHECK_FALSE(choice.upscale_4k);
 }
+
+TEST_CASE("OoT FSR output size switch keeps 4K unless asked", "[video_core][ocarina]") {
+    using enum VideoCommon::OcarinaUpscaleBackend;
+    using VideoCommon::OcarinaFsrOutputsGameSize;
+    STATIC_REQUIRE_FALSE(OcarinaFsrOutputsGameSize(0, Fsr, 1440));
+    STATIC_REQUIRE(OcarinaFsrOutputsGameSize(1, Fsr, 0));
+    STATIC_REQUIRE(OcarinaFsrOutputsGameSize(1, Fsr, 2160));
+    STATIC_REQUIRE(OcarinaFsrOutputsGameSize(2, Fsr, 1440));
+    STATIC_REQUIRE(OcarinaFsrOutputsGameSize(2, Fsr, 1080));
+    STATIC_REQUIRE_FALSE(OcarinaFsrOutputsGameSize(2, Fsr, 1600));
+    STATIC_REQUIRE_FALSE(OcarinaFsrOutputsGameSize(2, Fsr, 0));
+    STATIC_REQUIRE_FALSE(OcarinaFsrOutputsGameSize(1, Dlss, 1440));
+    STATIC_REQUIRE_FALSE(OcarinaFsrOutputsGameSize(1, Native, 1440));
+}

@@ -8,6 +8,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -34,6 +35,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/small_card.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -1097,6 +1099,13 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    if (WantsSideQueue()) {
+        side_queue = logical.GetQueue(graphics_family, 1);
+        has_side_queue = true;
+        LOG_INFO(Render_Vulkan, "FRITCHII_READ_SIDE_COPY: side queue made (graphics family {}, "
+                                "queue 1)",
+                 graphics_family);
+    }
 
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_extensions) {
@@ -1425,6 +1434,30 @@ u64 Device::KeptBlockBytes() const noexcept {
     return kept_blocks ? kept_blocks->KeptBytes() : 0;
 }
 
+VkDeviceSize Device::DeviceBufferBlockSize() noexcept {
+    // FRITCHII_BUFFER_POOL_BLOCK_MB=<n> (boot, default 0 = 16 MiB): n MiB blocks (1..64) for the
+    // buffer cache's device-local pool, buffers over half a block take the default blocks.
+    // 4 = small blocks with a 2 MiB cut-off: a 16 MiB block holds a few buffers and stays
+    // pinned while any of them lives, mostly empty ("buffer pool" slack in VRAM_OWNERS).
+    static const VkDeviceSize size = [] {
+        const char* value = std::getenv("FRITCHII_BUFFER_POOL_BLOCK_MB");
+        if (value == nullptr || value[0] == '\0') {
+            return SeparatePoolBlockSize;
+        }
+        const long mib = std::strtol(value, nullptr, 10);
+        if (mib <= 0) {
+            return SeparatePoolBlockSize;
+        }
+        const VkDeviceSize clamped = static_cast<VkDeviceSize>((std::min)(mib, 64L)) << 20;
+        LOG_INFO(Render_Vulkan,
+                 "FRITCHII_BUFFER_POOL_BLOCK_MB: device buffer pool blocks {} MiB, buffers over "
+                 "{} KiB take the default blocks",
+                 clamped >> 20, (clamped / 2) >> 10);
+        return clamped;
+    }();
+    return size;
+}
+
 VmaPool Device::GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const {
     std::scoped_lock lk{separate_pools_mutex};
     // Each allocator has its own pools: a pool belongs to the allocator that made it.
@@ -1435,7 +1468,8 @@ VmaPool Device::GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memor
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::DeviceBuffers ? DeviceBufferBlockSize()
+                                                             : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,
@@ -1444,9 +1478,27 @@ VmaPool Device::GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memor
         };
         if (vmaCreatePool(owner, &ci, &pool) != VK_SUCCESS) {
             pool = VK_NULL_HANDLE;
+        } else {
+            // Named, so VMA's detailed map (FRITCHII_VRAM_HOLES) tells the pools apart.
+            vmaSetPoolName(owner, pool, kind == SeparatePool::SparsePages ? "sparse" : "buffer");
         }
     }
     return pool;
+}
+
+VmaPool Device::PeekSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const {
+    if (memory_type >= VK_MAX_MEMORY_TYPES) {
+        return VK_NULL_HANDLE;
+    }
+    std::scoped_lock lk{separate_pools_mutex};
+    // Only `owner`'s own pools: with one allocator (no split) the buffer slot is never used.
+    if (owner == allocator) {
+        return separate_pools[0][static_cast<u32>(kind)][memory_type];
+    }
+    if (buffer_allocator != nullptr && owner == buffer_allocator) {
+        return separate_pools[1][static_cast<u32>(kind)][memory_type];
+    }
+    return VK_NULL_HANDLE;
 }
 
 void Device::LoadStaticPipelineCache() {
@@ -1496,7 +1548,13 @@ void Device::LoadStaticPipelineCache() {
         create(0, nullptr);
         return;
     }
-    create(data.size(), data.empty() ? nullptr : data.data());
+    try {
+        create(data.size(), data.empty() ? nullptr : data.data());
+    } catch (const vk::Exception& e) {
+        LOG_ERROR(Render_Vulkan, "Driver rejected the static pipeline cache ({}), starting empty",
+                  e.what());
+        create(0, nullptr);
+    }
 }
 
 void Device::SaveStaticPipelineCache() const {
@@ -1515,8 +1573,11 @@ void Device::SaveStaticPipelineCache() const {
     }
     data.resize(size);
     static_pipeline_cache.Read(&size, data.data());
+    // Written beside the cache and renamed over it, so an exit mid-write keeps the old one.
+    auto temporary = filename;
+    temporary += ".tmp";
     try {
-        std::ofstream file(filename, std::ios::binary | std::ios::trunc);
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
         file.exceptions(std::ofstream::failbit);
         if (!file.is_open()) {
             return;
@@ -1525,8 +1586,16 @@ void Device::SaveStaticPipelineCache() const {
             .write(reinterpret_cast<const char*>(&STATIC_CACHE_VERSION),
                    sizeof(STATIC_CACHE_VERSION))
             .write(data.data(), static_cast<std::streamsize>(size));
+        file.close();
     } catch (const std::ios_base::failure& e) {
-        Common::FS::RemoveFile(filename);
+        Common::FS::RemoveFile(temporary);
+        return;
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, filename, error);
+    if (error) {
+        LOG_ERROR(Render_Vulkan, "Couldn't replace the static pipeline cache: {}", error.message());
+        Common::FS::RemoveFile(temporary);
     }
 }
 
@@ -1566,6 +1635,7 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 
 void Device::ReportLoss() const {
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+    PipelineBinary::NoteDeviceLoss();
     ReportDeviceFault();
 
     // Wait for the log to flush and for Nsight Aftermath to dump the results
@@ -1812,13 +1882,33 @@ bool Device::GetSuitability(bool requires_swapchain) {
         return Settings::values.use_graphics_pipeline_library.GetValue() &&
                (vendor == 0x10DE || vendor == 0x1002);
     }();
-    if (graphics_pipeline_library_requested &&
+    const bool gpl_offered =
         supported_extensions.contains(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
-        supported_extensions.contains(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+        supported_extensions.contains(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+    if (graphics_pipeline_library_requested && gpl_offered) {
         loaded_extensions.insert(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
         loaded_extensions.insert(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
     } else {
+        // Says whether the driver offers them at all (an Arc B580 log could not tell, helper
+        // CZ); fast linking is read only once requested, then logged below.
+        LOG_INFO(Render_Vulkan,
+                 "Nx2Perf gpl: shader libraries {} (the driver {} VK_EXT_graphics_pipeline_library; "
+                 "EDEN_NX2_GPL=1 requests them on any GPU)",
+                 graphics_pipeline_library_requested ? "requested but unavailable"
+                                                     : "not requested",
+                 gpl_offered ? "offers" : "does not offer");
         graphics_pipeline_library_requested = false;
+    }
+
+    // VK_KHR_pipeline_binary (FRITCHII_PIPELINE_BINARY, vk_pipeline_binary.h): enabled only with
+    // the switch on (on by default for AMD's Windows driver). Its properties are read and logged
+    // whenever the driver offers it.
+    PipelineBinary::ChooseDefault(properties.properties.vendorID);
+    pipeline_binary_offered = supported_extensions.contains(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+    pipeline_binary_requested = pipeline_binary_offered && PipelineBinary::SwitchValue() != 0 &&
+                                supported_extensions.contains(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+    if (pipeline_binary_requested) {
+        loaded_extensions.insert(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
     }
 
     extensions.depth_stencil_resolve =
@@ -1937,6 +2027,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
         graphics_pipeline_library_features.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT;
         SetNext(next, graphics_pipeline_library_features);
+    }
+    // In the chain the device is created with: only when the extension is enabled.
+    if (pipeline_binary_requested) {
+        pipeline_binary_features.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR;
+        SetNext(next, pipeline_binary_features);
     }
 
     // VK_EXT_device_fault: what the driver knows about a device loss (ReportLoss). Only the
@@ -2062,6 +2158,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.graphics_pipeline_library.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
         SetNext(next, properties.graphics_pipeline_library);
+    }
+    if (pipeline_binary_offered) {
+        pipeline_binary_properties.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_PROPERTIES_KHR;
+        SetNext(next, pipeline_binary_properties);
     }
 
     // Perform the property fetch.
@@ -2565,6 +2666,32 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance5, features.maintenance5,
                                        VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 
+    // VK_KHR_pipeline_binary (FRITCHII_PIPELINE_BINARY): needs maintenance5 (the capture flag
+    // is a VkPipelineCreateFlags2 bit).
+    if (pipeline_binary_offered) {
+        const auto& binary = pipeline_binary_properties;
+        LOG_INFO(Render_Vulkan,
+                 "VK_KHR_pipeline_binary: internal cache {}, internal cache control {}, prefers "
+                 "internal cache {}, precompiled internal cache {}, compressed data {}",
+                 binary.pipelineBinaryInternalCache, binary.pipelineBinaryInternalCacheControl,
+                 binary.pipelineBinaryPrefersInternalCache,
+                 binary.pipelineBinaryPrecompiledInternalCache,
+                 binary.pipelineBinaryCompressedData);
+    }
+    if (pipeline_binary_requested) {
+        const bool usable = pipeline_binary_features.pipelineBinaries && extensions.maintenance5;
+        if (!usable) {
+            LOG_WARNING(Render_Vulkan, "FRITCHII_PIPELINE_BINARY: the driver has no usable "
+                                       "pipeline binaries (feature or maintenance5 missing), off");
+            loaded_extensions.erase(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+            pipeline_binary_features.pipelineBinaries = VK_FALSE;
+        } else if (pipeline_binary_properties.pipelineBinaryPrefersInternalCache) {
+            LOG_INFO(Render_Vulkan, "FRITCHII_PIPELINE_BINARY: the driver prefers its own cache; "
+                                    "the store runs anyway");
+        }
+        pipeline_binary_enabled = usable;
+    }
+
     // VK_EXT_shader_float8, only for AMD FSR 4: its RDNA 4 network runs in FP8 and drew a black
     // picture without the feature on the device (found by CheezerWheezer).
     if (extensions.shader_float8 &&
@@ -2788,6 +2915,38 @@ bool Device::MainHeapUsage(u64& usage, u64& budget_bytes) const {
     return true;
 }
 
+bool Device::MainHeapNumbers(u64& size, u64& usage, u64& budget_bytes) const {
+    if (!extensions.memory_budget) {
+        return false;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    const auto mem_info = physical.GetMemoryProperties(&budget);
+    size = mem_info.memoryProperties.memoryHeaps[main_heap].size;
+    usage = budget.heapUsage[main_heap];
+    budget_bytes = budget.heapBudget[main_heap];
+    if (heap_size_limit != 0) {
+        size = (std::min)(size, heap_size_limit);
+        budget_bytes = (std::min)(budget_bytes, heap_size_limit);
+    }
+    return true;
+}
+
+bool Device::GetDeviceLuid(u32& low, s32& high) const {
+    VkPhysicalDeviceIDProperties id{};
+    id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDeviceProperties2 properties{};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties.pNext = &id;
+    physical.GetProperties2(properties);
+    if (!id.deviceLUIDValid) {
+        return false;
+    }
+    std::memcpy(&low, id.deviceLUID, sizeof(low));
+    std::memcpy(&high, id.deviceLUID + sizeof(low), sizeof(high));
+    return true;
+}
+
 void Device::LogMemoryHeaps() const {
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
@@ -2990,8 +3149,27 @@ void Device::CollectToolingInfo() {
 #endif
 }
 
+bool Device::WantsSideQueue() const {
+    // Read where the device is made: after main() applied nx2_switches.txt.
+    static const bool wanted = [this] {
+        const char* value = std::getenv("FRITCHII_READ_SIDE_COPY");
+        if (value == nullptr || value[0] < '2' || value[0] > '9') {
+            return false;
+        }
+        const auto families = physical.GetQueueFamilyProperties();
+        if (graphics_family >= families.size() || families[graphics_family].queueCount < 2) {
+            LOG_WARNING(Render_Vulkan, "FRITCHII_READ_SIDE_COPY: the graphics family has one "
+                                       "queue, no side queue (the side copy counts dry)");
+            return false;
+        }
+        return true;
+    }();
+    return wanted;
+}
+
 std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     static constexpr float QUEUE_PRIORITY = 1.0f;
+    static constexpr std::array<float, 2> QUEUE_PRIORITIES{1.0f, 1.0f};
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
@@ -3007,6 +3185,11 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
             .pQueuePriorities = nullptr,
         });
         ci.pQueuePriorities = &QUEUE_PRIORITY;
+        // FRITCHII_READ_SIDE_COPY >= 2: the side queue is the graphics family's second.
+        if (queue_family == graphics_family && WantsSideQueue()) {
+            ci.queueCount = 2;
+            ci.pQueuePriorities = QUEUE_PRIORITIES.data();
+        }
     }
 
     return queue_cis;
@@ -3109,6 +3292,78 @@ void Device::ShutdownGPULogging() {
     if (GPU::Logging::GPULogger::GetInstance().IsInitialized()) {
         GPU::Logging::GPULogger::GetInstance().Shutdown();
     }
+}
+
+std::vector<PhysicalDeviceSummary> SummarizePhysicalDevices(
+    const vk::InstanceDispatch& dld, std::span<const VkPhysicalDevice> devices) {
+    std::vector<PhysicalDeviceSummary> summaries;
+    summaries.reserve(devices.size());
+    for (const VkPhysicalDevice handle : devices) {
+        const vk::PhysicalDevice physical(handle, dld);
+        const VkPhysicalDeviceProperties properties = physical.GetProperties();
+        PhysicalDeviceSummary summary;
+        summary.name = properties.deviceName;
+        summary.type = properties.deviceType;
+        const VkPhysicalDeviceMemoryProperties memory = physical.GetMemoryProperties().memoryProperties;
+        for (u32 heap = 0; heap < memory.memoryHeapCount; ++heap) {
+            if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                summary.local_memory = (std::max)(summary.local_memory,
+                                                  u64{memory.memoryHeaps[heap].size});
+            }
+        }
+        summaries.push_back(std::move(summary));
+    }
+    return summaries;
+}
+
+PhysicalDevicePick PickPhysicalDevice(std::span<const PhysicalDeviceSummary> devices,
+                                      u32 saved_index, std::string_view saved_name) {
+    if (devices.empty()) {
+        return {0, "no device"};
+    }
+    if (!saved_name.empty()) {
+        // The saved index first: two cards of the same model keep the one picked.
+        if (saved_index < devices.size() && devices[saved_index].name == saved_name) {
+            return {saved_index, "the saved choice"};
+        }
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (devices[i].name == saved_name) {
+                return {i, "the saved choice, found by name (the device order changed)"};
+            }
+        }
+    } else if (saved_index != 0 && saved_index < devices.size()) {
+        return {saved_index, "the saved choice (index, from before names were saved)"};
+    }
+    // Automatic: a discrete card before an integrated GPU, then the most device-local memory.
+    // Index 0 stays when nothing beats it, so single-GPU PCs never change.
+    const auto rank = [](VkPhysicalDeviceType type) {
+        switch (type) {
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+            return 3;
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+            return 2;
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+            return 1;
+        default:
+            return 0;
+        }
+    };
+    size_t best = 0;
+    for (size_t i = 1; i < devices.size(); ++i) {
+        const int candidate = rank(devices[i].type);
+        const int current = rank(devices[best].type);
+        if (candidate > current ||
+            (candidate == current && devices[i].local_memory > devices[best].local_memory)) {
+            best = i;
+        }
+    }
+    if (!saved_name.empty()) {
+        return {best, "automatic (the saved card is not in this PC any more)"};
+    }
+    if (saved_index >= devices.size()) {
+        return {best, "automatic (the saved index is past the device list)"};
+    }
+    return {best, "automatic (discrete card with the most video memory first)"};
 }
 
 } // namespace Vulkan

@@ -138,6 +138,18 @@ public:
         return translation_generation.load(std::memory_order_acquire);
     }
 
+    /// The bytes from `address` (at most `size`) before the first device page with no host
+    /// backing, which ReadBlock reads as zeros (FRITCHII_BARE_SSBO_CLAMP). One table read a page.
+    [[nodiscard]] size_t BackedPrefix(DAddr address, size_t size) const {
+        const DAddr end = address + size;
+        for (DAddr page = address & ~DAddr{page_mask}; page < end; page += page_size) {
+            if (tracked_entries[page >> page_bits].compressed_physical_ptr == 0) {
+                return page <= address ? 0 : static_cast<size_t>(page - address);
+            }
+        }
+        return size;
+    }
+
     void ReadBlock(DAddr address, void* dest_pointer, size_t size);
     void ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size);
     void WriteBlock(DAddr address, const void* src_pointer, size_t size);

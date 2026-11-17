@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -176,9 +177,34 @@ public:
         return is_built.load(std::memory_order::acquire);
     }
 
-    /// Whether no build of this pipeline is left queued on a worker thread, which holds it
+    /// Whether no build of this pipeline is left queued on a worker thread (the pipeline workers
+    /// or FRITCHII_ASYNC_COMPUTE_SKIP's kick thread), which holds it
     [[nodiscard]] bool IsBuildTaskDone() const noexcept {
-        return build_task_done.load(std::memory_order::acquire);
+        return build_task_done.load(std::memory_order::acquire) &&
+               !kick_pending.load(std::memory_order::acquire);
+    }
+
+    // --- FRITCHII_ASYNC_COMPUTE_SKIP (vk_async_compute_skip.h) ---
+
+    /// Waits at most `timeout` for the build, never building it on the calling thread. True
+    /// once built.
+    [[nodiscard]] bool WaitBuiltFor(std::chrono::nanoseconds timeout);
+    /// Starts the build on `worker` now, unless a thread claimed it already: the pipeline
+    /// workers are first in, first out and may hold hundreds of builds before this one.
+    void KickBuild(Common::ThreadWorker& worker);
+    /// When the build ended (steady clock); only once IsBuilt().
+    [[nodiscard]] std::chrono::steady_clock::time_point BuiltAt() const noexcept {
+        return std::chrono::steady_clock::time_point{
+            std::chrono::steady_clock::duration{built_at.load(std::memory_order::acquire)}};
+    }
+    /// Configure's storage pointer binds (the uniform state, the storage buffer binds and the
+    /// shader hash), done ahead so the dispatch's written ranges can be judged before anything
+    /// is uploaded or marked. The buffer cache's lock held. Configure skips them once after.
+    void BindStoragePointers(BufferCache& buffer_cache);
+    /// The pointers BindStoragePointers bound are the ones Configure uses next (set by the
+    /// caller after BindStoragePointers, for a dispatch that runs).
+    void UsePreboundPointers() noexcept {
+        pointers_prebound = true;
     }
 
 private:
@@ -214,6 +240,11 @@ private:
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
+    /// FRITCHII_ASYNC_COMPUTE_SKIP: the build's end (steady clock ticks), a kick queued, and
+    /// Configure's pointer binds done ahead (BindStoragePointers).
+    std::atomic<std::chrono::steady_clock::rep> built_at{};
+    std::atomic_bool kick_pending{false};
+    bool pointers_prebound{};
 };
 
 } // namespace Vulkan

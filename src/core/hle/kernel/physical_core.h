@@ -52,6 +52,11 @@ public:
     // Log backtrace of current processor state.
     void LogBacktrace(KernelCore& kernel);
 
+    // Fritchii hang report: asks this core's thread for a backtrace of the guest thread it runs
+    // (logged when the JIT next returns). Returns that thread's id, or ~0 when the core runs no
+    // guest code now (idle). Any thread may call it.
+    u64 RequestBacktrace(const char* reason);
+
     // Wait for an interrupt.
     void Idle(KernelCore& kernel);
 

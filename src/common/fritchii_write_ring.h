@@ -149,6 +149,33 @@ bool ForEachSince(u64 after, Func&& func) {
     return complete;
 }
 
+/// The device reads inside a ReadSiteScope (always on, two thread-local stores): the "site" of
+/// the unmapped device read lines (Core::ReportUnmappedRead), innermost and outermost.
+inline thread_local const char* t_read_site = nullptr;
+inline thread_local const char* t_read_context = nullptr;
+class ReadSiteScope {
+public:
+    explicit ReadSiteScope(const char* name) noexcept
+        : previous_site{t_read_site}, owns_context{t_read_context == nullptr} {
+        t_read_site = name;
+        if (owns_context) {
+            t_read_context = name;
+        }
+    }
+    ~ReadSiteScope() {
+        t_read_site = previous_site;
+        if (owns_context) {
+            t_read_context = nullptr;
+        }
+    }
+    ReadSiteScope(const ReadSiteScope&) = delete;
+    ReadSiteScope& operator=(const ReadSiteScope&) = delete;
+
+private:
+    const char* previous_site;
+    bool owns_context;
+};
+
 /// Names the writes inside it (innermost names the site, outermost the context).
 class SiteScope {
 public:

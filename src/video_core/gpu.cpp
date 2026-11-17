@@ -24,6 +24,7 @@
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
 #include "video_core/buffer_cache/read_run_stats.h"
+#include "video_core/buffer_cache/store_footprint_live.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
@@ -444,6 +445,14 @@ struct GPU::Impl {
             ReadRunStats::t_writer_answer = {};
         }
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
+        // FRITCHII_STORE_FOOTPRINT=2: a sampled read compares its bytes once its wait is over
+        // (nothing pending: one acquire load)
+        SCOPE_EXIT {
+            VideoCommon::StoreFootprintLive::FinishVerify(
+                addr, size, [this](u64 address, u8* out, u64 bytes) {
+                    system.Host1x().MemoryManager().ReadBlockUnsafe(address, out, bytes);
+                });
+        };
         if (raster_area.preemtive) {
             return raster_area;
         }

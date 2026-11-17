@@ -64,6 +64,11 @@ public:
 
     Dynarmic::CodePage cached_code_page;
     u64 last_code_addr = u64(-1);
+    /// Other threads invalidate by bumping code_generation instead of writing last_code_addr:
+    /// a page copy that raced an invalidation is refetched at the next read, where before
+    /// the owner's store of last_code_addr could overwrite the reset and keep old code.
+    u32 cached_code_generation = 0;
+    std::atomic<u32> code_generation{0};
     /// Warm compiles read code straight from memory: other threads reset last_code_addr
     /// (InvalidateCacheRange) and the page copy may hold another page (fable52_answer_12).
     bool direct_code_reads = false;

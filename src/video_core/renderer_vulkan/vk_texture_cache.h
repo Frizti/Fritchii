@@ -16,6 +16,7 @@
 #include <optional>
 #include <span>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -204,6 +205,26 @@ public:
 
     /// FRITCHII_KEEP_BLOCKS: the kept blocks' limit from the budget check (Device::LimitKeptBlocks).
     void LimitKeptBlocks(u64 budget, u64 critical) const;
+
+    /// FRITCHII_VRAM_BUDGET_MODE: the main heap's size and the driver's usage and budget for it
+    /// (Device::MainHeapNumbers). False without VK_EXT_memory_budget.
+    bool MainHeapNumbers(u64& size, u64& usage, u64& budget) const;
+
+    /// FRITCHII_VRAM_BUDGET_MODE=os: dedicated video memory the other processes hold on this
+    /// adapter (the OS's counters, Common::GetAdapterVideoMemory). None before the first sample,
+    /// without the counters and off Windows.
+    [[nodiscard]] std::optional<u64> OtherProcessesVideoMemory() const;
+
+    /// The texture cache's live budget cap binds (FRITCHII_VRAM_BUDGET_MODE): the image pool
+    /// follows the room under the budget as with FRITCHII_VRAM_POOL_FIT and kept blocks go back.
+    void SetBudgetPressure(bool pressure) noexcept {
+        budget_pressure = pressure;
+    }
+
+    /// FRITCHII_VRAM_OWNERS: the device side of the owners line (the driver's usage and budget,
+    /// both allocators, what lies outside them, the pool, frees in flight, kept blocks, staging),
+    /// with the texture cache's live images and its deleted ones still allocated.
+    [[nodiscard]] std::string VramOwnersText(u64 texture_image_bytes, u64 deleted_bytes);
 
     bool CanReportMemoryUsage() const;
 
@@ -522,6 +543,10 @@ public:
     /// FRITCHII_VRAM_POOL_FIT: recomputes pool_fit_cap from the budget and the usage.
     void UpdatePoolFitCap();
     u64 pool_fit_cap{~u64{0}};  ///< ~0 while FRITCHII_VRAM_POOL_FIT is off
+    bool budget_pressure{};     ///< SetBudgetPressure
+    mutable int luid_state{};   ///< FRITCHII_VRAM_BUDGET_MODE=os: 0 not looked up, 1 found, 2 none
+    mutable u32 luid_low{};
+    mutable s32 luid_high{};
     u64 pool_fit_lowest{~u64{0}}; ///< the lowest fitted cap since the last report
     u64 pool_fit_budget{};
     u64 pool_fit_others{};
@@ -536,6 +561,12 @@ public:
     u64 vram_report_last_budget{};
     u32 vram_report_seen_pressure{};
     u32 vram_report_seen_failed{};
+    /// FRITCHII_VRAM_TRIM: every 60 frames near the budget, the allocators' empty blocks go.
+    void TickVramTrim();
+    u32 vram_trim_frames{};
+    u32 vram_trim_events{};  ///< trims that gave memory back, this session
+    u64 vram_trim_bytes{};   ///< what they gave back, this session
+    std::chrono::steady_clock::time_point vram_trim_logged{};
     static constexpr u64 ImagePoolMaxFrames = 180;
     std::deque<PooledImage> image_pool;
     u64 image_pool_bytes{};
@@ -745,6 +776,13 @@ public:
 
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);
+
+    /// FRITCHII_ZERO_UPLOAD: what uploading all-zero guest bytes writes (zero in every level and
+    /// layer), as a GPU clear, with the barriers of an upload. Single-sample, uncompressed images
+    /// not scaled (the texture cache checks).
+    /// current: clears the image in use instead (the scaled one when rescaled;
+    /// FRITCHII_STALE_ZERO).
+    void ClearToZero(bool current = false);
 
     void DownloadMemory(VkBuffer buffer, size_t offset,
                         std::span<const VideoCommon::BufferImageCopy> copies);

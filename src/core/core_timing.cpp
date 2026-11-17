@@ -63,6 +63,91 @@ int SpinBudgetPercent() {
 }
 constexpr s64 SpinBurstNs = 2'000'000;
 
+/// FRITCHII_HOSTTIMING_PRIORITY (live, default 0 = highest, as before): 1 = the timer thread runs
+/// time critical, the priority of the guest cores and the GPU threads. At highest it is one step
+/// below them and below DWM and audio threads: in market windows where other processes took 2.5+
+/// CPUs, 400-900 timer callbacks every 10 s ran 1 ms or more late (guest sleeps, timeouts and the
+/// syncpoint polls the game's GPU waits are answered by) and single callbacks took 4-9 ms of wall
+/// time, most likely the thread off the CPU. Only the thread's OS priority changes.
+/// FRITCHII_HOSTTIMING_OFF_GPU (live, default 0; helper DE). Where the timer thread spins.
+/// 0 (as before): BackgroundWorkCpuMask at the first spin after any GPU thread pinned, never
+/// again; the GPU threads pin one after another at boot, so a spin between the front's pin and
+/// the back's left HostTiming allowed onto the back's core (b37 census: HostTiming 295-496 ms/s
+/// allowed on 0x30, the busiest thread that could share E's core). 1: every processor but the
+/// physical cores of the pinned GPU threads (front, back, R; both hardware threads), placed
+/// again whenever another GPU thread pins; refused on small CPUs (Common::HostTimingOffGpuMask).
+/// Back to 0 restores the placement 0 made. Each placement is logged with where the thread is.
+void PlaceTimerSpin() {
+    static bool placed = false;          // mode 0's own placement
+    static u64 placed_mask = 0;          // what mode 0 set (0: none yet)
+    static int applied_mode = 0;         // the mode the thread's mask follows
+    static u32 applied_generation = ~0U; // mode 1: the pinned set it was placed for
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_hosttiming_off_gpu,
+                                                      "FRITCHII_HOSTTIMING_OFF_GPU") != 0
+                         ? 1
+                         : 0;
+    const auto log_place = [](const char* why, u64 mask, u64 gpu) {
+        const int processor = Common::CurrentProcessorNumber();
+        LOG_INFO(Core_Timing,
+                 "HostTiming placed ({}): mask {:#x}, GPU threads' cores {:#x}, running on "
+                 "processor {}",
+                 why, mask, gpu, processor);
+    };
+    if (mode == 0) {
+        if (applied_mode != 0) {
+            // Back from 1: the placement mode 0 had (or every processor if it had none).
+            Common::SetCurrentThreadCpuMask(placed_mask);
+            applied_mode = 0;
+            log_place("FRITCHII_HOSTTIMING_OFF_GPU=0", placed_mask, 0);
+        }
+        if (!placed) {
+            // Off the GPU threads' cores, once they are pinned.
+            if (const u64 mask = Common::BackgroundWorkCpuMask(); mask != 0) {
+                Common::SetCurrentThreadCpuMask(mask);
+                placed = true;
+                placed_mask = mask;
+                log_place("first spin after a GPU pin", mask, 0);
+            }
+        }
+        return;
+    }
+    const u32 generation = Common::PinGeneration();
+    if (applied_mode == 1 && generation == applied_generation) [[likely]] {
+        return;
+    }
+    u64 gpu_cores = 0;
+    const u64 mask = Common::HostTimingOffGpuMask(gpu_cores);
+    applied_generation = generation;
+    if (mask == 0) {
+        // Nothing pinned yet (looked at again at the next pin) or refused on this CPU.
+        applied_mode = 1;
+        return;
+    }
+    Common::SetCurrentThreadCpuMask(mask);
+    applied_mode = 1;
+    log_place("FRITCHII_HOSTTIMING_OFF_GPU=1", mask, gpu_cores);
+}
+
+int TimerPriorityMode() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_hosttiming_priority,
+                                            "FRITCHII_HOSTTIMING_PRIORITY");
+}
+
+/// On the timer thread: applies FRITCHII_HOSTTIMING_PRIORITY when it changed. Off: one relaxed
+/// load and a compare per pass.
+void ApplyTimerPriority() {
+    static thread_local int applied = 0; // The thread starts at highest (Initialize)
+    const int wanted = TimerPriorityMode();
+    if (wanted == applied) [[likely]] {
+        return;
+    }
+    Common::SetCurrentThreadPriority(wanted == 1 ? Common::ThreadPriority::Critical
+                                                 : Common::ThreadPriority::VeryHigh);
+    LOG_INFO(Core_Timing, "HostTiming priority (FRITCHII_HOSTTIMING_PRIORITY={}): {}", wanted,
+             wanted == 1 ? "time critical" : "highest");
+    applied = wanted;
+}
+
 /// What the timer thread did, logged every 10 s from it ("HostTiming in 10 s"). The spins and the
 /// callbacks of 1 ms or more also go to the hitch line, so a hitch where HostTiming is busy says
 /// which of the two it was. Thread local: Advance also runs on the CPU thread in single core mode.
@@ -129,14 +214,16 @@ void MaybeLogTimerStats(s64 now) {
              "HostTiming in {:.0f} s: spun {:.1f} ms/s before guest timers ({} spins, longest {} us; "
              "EXP75={} us, FRITCHII_HOSTTIMING_SPIN_BUDGET={}%: {} cut by it); {} OS waits; {} "
              "events, callbacks {:.1f} ms/s, longest {} us ({}), {} of 1 ms or more; most in one "
-             "pass {}; {} ran 1 ms or more late (worst {:.1f} ms, {})",
+             "pass {}; {} ran 1 ms or more late (worst {:.1f} ms, {}); "
+             "FRITCHII_HOSTTIMING_PRIORITY={}",
              seconds, static_cast<double>(s.spin_ns) / 1e6 / seconds, s.spins,
              s.longest_spin / 1000, TimerSpinNs() / 1000, SpinBudgetPercent(), s.budget_cuts,
              s.waits, s.events, static_cast<double>(s.callback_ns) / 1e6 / seconds,
              s.longest_callback / 1000,
              s.longest_callback_name.empty() ? "none" : s.longest_callback_name.c_str(),
              s.slow_callbacks, s.most_in_pass, s.late_1ms, static_cast<double>(s.worst_late) / 1e6,
-             s.worst_late_name.empty() ? "none" : s.worst_late_name.c_str());
+             s.worst_late_name.empty() ? "none" : s.worst_late_name.c_str(),
+             TimerPriorityMode());
     s = TimerStats{};
     s.window_start = now;
 }
@@ -272,6 +359,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
             while (!stop_token.stop_requested()) {
                 while (!paused && !stop_token.stop_requested()) {
                     paused_set = false;
+                    ApplyTimerPriority();
                     if (auto const next_time = Advance(); next_time) {
                         const s64 now_ns = GetGlobalTimeNs().count();
                         MaybeLogTimerStats(now_ns);
@@ -301,15 +389,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                                 spin_budget_at = 0;
                             }
                             if (precise_in <= spin_ns) {
-                                static bool placed = false;
-                                if (!placed) {
-                                    // Off the GPU threads' cores, once they are pinned.
-                                    if (const u64 mask = Common::BackgroundWorkCpuMask();
-                                        mask != 0) {
-                                        Common::SetCurrentThreadCpuMask(mask);
-                                        placed = true;
-                                    }
-                                }
+                                PlaceTimerSpin();
                                 const u32 seen = wake_count.load(std::memory_order_acquire);
                                 s64 spun_until = now_ns;
                                 while ((spun_until = GetGlobalTimeNs().count()) < *next_time &&

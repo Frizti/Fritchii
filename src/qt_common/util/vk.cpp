@@ -24,11 +24,23 @@ class QWindow;
 namespace VkDeviceInfo {
 Record::Record(std::string_view name_, const std::vector<VkPresentModeKHR>& vsync_modes_,
                bool has_broken_compute_, std::string_view driver_version_, bool fsr4_capable_,
-               bool nvidia_)
+               bool nvidia_, std::string_view device_name_, VkPhysicalDeviceType device_type_,
+               u64 local_memory_)
     : name{name_}, vsync_support{vsync_modes_}, has_broken_compute{has_broken_compute_},
-      driver_version{driver_version_}, fsr4_capable{fsr4_capable_}, nvidia{nvidia_} {}
+      driver_version{driver_version_}, fsr4_capable{fsr4_capable_}, nvidia{nvidia_},
+      device_name{device_name_}, device_type{device_type_}, local_memory{local_memory_} {}
 
 Record::~Record() = default;
+
+size_t PickedIndex(const std::vector<Record>& records, u32 saved_index,
+                   std::string_view saved_name) {
+    std::vector<Vulkan::PhysicalDeviceSummary> summaries;
+    summaries.reserve(records.size());
+    for (const Record& record : records) {
+        summaries.push_back({record.device_name, record.device_type, record.local_memory});
+    }
+    return Vulkan::PickPhysicalDevice(summaries, saved_index, saved_name).index;
+}
 
 void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
     using namespace Vulkan;
@@ -47,7 +59,9 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
 
     records.clear();
     records.reserve(physical_devices.size());
-    for (const VkPhysicalDevice device : physical_devices) {
+    const auto summaries = Vulkan::SummarizePhysicalDevices(dld, physical_devices);
+    for (size_t index = 0; index < physical_devices.size(); ++index) {
+        const VkPhysicalDevice device = physical_devices[index];
         const auto physical_device = vk::PhysicalDevice(device, dld);
         std::string name = physical_device.GetProperties().deviceName;
 
@@ -80,7 +94,9 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
         records.push_back(VkDeviceInfo::Record(name, present_modes, has_broken_compute,
                                                static_cast<const char*>(driver_properties.driverInfo),
                                                fsr4_capable,
-                                               properties.properties.vendorID == 0x10DE));
+                                               properties.properties.vendorID == 0x10DE,
+                                               summaries[index].name, summaries[index].type,
+                                               summaries[index].local_memory));
     }
 } catch (const Vulkan::vk::Exception& exception) {
     LOG_ERROR(Frontend, "Failed to enumerate devices with error: {}", exception.what());

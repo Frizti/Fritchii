@@ -23,6 +23,7 @@
 #include "video_core/upscaler_fallback_log.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
+#include "video_core/renderer_vulkan/vk_async_compute_skip.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -334,6 +335,16 @@ private:
     /// lookup's hooks threw, which propagates as a lent dispatch's exception would). False = lend
     /// it; `onef_dispatch_lent_pipeline` is set when E looked the pipeline up already.
     [[nodiscard]] bool OneFollowerPostDispatch();
+    /// FRITCHII_ASYNC_COMPUTE_SKIP (vk_async_compute_skip.h): DispatchCompute's decision for a
+    /// pipeline that counts as unbuilt, both caches' locks held, before the fill. True = skip
+    /// the dispatch (nothing was marked or uploaded). False = run it (it waits for the build as
+    /// before, or got it within the frame's wait budget).
+    [[nodiscard]] bool SkipUnbuiltDispatch(ComputePipeline& pipeline, bool indirect,
+                                           bool special_pass);
+    /// The written ranges of the bound dispatch (its storage pointers bound), as its marks
+    /// will be; false when one is not bounded (G4). Buffer cache's lock held.
+    [[nodiscard]] bool CollectComputeWrites(
+        boost::container::small_vector<AsyncComputeSkip::Range, 8>& ranges);
     /// R, the dispatch op: takes ring B's packet `number` and records the dispatch with
     /// `pipeline` (E's lookup) on R's view of the compute engine.
     void OneFollowerPlayDispatch(ComputePipeline* pipeline, u64 number);
@@ -564,6 +575,9 @@ private:
     QueryCacheRuntime query_cache_runtime;
     QueryCache query_cache;
     PipelineCache pipeline_cache;
+    /// FRITCHII_ASYNC_COMPUTE_SKIP (vk_async_compute_skip.h). After pipeline_cache: its kick
+    /// thread builds that cache's pipelines, so it is joined before they go.
+    AsyncComputeSkip async_compute_skip;
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
     FrameDump frame_dump;

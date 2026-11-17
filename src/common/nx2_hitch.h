@@ -51,6 +51,8 @@ enum class Cause : u8 {
     WarmRefusedSpace, ///< warm compiles refused: the code cache kept its free half (count only)
     StagingCreate,    ///< new staging buffers (StagingBufferPool::CreateStagingBuffer), bytes
     TextureUpload,    ///< TextureCache::UploadImageContents (read, untile, staging write), bytes
+    ZeroUpload,       ///< FRITCHII_ZERO_UPLOAD: the zero check of an upload, bytes looked at
+    RecompileListed,  ///< Recompile of a FRITCHII_JIT_BLOCK_LIST block the warm-up had not reached
     Count,
 };
 
@@ -65,7 +67,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Cause::Count)> Caus
     "recompiling code this core had compiled before (dropped since)",
     "game code dropped by invalidations (blocks)", "game code dropped by fastmem faults (blocks)",
     "warm compiles refused (code cache full)", "staging buffers made",
-    "texture uploads (CPU side)"};
+    "texture uploads (CPU side)", "zero checks of texture uploads",
+    "recompiling listed game code the warm-up had not compiled yet (summed over cores)"};
 
 struct Counters {
     std::array<std::atomic<u64>, static_cast<size_t>(Cause::Count)> ns{};
@@ -222,7 +225,9 @@ void OnPresent(long long gap_us);
 // in flight, the game's threads in kernel waits), then every thread's stack (Windows x64,
 // module+offset). FRITCHII_HANG_DUMP=1 (boot) adds a minidump next to the log (Windows). One
 // report per freeze: the next present re-arms it. Read only (threads are suspended only for the
-// moment their registers are read).
+// moment their registers are read). A boot or shutdown (SetHangHooks, ClearHangHooks) starts the
+// count over; until the session's first present the threshold is FRITCHII_HANG_BOOT_S (live,
+// default 60), as the first frame comes 16-19 s into a boot.
 struct HangHooks {
     /// The report's threshold in seconds while the game runs, 0 while it does not (or the
     /// switch is 0). Called once a second under the hooks' lock.

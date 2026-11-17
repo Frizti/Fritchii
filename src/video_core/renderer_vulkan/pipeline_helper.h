@@ -95,13 +95,32 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
     for (const DescriptorBufferBinding& binding : layout.bindings) {
         for (u32 index = 0; index < binding.count; ++index) {
             const DescriptorUpdateEntry& entry = *(payload++);
-            const VkDescriptorAddressInfoEXT address_info{
+            VkDescriptorAddressInfoEXT address_info{
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
                 .pNext = nullptr,
                 .address = entry.address.address,
                 .range = entry.address.range,
                 .format = entry.address.format,
             };
+            const bool buffer_type = binding.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                                     binding.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                                     binding.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                                     binding.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+            if (buffer_type && address_info.address < 0x1000 &&
+                (address_info.address != 0 || address_info.range != VK_WHOLE_SIZE))
+                [[unlikely]] {
+                // No buffer lives in the first page: address 0 with a real range (or an offset
+                // added to 0) is a missing buffer. The driver would build a descriptor that
+                // reads and writes at device address 0. The null form instead (address 0, whole
+                // size: what MakeBufferEntry already makes for a buffer without an address).
+                vk::NoteNullTarget(binding.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                                           binding.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
+                                       ? "storage descriptor at device address 0, made null"
+                                       : "uniform descriptor at device address 0, made null",
+                                   std::source_location::current());
+                address_info.address = 0;
+                address_info.range = VK_WHOLE_SIZE;
+            }
             VkDescriptorGetInfoEXT get_info{
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
                 .pNext = nullptr,

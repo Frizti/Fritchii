@@ -64,10 +64,12 @@ public:
                                                                VkDeviceSize offset,
                                                                VkDeviceSize size) {
         if (!descriptor_buffer) {
+            // A null buffer is a null descriptor only as (0, VK_WHOLE_SIZE); with a real offset
+            // or range the driver may build one at device address 0 instead.
             return VkDescriptorBufferInfo{
                 .buffer = buffer,
-                .offset = offset,
-                .range = size,
+                .offset = buffer == VK_NULL_HANDLE ? 0 : offset,
+                .range = buffer == VK_NULL_HANDLE ? VK_WHOLE_SIZE : size,
             };
         }
         return DescriptorAddress{
@@ -127,8 +129,8 @@ public:
         SeamHook::Watch(SeamHook::Use::DescriptorAdd);
         *(payload_cursor++) = VkDescriptorBufferInfo{
             .buffer = buffer,
-            .offset = offset,
-            .range = size,
+            .offset = buffer == VK_NULL_HANDLE ? 0 : offset,
+            .range = buffer == VK_NULL_HANDLE ? VK_WHOLE_SIZE : size,
         };
     }
 

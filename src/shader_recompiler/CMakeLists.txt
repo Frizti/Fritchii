@@ -181,6 +181,7 @@ add_library(shader_recompiler STATIC
     ir_opt/conditional_barrier_pass.cpp
     ir_opt/constant_propagation_pass.cpp
     ir_opt/dead_code_elimination_pass.cpp
+    ir_opt/dominance.h
     ir_opt/dual_vertex_pass.cpp
     ir_opt/geometry_compaction_pass.cpp
     ir_opt/global_memory_to_storage_buffer_pass.cpp

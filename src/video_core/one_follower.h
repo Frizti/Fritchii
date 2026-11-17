@@ -726,6 +726,14 @@ void FlushCarried() noexcept;
 [[nodiscard]] bool DryReleaseOn() noexcept;
 /// FRITCHII_ONEF_SEM_E (with POST_FENCE on; refreshes g_sem_e): fable_b 19.4, 19.6, 20.3.
 [[nodiscard]] bool SemOnE() noexcept;
+/// FRITCHII_ONEF_SIGNAL_ON_R (with SEM_E on): SEM_E's guest-visible signals happen at R's played
+/// place (payload writes on R in posted ops, sync points signalled by R, SignalFence lent). E.
+[[nodiscard]] bool SignalOnR() noexcept;
+/// E: a signal SEM_E would have made on E went to R instead (the fence decisions line).
+void CountSignalOnR() noexcept;
+/// E, right after the PushOp of an op that writes the report at `device` on R: E's reads of its
+/// page wait until R played that op (13.0's landing pages, keyed to the op itself).
+void NoteReportLandsAtLastPush(u64 device) noexcept;
 /// FRITCHII_ONEF_SOFT_RELEASE_E: a non-forced ReleaseFences is answered on E.
 [[nodiscard]] bool SoftReleaseOnE() noexcept;
 /// FRITCHII_ONEF_POST_IDLE (with POST_FENCE on): WaitForIdle posted.
@@ -813,6 +821,9 @@ enum class DispatchCount : u8 {
     /// R: an image's real range (the texture cache's backing image) reaches past E's record
     /// (a view into a larger image: the lent path would record more; not a must-be-0)
     ImageWiderThanRecord,
+    /// lent: FRITCHII_ASYNC_COMPUTE_SKIP on and the pipeline not built yet (the lent call
+    /// decides to skip or wait before anything is marked)
+    Unbuilt,
     Count,
 };
 /// The kinds that count a posted dispatch a second time (not in the line's total).
@@ -840,6 +851,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DispatchCount::Coun
         "lent: byte-addressed image write", "posted writing images", "posted indirect",
         "lent indirect grid over the limit (dry)", "posted images ranged",
         "posted images unbounded", "images on a front read page", "images wider than E's record",
+        "lent: unbuilt pipeline (FRITCHII_ASYNC_COMPUTE_SKIP)",
 };
 /// E: the first reason a dispatch cannot be posted before its lookup, Count when it may be;
 /// DispatchCount::Posted (never returned) is not a reason. Returns Count too when the switch is
@@ -870,12 +882,19 @@ void NoteFencePosted(u64 number) noexcept;
 void NoteFenceLent() noexcept;
 /// R, at a samples report: E's bit against R's streamer.
 void CountSyncMirror(bool engine_bit, bool render_bit) noexcept;
+/// R, at a draw it skips (no pipeline, configure failed, ...) with the samples count enabled in
+/// its view: E's mirror counted the draw, R's counter will not start for it
+/// (FRITCHII_ONEF_MIRROR_STOP=2 explains the next "E's mirror started, R's counter not").
+void NoteSkippedSamplesDraw() noexcept;
 /// E: the view is tracked and seeded at R (a posted op reads it).
 [[nodiscard]] bool ViewReady() noexcept;
 
 /// FRITCHII_ONEF_WAITS_E (live; fable_b 11.2): the front's waits on game memory, QMDs,
 /// semaphore flushes and lists read E's position (`consumed`), the rest R's (`played`).
 [[nodiscard]] bool WaitsE() noexcept;
+/// FRITCHII_ONEF_WAITS_R (live): overrides WAITS_E and SEM_E's lagged acquire check, every front
+/// wait ends at R's played position.
+[[nodiscard]] bool WaitsR() noexcept;
 /// The newest render op that writes game memory on R (a plain report): its ring A entry
 /// position + 1, 0 = none yet. E stores it before it stores a `consumed` past that entry.
 [[nodiscard]] u64 GuestWriteOpMark() noexcept;
@@ -947,6 +966,7 @@ enum class QueryKind : u8 {
     PayloadReleaseOnE,     ///< FRITCHII_ONEF_SEM_E: a payload release E wrote (R notes the sync)
     PayloadFenceOnE,       ///< FRITCHII_ONEF_SEM_E: a fence-flagged payload report E wrote
     FenceReportPosted,     ///< FRITCHII_ONEF_POST_FENCE_REPORT: a counter fence report posted
+    PayloadReleaseOnR,     ///< FRITCHII_ONEF_SIGNAL_ON_R: a payload release R writes (posted op)
     Count,
 };
 inline constexpr std::array<const char*, static_cast<size_t>(QueryKind::Count)> query_kind_names{
@@ -954,6 +974,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(QueryKind::Count)> 
     "condition conditional", "condition if equal", "condition if not equal", "reset",
     "plain report", "report on buffer page", "report on buffer page as op", "fence report",
     "payload release", "payload release on E", "payload fence on E", "fence report posted",
+    "payload release on R",
 };
 /// fable_b 19 step 2's dry counter: which test made a draw lend with LentReason::Transient, in
 /// the order UnlentBlocker and FillRing (vk_one_follower_draw.cpp) try them. Logged per second

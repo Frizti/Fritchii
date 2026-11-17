@@ -12,6 +12,17 @@
 // then append-only chunks (count, checksum, entries). An entry is a block's location key with its
 // pc taken relative to the code image (the image moves every launch). A chunk cut short or with a
 // wrong checksum ends the list; the file is cut back to the good part before the next write.
+//
+// One file per code layout: <program id>-<build id>-<image size>.blocks (2026-11-17, helper DD).
+// The single per-title file was rewritten from zero whenever the image size changed: a mod that
+// adds a module (the cheat menu's subsdk8, +0x2434000) alternated with plain launches in the test
+// root and wiped the list each time, so the owner's fight launch (killcap-v8owner, 02:02) warmed a
+// list that had never seen a kill and compiled 77,816 blocks while playing (548 ms in hitch
+// frames). An old <program id>-<build id>.blocks whose header matches is renamed to the new name.
+//
+// FRITCHII_JIT_LIST_SEED=<dir> (boot, default off; 1 = <exe dir>\jit on Windows): also warms the
+// entries of <dir>\<same file name> (a list shipped with the build, merged from test sessions with
+// work\jit_list_merge.py) that the user's own list lacks. Not written into the user's file.
 
 #pragma once
 
@@ -36,9 +47,19 @@ void Begin(u64 program_id, std::span<const u8> build_id, u64 image_base, u64 ima
 /// The application stops: writes what is left and stops the writer.
 void End();
 
-/// From the recompiler, any core: execution compiled block `key` (an A64 location key). Cheap
-/// when the list is off or the key is already listed.
-void Note(u64 key);
+/// What Note knew of a block the game waited for.
+enum class Seen : u8 {
+    Off,      ///< not recording, single-stepping, or outside the code image
+    New,      ///< not in the list: recorded now
+    Listed,   ///< in the list (an earlier launch or the seed), the warm-up had not compiled it
+    Recorded, ///< recorded earlier this launch
+};
+
+/// From the recompiler, any core: execution compiled block `key` (an A64 location key) while the
+/// game waited; `compiled_earlier` = some core compiled it before in this launch (dropped since,
+/// or another core was compiling it). Counts it for the writer's line ("compiles while the game
+/// ran"). Cheap when the list is off; one hash lookup under the list's lock when on.
+Seen Note(u64 key, bool compiled_earlier);
 
 /// For `core`'s warm-up while it is idle: up to `max` listed keys it has not been handed yet, in
 /// list order (appended to `out`). Returns how many.

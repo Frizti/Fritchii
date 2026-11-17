@@ -24,6 +24,7 @@
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/renderer_vulkan/vk_side_queue.h"
 
 namespace Vulkan {
 
@@ -192,6 +193,60 @@ public:
     /// Whether the host GPU completed `tick`, asking it when the tick is submitted but not known
     /// to be done.
     [[nodiscard]] bool IsFreeNow(u64 tick);
+
+    /// FRITCHII_READ_RUNS=2 (counter only), on any thread: the scheduler tick `stamp` is recorded
+    /// in (the open one when it is not published yet), the scheduler's current tick, and the host
+    /// GPU's completed tick (refreshed).
+    struct ReadTicks {
+        u64 write;
+        u64 current;
+        u64 known;
+    };
+    [[nodiscard]] ReadTicks ReadWriterTicks(u64 stamp);
+
+    /// FRITCHII_READ_RUNS=2 (counter only), on any thread: false when scheduler tick `tick` is not
+    /// submitted (nothing done: no flush is asked for); else waits until the host GPU ran it.
+    bool WaitTickIfSubmitted(u64 tick);
+
+    /// FRITCHII_SUBMIT_TIMES (diagnostic), on any thread: the GPU's start and end of the
+    /// scheduler ticks [first, last] (those it ran), as busy time and gaps.
+    struct AheadTimes {
+        u32 submissions;
+        u32 resolved;
+        u64 busy_ns;
+        u64 gap_ns;
+        u64 overlap_ns;
+        u64 span_ns;
+    };
+    [[nodiscard]] AheadTimes MeasureSubmissions(u64 first, u64 last);
+
+    /// FRITCHII_READ_SIDE_COPY >= 2 (vk_side_queue.h): whether the side queue is there (made on
+    /// the first ask; the device must have been made with it).
+    [[nodiscard]] bool SideCopyReady();
+
+    /// One region of a side copy: from a buffer cache buffer into a download staging buffer.
+    struct SideCopyRegion {
+        VkBuffer src;
+        VkBuffer dst;
+        u64 src_offset;
+        u64 dst_offset;
+        u64 size;
+    };
+    /// Submits `regions` on the side queue after the main queue ran scheduler tick `main_tick`;
+    /// returns the side value (0: not submitted). Every later main submission waits for it.
+    [[nodiscard]] u64 SideCopy(u64 main_tick, std::span<const SideCopyRegion> regions);
+    [[nodiscard]] bool SideDone(u64 value);
+    void WaitSide(u64 value);
+    /// FRITCHII_READ_SIDE_COPY: the side queue's and the main queue's counts since the last call
+    /// (raised waits, slow host waits, main submissions that waited, must-be-0 unsubmitted).
+    struct SideQueueStats {
+        u64 raised;
+        u64 slow_waits;
+        u64 not_queued;
+        u64 main_waits;
+        u64 unsubmitted;
+    };
+    [[nodiscard]] SideQueueStats TakeSideQueueStats();
 
     u64 GetDeviceLocalMemory() const;
 
@@ -383,6 +438,10 @@ private:
     GuestDescriptorQueue& guest_descriptor_queue;
     MemStage& mem_stage;
     SeamClock& clock;
+
+    /// FRITCHII_READ_SIDE_COPY >= 2: made on the first SideCopyReady.
+    std::unique_ptr<SideQueue> side_queue;
+    std::once_flag side_queue_once;
 
     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;

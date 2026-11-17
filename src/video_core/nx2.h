@@ -590,6 +590,15 @@ public:
         count.store(waiters.size(), std::memory_order_release);
     }
 
+    /// A new emulation session (nvdrv's Module): the previous session's waiters are gone. Left
+    /// in, a hang report listed acquires waiting longer than the session ran (Damage's log
+    /// 2026-11-17: 6 waiters of 2,500-6,300 s) and read their words through stale pointers.
+    void Clear() {
+        std::scoped_lock lk{mutex};
+        waiters.clear();
+        count.store(0, std::memory_order_release);
+    }
+
     [[nodiscard]] bool Latched(const void* owner) {
         if (count.load(std::memory_order_acquire) == 0) {
             return false;

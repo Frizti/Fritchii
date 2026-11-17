@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
+#include <string>
 #include <thread>
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -148,6 +149,42 @@ void PinCurrentThread(PinnedRole role, int guest_core = -1);
 [[nodiscard]] u64 BackgroundWorkCpuMask();
 /// Windows: hard affinity to `mask` (group 0), or with 0 to every CPU the process may use.
 void SetCurrentThreadCpuMask(u64 mask);
+
+// GPU core siblings (helper DE, 2026-11-17). The pinned GPU threads own a whole physical core each
+// (front 0xc, back 0x30 on a 7800X3D) but use one of its two logical processors; the other one is
+// in no thread's mask, so it is often the only idle logical processor and unpinned busy threads
+// (VulkanWorker ~400 ms/s at Critical priority, GPUFencingThread, VulkanPresent) land on it and
+// share the GPU thread's core.
+/// The unpinned threads that note where they run for FRITCHII_SIBLING_CENSUS.
+enum class CensusThread : u32 { VulkanWorker, Fencing, Present, Count };
+/// FRITCHII_SIBLING_CENSUS=1 (boot, default 0; a dry counter, changes nothing): notes the logical
+/// processor the calling thread runs on (one call per unit of work). A flag test when off.
+void NoteCensusCpu(CensusThread who);
+/// Once a second, on the Pulse thread. FRITCHII_GPU_SIBLINGS_FREE=2: every other thread of the
+/// process nobody placed (still on the whole process mask: driver threads, audio, VSync...) is
+/// kept off the pinned GPU threads' cores too; another value gives them their masks back.
+/// FRITCHII_SIBLING_CENSUS=1: returns what ran on each pinned GPU thread's physical core besides
+/// that thread (ms/s, DPC + interrupt time apart), this process's busiest threads allowed onto
+/// it by name, and where the noted threads ran. Empty when the census is off.
+[[nodiscard]] std::string GpuCoreTick();
+/// FRITCHII_GPU_SIBLINGS_FREE (live, default 0): 1 or 2 = the calling thread keeps off the pinned
+/// GPU threads' cores (BackgroundWorkCpuMask); back to 0 = every CPU the process may use. Refused
+/// (logged once, nothing changes) when that would leave fewer than MinAutoGuestProcessors + 2
+/// fast logical processors (6-core CPUs with SMT, 8 cores without SMT). `applied` is the caller's
+/// own record (start with 0: nothing changes while the switch is 0). Called once per unit of
+/// work; one relaxed load when nothing changed.
+void KeepOffGpuCores(int& applied);
+/// Bumped each time a GPU role thread pins (front, back, R/GPUMem): placements that depend on
+/// the pinned set look again when it moved (one relaxed load).
+[[nodiscard]] u32 PinGeneration();
+/// The logical processor (group 0 number) the calling thread runs on; -1 where unknown.
+[[nodiscard]] int CurrentProcessorNumber();
+/// FRITCHII_HOSTTIMING_OFF_GPU (live, default 0; core_timing.cpp): the mask HostTiming's spin
+/// runs on with 1: every logical processor of the process except the physical cores (both
+/// hardware threads) of the pinned GPU threads (front, back, R/GPUMem). 0 while none is pinned,
+/// or when that would leave fewer than MinAutoGuestProcessors + 2 fast logical processors
+/// (refused, logged once). `gpu_cores` gets the excluded cores.
+[[nodiscard]] u64 HostTimingOffGpuMask(u64& gpu_cores);
 /// THREAD_PRIORITY_IDLE on Windows, ThreadPriority::Low elsewhere.
 void SetCurrentThreadIdlePriority();
 void SetCurrentThreadToEfficiencyCores();

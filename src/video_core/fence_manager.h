@@ -20,6 +20,7 @@
 #include <queue>
 
 #include "common/common_types.h"
+#include "common/fritchii_lock_census.h"
 #include "common/logging.h"
 #include "common/nx2_timeline.h"
 #include "common/settings.h"
@@ -465,6 +466,9 @@ private:
         Common::SetCurrentThreadName("GPUFencingThread");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
         Common::SetCurrentThreadToPerformanceCores();
+        // FRITCHII_FENCE_COPY_UNLOCKED's line: E's lock waits behind this thread.
+        Common::LockCensus::g_fence_thread.store(std::this_thread::get_id(),
+                                                 std::memory_order_relaxed);
 
         // Every fence the host GPU has already passed is released together: Switch 2 titles
         // signal thousands a second and the host GPU completes them in bursts, so each cache's
@@ -491,7 +495,10 @@ private:
             pending_flushes.pop_front();
             pending_query_pops.pop_front();
         };
+        int siblings_free_applied = 0; ///< FRITCHII_GPU_SIBLINGS_FREE as this thread applied it
         while (!stop_token.stop_requested()) {
+            // FRITCHII_GPU_SIBLINGS_FREE (live): off the GPU threads' cores before the wait.
+            Common::KeepOffGpuCores(siblings_free_applied);
             {
                 std::unique_lock lock(guard);
                 // Work the GPU thread runs inline (FoldStubbedFence) goes before any fence
@@ -509,6 +516,8 @@ private:
                 take_front();
                 fence_thread_busy = true;
             }
+            // FRITCHII_SIBLING_CENSUS (dry): where this thread woke up to work.
+            Common::NoteCensusCpu(Common::CensusThread::Fencing);
             if (!batch.front().fence->IsStubbed()) {
                 // The host GPU reaching the fence's submission.
                 Common::Nx2Timeline::Span wait_span{"fence: wait for fence"};
@@ -544,11 +553,37 @@ private:
             // under the lock the thread lets it go between two pops, so the back can take it;
             // the same pops in the same order, each whole under the lock.
             const int hand_back_us = VideoCore::Nx2Debug::Experiment(74);
-            const auto pop_all = [hand_back_us](auto& mutex, size_t pops, auto&& pop) {
+            // FRITCHII_FENCE_YIELD_E (helper CP, common/fritchii_lock_census.h): between two
+            // pops, the lock goes to E if E waits for it (1), or that chance is counted (3).
+            const int yield_e = Common::LockCensus::FenceYieldE();
+            const auto pop_all = [hand_back_us, yield_e](auto& mutex, size_t pops, auto&& pop) {
                 std::unique_lock lock{mutex};
                 auto held_since = std::chrono::steady_clock::now();
+                u64 chances = 0;
+                u64 yield_ns = 0;
                 for (size_t i = 0; i < pops; ++i) {
                     pop();
+                    if (yield_e != 0 && i + 1 < pops && mutex.BackWaiting()) [[unlikely]] {
+                        ++chances;
+                        if (yield_e == 1) {
+                            // E spins for the lock: it takes it at the unlock. Taken back once E
+                            // has it (its mark is gone) or after 50 us; the next pop then waits
+                            // for E's hold to end, as E waited for the pops before.
+                            const auto yield_start = std::chrono::steady_clock::now();
+                            lock.unlock();
+                            while (mutex.BackWaiting() &&
+                                   std::chrono::steady_clock::now() - yield_start <
+                                       std::chrono::microseconds{50}) {
+                            }
+                            lock.lock();
+                            held_since = std::chrono::steady_clock::now();
+                            yield_ns += static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    held_since - yield_start)
+                                    .count());
+                            continue;
+                        }
+                    }
                     if (hand_back_us > 0 && i + 1 < pops) {
                         const auto now = std::chrono::steady_clock::now();
                         if (now - held_since >= std::chrono::microseconds{hand_back_us}) {
@@ -558,6 +593,10 @@ private:
                             held_since = std::chrono::steady_clock::now();
                         }
                     }
+                }
+                if (yield_e != 0) [[unlikely]] {
+                    Common::LockCensus::NoteFencePops(yield_e, pops, chances, mutex.BackWaiting(),
+                                                      yield_ns);
                 }
             };
             // pop_all with the stats: each pop described and timed, the mutex's waits and holds.
@@ -615,9 +654,25 @@ private:
                             buffer_cache.Nx2DescribeNextPop(landing);
                         },
                         [this] { buffer_cache.PopAsyncFlushes(); });
+                } else if (const int copy_unlocked = Common::LockCensus::FenceCopyUnlocked();
+                           copy_unlocked != 0) {
+                    // FRITCHII_FENCE_COPY_UNLOCKED (helper CQ): the same pops in the same order,
+                    // each landing's copy out of the lock (BufferCache::PopAsyncBuffersUnlocked).
+                    Common::LockCensus::g_fence_copy_watch.store(true, std::memory_order_relaxed);
+                    Common::LockCensus::FenceCopyBatch copy_batch{};
+                    copy_batch.mode = copy_unlocked;
+                    buffer_cache.PopAsyncBuffersUnlocked(buffer_pops, copy_unlocked, copy_batch);
+                    Common::LockCensus::NoteFenceCopy(copy_batch);
                 } else {
                     pop_all(buffer_cache.mutex, buffer_pops,
                             [this] { buffer_cache.PopAsyncFlushes(); });
+                    // Once the switch was on, its line goes on at 0 (E's waits for both arms).
+                    if (Common::LockCensus::g_fence_copy_watch.load(std::memory_order_relaxed))
+                        [[unlikely]] {
+                        Common::LockCensus::FenceCopyBatch copy_batch{};
+                        copy_batch.pops = buffer_pops;
+                        Common::LockCensus::NoteFenceCopy(copy_batch);
+                    }
                 }
             }
             // Queries and operations keep their per-fence order.

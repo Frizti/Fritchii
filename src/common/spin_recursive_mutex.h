@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <thread>
 
+#include "common/fritchii_lock_census.h"
 #include "common/nx2_hitch.h"
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -92,6 +93,18 @@ public:
         return owner.load(std::memory_order_relaxed) == std::this_thread::get_id();
     }
 
+    /// FRITCHII_LOCK_CENSUS: the lock's name in the census line ("buffer cache", "texture
+    /// cache"). Set once, before the mutex is shared.
+    void SetCensusName(const char* name) {
+        census_name = name;
+    }
+
+    /// FRITCHII_FENCE_YIELD_E: whether E (GPUBack) waits for this lock now (only marked while
+    /// the switch is on).
+    [[nodiscard]] bool BackWaiting() const {
+        return back_waiters.load(std::memory_order_relaxed) != 0;
+    }
+
     /// The holding thread, or a default id when free (a watchdog's snapshot, racy by nature).
     [[nodiscard]] std::thread::id Owner() const {
         return owner.load(std::memory_order_relaxed);
@@ -126,10 +139,43 @@ private:
     }
 
     // Timed per thread role for the drain sites line (fable52_answer_13 section 3).
+    // FRITCHII_LOCK_CENSUS (helper CP): the holder at the wait's start, named per waiter.
     void LockContended() {
         const std::uint64_t begin = Nx2Hitch::NowNs();
+        const int census = LockCensus::Mode();
+        LockCensus::WaitToken token{};
+        if (census > 0) [[unlikely]] {
+            token = LockCensus::BeginWait(census, owner.load(std::memory_order_relaxed),
+                                          census_name, &owner);
+        }
+        // FRITCHII_FENCE_YIELD_E: E marks its wait for the fencing thread's pops.
+        const bool back_mark = Nx2Hitch::t_role == Nx2Hitch::Role::GpuBack &&
+                               LockCensus::FenceYieldE() != 0;
+        if (back_mark) [[unlikely]] {
+            back_waiters.fetch_add(1, std::memory_order_relaxed);
+        }
+        // FRITCHII_FENCE_COPY_UNLOCKED's line: E's waits that began behind the fencing thread.
+        const bool fence_watch = Nx2Hitch::t_role == Nx2Hitch::Role::GpuBack &&
+                                 LockCensus::g_fence_copy_watch.load(std::memory_order_relaxed);
+        std::thread::id holder_at_start{};
+        if (fence_watch) [[unlikely]] {
+            holder_at_start = owner.load(std::memory_order_relaxed);
+        }
         LockContendedUntimed();
-        Nx2Hitch::AddLockWait(Nx2Hitch::NowNs() - begin);
+        if (back_mark) [[unlikely]] {
+            back_waiters.fetch_sub(1, std::memory_order_relaxed);
+        }
+        const std::uint64_t waited = Nx2Hitch::NowNs() - begin;
+        if (fence_watch && holder_at_start != std::thread::id{} &&
+            holder_at_start == LockCensus::g_fence_thread.load(std::memory_order_relaxed))
+            [[unlikely]] {
+            LockCensus::g_back_behind_fence_ns.fetch_add(waited, std::memory_order_relaxed);
+            LockCensus::g_back_behind_fence_waits.fetch_add(1, std::memory_order_relaxed);
+        }
+        Nx2Hitch::AddLockWait(waited);
+        if (census > 0) [[unlikely]] {
+            LockCensus::EndWait(token, waited);
+        }
     }
 
     void LockContendedUntimed() {
@@ -200,6 +246,8 @@ private:
     std::uint32_t depth{}; ///< Recursion depth, touched only by the owner
     void (*on_release)(void*){};
     void* on_release_context{};
+    const char* census_name = nullptr; ///< FRITCHII_LOCK_CENSUS
+    std::atomic<std::uint32_t> back_waiters{0}; ///< FRITCHII_FENCE_YIELD_E
 };
 
 } // namespace Common

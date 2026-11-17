@@ -27,6 +27,11 @@ DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
 /// VirtualProtect on the whole range without the placeholder lock (docs/fritchii/switches.md).
 inline std::atomic<int> g_protect_unlocked{-1};
 
+/// FRITCHII_ZERO_TRIM_CHUNK (live, default 0; -1 = not read yet; helper CR): the zero-page pass
+/// takes a run of pages out of the working set in calls of at most 256 pages (1) or N pages
+/// (N >= 2) instead of one call per run (docs/fritchii/switches.md). Read once per pass.
+inline std::atomic<int> g_zero_trim_chunk{-1};
+
 /**
  * A low level linear memory buffer, which supports multiple mappings
  * Its purpose is to rebuild a given sparse memory layout, including mirrors.
@@ -80,6 +85,14 @@ public:
         u64 unlock_us{};
         u64 unlock_runs{};
         u64 longest_unlock_us{};
+        /// FRITCHII_ZERO_TRIM_CHUNK (helper CR): the mode the pass ran with, its VirtualUnlock
+        /// calls and the longest one, and the guest map/unmap/protect calls that ran while the
+        /// pass was unlocking: how many and the longest (both arms of an A/B get these).
+        int chunk_mode{};
+        u64 unlock_calls{};
+        u64 longest_call_us{};
+        u64 guest_calls{};
+        u64 longest_guest_us{};
     };
     [[nodiscard]] static ZeroTrimPhases LastZeroTrimPhases() noexcept;
 

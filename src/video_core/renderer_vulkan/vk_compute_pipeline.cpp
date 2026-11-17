@@ -21,9 +21,11 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/early_compute.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
@@ -264,7 +266,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                           exception.what());
                 std::scoped_lock lock{build_mutex};
                 is_built = true;
-                build_condvar.notify_one();
+                built_at.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                               std::memory_order::release);
+                build_condvar.notify_all();
                 if (shader_notify) {
                     shader_notify->MarkShaderComplete();
                 }
@@ -329,13 +333,16 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineIndex = 0,
         };
         try {
-            pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            // Through Fritchii's pipeline binary store when it is on (FRITCHII_PIPELINE_BINARY).
+            pipeline = PipelineBinary::CreateComputePipeline(device, compute_ci, *pipeline_cache);
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
             std::scoped_lock lock{build_mutex};
             is_built = true;
-            build_condvar.notify_one();
+            built_at.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                           std::memory_order::release);
+            build_condvar.notify_all();
             if (shader_notify) {
                 shader_notify->MarkShaderComplete();
             }
@@ -357,7 +364,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         spv_module.reset();
         std::scoped_lock lock{build_mutex};
         is_built = true;
-        build_condvar.notify_one();
+        built_at.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                       std::memory_order::release);
+        // All waiters: the scheduler's wait in Configure and FRITCHII_ASYNC_COMPUTE_SKIP's
+        // bounded wait on the GPU thread can wait at once.
+        build_condvar.notify_all();
         if (shader_notify) {
             shader_notify->MarkShaderComplete();
         }
@@ -383,6 +394,44 @@ void ComputePipeline::RunBuild() {
     }
     build_task();
     build_task = nullptr;
+}
+
+bool ComputePipeline::WaitBuiltFor(std::chrono::nanoseconds timeout) {
+    std::unique_lock lock{build_mutex};
+    return build_condvar.wait_for(lock, timeout,
+                                  [this] { return is_built.load(std::memory_order::relaxed); });
+}
+
+void ComputePipeline::KickBuild(Common::ThreadWorker& worker) {
+    // A claimed build runs already (a worker, the scheduler's wait, an earlier kick). The queued
+    // pipeline worker's task finds the claim taken and returns at once when it gets there.
+    // kick_pending keeps the pipeline alive (IsBuildTaskDone) until the kick task is done.
+    if (build_claimed.load(std::memory_order::acquire) ||
+        kick_pending.exchange(true, std::memory_order::acq_rel)) {
+        return;
+    }
+    worker.QueueWork([this] {
+        RunBuild();
+        kick_pending.store(false, std::memory_order::release);
+    });
+}
+
+void ComputePipeline::BindStoragePointers(BufferCache& buffer_cache) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    const Profile::Scope pointers_scope{Profile::Zone::ComputePointers};
+    buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
+    buffer_cache.UnbindComputeStorageBuffers();
+    buffer_cache.SetComputeShaderHash(shader_hash);
+    size_t ssbo_index{};
+    for (const auto& desc : info.storage_buffers_descriptors) {
+        ASSERT(desc.count == 1);
+        buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
+                                              desc.is_written, desc.indirect_offset,
+                                              desc.write_extent,
+                                              Shader::StorageWriteExtraOf(info, ssbo_index),
+                                              Shader::StorageReadExtentOf(info, ssbo_index));
+        ++ssbo_index;
+    }
 }
 
 bool ComputePipeline::CanReplaceOcarinaUpscale() const {
@@ -447,20 +496,11 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     // cache then: it is E's, E running ahead).
     const bool ring_held = held != nullptr && mem_stage.HeldDispatchFromRing();
     namespace Profile = VideoCommon::Nx2Profile;
-    if (held == nullptr) {
-        const Profile::Scope pointers_scope{Profile::Zone::ComputePointers};
-        buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
-        buffer_cache.UnbindComputeStorageBuffers();
-        buffer_cache.SetComputeShaderHash(shader_hash);
-        size_t ssbo_index{};
-        for (const auto& desc : info.storage_buffers_descriptors) {
-            ASSERT(desc.count == 1);
-            buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                                  desc.is_written, desc.indirect_offset,
-
-                                                  desc.write_extent);
-            ++ssbo_index;
-        }
+    // FRITCHII_ASYNC_COMPUTE_SKIP: the decision on an unbuilt pipeline bound them already
+    // (BindStoragePointers), with nothing in between; consumed here whatever path runs.
+    const bool prebound = std::exchange(pointers_prebound, false);
+    if (held == nullptr && !prebound) {
+        BindStoragePointers(buffer_cache);
     }
 
     // Ends after FillImageViews (views_scope.reset() below).
@@ -619,6 +659,21 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
     views_scope.reset();
+    // FRITCHII_EARLY_COMPUTE (dry): a feeder's sampled and storage images, and whether one has a
+    // GPU write the host GPU has not run (the buffers are judged where they are bound).
+    if (VideoCommon::EarlyCompute::g_early &&
+        VideoCommon::EarlyCompute::IsFeeder(shader_hash)) [[unlikely]] {
+        const size_t first_image = Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                                   Shader::NumDescriptors(info.image_buffer_descriptors);
+        bool pending = false;
+        for (size_t i = first_image; i < views.size() && !pending; ++i) {
+            pending = texture_cache.EarlyImageWritePending(views[i].id);
+        }
+        const bool writes_images = std::ranges::any_of(
+            info.image_descriptors, [](const auto& desc) { return desc.is_written; });
+        VideoCommon::EarlyCompute::NoteImages(shader_hash, views.size() > first_image, pending,
+                                              writes_images);
+    }
     // Not for a ring-held dispatch (one follower): the trace reads the buffer cache, E's.
     if (auto& trace{GetUpscalerTrace()}; trace.enabled && kepler_compute.IsNativeMode() && !ring_held) {
         const u64 frame{trace.frame.load(std::memory_order_relaxed)};

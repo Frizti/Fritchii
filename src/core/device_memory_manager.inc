@@ -31,6 +31,22 @@
 #include "video_core/back_read_audit.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/rasterizer_download_area.h"
+
+// The read's caller as an offset in the executable (resolve it with the build's PDB or map):
+// the "caller" of the unmapped read lines, for reads no ReadSiteScope names. With LTO the
+// read may be inlined into its caller, which then names that caller's caller.
+#if defined(__clang__) || defined(__GNUC__)
+#define FRITCHII_READ_CALLER() __builtin_return_address(0)
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#define FRITCHII_READ_CALLER() _ReturnAddress()
+#else
+#define FRITCHII_READ_CALLER() nullptr
+#endif
+#ifdef _WIN32
+extern "C" const char __ImageBase; // the executable's base (MSVC, lld, MinGW)
+#endif
 
 namespace Core {
 
@@ -44,8 +60,20 @@ namespace {
 std::atomic<u64> g_unmapped_reads{};
 std::atomic<u64> g_unmapped_read_bytes{};
 
+#ifdef _WIN32
+u64 CallerOffset(const void* caller) {
+    const u64 base = reinterpret_cast<u64>(&::__ImageBase);
+    const u64 at = reinterpret_cast<u64>(caller);
+    return at >= base ? at - base : at;
+}
+#else
+u64 CallerOffset(const void* caller) {
+    return reinterpret_cast<u64>(caller);
+}
+#endif
+
 void ReportUnmappedRead(const char* what, DAddr address, size_t size, DAddr first_unmapped,
-                        size_t unmapped_bytes) {
+                        size_t unmapped_bytes, const void* caller) {
     const u64 reads = g_unmapped_reads.fetch_add(1, std::memory_order_relaxed) + 1;
     const u64 total = g_unmapped_read_bytes.fetch_add(unmapped_bytes, std::memory_order_relaxed) +
                       unmapped_bytes;
@@ -54,12 +82,19 @@ void ReportUnmappedRead(const char* what, DAddr address, size_t size, DAddr firs
     }
     std::array<char, 17> thread{};
     std::memcpy(thread.data(), Common::WriteRing::t_thread.data(), 16);
-    const char* const site = Common::WriteRing::t_site;
+    // The read's own site (ReadSiteScope), else the write ring's (on with its switch only).
+    const char* const read_site = Common::WriteRing::t_read_site;
+    const char* const site = read_site != nullptr ? read_site : Common::WriteRing::t_site;
+    const char* const context =
+        read_site != nullptr ? Common::WriteRing::t_read_context : Common::WriteRing::t_context;
     LOG_ERROR(HW_Memory,
               "Unmapped Device {} @ {:#016x} size {:#x}: {} KiB unmapped, first at {:#016x} "
-              "(read as zeros; thread {}, site {}); {} such reads, {} KiB unmapped this session",
+              "(read as zeros; thread {}, site {}{}{}, caller exe+{:#x}); {} such reads, {} KiB "
+              "unmapped this session",
               what, address, size, unmapped_bytes >> 10, first_unmapped,
-              thread[0] != '\0' ? thread.data() : "?", site != nullptr ? site : "-", reads,
+              thread[0] != '\0' ? thread.data() : "?", site != nullptr ? site : "-",
+              context != nullptr && context != site ? " in " : "",
+              context != nullptr && context != site ? context : "", CallerOffset(caller), reads,
               total >> 10);
 }
 
@@ -213,6 +248,9 @@ DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory& device_memo
 {
     impl = std::make_unique<DeviceMemoryManagerAllocator<Traits>>();
     cached_pages = std::make_unique<CachedPages>();
+    // FRITCHII_MEM_CENSUS (no-ops when off)
+    compressed_device_addr.SetCensusName("SMMU address map");
+    tracked_entries.SetCensusName("SMMU page entries");
 }
 
 template <typename Traits>
@@ -334,6 +372,10 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
     device_inter->InvalidateRegion(address, size);
+    // FRITCHII_FENCE_COPY_UNLOCKED: a fence download the fencing thread is writing here without
+    // the buffer cache's lock ends before the backing is erased (with the lock held for the whole
+    // pop, the invalidation above waited for it).
+    VideoCore::DownloadLanding::AwaitUnlockedFenced(address, size);
     // EXP92: as in Map, before the backing is erased (and before EXP89's release).
     UnwatchUniformKeepPages(address, size);
     // EXP89: the pages the caches just dropped may linger; the uncache needs their guest
@@ -587,7 +629,8 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
             dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;
         });
     if (unmapped_bytes != 0) [[unlikely]] {
-        ReportUnmappedRead(__func__, address, size, first_unmapped, unmapped_bytes);
+        ReportUnmappedRead(__func__, address, size, first_unmapped, unmapped_bytes,
+                           FRITCHII_READ_CALLER());
     }
 }
 
@@ -657,7 +700,8 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
             dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;
         });
     if (unmapped_bytes != 0) [[unlikely]] {
-        ReportUnmappedRead(__func__, address, size, first_unmapped, unmapped_bytes);
+        ReportUnmappedRead(__func__, address, size, first_unmapped, unmapped_bytes,
+                           FRITCHII_READ_CALLER());
     }
 }
 

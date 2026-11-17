@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <deque>
+#include <set>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -25,6 +26,7 @@
 #include "common/fritchii_write_ring.h"
 #include "common/nx2_uniform_keep_pages.h"
 #include "common/range_sets.inc"
+#include "shader_recompiler/frontend/ir/opcodes.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/mem_read_log.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
@@ -252,10 +254,27 @@ void BufferCache<P>::TickFrame() {
     if (DownloadReadStats::g_enabled && frame_tick % 600 == 0) [[unlikely]] {
         DownloadReadStats::Log();
     }
+    // FRITCHII_EXTENT_CENSUS / _CBUF / _SHARED / _GUARD: the 10 s lines (empty while all are off)
+    if (!extent_census.empty()) [[unlikely]] {
+        LogExtentCensus();
+    }
+    // FRITCHII_STORE_FOOTPRINT (armed): the live line every 10 s
+    if (footprint_following) [[unlikely]] {
+        StoreFootprintLive::MaybeLog(footprint_shadow.NumEntries());
+    }
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::g_frame.fetch_add(1, std::memory_order_relaxed);
         ReadRunStats::FrameTick();
+        // FRITCHII_STORE_FOOTPRINT / FRITCHII_FEEDER_LANE: their 10 s lines
+        ReadRunStats::LogDry();
         if (frame_tick % 600 == 0) {
+            if constexpr (!IS_OPENGL) {
+                if (EarlyCompute::g_side_copy.Get() >= 2) {
+                    const auto queue = runtime.TakeSideQueueStats();
+                    EarlyCompute::NoteQueueStats(queue.raised, queue.slow_waits, queue.not_queued,
+                                                 queue.main_waits, queue.unsubmitted);
+                }
+            }
             ReadRunStats::Log(VideoCore::Nx2Debug::Experiment(112));
         }
     }
@@ -575,6 +594,30 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
             ReadRunStats::FindWriter(device_addr, size, device_addr_start_aligned,
                                      device_addr_end_aligned);
             ReadRunStats::WriterAnswer& writer = ReadRunStats::t_writer_answer;
+            if constexpr (!IS_OPENGL) {
+                // FRITCHII_READ_RUNS=2: where the host GPU is with the newest write over the
+                // read's pages ("Read writer ticks").
+                if (ReadRunStats::g_writer_ticks && writer.area_found) {
+                    const auto ticks = runtime.ReadWriterTicks(writer.area_mark.stamp);
+                    writer.write_tick = ticks.write;
+                    writer.read_tick = ticks.current;
+                    writer.known_tick = ticks.known;
+                    // FRITCHII_EXTENT_CBUF / _SHARED =3: the tick of the mark the proof leaves
+                    // over the read's bytes (WaitReadWriter times it)
+                    if (writer.dry_cover_found && writer.dry_cover.stamp != 0) [[unlikely]] {
+                        writer.dry_cover_tick =
+                            runtime.ReadWriterTicks(writer.dry_cover.stamp).write;
+                    }
+                    // FRITCHII_FEEDER_LANE: the writing feeder's D as ticks (0: nothing unrun)
+                    const EarlyCompute::Lane& lane = writer.area_mark.lane;
+                    if (EarlyCompute::g_lane && lane.judged) [[unlikely]] {
+                        writer.lane_tick =
+                            lane.d != 0 ? runtime.ReadWriterTicks(lane.d).write : 0;
+                        writer.lane_copy_tick =
+                            lane.d_copy != 0 ? runtime.ReadWriterTicks(lane.d_copy).write : 0;
+                    }
+                }
+            }
             writer.compared =
                 static_cast<u32>((std::min<u64>)(size, ReadRunStats::CompareBytes));
             VideoCommon::OneFollower::BeforeEngineRead(device_addr, writer.compared);
@@ -596,6 +639,22 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
         }
     }
     const bool preflushable = memory_tracker.IsRegionPreflushable(device_addr, size);
+    // FRITCHII_STORE_FOOTPRINT=1/2 (live once armed): every GPU-modified byte of the read is held
+    // only by marks whose store footprints exclude it, so no GPU write since those bytes were
+    // last clean touched them and guest memory holds them. Answered without a wait; nothing else
+    // changes (FootprintAnswersRead re-arms the pages' traps). The core may keep only the read's
+    // own bytes as its read area.
+    if (footprint_following && !preflushable) [[unlikely]] {
+        const int live = StoreFootprintLive::Mode();
+        if ((live == 1 || live == 2) &&
+            FootprintAnswersRead(device_addr, size, device_addr_start_aligned,
+                                 device_addr_end_aligned, live)) {
+            area->start_address = device_addr;
+            area->end_address = device_addr + size;
+            area->preemtive = true;
+            return area;
+        }
+    }
     // EDEN_NX2_EXP49: all of the area's GPU-modified bytes on their way for an earlier read. No
     // new copies: the read waits for those (in_flight), or finds them landed.
     if (!read_downloads.empty() &&
@@ -943,14 +1002,60 @@ void BufferCache<P>::RecordReadDownload(std::span<const std::pair<DAddr, u64>> r
         if (copies.empty()) {
             return;
         }
+        download.id = ++read_download_ids;
+        // FRITCHII_READ_SIDE_COPY: where the newest write over these bytes is (before anything
+        // is recorded: the current tick is the one the submit below closes).
+        const int side_mode = EarlyCompute::g_side_copy.Get();
+        if (side_mode != 0) [[unlikely]] {
+            boost::container::small_vector<std::pair<DAddr, u64>, 8> copied;
+            for (const Copy& entry : copies) {
+                copied.emplace_back(slot_buffers[entry.buffer_id].CpuAddr() +
+                                        entry.copy.src_offset,
+                                    entry.copy.size);
+            }
+            u64 stamp = 0;
+            if (!ReadRunStats::NewestMarkOver(copied, stamp)) {
+                EarlyCompute::NoteSideDownload(EarlyCompute::SideWriter::NoMark);
+            } else {
+                const auto ticks = runtime.ReadWriterTicks(stamp);
+                download.side_eligible = ticks.write < ticks.current;
+                download.side_tick = ticks.write;
+                EarlyCompute::NoteSideDownload(download.side_eligible
+                                                   ? EarlyCompute::SideWriter::Submitted
+                                                   : EarlyCompute::SideWriter::Open);
+            }
+        }
+        // >= 2: the copy on the side queue too (2, into a second staging buffer, compared at the
+        // landing) or instead (3). Only for a writer already submitted (eligible).
+        const bool side_copy =
+            side_mode >= 2 && download.side_eligible && runtime.SideCopyReady();
+        const bool main_copy = !side_copy || side_mode == 2;
         auto staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+        boost::container::small_vector<typename Runtime::SideCopyRegion, 8> side_regions;
+        std::optional<Async_Buffer> verify_staging;
+        if (side_copy && side_mode == 2) {
+            verify_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+        }
         for (Copy& entry : copies) {
             Buffer& buffer = slot_buffers[entry.buffer_id];
+            const u64 relative_dst = entry.copy.dst_offset;
             entry.copy.dst_offset += staging.offset;
             buffer.MarkUsage(entry.copy.src_offset, entry.copy.size);
-            // Mapped buffers too: the GPU thread's later work may write them before the copy is
-            // read.
-            runtime.CopyBuffer(staging.buffer, buffer, std::span{&entry.copy, 1}, true);
+            if (main_copy) {
+                // Mapped buffers too: the GPU thread's later work may write them before the
+                // copy is read.
+                runtime.CopyBuffer(staging.buffer, buffer, std::span{&entry.copy, 1}, true);
+            }
+            if (side_copy) {
+                const Async_Buffer& target = verify_staging ? *verify_staging : staging;
+                side_regions.push_back({
+                    .src = buffer.Handle(),
+                    .dst = target.buffer,
+                    .src_offset = entry.copy.src_offset,
+                    .dst_offset = target.offset + relative_dst,
+                    .size = entry.copy.size,
+                });
+            }
             download.copies.push_back(BufferCopy{
                 .src_offset = buffer.CpuAddr() + entry.copy.src_offset,
                 .dst_offset = entry.copy.dst_offset,
@@ -958,6 +1063,25 @@ void BufferCache<P>::RecordReadDownload(std::span<const std::pair<DAddr, u64>> r
             });
         }
         download.staging = staging;
+        if (side_copy) {
+            download.side_value = runtime.SideCopy(download.side_tick, side_regions);
+            if (download.side_value == 0 && !main_copy) {
+                // The side submit failed: the main copies after all.
+                for (const Copy& entry : copies) {
+                    runtime.CopyBuffer(staging.buffer, slot_buffers[entry.buffer_id],
+                                       std::span{&entry.copy, 1}, true);
+                }
+            }
+            if (verify_staging) {
+                if (download.side_value != 0) {
+                    download.side_verify = true;
+                    download.verify_staging = *verify_staging;
+                } else {
+                    async_buffers_death_ring.push_back(*verify_staging);
+                }
+            }
+            EarlyCompute::NoteSideSubmit(download.side_value != 0);
+        }
         // Submitted now, not waited for: the reading thread waits (FinishReadDownloads).
         download.tick = runtime.SubmitForHostRead();
         read_downloads.push_back(std::move(download));
@@ -975,21 +1099,97 @@ std::optional<u64> BufferCache<P>::FinishReadDownloads(DAddr device_addr, u64 si
         std::unique_lock lock{mutex};
         // The newest one over the range: those before it are written first.
         std::optional<u64> tick;
+        bool side_eligible = false;
+        u64 side_tick = 0;
+        u64 side_value = 0;
+        bool side_verify = false;
+        u64 download_id = 0;
+        u32 downloads_over = 0;
         for (const ReadDownload& download : read_downloads) {
             if (download.write_ranges.Intersects(device_addr, size)) {
                 tick = download.tick;
+                side_eligible = download.side_eligible;
+                side_tick = download.side_tick;
+                side_value = download.side_value;
+                side_verify = download.side_verify;
+                download_id = download.id;
+                ++downloads_over;
             }
         }
         if (!tick) {
             return std::nullopt;
         }
+        const bool reading = VideoCore::AsyncReadback::t_reading;
+        // FRITCHII_READ_SIDE_COPY=3: the download is the side copy alone. Its reader waits for
+        // that copy only and lands it at once, out of order (read downloads never overlap), when
+        // no other download covers the range. Anyone else waits for the main tick as before:
+        // its submission waited for the side copy.
+        if (side_value != 0 && !side_verify && reading && downloads_over == 1) [[unlikely]] {
+            u64 waited = 0;
+            if (!runtime.SideDone(side_value)) {
+                lock.unlock();
+                const u64 wait_start = VideoCore::AsyncReadback::Now();
+                runtime.WaitSide(side_value);
+                waited = (std::max)(VideoCore::AsyncReadback::Now() - wait_start, u64{1});
+                VideoCore::AsyncReadback::CountHostWait(waited);
+                VideoCore::AsyncReadback::Add(VideoCore::AsyncReadback::g_counters.on_card_ns,
+                                              waited);
+                lock.lock();
+            }
+            EarlyCompute::NoteSideLanded(waited);
+            for (auto it = read_downloads.begin(); it != read_downloads.end(); ++it) {
+                if (it->id == download_id) {
+                    LandReadDownload(*it);
+                    read_downloads.erase(it);
+                    VideoCore::g_read_downloads.fetch_sub(1, std::memory_order_release);
+                    break;
+                }
+            }
+            return waited;
+        }
         u64 waited = 0;
         if (!runtime.IsFree(*tick)) {
             lock.unlock();
             const u64 wait_start = VideoCore::AsyncReadback::Now();
+            // FRITCHII_READ_SIDE_COPY=2 (verify): the side copy's own wait first, then the main
+            // copy's as before (both land, and are compared, at the landing).
+            u64 side_ns = 0;
+            if (side_verify && reading) [[unlikely]] {
+                runtime.WaitSide(side_value);
+                side_ns = (std::max)(VideoCore::AsyncReadback::Now() - wait_start, u64{1});
+            }
+            // FRITCHII_READ_RUNS=2 (counter only): the reader's wait, first until its writer's
+            // submission ran. The "on the host GPU" figure keeps both parts.
+            // FRITCHII_READ_SIDE_COPY (dry): an eligible download's wait is cut at the newest
+            // write over all its bytes instead (RecordReadDownload), the side copy's own wait.
+            u64 writer_ns = 0;
+            const bool side_cut = side_eligible && EarlyCompute::g_side_copy && reading &&
+                                  side_ns == 0;
+            if (side_cut) [[unlikely]] {
+                writer_ns = WaitReadWriter(side_tick);
+                VideoCore::AsyncReadback::Add(VideoCore::AsyncReadback::g_counters.on_card_ns,
+                                              writer_ns);
+            } else if (ReadRunStats::g_writer_ticks && VideoCore::AsyncReadback::t_reading)
+                [[unlikely]] {
+                writer_ns = WaitReadWriter();
+                VideoCore::AsyncReadback::Add(VideoCore::AsyncReadback::g_counters.on_card_ns,
+                                              writer_ns);
+            }
             runtime.WaitForHostRead(*tick);
             waited = (std::max)(VideoCore::AsyncReadback::Now() - wait_start, u64{1});
             VideoCore::AsyncReadback::CountHostWait(waited);
+            if (ReadRunStats::t_writer_answer.cut) [[unlikely]] {
+                ReadRunStats::t_writer_answer.rest_wait_ns =
+                    waited > writer_ns ? waited - writer_ns : 0;
+                if (side_cut) {
+                    EarlyCompute::NoteSideCut(writer_ns,
+                                              ReadRunStats::t_writer_answer.rest_wait_ns);
+                }
+                MeasureRunUp();
+            }
+            if (side_ns != 0) [[unlikely]] {
+                EarlyCompute::NoteSideVerifyWait(side_ns, waited);
+            }
             lock.lock();
         }
         WriteReadDownloads(*tick);
@@ -1034,7 +1234,37 @@ void BufferCache<P>::WriteReadDownloads(u64 tick) {
     const Common::WriteRing::SiteScope write_site{"buffer read download (WriteReadDownloads)", true};
     if constexpr (!IS_OPENGL) {
         while (!read_downloads.empty() && read_downloads.front().tick <= tick) {
-            ReadDownload& download = read_downloads.front();
+            LandReadDownload(read_downloads.front());
+            read_downloads.pop_front();
+            VideoCore::g_read_downloads.fetch_sub(1, std::memory_order_release);
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::LandReadDownload(ReadDownload& download) {
+    if constexpr (!IS_OPENGL) {
+        {
+            // FRITCHII_READ_SIDE_COPY=2: the side copy's bytes against the main copy's. The main
+            // tick is done here or the side value was waited for: every main submission after
+            // the side submit waited for it, so both are in.
+            if (download.side_verify) [[unlikely]] {
+                runtime.WaitSide(download.side_value);
+                u64 bytes = 0;
+                u64 differing = 0;
+                const u8* const main_base = download.staging.mapped_span.data();
+                const u8* const side_base = download.verify_staging.mapped_span.data();
+                for (const BufferCopy& copy : download.copies) {
+                    const u64 relative = copy.dst_offset - download.staging.offset;
+                    bytes += copy.size;
+                    if (std::memcmp(main_base + relative, side_base + relative, copy.size) != 0) {
+                        ++differing;
+                    }
+                }
+                EarlyCompute::NoteSideVerify(download.copies.size(), differing, bytes);
+                async_buffers_death_ring.push_back(download.verify_staging);
+                download.side_verify = false;
+            }
             // Guest memory this writes. The guest CPU writes collected from now on store their
             // bytes once this download is in guest memory.
             DAddr landing_begin = ~DAddr{0};
@@ -1080,8 +1310,6 @@ void BufferCache<P>::WriteReadDownloads(u64 tick) {
             });
             // Freed by the GPU thread (TickFrame).
             async_buffers_death_ring.push_back(download.staging);
-            read_downloads.pop_front();
-            VideoCore::g_read_downloads.fetch_sub(1, std::memory_order_release);
         }
     }
 }
@@ -1311,6 +1539,13 @@ void BufferCache<P>::ClearReplacedDownload(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::ClearFenceDownloads(DAddr device_addr, u64 size) {
+    // FRITCHII_FENCE_COPY_UNLOCKED: the fencing thread may be copying a fence download here
+    // without the lock (PopAsyncBuffersUnlocked), from ranges it read before this takes them
+    // away. The caller writes newer bytes here next (a synchronous download, a GPU-side write
+    // after PrepareRegionWrite), or a guest write is collected here (its bytes store after any
+    // landing over them): the copy lands first, as when the pop held the lock throughout. One
+    // acquire load while no such copy is under way.
+    VideoCore::DownloadLanding::AwaitUnlocked(device_addr, size);
     PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     for (auto& ranges : pending_download_ranges) {
         ranges.Subtract(device_addr, size);
@@ -1382,7 +1617,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         gpu_modified_ranges.Add(pair.first, pair.second);
         // FRITCHII_READ_RUNS: a GPU copy of GPU-written bytes is a write mark too (writer Other).
         if (ReadRunStats::g_enabled) [[unlikely]] {
-            ReadRunStats::NoteWrite(pair.first, pair.second);
+            ReadRunStats::NoteWrite(pair.first, pair.second, ReadWriteStamp());
         }
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
@@ -1693,6 +1928,16 @@ void BufferCache<P>::BindHostComputeBuffers() {
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::g_dispatches.fetch_add(1, std::memory_order_relaxed);
     }
+    // FRITCHII_EARLY_COMPUTE (dry): could this feeder dispatch run at once on a second queue?
+    // Judged before its own binds; its write marks carry the verdict to the reads.
+    if constexpr (!IS_OPENGL) {
+        if (EarlyCompute::g_early && EarlyCompute::IsFeeder(compute_shader_hash)) [[unlikely]] {
+            JudgeEarlyCompute();
+        }
+    }
+    SCOPE_EXIT {
+        EarlyCompute::t_verdict = EarlyCompute::Verdict::NotJudged;
+    };
     BindHostComputeUniformBuffers();
     if (channel_state->enabled_compute_storage_buffers != 0) {
         BindHostComputeStorageBuffers();
@@ -1700,9 +1945,180 @@ void BufferCache<P>::BindHostComputeBuffers() {
     if (channel_state->enabled_compute_texture_buffers != 0) {
         BindHostComputeTextureBuffers();
     }
+    if (EarlyCompute::t_verdict != EarlyCompute::Verdict::NotJudged) [[unlikely]] {
+        EarlyCompute::NoteJudged(EarlyCompute::t_verdict, any_buffer_uploaded);
+        if (EarlyCompute::t_lane.judged) {
+            NoteFeederLaneBound();
+            EarlyCompute::t_lane = {};
+        }
+    }
     if (any_buffer_uploaded) {
         runtime.PostCopyBarrier();
         any_buffer_uploaded = false;
+    }
+}
+
+template <class P>
+void BufferCache<P>::NoteFeederLaneBound() {
+    // FRITCHII_FEEDER_LANE (dry): a bind that uploaded CPU data puts D in its own chunk (the
+    // copy is recorded right before the dispatch); D_copy is what the lane would wait for if it
+    // took the copy too.
+    if constexpr (!IS_OPENGL) {
+        EarlyCompute::Lane& lane = EarlyCompute::t_lane;
+        if (any_buffer_uploaded && lane.kind != EarlyCompute::LaneKind::Wrapped) {
+            lane.d = (std::max)(lane.d, runtime.CurrentTick());
+            lane.kind = EarlyCompute::LaneKind::Upload;
+            ReadRunStats::PatchLaneUpload(
+                ReadRunStats::g_dispatches.load(std::memory_order_relaxed), compute_shader_hash,
+                lane.d);
+        }
+        u32 storage_bindings = 0;
+        u32 read_extents = 0;
+        ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+            ++storage_bindings;
+            read_extents += lane_read_end[index] != ~u64{0} ? 1 : 0;
+        });
+        EarlyCompute::NoteLaneJudged(compute_shader_hash, lane, any_buffer_uploaded,
+                                     storage_bindings, read_extents);
+    }
+}
+
+template <class P>
+void BufferCache<P>::JudgeEarlyCompute() {
+    if constexpr (!IS_OPENGL) {
+        // Every bound range, and those the dispatch writes.
+        boost::container::small_vector<std::pair<DAddr, DAddr>, 24> bound;
+        boost::container::small_vector<std::pair<DAddr, DAddr>, 8> written;
+        const auto add = [&](const Binding& binding, bool is_written) {
+            if (binding.segment_count != 0) {
+                for (u32 i = 0; i < binding.segment_count &&
+                                binding.segment_first + i < compute_segments.size();
+                     ++i) {
+                    const MultiRangeSegment& segment = compute_segments[binding.segment_first + i];
+                    bound.emplace_back(segment.device_addr, segment.device_addr + segment.size);
+                    if (is_written) {
+                        written.emplace_back(segment.device_addr,
+                                             segment.device_addr + segment.size);
+                    }
+                }
+                return;
+            }
+            if (binding.size == 0 || binding.device_addr == 0) {
+                return;
+            }
+            bound.emplace_back(binding.device_addr, binding.device_addr + binding.size);
+            if (is_written) {
+                written.emplace_back(binding.device_addr, binding.device_addr + binding.size);
+            }
+        };
+        ForEachEnabledBit(channel_state->enabled_compute_uniform_buffer_mask, [&](u32 index) {
+            add(channel_state->compute_uniform_buffers[index], false);
+        });
+        ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+            add(channel_state->compute_storage_buffers[index],
+                ((channel_state->written_compute_storage_buffers >> index) & 1) != 0);
+        });
+        ForEachEnabledBit(channel_state->enabled_compute_texture_buffers, [&](u32 index) {
+            add(channel_state->compute_texture_buffers[index],
+                ((channel_state->written_compute_texture_buffers >> index) & 1) != 0);
+        });
+        (void)runtime.ReadWriterTicks(0); // refreshes the host GPU's known tick
+        const auto is_free = [this](u64 stamp) { return runtime.IsFree(stamp); };
+        EarlyCompute::Verdict verdict = EarlyCompute::Verdict::Qualifies;
+        if (ReadRunStats::AnyPendingMark(bound, is_free)) {
+            verdict = EarlyCompute::Verdict::PendingWrite;
+        } else {
+            for (const auto& [begin, end] : written) {
+                if (EarlyCompute::PendingUse(begin, end, is_free)) {
+                    verdict = EarlyCompute::Verdict::PendingUse;
+                    break;
+                }
+            }
+        }
+        EarlyCompute::t_verdict = verdict;
+        if (EarlyCompute::g_lane) {
+            JudgeFeederLane(is_free);
+        }
+    }
+}
+
+template <class P>
+template <typename IsFree>
+void BufferCache<P>::JudgeFeederLane(IsFree&& is_free) {
+    if constexpr (!IS_OPENGL) {
+        // FRITCHII_FEEDER_LANE (dry): D, the newest unrun main-queue work this feeder really
+        // depends on. Its inputs: uniform and texture buffers whole; a native storage binding's
+        // reads up to its proven read extent (else the whole binding) plus, when written, its
+        // write mark (write after write). Its outputs (write after read): the write marks.
+        boost::container::small_vector<std::pair<DAddr, DAddr>, 24> inputs;
+        boost::container::small_vector<std::pair<DAddr, DAddr>, 8> outputs;
+        const auto add_whole = [&](const Binding& binding, bool is_written) {
+            if (binding.segment_count != 0) {
+                for (u32 i = 0; i < binding.segment_count &&
+                                binding.segment_first + i < compute_segments.size();
+                     ++i) {
+                    const MultiRangeSegment& segment = compute_segments[binding.segment_first + i];
+                    inputs.emplace_back(segment.device_addr, segment.device_addr + segment.size);
+                    if (is_written) {
+                        outputs.emplace_back(segment.device_addr,
+                                             segment.device_addr + segment.size);
+                    }
+                }
+                return;
+            }
+            if (binding.size == 0 || binding.device_addr == 0) {
+                return;
+            }
+            inputs.emplace_back(binding.device_addr, binding.device_addr + binding.size);
+            if (is_written) {
+                outputs.emplace_back(binding.device_addr, binding.device_addr + binding.size);
+            }
+        };
+        ForEachEnabledBit(channel_state->enabled_compute_uniform_buffer_mask, [&](u32 index) {
+            add_whole(channel_state->compute_uniform_buffers[index], false);
+        });
+        ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+            const Binding& binding = channel_state->compute_storage_buffers[index];
+            const bool is_written =
+                ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
+            if (binding.segment_count != 0 || binding.size == 0 || binding.device_addr == 0) {
+                add_whole(binding, is_written);
+                return;
+            }
+            const bool native =
+                ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
+            const u64 read_end = (std::min<u64>)(lane_read_end[index], binding.size);
+            const u64 write_end =
+                native ? (std::min<u64>)(channel_state->compute_storage_write_marks[index],
+                                         binding.size)
+                       : binding.size;
+            if (read_end != 0) {
+                inputs.emplace_back(binding.device_addr, binding.device_addr + read_end);
+            }
+            if (is_written && write_end != 0) {
+                inputs.emplace_back(binding.device_addr, binding.device_addr + write_end);
+                outputs.emplace_back(binding.device_addr, binding.device_addr + write_end);
+            }
+        });
+        ForEachEnabledBit(channel_state->enabled_compute_texture_buffers, [&](u32 index) {
+            add_whole(channel_state->compute_texture_buffers[index],
+                      ((channel_state->written_compute_texture_buffers >> index) & 1) != 0);
+        });
+        EarlyCompute::LaneDep dep = ReadRunStats::NewestPendingMark(inputs, is_free);
+        dep.Merge(EarlyCompute::NewestPendingUse(outputs, is_free));
+        EarlyCompute::Lane lane{
+            .d = dep.d,
+            .d_copy = dep.d_copy,
+            .kind = dep.d != 0 ? dep.kind : EarlyCompute::LaneKind::None,
+            .copy_kind = dep.d_copy != 0 ? dep.copy_kind : EarlyCompute::LaneKind::None,
+            .judged = true,
+        };
+        if (dep.incomplete) {
+            // Not every dependency is known: its own chunk
+            lane.d = lane.d_copy = runtime.CurrentTick();
+            lane.kind = lane.copy_kind = EarlyCompute::LaneKind::Wrapped;
+        }
+        EarlyCompute::t_lane = lane;
     }
 }
 
@@ -1848,6 +2264,9 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
     for (ExtentProbeRequest& request : extent_probe_requests) {
         request.active = false;
     }
+    cbuf_dry_proven.fill(0);
+    footprint_dry.fill({});
+    lane_read_end.fill(~u64{0});
     channel_state->native_compute_storage_buffers = 0;
     channel_state->image_compute_texture_buffers = 0;
 }
@@ -1855,7 +2274,9 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
 template <class P>
 void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                               bool is_written, u32 indirect_offset,
-                                              const Shader::StorageWriteExtent& write_extent) {
+                                              const Shader::StorageWriteExtent& write_extent,
+                                              const Shader::StorageWriteExtra* extra,
+                                              const Shader::StorageWriteExtent* read_extent) {
     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
                   ssbo_index);
@@ -1932,13 +2353,75 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                 grid = std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
                                           qmd.grid_dim_z.Value()};
             }
-            if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
-                // The extent counts from the pointer, the binding from the pointer aligned down.
-                const GPUVAddr pointer = Inputs().ReadGameU64(ssbo_addr);
-                MemReadLog::Value(MemReadLog::Kind::ComputePointer, gpu_memory, ssbo_addr, pointer);
+            std::optional<u64> extent =
+                Shader::ResolveStorageWriteExtent(write_extent, block, grid);
+            static constexpr Shader::StorageWriteExtra NoExtra{};
+            // The census names the analysis' reason only where the extent is unknown.
+            const Shader::ExtentUnknownWhy write_unknown =
+                write_extent.bounded
+                    ? Shader::ExtentUnknownWhy{.kind = Shader::ExtentUnknown::Known}
+                    : (extra != nullptr ? *extra : NoExtra).write_unknown;
+            const Shader::StorageCbufExtent& cbuf_extent =
+                (extra != nullptr ? *extra : NoExtra).cbuf_extent;
+            // FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF (live, default 0): off, one load each.
+            const int census = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_extent_census, "FRITCHII_EXTENT_CENSUS", 0);
+            const int cbuf_switch = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_extent_cbuf, "FRITCHII_EXTENT_CBUF", 0);
+            // FRITCHII_EXTENT_SHARED (live, default 0): the same for a cbuf extent proven by
+            // following offsets through the program's private shared memory slots (via_shared);
+            // it, not FRITCHII_EXTENT_CBUF, decides about those.
+            const int shared_switch = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_extent_shared, "FRITCHII_EXTENT_SHARED", 0);
+            // FRITCHII_EXTENT_GUARD (live, default 0): the same for a cbuf extent proven with the
+            // branch conditions on the stores' paths (via_guard).
+            const int guard_switch = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_extent_guard, "FRITCHII_EXTENT_GUARD", 0);
+            const int cbuf_mode = cbuf_extent.via_guard    ? guard_switch
+                                  : cbuf_extent.via_shared ? shared_switch
+                                                           : cbuf_switch;
+            FullMarkWhy full_why = FullMarkWhy::Analysis;
+            if (!extent && write_extent.bounded) {
+                full_why = grid ? FullMarkWhy::GuardOrDims : FullMarkWhy::IndirectGrid;
+            }
+            // FRITCHII_EXTENT_CBUF: a store extent with constant buffer words, its words read
+            // now like the pointer word. =1 marks by it (through the ExtentTrust checks below),
+            // =3 only counts what it would free.
+            CbufOutcome cbuf_outcome = CbufOutcome::None;
+            std::optional<u64> cbuf_bytes;
+            if (!extent && (cbuf_mode == 1 || cbuf_mode == 3) && cbuf_extent.ids.bounded)
+                [[unlikely]] {
+                cbuf_bytes = ResolveCbufExtent(cbuf_extent, block, grid, cbuf_outcome);
+            }
+            // Only with the ExtentTrust checks (they need Vulkan and EXP45 off).
+            const bool cbuf_marks = !IS_OPENGL && cbuf_mode == 1 && cbuf_bytes.has_value() &&
+                                    VideoCore::Nx2Debug::Experiment(45) == 0;
+            if (cbuf_marks) {
+                extent = cbuf_bytes;
+            }
+            // The pointer word, read once (the extent counts from the pointer, the binding from
+            // the pointer aligned down).
+            std::optional<GPUVAddr> pointer_word;
+            const auto read_pointer = [&]() -> GPUVAddr {
+                if (!pointer_word) {
+                    pointer_word = Inputs().ReadGameU64(ssbo_addr);
+                    MemReadLog::Value(MemReadLog::Kind::ComputePointer, gpu_memory, ssbo_addr,
+                                      *pointer_word);
+                }
+                return *pointer_word;
+            };
+            u64 cbuf_proven = 0;
+            if (extent) {
+                const GPUVAddr pointer = read_pointer();
                 const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
                 const u64 proven = std::min<u64>(binding.size, pad + *extent);
                 mark = proven;
+                if (cbuf_marks) {
+                    cbuf_proven = proven;
+                }
+                if (proven >= binding.size) {
+                    full_why = FullMarkWhy::WholeBinding;
+                }
                 // Not yet checked at these dims, or caught writing past it: mark in full (see
                 // ExtentTrust), and check this dispatch.
                 if (!IS_OPENGL && proven < binding.size &&
@@ -1953,6 +2436,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                     if (trust.distrusted || bigger) {
                         mark = binding.size;
                         ++extent_full_marks;
+                        full_why =
+                            trust.distrusted ? FullMarkWhy::Distrusted : FullMarkWhy::Checking;
                         if (!trust.distrusted && !trust.probe_pending) {
                             extent_probe_requests[ssbo_index] = ExtentProbeRequest{
                                 .active = true,
@@ -1965,6 +2450,42 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                         }
                     }
                 }
+            } else if (cbuf_mode == 3 && cbuf_bytes) [[unlikely]] {
+                // Dry: the full mark stays; the read ring learns where the proof would end it.
+                const GPUVAddr pointer = read_pointer();
+                const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+                cbuf_proven = std::min<u64>(binding.size, pad + *cbuf_bytes);
+                if (cbuf_proven < binding.size) {
+                    cbuf_dry_proven[ssbo_index] = static_cast<u32>(cbuf_proven);
+                }
+            }
+            // FRITCHII_STORE_FOOTPRINT=3 (dry): the binding's store footprint for its write marks,
+            // counted from the pointer (a binding of several device ranges has none).
+            // FRITCHII_STORE_FOOTPRINT armed (any value at boot): the live shadow follows
+            // gpu_modified_ranges from the first such bind on, and the marks carry the same
+            // footprint (BindHostComputeStorageBuffers).
+            if (ReadRunStats::g_store_footprint) [[unlikely]] {
+                if (!footprint_following) {
+                    footprint_shadow.Start(gpu_modified_ranges);
+                    gpu_modified_ranges.SetFollower(&footprint_shadow);
+                    footprint_following = true;
+                }
+                NoteBindFootprint(ssbo_index, binding, write_extent, extra, block, grid,
+                                  read_pointer());
+            }
+            if (census != 0 || cbuf_switch != 0 || shared_switch != 0 || guard_switch != 0)
+                [[unlikely]] {
+                // Every native written binding (the census ranks them by read-back waits too)
+                NoteExtentCensus(static_cast<u32>(ssbo_index), binding, cbuf_index, cbuf_offset,
+                                 mark, full_why, write_unknown, cbuf_extent, cbuf_outcome,
+                                 cbuf_proven, cbuf_marks && mark < binding.size,
+                                 !write_extent.bounded, extra != nullptr,
+                                 (extra != nullptr ? *extra : NoExtra).shared_why,
+                                 (extra != nullptr ? *extra : NoExtra).guard_why);
+                if (census != 0 &&
+                    !ReadRunStats::g_wait_census.load(std::memory_order_relaxed)) {
+                    ReadRunStats::g_wait_census.store(true, std::memory_order_relaxed);
+                }
             }
             break;
         }
@@ -1976,6 +2497,727 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         }
     }
     channel_state->compute_storage_write_marks[ssbo_index] = static_cast<u32>(mark);
+    // FRITCHII_FEEDER_LANE (dry): how far a native binding's loads and atomics reach, for the
+    // feeder's D (JudgeEarlyCompute). Unknown (the whole binding) without a proven read extent.
+    if constexpr (!IS_OPENGL) {
+        if (EarlyCompute::g_lane && native_pointer && read_extent != nullptr &&
+            read_extent->bounded && binding.size != 0 && binding.segment_count == 0)
+            [[unlikely]] {
+            const auto& qmd = launch_desc;
+            const std::array<u32, 3> block{qmd.block_dim_x.Value(), qmd.block_dim_y.Value(),
+                                           qmd.block_dim_z.Value()};
+            std::optional<std::array<u32, 3>> grid;
+            if (!Inputs().IndirectComputeAddress()) {
+                grid = std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
+                                          qmd.grid_dim_z.Value()};
+            }
+            if (const std::optional<u64> bytes =
+                    Shader::ResolveStorageWriteExtent(*read_extent, block, grid)) {
+                const GPUVAddr pointer = Inputs().ReadGameU64(ssbo_addr);
+                const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+                lane_read_end[ssbo_index] = std::min<u64>(binding.size, pad + *bytes);
+            }
+        }
+    }
+}
+
+template <class P>
+std::optional<u64> BufferCache<P>::ResolveCbufExtent(const Shader::StorageCbufExtent& extent,
+                                                     const std::array<u32, 3>& block,
+                                                     const std::optional<std::array<u32, 3>>& grid,
+                                                     CbufOutcome& outcome) {
+    // FRITCHII_EXTENT_CBUF: each term's word as the dispatch's uniform upload reads it (game
+    // memory at bind). A word on a GPU-written page may be stale in game memory: full mark.
+    const auto& launch_desc = Inputs().LaunchDescription();
+    const auto& cbufs = launch_desc.const_buffer_config;
+    const auto read_word = [&](const Shader::StorageExtentTerm& term, u32& value) {
+        if (term.cbuf_index >= cbufs.size() ||
+            ((launch_desc.const_buffer_enable_mask >> term.cbuf_index) & 1) == 0) {
+            outcome = CbufOutcome::Unresolved;
+            return false;
+        }
+        const GPUVAddr address = cbufs[term.cbuf_index].Address() + term.cbuf_offset;
+        const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(address);
+        if (!device) {
+            outcome = CbufOutcome::Unresolved;
+            return false;
+        }
+        const DAddr page = Common::AlignDown(*device, Core::DEVICE_PAGESIZE);
+        if (GpuWrittenHere(page, Core::DEVICE_PAGESIZE)) {
+            outcome = CbufOutcome::Fallback;
+            return false;
+        }
+        value = Inputs().ReadGameU32(address);
+        return true;
+    };
+    std::array<u32, Shader::MaxExtentTerms> values{};
+    std::array<u32, Shader::MaxExtentTerms> guard_values{};
+    for (size_t i = 0; i < extent.num_terms && i < Shader::MaxExtentTerms; ++i) {
+        if (!read_word(extent.terms[i], values[i])) {
+            return std::nullopt;
+        }
+    }
+    for (size_t i = 0; i < extent.num_guard_terms && i < Shader::MaxExtentTerms; ++i) {
+        if (!read_word(extent.guard_terms[i], guard_values[i])) {
+            return std::nullopt;
+        }
+    }
+    // FRITCHII_EXTENT_GUARD: the words a clamp needs at least a value in, read the same way
+    std::array<u32, Shader::MaxExtentFloors> floor_values{};
+    for (size_t i = 0; i < extent.num_floors && i < Shader::MaxExtentFloors; ++i) {
+        const Shader::StorageExtentTerm word{.cbuf_index = extent.floors[i].cbuf_index,
+                                             .cbuf_offset = extent.floors[i].cbuf_offset};
+        if (!read_word(word, floor_values[i])) {
+            return std::nullopt;
+        }
+    }
+    const std::optional<u64> bytes = Shader::ResolveStorageCbufExtent(
+        extent, block, grid, values, guard_values, floor_values);
+    outcome = bytes ? CbufOutcome::Resolved : CbufOutcome::Unresolved;
+    return bytes;
+}
+
+template <class P>
+void BufferCache<P>::NoteBindFootprint(size_t ssbo_index, const Binding& binding,
+                                       const Shader::StorageWriteExtent& write_extent,
+                                       const Shader::StorageWriteExtra* extra,
+                                       const std::array<u32, 3>& block,
+                                       const std::optional<std::array<u32, 3>>& grid,
+                                       GPUVAddr pointer) {
+    namespace Live = StoreFootprintLive;
+    Live::Stats& stats = Live::GetStats();
+    if (binding.segment_count != 0 || binding.size == 0) {
+        Live::Bump(stats.bind_none);
+        return;
+    }
+    static constexpr Shader::StorageStoreFootprint NoFootprint{};
+    const Shader::StorageStoreFootprint& recorded =
+        extra != nullptr ? extra->footprint : NoFootprint;
+    const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+    const u32 binding_index = static_cast<u32>(ssbo_index);
+    u32 id = 0;
+    if (!recorded.Valid() || recorded.covers_all || recorded.PowerOfTwo()) {
+        // A power-of-two modulus holds whatever the 32-bit offsets do; none claims nothing
+        id = ReadRunStats::InternFootprint(compute_shader_hash, binding_index, recorded);
+        Live::Bump(recorded.Valid() && !recorded.covers_all ? stats.bind_full : stats.bind_none);
+    } else {
+        // Another modulus holds only while pointer + offset doesn't wrap 32 bits. Offsets made
+        // from the ids alone are below the plain store extent at these dims: then no store that
+        // lands in the binding wrapped (one below the pointer by more than the pad lands past
+        // 4 GiB - 16 MiB, outside it).
+        const std::optional<u64> plain = Shader::ResolveStorageWriteExtent(write_extent, block, grid);
+        if (recorded.ids_only && plain && pad + *plain <= (u64{1} << 32)) {
+            id = ReadRunStats::InternFootprint(compute_shader_hash, binding_index, recorded);
+            Live::Bump(stats.bind_full);
+        } else {
+            id = ReadRunStats::InternFootprint(compute_shader_hash, binding_index | 0x80000000U,
+                                               Shader::ReduceStoreFootprint(recorded));
+            Live::Bump(stats.bind_reduced);
+        }
+    }
+    footprint_dry[ssbo_index] = ReadRunStats::FootprintRef{
+        .id = id,
+        .base = binding.device_addr + pad,
+    };
+}
+
+template <class P>
+bool BufferCache<P>::FootprintAnswersRead(DAddr device_addr, u64 size, DAddr page_begin,
+                                          DAddr page_end, int live) {
+    namespace Live = StoreFootprintLive;
+    Live::Stats& stats = Live::GetStats();
+    Live::Bump(stats.asked);
+    switch (footprint_shadow.Check(device_addr, size, gpu_modified_ranges)) {
+    case Live::Answer::NotModified:
+        Live::Bump(stats.not_modified);
+        return false;
+    case Live::Answer::Unclaimed:
+        Live::Bump(stats.unclaimed);
+        return false;
+    case Live::Answer::Inside:
+        Live::Bump(stats.inside);
+        return false;
+    case Live::Answer::Outside:
+        break;
+    }
+    if (live == 2 && ++footprint_skip_count % Live::VerifyEvery == 0) {
+        // Waits as before; its bytes now are compared with the landed ones (GPU::OnCPURead)
+        std::array<u8, 64> bytes{};
+        const u32 compared = static_cast<u32>((std::min<u64>)(size, bytes.size()));
+        VideoCommon::OneFollower::BeforeEngineRead(device_addr, compared);
+        device_memory.ReadBlockUnsafe(device_addr, bytes.data(), compared);
+        Live::AddVerify(device_addr, compared, bytes.data());
+        return false;
+    }
+    // The core took this read's page traps (it keeps the pages readable until a GPU write arms
+    // them again), but the pages still hold GPU-modified bytes this read did not need: arm them
+    // now so the next read of one traps and is asked here as before.
+    read_trapped_ranges.Subtract(page_begin, page_end - page_begin);
+    ArmReadTraps(page_begin, page_end - page_begin);
+    Live::Bump(stats.rearmed, (page_end - page_begin) >> Core::DEVICE_PAGEBITS);
+    Live::Bump(stats.skipped);
+    return true;
+}
+
+template <class P>
+void BufferCache<P>::FootprintCheckLanding(const Common::RangeSet<DAddr>* cpu_written,
+                                           DAddr device_addr, const u8* data, u64 size) {
+    namespace Live = StoreFootprintLive;
+    if (!footprint_shadow.AnyClaimed(device_addr, size)) {
+        return;
+    }
+    Live::Stats& stats = Live::GetStats();
+    const u64 checked = (std::min<u64>)(size, Live::LandingCheckBytes);
+    std::array<u8, 4096> guest{};
+    u64 differed = 0;
+    u64 first_differed = 0;
+    for (u64 offset = 0; offset < checked; offset += guest.size()) {
+        const u64 chunk = (std::min<u64>)(guest.size(), checked - offset);
+        device_memory.ReadBlockUnsafe(device_addr + offset, guest.data(), chunk);
+        if (std::memcmp(guest.data(), data + offset, chunk) == 0) {
+            continue;
+        }
+        for (u64 i = 0; i < chunk; ++i) {
+            if (guest[i] == data[offset + i]) {
+                continue;
+            }
+            const DAddr address = device_addr + offset + i;
+            if (cpu_written != nullptr && cpu_written->Intersects(address, 1)) {
+                continue; // newer guest bytes: the landing leaves them
+            }
+            if (footprint_shadow.ClaimedOutside(address)) {
+                if (differed == 0) {
+                    first_differed = address;
+                }
+                ++differed;
+            }
+        }
+    }
+    Live::Bump(stats.landings_checked);
+    Live::Bump(stats.landing_bytes_checked, checked);
+    if (differed != 0) {
+        const u64 count = stats.landings_differed.fetch_add(1, std::memory_order_relaxed) + 1;
+        Live::Bump(stats.landing_bytes_differed, differed);
+        if (count <= 16) {
+            LOG_ERROR(HW_GPU,
+                      "Store footprint (FRITCHII_STORE_FOOTPRINT=2): a download landing at {:#x} "
+                      "+{:#x} would overwrite {} guest bytes outside every footprint over them, "
+                      "first at {:#x} (must be 0)",
+                      device_addr, size, differed, first_differed);
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::NoteExtentCensus(u32 ssbo_index, const Binding& binding, u32 cbuf_index,
+                                      u32 cbuf_offset, u64 mark, FullMarkWhy why,
+                                      const Shader::ExtentUnknownWhy& write_unknown,
+                                      const Shader::StorageCbufExtent& cbuf_extent,
+                                      CbufOutcome cbuf_outcome, u64 cbuf_proven,
+                                      bool cbuf_marked, bool extent_unknown, bool has_extra,
+                                      const Shader::ExtentUnknownWhy& shared_why,
+                                      const Shader::ExtentUnknownWhy& guard_why) {
+    if (extent_census.empty() && extent_census_frames == 0) {
+        extent_census_start = std::chrono::steady_clock::now();
+    }
+    ExtentCensusEntry& entry = extent_census[{compute_shader_hash, ssbo_index}];
+    entry.analysis = write_unknown;
+    entry.shared_why = shared_why;
+    entry.guard_why = guard_why;
+    entry.pointer_cbuf_index = cbuf_index;
+    entry.pointer_cbuf_offset = cbuf_offset;
+    entry.binding_bytes = binding.size;
+    entry.cbuf_extent = cbuf_extent;
+    ++entry.dispatches;
+    entry.marked_bytes += (std::min<u64>)(mark, binding.size);
+    if (extent_unknown) {
+        ++entry.unknown_dispatches;
+        entry.no_extra_dispatches += has_extra ? 0 : 1;
+    }
+    if (mark >= binding.size) {
+        ++entry.full_dispatches;
+        entry.full_bytes += binding.size;
+        ++entry.whys[static_cast<size_t>(why)];
+    }
+    switch (cbuf_outcome) {
+    case CbufOutcome::Resolved:
+        ++entry.cbuf_resolved;
+        entry.cbuf_proven_bytes += cbuf_proven;
+        entry.cbuf_binding_bytes += binding.size;
+        break;
+    case CbufOutcome::Fallback:
+        ++entry.cbuf_fallback;
+        break;
+    case CbufOutcome::Unresolved:
+        ++entry.cbuf_unresolved;
+        break;
+    case CbufOutcome::None:
+        break;
+    }
+    entry.cbuf_marked += cbuf_marked ? 1 : 0;
+}
+
+template <class P>
+void BufferCache<P>::LogExtentCensus() {
+    // TickFrame, every frame while FRITCHII_EXTENT_CENSUS, FRITCHII_EXTENT_CBUF,
+    // FRITCHII_EXTENT_SHARED or FRITCHII_EXTENT_GUARD is on: the lines every 10 s.
+    if (extent_census.empty()) {
+        extent_census_frames = 0;
+        return;
+    }
+    ++extent_census_frames;
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - extent_census_start).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const int census = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_extent_census,
+                                                        "FRITCHII_EXTENT_CENSUS", 0);
+    const int cbuf_mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_extent_cbuf,
+                                                           "FRITCHII_EXTENT_CBUF", 0);
+    const int shared_mode = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_extent_shared, "FRITCHII_EXTENT_SHARED", 0);
+    const int guard_mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_extent_guard,
+                                                            "FRITCHII_EXTENT_GUARD", 0);
+    // Which switch decides about a cbuf extent: 0 FRITCHII_EXTENT_CBUF, 1 _SHARED (via_shared),
+    // 2 _GUARD (via_guard)
+    const auto proof_kind = [](const Shader::StorageCbufExtent& extent) -> size_t {
+        return extent.via_guard ? 2 : extent.via_shared ? 1 : 0;
+    };
+    static constexpr std::array<const char*, 3> proof_word{"cbuf", "shared", "guard"};
+    static constexpr std::array<const char*, 3> proof_switch{
+        "FRITCHII_EXTENT_CBUF", "FRITCHII_EXTENT_SHARED", "FRITCHII_EXTENT_GUARD"};
+    const std::array<int, 3> proof_mode{cbuf_mode, shared_mode, guard_mode};
+    const double frames = static_cast<double>((std::max<u64>)(extent_census_frames, 1));
+    const auto opcode_name = [](u16 opcode) {
+        return std::string{Shader::IR::NameOf(static_cast<Shader::IR::Opcode>(opcode))};
+    };
+    const auto why_text = [&](const Shader::ExtentUnknownWhy& why) {
+        std::string text{Shader::ExtentUnknownName(why.kind)};
+        switch (why.kind) {
+        case Shader::ExtentUnknown::OtherCbufWord:
+            text += fmt::format(" c{}[{:#x}]", why.cbuf_index, why.cbuf_offset);
+            break;
+        case Shader::ExtentUnknown::DynamicCbuf:
+        case Shader::ExtentUnknown::LoadedFromMemory:
+        case Shader::ExtentUnknown::AtomicResult:
+        case Shader::ExtentUnknown::SignedOr64Bit:
+        case Shader::ExtentUnknown::VariableProduct:
+        case Shader::ExtentUnknown::OtherOp:
+        case Shader::ExtentUnknown::LoopCarried:
+        case Shader::ExtentUnknown::AddressNotTracked:
+        case Shader::ExtentUnknown::NoPointerTerm:
+        case Shader::ExtentUnknown::TooLarge:
+        case Shader::ExtentUnknown::GuardFailed:
+        case Shader::ExtentUnknown::SharedNotPrivate:
+        case Shader::ExtentUnknown::SharedPartialWrite:
+        case Shader::ExtentUnknown::SharedNotDominated:
+        case Shader::ExtentUnknown::GuardNotDominating:
+        case Shader::ExtentUnknown::GuardSigned:
+        case Shader::ExtentUnknown::GuardWraps:
+        case Shader::ExtentUnknown::GuardLimitUnknown:
+        case Shader::ExtentUnknown::GuardInLoop:
+            if (why.opcode != 0) {
+                text += fmt::format(" ({})", opcode_name(why.opcode));
+            }
+            break;
+        default:
+            break;
+        }
+        return text;
+    };
+    const auto terms_text = [](const Shader::StorageCbufExtent& extent) -> std::string {
+        if (!extent.ids.bounded) {
+            return "none";
+        }
+        std::string text;
+        for (size_t i = 0; i < extent.num_terms; ++i) {
+            text += fmt::format("{}c{}[{:#x}] x{:#x}", i == 0 ? "" : " + ",
+                                extent.terms[i].cbuf_index, extent.terms[i].cbuf_offset,
+                                extent.terms[i].coef);
+        }
+        if (extent.num_guard_terms != 0) {
+            text += " (16-bit guard on";
+            for (size_t i = 0; i < extent.num_guard_terms; ++i) {
+                text += fmt::format(" c{}[{:#x}] x{}", extent.guard_terms[i].cbuf_index,
+                                    extent.guard_terms[i].cbuf_offset,
+                                    extent.guard_terms[i].coef);
+            }
+            text += ")";
+        }
+        if (extent.num_floors != 0) {
+            // FRITCHII_EXTENT_GUARD: the clamps' words, each at least its min at bind
+            text += text.empty() ? "(needs" : " (needs";
+            for (size_t i = 0; i < extent.num_floors; ++i) {
+                text += fmt::format("{} c{}[{:#x}] >= {:#x}", i == 0 ? "" : ",",
+                                    extent.floors[i].cbuf_index, extent.floors[i].cbuf_offset,
+                                    extent.floors[i].min);
+            }
+            text += ")";
+        }
+        return text.empty() ? std::string{"no words (proven without them)"} : text;
+    };
+    // FRITCHII_EXTENT_GUARD: the extent proven with the stores' path facts, or why not
+    const auto guard_text = [&](const ExtentCensusEntry& entry) -> std::string {
+        if (entry.cbuf_extent.via_guard && entry.cbuf_extent.ids.bounded) {
+            const Shader::StorageWriteExtent& ids = entry.cbuf_extent.ids;
+            return fmt::format("end {:#x} + local {:#x}/{:#x}/{:#x} + group {:#x}/{:#x}/{:#x}{} + "
+                               "words: {}",
+                               ids.const_end, ids.local_stride[0], ids.local_stride[1],
+                               ids.local_stride[2], ids.group_stride[0], ids.group_stride[1],
+                               ids.group_stride[2], ids.guarded ? " (16-bit guard)" : "",
+                               terms_text(entry.cbuf_extent));
+        }
+        if (entry.guard_why.kind == Shader::ExtentUnknown::Unrecorded) {
+            return "not tried";
+        }
+        return "refused: " + why_text(entry.guard_why);
+    };
+    // FRITCHII_EXTENT_SHARED: the extent proven through shared memory slots, or why not
+    const auto shared_text = [&](const ExtentCensusEntry& entry) -> std::string {
+        if (entry.cbuf_extent.via_shared && entry.cbuf_extent.ids.bounded) {
+            const Shader::StorageWriteExtent& ids = entry.cbuf_extent.ids;
+            return fmt::format("{} (end {:#x} + local {:#x}/{:#x}/{:#x} + group {:#x}/{:#x}/{:#x}"
+                               "{})",
+                               entry.cbuf_extent.num_terms == 0 ? "ids only" : "with words",
+                               ids.const_end, ids.local_stride[0], ids.local_stride[1],
+                               ids.local_stride[2], ids.group_stride[0], ids.group_stride[1],
+                               ids.group_stride[2], ids.guarded ? ", 16-bit guard" : "");
+        }
+        if (entry.shared_why.kind == Shader::ExtentUnknown::Unrecorded) {
+            return "not tried";
+        }
+        return "refused: " + why_text(entry.shared_why);
+    };
+    using Entry = std::pair<const std::pair<u64, u32>*, const ExtentCensusEntry*>;
+    constexpr size_t Top = 8;
+    if (census == 0) {
+        ReadRunStats::g_wait_census.store(false, std::memory_order_relaxed);
+    } else {
+        // Read-back waits by writer (the read ring: FRITCHII_EXTENT_CENSUS or
+        // FRITCHII_EXTENT_CBUF=3 at boot, or FRITCHII_READ_RUNS)
+        const auto waits = ReadRunStats::TakeWaits();
+        const auto wait_of =
+            [&](const std::pair<u64, u32>& key) -> const ReadRunStats::WaitStats* {
+            const ReadRunStats::Writer writer{.program = key.first,
+                                              .binding = key.second,
+                                              .kind = ReadRunStats::WriterKind::ComputeStorage};
+            const auto it = waits.find(writer);
+            return it != waits.end() ? &it->second : nullptr;
+        };
+        u64 dispatches = 0;
+        u64 full_dispatches = 0;
+        u64 full_bytes = 0;
+        u64 unknown = 0;
+        u64 no_extra = 0;
+        u64 full_bindings = 0;
+        for (const auto& [key, entry] : extent_census) {
+            dispatches += entry.dispatches;
+            full_dispatches += entry.full_dispatches;
+            full_bytes += entry.full_bytes;
+            unknown += entry.unknown_dispatches;
+            no_extra += entry.no_extra_dispatches;
+            full_bindings += entry.full_dispatches != 0 ? 1 : 0;
+        }
+        u64 wait_ns = 0;
+        for (const auto& [writer, stats] : waits) {
+            wait_ns += stats.wait_ns;
+        }
+        LOG_INFO(HW_GPU,
+                 "Extent census (FRITCHII_EXTENT_CENSUS) last {:.1f} s: {:.0f} native written "
+                 "bindings a second, {:.0f} of them marked in full ({:.0f} MiB/s) over {} program "
+                 "bindings; extent unknown {:.0f}/s, {:.0f}/s of those with no reason recorded "
+                 "(must be 0 with EDEN_NX2_PRECOMPILED_FAST=0) | read-back waits {:.2f} ms a frame "
+                 "over {} writers{}",
+                 seconds, static_cast<double>(dispatches) / seconds,
+                 static_cast<double>(full_dispatches) / seconds,
+                 static_cast<double>(full_bytes) / 1048576.0 / seconds, full_bindings,
+                 static_cast<double>(unknown) / seconds, static_cast<double>(no_extra) / seconds,
+                 static_cast<double>(wait_ns) / 1e6 / frames, waits.size(),
+                 ReadRunStats::g_enabled ? ""
+                                         : " (read ring off: FRITCHII_EXTENT_CENSUS at boot)");
+        const auto log_entry = [&](const char* rank, size_t i, size_t n,
+                                   const std::pair<u64, u32>& key,
+                                   const ExtentCensusEntry& entry) {
+            const ReadRunStats::WaitStats* waited = wait_of(key);
+            const auto& w = entry.whys;
+            LOG_INFO(HW_GPU,
+                     "Extent census {} {}/{}: program {:016x} binding {} (pointer c{}[{:#x}]) | "
+                     "read-back {} reads, {:.2f} ms a frame | {:.1f} dispatches/s, {:.1f} "
+                     "full-marked/s, {:.1f} MiB marked/s ({} KiB binding) | why unknown: {} | "
+                     "full mark because: unknown {}, indirect grid {}, 16-bit guard or dims {}, "
+                     "distrusted {}, checking new dims {}, proof covers the binding {} | cbuf "
+                     "extent: {} | shared extent: {} | guard extent: {}",
+                     rank, i + 1, n, key.first, key.second, entry.pointer_cbuf_index,
+                     entry.pointer_cbuf_offset, waited != nullptr ? waited->reads : 0,
+                     waited != nullptr ? static_cast<double>(waited->wait_ns) / 1e6 / frames : 0.0,
+                     static_cast<double>(entry.dispatches) / seconds,
+                     static_cast<double>(entry.full_dispatches) / seconds,
+                     static_cast<double>(entry.marked_bytes) / 1048576.0 / seconds,
+                     entry.binding_bytes >> 10, why_text(entry.analysis),
+                     w[static_cast<size_t>(FullMarkWhy::Analysis)],
+                     w[static_cast<size_t>(FullMarkWhy::IndirectGrid)],
+                     w[static_cast<size_t>(FullMarkWhy::GuardOrDims)],
+                     w[static_cast<size_t>(FullMarkWhy::Distrusted)],
+                     w[static_cast<size_t>(FullMarkWhy::Checking)],
+                     w[static_cast<size_t>(FullMarkWhy::WholeBinding)],
+                     entry.cbuf_extent.via_guard    ? std::string{"none (see guard extent)"}
+                     : entry.cbuf_extent.via_shared ? std::string{"none (see shared extent)"}
+                                                    : terms_text(entry.cbuf_extent),
+                     shared_text(entry), guard_text(entry));
+        };
+        // 1. The writers the guest waited for most, whatever they are (the ones that matter)
+        std::vector<std::pair<const ReadRunStats::Writer*, const ReadRunStats::WaitStats*>>
+            by_wait;
+        for (const auto& [writer, stats] : waits) {
+            by_wait.emplace_back(&writer, &stats);
+        }
+        const size_t wait_shown = (std::min)(Top, by_wait.size());
+        std::partial_sort(by_wait.begin(),
+                          by_wait.begin() + static_cast<std::ptrdiff_t>(wait_shown), by_wait.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.second->wait_ns > b.second->wait_ns;
+                          });
+        std::set<std::pair<u64, u32>> shown_keys;
+        for (size_t i = 0; i < wait_shown; ++i) {
+            const ReadRunStats::Writer& writer = *by_wait[i].first;
+            const ReadRunStats::WaitStats& stats = *by_wait[i].second;
+            const std::pair<u64, u32> key{writer.program, writer.binding};
+            if (writer.kind == ReadRunStats::WriterKind::ComputeStorage) {
+                if (const auto it = extent_census.find(key); it != extent_census.end()) {
+                    log_entry("read-back", i, wait_shown, key, it->second);
+                    shown_keys.insert(key);
+                    continue;
+                }
+            }
+            const bool draw = writer.kind == ReadRunStats::WriterKind::DrawStorage ||
+                              writer.kind == ReadRunStats::WriterKind::DrawTexture;
+            LOG_INFO(HW_GPU,
+                     "Extent census read-back {}/{}: {} program {:016x} {} {} | read-back {} "
+                     "reads, {:.2f} ms a frame | no bare native written binding of it bound in "
+                     "this window (a sized buffer, a texture buffer, a draw or a copy): no store "
+                     "extent applies",
+                     i + 1, wait_shown, ReadRunStats::WriterKindName(writer.kind), writer.program,
+                     draw ? "stage/binding" : "binding",
+                     draw ? fmt::format("{}/{}", writer.binding / 64, writer.binding % 64)
+                          : fmt::format("{}", writer.binding),
+                     stats.reads, static_cast<double>(stats.wait_ns) / 1e6 / frames);
+        }
+        // 2. The bindings marked in full the most, not shown above
+        std::vector<Entry> order;
+        for (const auto& [key, entry] : extent_census) {
+            if (entry.full_dispatches != 0 && !shown_keys.contains(key)) {
+                order.emplace_back(&key, &entry);
+            }
+        }
+        const size_t shown = (std::min)(Top, order.size());
+        std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(shown),
+                          order.end(), [](const Entry& a, const Entry& b) {
+                              return a.second->full_bytes > b.second->full_bytes;
+                          });
+        for (size_t i = 0; i < shown; ++i) {
+            log_entry("marked", i, shown, *order[i].first, *order[i].second);
+        }
+    }
+    const bool cbuf_on = cbuf_mode == 1 || cbuf_mode == 3;
+    const bool shared_on = shared_mode == 1 || shared_mode == 3;
+    const bool guard_on = guard_mode == 1 || guard_mode == 3;
+    if (cbuf_on || shared_on || guard_on) {
+        // The dry read counts (=3: the read ring's marks carry the proof's end). The extents
+        // proven through shared memory slots (FRITCHII_EXTENT_SHARED) and with the stores' path
+        // facts (FRITCHII_EXTENT_GUARD) have their own lines.
+        auto dry = ReadRunStats::TakeDry();
+        std::vector<Entry> order;
+        std::array<size_t, 3> proof_entries{};
+        for (const auto& [key, entry] : extent_census) {
+            if (entry.cbuf_resolved + entry.cbuf_fallback + entry.cbuf_unresolved != 0) {
+                order.emplace_back(&key, &entry);
+                ++proof_entries[proof_kind(entry.cbuf_extent)];
+            }
+        }
+        const size_t cbuf_entries = proof_entries[0];
+        const size_t shared_entries = proof_entries[1];
+        const size_t guard_entries = proof_entries[2];
+        if ((cbuf_on && cbuf_entries == 0) || (shared_on && shared_entries == 0) ||
+            (guard_on && guard_entries == 0)) {
+            // Say so rather than stay silent: no binding had such an extent to try
+            u64 unknown = 0;
+            u64 no_extra = 0;
+            u64 shared_refused = 0;
+            u64 guard_refused = 0;
+            const auto refused = [](const Shader::ExtentUnknownWhy& why) {
+                return why.kind != Shader::ExtentUnknown::Unrecorded &&
+                       why.kind != Shader::ExtentUnknown::Known;
+            };
+            for (const auto& [key, entry] : extent_census) {
+                unknown += entry.unknown_dispatches;
+                no_extra += entry.no_extra_dispatches;
+                shared_refused += refused(entry.shared_why) ? entry.dispatches : 0;
+                guard_refused += refused(entry.guard_why) ? entry.dispatches : 0;
+            }
+            if (guard_on && guard_entries == 0) {
+                LOG_INFO(HW_GPU,
+                         "Extent guard (FRITCHII_EXTENT_GUARD={}) last {:.1f} s: no native "
+                         "written binding had an extent proven with its stores' path facts; "
+                         "refused {:.0f} dispatches/s (the census' guard extent says why); "
+                         "extent unknown {:.0f} dispatches/s, {:.0f}/s of them with no reason "
+                         "recorded (run with EDEN_NX2_PRECOMPILED_FAST=0)",
+                         guard_mode, seconds, static_cast<double>(guard_refused) / seconds,
+                         static_cast<double>(unknown) / seconds,
+                         static_cast<double>(no_extra) / seconds);
+            }
+            if (cbuf_on && cbuf_entries == 0) {
+                LOG_INFO(HW_GPU,
+                         "Extent cbuf (FRITCHII_EXTENT_CBUF={}) last {:.1f} s: no native written "
+                         "binding had a cbuf extent; extent unknown {:.0f} dispatches/s, {:.0f}/s "
+                         "of them with no reason recorded (no Shader::StorageWriteExtra)",
+                         cbuf_mode, seconds, static_cast<double>(unknown) / seconds,
+                         static_cast<double>(no_extra) / seconds);
+            }
+            if (shared_on && shared_entries == 0) {
+                LOG_INFO(HW_GPU,
+                         "Extent shared (FRITCHII_EXTENT_SHARED={}) last {:.1f} s: no native "
+                         "written binding had an extent proven through shared memory slots; "
+                         "refused {:.0f} dispatches/s (the census' shared extent says why); "
+                         "extent unknown {:.0f} dispatches/s, {:.0f}/s of them with no reason "
+                         "recorded (run with EDEN_NX2_PRECOMPILED_FAST=0)",
+                         shared_mode, seconds, static_cast<double>(shared_refused) / seconds,
+                         static_cast<double>(unknown) / seconds,
+                         static_cast<double>(no_extra) / seconds);
+            }
+        }
+        const auto dry_of = [&](const std::pair<u64, u32>& key) -> const ReadRunStats::DryStats* {
+            const ReadRunStats::Writer writer{.program = key.first,
+                                              .binding = key.second,
+                                              .kind = ReadRunStats::WriterKind::ComputeStorage};
+            const auto it = dry.find(writer);
+            return it != dry.end() ? &it->second : nullptr;
+        };
+        const auto weight = [&](const Entry& e) {
+            const ReadRunStats::DryStats* d = dry_of(*e.first);
+            u64 wait = 0;
+            if (d != nullptr) {
+                for (const u64 ns : d->wait_ns) {
+                    wait += ns;
+                }
+            }
+            return std::pair<u64, u64>{wait, e.second->cbuf_resolved};
+        };
+        const size_t shown = (std::min)(Top, order.size());
+        std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(shown),
+                          order.end(),
+                          [&](const Entry& a, const Entry& b) { return weight(a) > weight(b); });
+        for (size_t i = 0; i < shown; ++i) {
+            const auto& [key, entry] = order[i];
+            const ReadRunStats::DryStats none{};
+            const ReadRunStats::DryStats* found = dry_of(*key);
+            const ReadRunStats::DryStats& d = found != nullptr ? *found : none;
+            using DR = ReadRunStats::DryRead;
+            const auto reads = [&](DR kind) { return d.reads[static_cast<size_t>(kind)]; };
+            const auto ms_frame = [&](DR kind) {
+                return static_cast<double>(d.wait_ns[static_cast<size_t>(kind)]) / 1e6 / frames;
+            };
+            const double kib_proven =
+                entry->cbuf_resolved != 0
+                    ? static_cast<double>(entry->cbuf_proven_bytes) / 1024.0 /
+                          static_cast<double>(entry->cbuf_resolved)
+                    : 0.0;
+            const double kib_binding =
+                entry->cbuf_resolved != 0
+                    ? static_cast<double>(entry->cbuf_binding_bytes) / 1024.0 /
+                          static_cast<double>(entry->cbuf_resolved)
+                    : 0.0;
+            const size_t kind = proof_kind(entry->cbuf_extent);
+            const std::string proof_text = kind == 2   ? guard_text(*entry)
+                                           : kind == 1 ? shared_text(*entry)
+                                                       : terms_text(entry->cbuf_extent);
+            LOG_INFO(HW_GPU,
+                     "Extent {} ({}={}) {}/{} last {:.1f} s: program {:016x} "
+                     "binding {} | {} extent {} | dispatches/s: proof {:.1f}, fallback (word on "
+                     "a GPU-written page) {:.1f}, unresolved {:.1f}, marked by the proof (=1) "
+                     "{:.1f} | proven {:.1f} KiB of {:.1f} KiB on average | reads to the back by "
+                     "its marks (=3): inside the proof {} ({:.2f} ms a frame), would be freed {} "
+                     "({:.2f} ms a frame), past the proof but under an older mark of the same "
+                     "writer {} / another writer {} ({:.2f} / {:.2f} ms a frame) | must be 0: "
+                     "freed reads whose bytes changed at landing {} of {} compared (inside: {} of "
+                     "{})",
+                     proof_word[kind], proof_switch[kind], proof_mode[kind], i + 1, shown,
+                     seconds, key->first, key->second, proof_word[kind], proof_text,
+                     static_cast<double>(entry->cbuf_resolved) / seconds,
+                     static_cast<double>(entry->cbuf_fallback) / seconds,
+                     static_cast<double>(entry->cbuf_unresolved) / seconds,
+                     static_cast<double>(entry->cbuf_marked) / seconds, kib_proven, kib_binding,
+                     reads(DR::Inside), ms_frame(DR::Inside), reads(DR::Freed),
+                     ms_frame(DR::Freed), reads(DR::CoveredSame), reads(DR::CoveredOther),
+                     ms_frame(DR::CoveredSame), ms_frame(DR::CoveredOther), d.freed_differed,
+                     d.freed_compared, d.inside_differed, d.inside_compared);
+            // The reads past the proof under an older mark: whose marks they would still wait
+            // for, and how long (timed with the write ticks: FRITCHII_EXTENT_SHARED=3, _GUARD=3 or
+            // FRITCHII_READ_RUNS=2 at boot)
+            u64 all_wait = 0;
+            for (const u64 ns : d.wait_ns) {
+                all_wait += ns;
+            }
+            u64 timed_wait = 0;
+            u64 timed_predicted = 0;
+            std::vector<std::pair<const ReadRunStats::Writer*, const ReadRunStats::DryStats::Cover*>>
+                covers;
+            for (const auto& [writer, cover] : d.covers) {
+                covers.emplace_back(&writer, &cover);
+                timed_wait += cover.timed_wait_ns;
+                timed_predicted += cover.predicted_ns;
+            }
+            constexpr size_t TopCovers = 4;
+            const size_t covers_shown = (std::min)(TopCovers, covers.size());
+            std::partial_sort(covers.begin(),
+                              covers.begin() + static_cast<std::ptrdiff_t>(covers_shown),
+                              covers.end(), [](const auto& a, const auto& b) {
+                                  return a.second->wait_ns > b.second->wait_ns;
+                              });
+            std::string covered_by;
+            for (size_t c = 0; c < covers_shown; ++c) {
+                const ReadRunStats::Writer& writer = *covers[c].first;
+                const ReadRunStats::DryStats::Cover& cover = *covers[c].second;
+                std::string why = "not in the census (not a bare native written binding)";
+                if (writer.kind == ReadRunStats::WriterKind::ComputeStorage) {
+                    if (const auto it = extent_census.find({writer.program, writer.binding});
+                        it != extent_census.end()) {
+                        why = fmt::format("{}, {:.1f} full-marked/s, pointer c{}[{:#x}]",
+                                          why_text(it->second.analysis),
+                                          static_cast<double>(it->second.full_dispatches) /
+                                              seconds,
+                                          it->second.pointer_cbuf_index,
+                                          it->second.pointer_cbuf_offset);
+                    }
+                }
+                const bool draw = writer.kind == ReadRunStats::WriterKind::DrawStorage ||
+                                  writer.kind == ReadRunStats::WriterKind::DrawTexture;
+                covered_by += fmt::format(
+                    "{}{} {:016x} {} {}: {} reads, {:.2f} ms a frame, timed {} would wait {:.2f} "
+                    "ms a frame instead of {:.2f} (why unknown: {})",
+                    c == 0 ? "" : "; ", ReadRunStats::WriterKindName(writer.kind),
+                    writer.program, draw ? "stage/binding" : "binding",
+                    draw ? fmt::format("{}/{}", writer.binding / 64, writer.binding % 64)
+                         : fmt::format("{}", writer.binding),
+                    cover.reads, static_cast<double>(cover.wait_ns) / 1e6 / frames, cover.timed,
+                    static_cast<double>(cover.predicted_ns) / 1e6 / frames,
+                    static_cast<double>(cover.timed_wait_ns) / 1e6 / frames, why);
+            }
+            LOG_INFO(HW_GPU,
+                     "Extent {} ({}={}) {}/{} with the proof: its reads would wait {:.2f} ms a "
+                     "frame instead of {:.2f} (freed reads as 0, covered reads until their cover "
+                     "ran: timed {}, untimed {} kept as waited; the timed ones {:.2f} instead of "
+                     "{:.2f}) | covered by {} writers: {}",
+                     proof_word[kind], proof_switch[kind], proof_mode[kind], i + 1, shown,
+                     static_cast<double>(d.proof_wait_ns) / 1e6 / frames,
+                     static_cast<double>(all_wait) / 1e6 / frames, d.covered_timed,
+                     d.covered_untimed, static_cast<double>(timed_predicted) / 1e6 / frames,
+                     static_cast<double>(timed_wait) / 1e6 / frames, covers.size(),
+                     covered_by.empty() ? std::string{"none"} : covered_by);
+        }
+    }
+    extent_census.clear();
+    extent_census_frames = 0;
 }
 
 template <class P>
@@ -2167,6 +3409,10 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         normalized_copies.push_back(second_copy);
     }
     runtime.PostCopyBarrier();
+    if (LandingCheckMode() != 0) [[unlikely]] {
+        LandingCheckCommit(std::span<const BufferCopy>(normalized_copies.data(),
+                                                       normalized_copies.size()));
+    }
     pending_downloads.emplace_back(std::move(normalized_copies));
     pending_download_ranges.emplace_back(std::move(download_ranges));
     async_buffers.emplace_back(download_staging);
@@ -2235,6 +3481,13 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     }
     Core::g_buffer_write_pages.Mark(device_addr, size);
     Core::g_watch_write_pages.Mark(device_addr, size);
+    if (LandingCheckMode() != 0) [[unlikely]] {
+        LandingCheckNoteLanded(device_addr, size);
+    }
+    // FRITCHII_STORE_FOOTPRINT=2: would this landing overwrite guest bytes no footprint writes?
+    if (footprint_following && StoreFootprintLive::Mode() == 2) [[unlikely]] {
+        FootprintCheckLanding(&cpu_written, device_addr, data, size);
+    }
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
@@ -2247,6 +3500,186 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     parts.ForEach([&](DAddr start, DAddr end) {
         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
     });
+}
+
+template <class P>
+int BufferCache<P>::LandingCheckMode() {
+    static const int mode = [] {
+        const char* const value = std::getenv("FRITCHII_LANDING_CHECK");
+        const int parsed = value != nullptr ? std::atoi(value) : 0;
+        if (parsed != 0) {
+            LOG_INFO(HW_GPU,
+                     "Landing check (FRITCHII_LANDING_CHECK={}): fence downloads compare the guest "
+                     "bytes they land over with the bytes at their commit{}",
+                     parsed, parsed == 2 ? "; bytes the guest changed since are kept" : "");
+        }
+        return parsed;
+    }();
+    return mode;
+}
+
+template <class P>
+void BufferCache<P>::LandingCheckCommit(std::span<const BufferCopy> copies) {
+    LandingSnapshot snapshot;
+    snapshot.committed_ns = Common::Nx2Hitch::NowNs();
+    {
+        std::scoped_lock lock{landing_check_mutex};
+        snapshot.landing_seq = landing_check_seq;
+    }
+    u64 total = 0;
+    snapshot.copy_offsets.reserve(copies.size());
+    for (const BufferCopy& copy : copies) {
+        snapshot.copy_offsets.push_back(total);
+        total += copy.size;
+    }
+    snapshot.bytes.resize(total);
+    for (size_t index = 0; index < copies.size(); ++index) {
+        device_memory.ReadBlockUnsafe(static_cast<DAddr>(copies[index].src_offset),
+                                      snapshot.bytes.data() + snapshot.copy_offsets[index],
+                                      copies[index].size);
+    }
+    landing_snapshots.push_back(std::move(snapshot));
+}
+
+template <class P>
+void BufferCache<P>::LandingCheckPop(bool begin) {
+    std::scoped_lock lock{landing_check_mutex};
+    if (begin) {
+        t_landing_check_pop_seq = ++landing_check_seq;
+        return;
+    }
+    t_landing_check_pop_seq = 0;
+    if (landing_check_pages.size() > 65536) {
+        // Only landings after the oldest pending commit matter (the popped snapshot is gone).
+        const u64 oldest = !landing_snapshots.empty() ? landing_snapshots.front().landing_seq
+                                                      : landing_check_seq;
+        std::erase_if(landing_check_pages, [oldest](const auto& entry) {
+            return entry.second <= oldest;
+        });
+    }
+}
+
+template <class P>
+void BufferCache<P>::LandingCheckNoteLanded(DAddr device_addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    std::scoped_lock lock{landing_check_mutex};
+    const u64 seq =
+        t_landing_check_pop_seq != 0 ? t_landing_check_pop_seq : ++landing_check_seq;
+    for (u64 page = device_addr >> Core::DEVICE_PAGEBITS;
+         page <= (device_addr + size - 1) >> Core::DEVICE_PAGEBITS; ++page) {
+        landing_check_pages[page] = seq;
+    }
+}
+
+template <class P>
+void BufferCache<P>::LandingCheckPiece(const LandingSnapshot& snapshot, const BufferCopy& copy,
+                                       size_t index, DAddr start, u8* data, u64 size,
+                                       const Common::RangeSet<DAddr>* cpu_written) {
+    const int mode = LandingCheckMode();
+    const DAddr copy_addr = static_cast<DAddr>(copy.src_offset);
+    if (size == 0 || index >= snapshot.copy_offsets.size() || start < copy_addr ||
+        start + size > copy_addr + copy.size) {
+        return;
+    }
+    const u8* const old = snapshot.bytes.data() + snapshot.copy_offsets[index] + (start - copy_addr);
+    std::vector<u8> now(size);
+    device_memory.ReadBlockUnsafe(start, now.data(), size);
+    // Collected CPU writes: the landing leaves those bytes alone. Treated as unchanged.
+    if (cpu_written != nullptr && cpu_written->Intersects(start, size)) {
+        cpu_written->ForEachInRange(start, size, [&](DAddr lower, DAddr upper) {
+            for (DAddr address = (std::max)(lower, start); address < (std::min)(upper, start + size);
+                 ++address) {
+                now[address - start] = old[address - start];
+            }
+        });
+    }
+    u64 changed = 0;
+    u64 skipped = 0;
+    u64 first_changed = ~u64{0};
+    std::array<u8, 8> first_now{}, first_old{}, first_landing{};
+    {
+        std::scoped_lock lock{landing_check_mutex};
+        u64 i = 0;
+        while (i < size) {
+            const u64 page = (start + i) >> Core::DEVICE_PAGEBITS;
+            const u64 page_end =
+                (std::min)(size, ((page + 1) << Core::DEVICE_PAGEBITS) - start);
+            const auto it = landing_check_pages.find(page);
+            // A landing (or read download) after the commit wrote this page: its bytes changed
+            // by a download, not by the guest.
+            const bool landed_since = it != landing_check_pages.end() &&
+                                      it->second > snapshot.landing_seq &&
+                                      it->second != t_landing_check_pop_seq;
+            for (; i < page_end; ++i) {
+                if (now[i] == old[i] || now[i] == data[i]) {
+                    continue;
+                }
+                if (landed_since) {
+                    ++skipped;
+                    continue;
+                }
+                if (first_changed == ~u64{0}) {
+                    first_changed = i;
+                    for (u64 b = 0; b < 8 && i + b < size; ++b) {
+                        first_now[b] = now[i + b];
+                        first_old[b] = old[i + b];
+                        first_landing[b] = data[i + b];
+                    }
+                }
+                ++changed;
+                if (mode == 2) {
+                    data[i] = now[i]; // the landing writes the guest's own byte back
+                }
+            }
+        }
+    }
+    auto& totals = landing_check_totals;
+    ++totals.landings;
+    totals.bytes += size;
+    totals.skipped_bytes += skipped;
+    if (changed != 0) {
+        ++totals.changed_landings;
+        totals.changed_bytes += changed;
+        if (mode == 2) {
+            totals.kept_bytes += changed;
+        }
+        static std::atomic<u64> logged{};
+        if (const u64 n = logged.fetch_add(1, std::memory_order_relaxed); n < 32 || n % 1000 == 0) {
+            const auto hex = [](const std::array<u8, 8>& bytes) {
+                u64 value = 0;
+                std::memcpy(&value, bytes.data(), sizeof(value));
+                return value;
+            };
+            LOG_CRITICAL(
+                HW_GPU,
+                "Landing check: a fence download lands over bytes the guest changed since its copy "
+                "was taken (must not happen): device [{:#x}, {:#x}), {} of {} bytes changed, "
+                "first at +{:#x}: guest now {:#018x}, at the commit {:#018x}, the landing "
+                "{:#018x} (little-endian words); {:.1f} ms after the commit, {} fences pending; "
+                "{} (#{})",
+                start, start + size, changed, size, first_changed, hex(first_now), hex(first_old),
+                hex(first_landing),
+                static_cast<double>(Common::Nx2Hitch::NowNs() - snapshot.committed_ns) / 1e6,
+                pending_downloads.size(),
+                mode == 2 ? "kept the guest's bytes" : "landed anyway (FRITCHII_LANDING_CHECK=2 keeps them)",
+                n + 1);
+        }
+    }
+    const u64 now_ns = Common::Nx2Hitch::NowNs();
+    if (now_ns - totals.last_log_ns >= 10'000'000'000ULL) {
+        if (totals.last_log_ns != 0) {
+            LOG_INFO(HW_GPU,
+                     "Landing check (FRITCHII_LANDING_CHECK={}) 10 s: {} landings, {} KiB checked; "
+                     "changed by the guest since the copy: {} landings, {} bytes (must be 0; {} "
+                     "kept); {} bytes on pages a later download wrote (skipped)",
+                     mode, totals.landings, totals.bytes >> 10, totals.changed_landings,
+                     totals.changed_bytes, totals.kept_bytes, totals.skipped_bytes);
+        }
+        totals = LandingCheckTotals{};
+        totals.last_log_ns = now_ns;
+    }
 }
 
 template <class P>
@@ -2274,6 +3707,13 @@ void BufferCache<P>::PopAsyncBuffers() {
     auto& async_buffer = async_buffers.front();
     u8* base = async_buffer->mapped_span.data();
     const size_t base_offset = async_buffer->offset;
+    // FRITCHII_LANDING_CHECK: this fence's snapshot (taken at its commit).
+    const LandingSnapshot* const landing_snapshot =
+        LandingCheckMode() != 0 && !landing_snapshots.empty() ? &landing_snapshots.front()
+                                                              : nullptr;
+    if (landing_snapshot != nullptr) [[unlikely]] {
+        LandingCheckPop(true);
+    }
     // F2 counter (EDEN_NX2_DOWNLOAD_READ_STATS): the ranges this fence writes to guest memory.
     std::vector<std::pair<u64, u64>> stats_landed;
     // Landed per copy (copies within a page of each other together), each inside a
@@ -2319,6 +3759,12 @@ void BufferCache<P>::PopAsyncBuffers() {
                 if (time_parts) [[unlikely]] {
                     part_start = FenceReleaseStats::Clock::now();
                 }
+                if (landing_snapshot != nullptr) [[unlikely]] {
+                    // The staging bytes are ours (mode 2 patches the guest's changes in).
+                    LandingCheckPiece(*landing_snapshot, copy, index, start,
+                                      const_cast<u8*>(&read_mapped_memory[start - device_addr]),
+                                      end - start, &cpu_written);
+                }
                 WriteDownloadedMemory(cpu_written, start, &read_mapped_memory[start - device_addr],
                                       end - start);
                 if (time_parts) [[unlikely]] {
@@ -2341,9 +3787,324 @@ void BufferCache<P>::PopAsyncBuffers() {
     async_buffers.pop_front();
     pending_downloads.pop_front();
     pending_download_ranges.pop_front();
+    if (LandingCheckMode() != 0 && !landing_snapshots.empty()) [[unlikely]] {
+        landing_snapshots.pop_front();
+        LandingCheckPop(false);
+    }
     {
         // EXP72: in guest memory now (the copies above wrote it).
         std::scoped_lock lock{fence_landed_mutex};
+        fence_downloads_landed.fetch_add(1, std::memory_order_release);
+    }
+    fence_landed_cv.notify_all();
+}
+
+template <class P>
+bool BufferCache<P>::PendingCpuWritesIn(DAddr begin, DAddr end, Common::RangeSet<DAddr>& out) {
+    out.Clear();
+    if (!pending_cpu_writes) {
+        return false;
+    }
+    // Only the writes over [begin, end): the callers ask about ranges inside it alone, so the
+    // answers are PendingCpuWriteRanges' (without building a set of every collected write).
+    struct Filter {
+        DAddr begin;
+        DAddr end;
+        Common::RangeSet<DAddr>* out;
+        bool any;
+    } filter{begin, end, &out, false};
+    pending_cpu_writes([filter_ptr = &filter](DAddr address, size_t size) {
+        if (size != 0 && address < filter_ptr->end && address + size > filter_ptr->begin) {
+            filter_ptr->out->Add(address, size);
+            filter_ptr->any = true;
+        }
+    });
+    return filter.any;
+}
+
+template <class P>
+void BufferCache<P>::WriteDownloadedMemoryUnlocked(const Common::RangeSet<DAddr>* cpu_written,
+                                                   DAddr device_addr, const u8* data, u64 size) {
+    const Common::WriteRing::SiteScope write_site{"buffer download", true};
+    if (LandingCheckMode() != 0) [[unlikely]] {
+        LandingCheckNoteLanded(device_addr, size);
+    }
+    if (cpu_written == nullptr || !cpu_written->Intersects(device_addr, size)) {
+        device_memory.WriteBlockUnsafe(device_addr, data, size);
+    } else {
+        unlocked_parts.Clear();
+        unlocked_parts.Add(device_addr, size);
+        cpu_written->ForEachInRange(device_addr, size, [this](DAddr start, DAddr end) {
+            unlocked_parts.Subtract(start, end - start);
+        });
+        unlocked_parts.ForEach([&](DAddr start, DAddr end) {
+            device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+        });
+    }
+    // WriteDownloadedMemory's marks, after the bytes landed: it marks first, which holds only
+    // under the lock (the native bank check takes g_buffer_write_pages under it). A mark taken
+    // between a mark and the bytes would leave the bytes unseen; after, a look before the mark
+    // sees the page as before this fence (as a draw before the pop did), the next one sees it.
+    if (Common::S4Count::On()) [[unlikely]] {
+        Common::S4Count::MarkGens(Common::S4Count::Writer::Gpu, device_addr, size);
+    }
+    Core::g_buffer_write_pages.Mark(device_addr, size);
+    Core::g_watch_write_pages.Mark(device_addr, size);
+}
+
+template <class P>
+void BufferCache<P>::VerifyUnlockedLanding(DAddr landing_begin, DAddr landing_end,
+                                           const Common::RangeSet<DAddr>& live,
+                                           Common::LockCensus::FenceCopyBatch& batch) {
+    // Under the lock, in a landing of its own: guest CPU writes collected from here on store
+    // their bytes after the compare. What the locked pop would have written: the pieces' bytes
+    // where the fence still writes (`live`), except over the CPU writes it found collected then
+    // (unlocked_cpu_written) and those collected since (they store after the copy: newer).
+    static std::atomic<u32> logged{};
+    const VideoCore::DownloadLanding landing{landing_begin, landing_end};
+    PendingCpuWritesIn(landing_begin, landing_end, unlocked_verify_cpu);
+    for (const UnlockedPiece& piece : unlocked_pieces) {
+        bool bad_piece = false;
+        live.ForEachInRange(piece.addr, piece.size, [&](DAddr start, DAddr end) {
+            unlocked_verify_parts.Clear();
+            unlocked_verify_parts.Add(start, end - start);
+            const auto cut = [this](DAddr lower, DAddr upper) {
+                unlocked_verify_parts.Subtract(lower, upper - lower);
+            };
+            unlocked_cpu_written.ForEachInRange(start, end - start, cut);
+            unlocked_verify_cpu.ForEachInRange(start, end - start, cut);
+            unlocked_verify_parts.ForEach([&](DAddr lower, DAddr upper) {
+                const u64 bytes = upper - lower;
+                if (unlocked_verify_bytes.size() < bytes) {
+                    unlocked_verify_bytes.resize(bytes);
+                }
+                device_memory.ReadBlockUnsafe(lower, unlocked_verify_bytes.data(), bytes);
+                const u8* const expected = piece.data + (lower - piece.addr);
+                batch.verify_bytes += bytes;
+                if (std::memcmp(unlocked_verify_bytes.data(), expected, bytes) == 0) [[likely]] {
+                    return;
+                }
+                u64 differ = 0;
+                u64 first_differ = bytes;
+                for (u64 i = 0; i < bytes; ++i) {
+                    if (unlocked_verify_bytes[i] != expected[i]) {
+                        ++differ;
+                        first_differ = (std::min)(first_differ, i);
+                    }
+                }
+                batch.verify_bad_bytes += differ;
+                bad_piece = true;
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_ERROR(HW_GPU,
+                              "Fence copy unlocked verify: {} of {} bytes at {:#x} differ from "
+                              "the fence's download (first at {:#x}; copy {:#x}+{:#x})",
+                              differ, bytes, lower, lower + first_differ, piece.addr,
+                              piece.size);
+                }
+            });
+        });
+        if (bad_piece) {
+            ++batch.verify_bad_pieces;
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::PopAsyncBuffersUnlocked(size_t pops, int mode,
+                                             Common::LockCensus::FenceCopyBatch& batch) {
+    // The popped lists are moved aside and freed after the lock is let go; room made now, out
+    // of the lock.
+    if (unlocked_trash_ranges.capacity() < pops) {
+        unlocked_trash_ranges.reserve((std::max)(pops, size_t{64}));
+    }
+    if (unlocked_trash_copies.capacity() < pops) {
+        unlocked_trash_copies.reserve((std::max)(pops, size_t{64}));
+    }
+    std::unique_lock lock{mutex};
+    u64 held_since = Common::Nx2Hitch::NowNs();
+    for (size_t i = 0; i < pops; ++i) {
+        PopOneUnlocked(lock, mode, batch, held_since);
+    }
+    batch.held_ns += Common::Nx2Hitch::NowNs() - held_since;
+    lock.unlock();
+    unlocked_trash_ranges.clear();
+    unlocked_trash_copies.clear();
+    batch.pops += pops;
+    VideoCore::DownloadLanding::TakeUnlockedWaits(batch.holder_waits, batch.holder_wait_ns);
+}
+
+template <class P>
+void BufferCache<P>::PopOneUnlocked(std::unique_lock<Common::SpinRecursiveMutex>& lock, int mode,
+                                    Common::LockCensus::FenceCopyBatch& batch, u64& held_since) {
+    // PopAsyncBuffers with each landing's copy out of the lock. Held on entry and on return.
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
+    const Common::WriteRing::SiteScope write_site{"buffer download landing (PopAsyncBuffers)", true};
+    if constexpr (!IS_OPENGL) {
+        if (!read_downloads.empty()) [[unlikely]] {
+            (void)runtime.IsFreeNow(read_downloads.front().tick);
+            WriteCompletedReadDownloads();
+        }
+    }
+    if (async_buffers.empty()) {
+        return;
+    }
+    if (!async_buffers.front().has_value()) {
+        async_buffers.pop_front();
+        return;
+    }
+    // References to the fronts stay good while the lock is let go: only this thread pops these
+    // deques, and a push at the back moves no element. They are read under the lock only; the
+    // copy outside it uses unlocked_pieces alone.
+    auto& downloads = pending_downloads.front();
+    auto& async_buffer = async_buffers.front();
+    u8* base = async_buffer->mapped_span.data();
+    const size_t base_offset = async_buffer->offset;
+    std::vector<std::pair<u64, u64>> stats_landed;
+    // FRITCHII_LANDING_CHECK: this fence's snapshot (checked under the lock, before each copy).
+    const LandingSnapshot* const landing_snapshot =
+        LandingCheckMode() != 0 && !landing_snapshots.empty() ? &landing_snapshots.front()
+                                                              : nullptr;
+    if (landing_snapshot != nullptr) [[unlikely]] {
+        LandingCheckPop(true);
+    }
+    // Below this many bytes a landing is copied under the lock as before: letting the lock go
+    // and taking it back costs more than such a copy (and E may take it in between). The
+    // verify mode copies every landing outside the lock.
+    constexpr u64 UnlockedMinBytes = 512;
+    size_t first = 0;
+    while (first < downloads.size()) {
+        // PopAsyncBuffers' landings: copies within a page of each other together.
+        DAddr landing_begin = static_cast<DAddr>(downloads[first].src_offset);
+        DAddr landing_end = landing_begin + downloads[first].size;
+        size_t last = first + 1;
+        for (; last < downloads.size(); ++last) {
+            const DAddr begin = static_cast<DAddr>(downloads[last].src_offset);
+            const DAddr end = begin + downloads[last].size;
+            if (end + Core::DEVICE_PAGESIZE < landing_begin ||
+                begin > landing_end + Core::DEVICE_PAGESIZE) {
+                break;
+            }
+            landing_begin = (std::min)(landing_begin, begin);
+            landing_end = (std::max)(landing_end, end);
+        }
+        // What the fence still writes (PopAsyncBuffers' ForEachInRange), read under the lock: a
+        // writer that takes a range away later waits for the copy (ClearFenceDownloads).
+        const Common::RangeSet<DAddr>& ranges = pending_download_ranges.front();
+        unlocked_pieces.clear();
+        landing_check_piece_copies.clear();
+        u64 bytes = 0;
+        for (size_t index = first; index < last; ++index) {
+            const auto& copy = downloads[index];
+            const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
+            const u8* const read_mapped_memory = base + (copy.dst_offset - base_offset);
+            ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
+                if (landing_snapshot != nullptr) [[unlikely]] {
+                    landing_check_piece_copies.push_back(index);
+                }
+                unlocked_pieces.push_back(
+                    UnlockedPiece{start, end - start, read_mapped_memory + (start - device_addr)});
+                bytes += end - start;
+            });
+        }
+        if (unlocked_pieces.empty()) {
+            // Nothing left to write (PopAsyncBuffers' landing writes nothing either).
+            first = last;
+            continue;
+        }
+        // FRITCHII_LANDING_CHECK: each piece, once the collected CPU writes are known.
+        const auto check_pieces = [&] {
+            for (size_t piece = 0;
+                 piece < unlocked_pieces.size() && piece < landing_check_piece_copies.size();
+                 ++piece) {
+                const size_t index = landing_check_piece_copies[piece];
+                LandingCheckPiece(*landing_snapshot, downloads[index], index,
+                                  unlocked_pieces[piece].addr,
+                                  const_cast<u8*>(unlocked_pieces[piece].data),
+                                  unlocked_pieces[piece].size, &unlocked_cpu_written);
+            }
+        };
+        if (bytes < UnlockedMinBytes && mode != 2) {
+            const VideoCore::DownloadLanding landing{landing_begin, landing_end};
+            PendingCpuWritesIn(landing_begin, landing_end, unlocked_cpu_written);
+            if (landing_snapshot != nullptr) [[unlikely]] {
+                check_pieces();
+            }
+            for (const UnlockedPiece& piece : unlocked_pieces) {
+                WriteDownloadedMemory(unlocked_cpu_written, piece.addr, piece.data, piece.size);
+                gpu_modified_ranges.Subtract(piece.addr, piece.size);
+                if (DownloadReadStats::g_enabled) [[unlikely]] {
+                    stats_landed.emplace_back(piece.addr, piece.addr + piece.size);
+                }
+            }
+            ++batch.groups_locked;
+            first = last;
+            continue;
+        }
+        // The landing and the collected CPU writes under the lock, in PopAsyncBuffers' order
+        // (published, then looked at): a write collected later stores its bytes once the landing
+        // ended, which is after the copy.
+        VideoCore::DownloadLanding::PublishUnlocked(landing_begin, landing_end);
+        const bool any_cpu = PendingCpuWritesIn(landing_begin, landing_end, unlocked_cpu_written);
+        if (landing_snapshot != nullptr) [[unlikely]] {
+            check_pieces();
+        }
+        // FRITCHII_STORE_FOOTPRINT=2: the unlocked landing's pieces, checked under the lock
+        if (footprint_following && StoreFootprintLive::Mode() == 2) [[unlikely]] {
+            for (const UnlockedPiece& piece : unlocked_pieces) {
+                FootprintCheckLanding(any_cpu ? &unlocked_cpu_written : nullptr, piece.addr,
+                                      piece.data, piece.size);
+            }
+        }
+        const u64 unlock_at = Common::Nx2Hitch::NowNs();
+        batch.held_ns += unlock_at - held_since;
+        lock.unlock();
+        for (const UnlockedPiece& piece : unlocked_pieces) {
+            WriteDownloadedMemoryUnlocked(any_cpu ? &unlocked_cpu_written : nullptr, piece.addr,
+                                          piece.data, piece.size);
+        }
+        VideoCore::DownloadLanding::EndUnlocked();
+        const u64 relock_at = Common::Nx2Hitch::NowNs();
+        batch.unlocked_ns += relock_at - unlock_at;
+        lock.lock();
+        held_since = Common::Nx2Hitch::NowNs();
+        batch.relock_ns += held_since - relock_at;
+        ++batch.groups_unlocked;
+        batch.pieces += unlocked_pieces.size();
+        batch.bytes += bytes;
+        // In guest memory now. The GPU-modified state goes where the fence still writes: a range
+        // taken away meanwhile was taken by a newer write, which set its own state (a GPU write
+        // keeps the range GPU-modified, a CPU write or a synchronous download cleared it).
+        PromoteAhead(); // a reader of the real sets
+        const Common::RangeSet<DAddr>& live = pending_download_ranges.front();
+        if (mode == 2) [[unlikely]] {
+            VerifyUnlockedLanding(landing_begin, landing_end, live, batch);
+        }
+        for (const UnlockedPiece& piece : unlocked_pieces) {
+            live.ForEachInRange(piece.addr, piece.size, [&](DAddr start, DAddr end) {
+                gpu_modified_ranges.Subtract(start, end - start);
+                if (DownloadReadStats::g_enabled) [[unlikely]] {
+                    stats_landed.emplace_back(start, end);
+                }
+            });
+        }
+        first = last;
+    }
+    if (DownloadReadStats::g_enabled) [[unlikely]] {
+        DownloadReadStats::Landed(stats_landed);
+    }
+    async_buffers_death_ring.emplace_back(*async_buffer);
+    async_buffers.pop_front();
+    unlocked_trash_copies.emplace_back(std::move(pending_downloads.front()));
+    pending_downloads.pop_front();
+    unlocked_trash_ranges.emplace_back(std::move(pending_download_ranges.front()));
+    pending_download_ranges.pop_front();
+    if (LandingCheckMode() != 0 && !landing_snapshots.empty()) [[unlikely]] {
+        landing_snapshots.pop_front();
+        LandingCheckPop(false);
+    }
+    {
+        // EXP72: in guest memory now (the copies above wrote it).
+        std::scoped_lock landed_lock{fence_landed_mutex};
         fence_downloads_landed.fetch_add(1, std::memory_order_release);
     }
     fence_landed_cv.notify_all();
@@ -2356,6 +4117,57 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
     // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
     // inline uploads once GPU-written ranges are no longer cleared by downloads).
     return gpu_modified_ranges.Intersects(addr, size);
+}
+
+template <class P>
+template <typename Func>
+bool BufferCache<P>::ForEachComputeWriteMark(Func&& func) const {
+    // As BindHostComputeStorageBuffers marks: min(the cap, the native write mark).
+    bool bounded = true;
+    ForEachEnabledBit(channel_state->enabled_compute_storage_buffers &
+                          channel_state->written_compute_storage_buffers,
+                      [&](u32 index) {
+                          const Binding& binding = channel_state->compute_storage_buffers[index];
+                          if (binding.device_addr == 0 || binding.size == 0) {
+                              return; // a null binding: nothing marked
+                          }
+                          const bool native =
+                              ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
+                          const u64 limit = channel_state->compute_storage_write_marks[index];
+                          const u64 capped = WrittenStorageMarkSize(binding.size);
+                          if (!native || binding.segment_count != 0 || limit >= binding.size ||
+                              (capped < binding.size && capped <= limit)) {
+                              bounded = false;
+                              return;
+                          }
+                          if (limit != 0) {
+                              func(binding.device_addr, limit);
+                          }
+                      });
+    return bounded;
+}
+
+template <class P>
+auto BufferCache<P>::ComputeSkipRangeFacts(DAddr addr, u64 size) -> SkipRangeFacts {
+    PromoteAhead();
+    SkipRangeFacts facts{};
+    const DAddr end = addr + size;
+    u64 covered = 0;
+    ForEachGpuWrittenHere(addr, size, [&](DAddr lower, DAddr upper) {
+        const DAddr begin = (std::max)(lower, addr);
+        const DAddr stop = (std::min)(upper, end);
+        if (begin < stop) {
+            covered += stop - begin;
+        }
+    });
+    facts.all_gpu_written = covered >= size;
+    facts.cpu_modified = memory_tracker.IsRegionCpuModified(addr, size);
+    const DAddr page_begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+    const u64 page_size = Common::AlignUp(end, Core::DEVICE_PAGESIZE) - page_begin;
+    facts.read_back = memory_tracker.IsRegionPreflushable(page_begin, page_size) ||
+                      cpu_read_ranges.Intersects(page_begin, page_size) ||
+                      read_download_ranges.Intersects(page_begin, page_size);
+    return facts;
 }
 
 template <class P>
@@ -5121,6 +6933,8 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
 
 template <class P>
 void BufferCache<P>::BindHostComputeStorageBuffers() {
+    // The unmapped device read lines' context (a few dispatches a frame: two stores each).
+    const Common::WriteRing::ReadSiteScope read_site{"compute storage bind"};
     u32 binding_index = 0;
     // EDEN_NX2_GPU_PROFILE: bytes bound against bytes uploaded (the compute bindings line).
     const bool profile = Nx2Profile::Enabled();
@@ -5140,6 +6954,8 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         storage_sync_scan = 0;
         if (ReadRunStats::g_enabled) [[unlikely]] {
             ReadRunStats::t_writer = {};
+            ReadRunStats::t_proven_end = 0;
+            ReadRunStats::t_footprint = {};
         }
     };
     ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
@@ -5148,6 +6964,11 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
             ReadRunStats::t_writer = {.program = compute_shader_hash,
                                       .binding = index,
                                       .kind = ReadRunStats::WriterKind::ComputeStorage};
+            // FRITCHII_EXTENT_CBUF=3: where the cbuf proof would have ended this binding's mark
+            ReadRunStats::t_proven_end =
+                cbuf_dry_proven[index] != 0 ? binding.device_addr + cbuf_dry_proven[index] : 0;
+            // FRITCHII_STORE_FOOTPRINT=3: this binding's footprint (none: id 0)
+            ReadRunStats::t_footprint = footprint_dry[index];
         }
         if (profile) {
             Nx2Profile::Add(Nx2Profile::Counter::ComputeStorageBindings, 1);
@@ -5187,9 +7008,14 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const u32 mark =
             is_written ? static_cast<u32>(std::min<u64>(capped_size, write_mark_limit)) : 0;
         if (mark != 0) {
+            // FRITCHII_STORE_FOOTPRINT (armed): the mark carries the binding's footprint
+            if (footprint_following) [[unlikely]] {
+                mark_footprint = footprint_dry[index];
+            }
             // Only the cap leaves writes past the mark; the native mark bounds them.
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, mark, true,
                               capped_size < size && capped_size <= write_mark_limit);
+            mark_footprint = {};
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
@@ -5253,6 +7079,7 @@ void BufferCache<P>::ProbeExtentTail(u32 index, const Binding& binding) {
         // other reasons: they are left out.
         probe.guest.resize(span);
         VideoCommon::OneFollower::BeforeEngineRead(tail, span);
+        const Common::WriteRing::ReadSiteScope read_site{"extent probe"};
         device_memory.ReadBlockUnsafe(tail, probe.guest.data(), span);
         const auto skip = [&](DAddr begin, DAddr end) {
             begin = (std::max)(begin, tail);
@@ -5804,7 +7631,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     }
     // FRITCHII_READ_RUNS: the write mark, with the writer its bind set (the "Read writer" lines).
     if (ReadRunStats::g_enabled) [[unlikely]] {
-        ReadRunStats::NoteWrite(device_addr, size);
+        ReadRunStats::NoteWrite(device_addr, size, ReadWriteStamp());
     }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
@@ -5821,7 +7648,13 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     OutdateReadDownloads(device_addr, size);
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
-    gpu_modified_ranges.Add(device_addr, size);
+    if (mark_footprint.id != 0) [[unlikely]] {
+        // FRITCHII_STORE_FOOTPRINT: who made these bytes GPU-modified (the shadow first)
+        footprint_shadow.AddClaimed(mark_footprint.id, mark_footprint.base, device_addr, size);
+        gpu_modified_ranges.Add(device_addr, size, true);
+    } else {
+        gpu_modified_ranges.Add(device_addr, size);
+    }
     const bool ampere = Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
     if (ampere) {
         // Before QueueFenceDownload arms read traps: guest reads skip the buffer cache's lock on
@@ -5909,7 +7742,7 @@ bool BufferCache<P>::MarkWrittenAhead(BufferId buffer_id, DAddr device_addr, u32
         nx2_written_mark_bytes += size;
     }
     if (ReadRunStats::g_enabled) [[unlikely]] {
-        ReadRunStats::NoteWrite(device_addr, size);
+        ReadRunStats::NoteWrite(device_addr, size, ReadWriteStamp());
     }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
@@ -5933,6 +7766,7 @@ bool BufferCache<P>::MarkWrittenAhead(BufferId buffer_id, DAddr device_addr, u32
         .size = size,
         .capped = capped,
         .ampere = ampere,
+        .footprint = mark_footprint,
     });
     ahead_ranges.Add(device_addr, size);
     AheadBump(ahead_stats.pushed);
@@ -5976,7 +7810,14 @@ void BufferCache<P>::PromoteAheadSlow(bool by_back) {
         // e again (the block comment above): THREAD 0 has the bit set after anything before the
         // write in stream order.
         memory_tracker.MarkRegionAsGpuModified(write.addr, write.size);
-        gpu_modified_ranges.Add(write.addr, write.size);
+        if (write.footprint.id != 0) [[unlikely]] {
+            // FRITCHII_STORE_FOOTPRINT: who made these bytes GPU-modified (the shadow first)
+            footprint_shadow.AddClaimed(write.footprint.id, write.footprint.base, write.addr,
+                                        write.size);
+            gpu_modified_ranges.Add(write.addr, write.size, true);
+        } else {
+            gpu_modified_ranges.Add(write.addr, write.size);
+        }
         // h ran at the fill, before this arms the read traps.
         QueueFenceDownload(write.addr, write.size);
         if (write.ampere) {
@@ -7219,6 +9060,7 @@ template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
     MemStageStats::Uploaded(copies.size(), total_size_bytes);
+    const Common::WriteRing::ReadSiteScope read_site{"buffer upload"};
     // FRITCHII_BANK_CENSUS: the pages these copies read from guest memory (the bank check's next
     // compare of each takes the mark).
     if (Core::DevicePageFlags* const census_uploads =
@@ -7715,6 +9557,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         GPUVAddr gpu_addr;
         u64 next_qword;
         u64 serial;
+        u64 backing; ///< FRITCHII_BARE_SSBO_CLAMP: the device backing's generation, else 0
         u32 flags;
         Binding binding;
     };
@@ -7722,15 +9565,23 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     thread_local std::array<std::array<CachedBinding, Ways>, 512> binding_cache{};
     // FRITCHII_BARE_SSBO_MIB is live: its reach is part of the answer's key (MiB, from bit 3).
     const u32 bare_reach = native_pointer ? VideoCore::Nx2Debug::BareStorageReach() : 0;
+    // FRITCHII_BARE_SSBO_CLAMP (live, default 0): a bare binding stops at the first device page
+    // with no host backing; the answer then also holds only until the backing changes (bit 31).
+    const bool bare_clamp =
+        native_pointer && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bare_ssbo_clamp,
+                                                           "FRITCHII_BARE_SSBO_CLAMP") != 0;
     const u32 flags = (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) |
-                      (table_pointer ? 4U : 0U) | ((bare_reach >> 20) << 3);
+                      (table_pointer ? 4U : 0U) | ((bare_reach >> 20) << 3) |
+                      (bare_clamp ? 1U << 31 : 0U);
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
+    const u64 backing = bare_clamp ? device_memory.TranslationGeneration() : 0;
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
     for (size_t way = 0; way < Ways; ++way) {
         const CachedBinding& cached = set[way];
         if (cached.owner == owner && cached.gpu_addr == gpu_addr &&
-            cached.next_qword == next_qword && cached.flags == flags && cached.serial == serial) {
+            cached.next_qword == next_qword && cached.flags == flags && cached.serial == serial &&
+            cached.backing == backing) {
             const Binding hit = cached.binding;
             std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
             if (compute) {
@@ -7816,6 +9667,26 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // a written one isn't split into separate ranges without sparse sources.
             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
         }
+        // FRITCHII_BARE_SSBO_CLAMP: stop at the first device page with no host backing (read as
+        // zeros: the AMD tester's market load read 16 MiB of them at one bare compute window,
+        // test 4 §5b); none backed at the start is the null binding (size 0 below).
+        if (bare_clamp && size != 0) {
+            if (const std::optional<DAddr> start = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+                const size_t backed = device_memory.BackedPrefix(*start, size);
+                if (backed < size) {
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 24) [[unlikely]] {
+                        LOG_WARNING(HW_GPU,
+                                    "Bare {} storage binding at {:#x} (device {:#x}, {}): {:#x} "
+                                    "bytes, host-backed {:#x}: {} (FRITCHII_BARE_SSBO_CLAMP=1)",
+                                    compute ? "compute" : "graphics", gpu_addr, *start,
+                                    is_written ? "written" : "read-only", size, backed,
+                                    backed == 0 ? "null binding" : "clamped");
+                    }
+                    size = static_cast<u32>(backed);
+                }
+            }
+        }
 
         // Alignment only applies to the offset of the buffer
         const u32 alignment = runtime.GetStorageBufferAlignment();
@@ -7846,7 +9717,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         };
     }();
     std::rotate(set.begin(), set.end() - 1, set.end());
-    set[0] = {owner, gpu_addr, next_qword, serial, flags, binding};
+    set[0] = {owner, gpu_addr, next_qword, serial, backing, flags, binding};
     return binding;
 }
 
@@ -7878,6 +9749,7 @@ std::span<const u8> BufferCache<P>::ImmediateBufferWithData(DAddr device_addr, s
         return std::span(base_pointer, size);
     } else {
         const std::span<u8> span = ImmediateBuffer(size);
+        const Common::WriteRing::ReadSiteScope read_site{"immediate buffer"};
         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
         return span;
     }

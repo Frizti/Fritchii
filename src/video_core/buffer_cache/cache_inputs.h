@@ -207,6 +207,10 @@ public:
     [[nodiscard]] u64 ReadGameU64(GPUVAddr address) const {
         return gpu_memory->Read<u64>(address);
     }
+    /// A 32-bit word of game memory: FRITCHII_EXTENT_CBUF's constant buffer words.
+    [[nodiscard]] u32 ReadGameU32(GPUVAddr address) const {
+        return gpu_memory->Read<u32>(address);
+    }
 
 private:
     Maxwell3D* maxwell3d;

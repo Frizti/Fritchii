@@ -118,6 +118,22 @@ void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_in
         throw InvalidArgument("Invalid stage {}", program.stage);
     }()};
     auto& descs{program.info.storage_buffers_descriptors};
+    // FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: the extras follow the descriptors (a global
+    // store may land anywhere in a driver buffer)
+    auto& extras{program.info.storage_write_extras};
+    const bool global_stores{program.info.stores_global_memory};
+    const StorageWriteExtra global_extra{
+        .write_unknown = ExtentUnknownWhy{.kind = ExtentUnknown::GlobalStore}};
+    if ((global_stores || !extras.empty()) && extras.size() != descs.size()) {
+        extras.assign(descs.size(), StorageWriteExtra{});
+    }
+    if (global_stores) {
+        // FRITCHII_STORE_FOOTPRINT: a global store may land in any written buffer
+        for (StorageWriteExtra& extra : extras) {
+            extra.footprint = StorageStoreFootprint{};
+            extra.footprint.why = StoreFootprintWhy::GlobalStore;
+        }
+    }
     for (u32 index = 0; index < num_buffers; ++index) {
         if (!program.info.nvn_buffer_used[index]) {
             continue;
@@ -131,6 +147,7 @@ void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_in
             if (program.info.stores_global_memory) {
                 // A global store may land anywhere in it
                 it->write_extent = {};
+                extras[static_cast<size_t>(it - descs.begin())] = global_extra;
             }
             continue;
         }
@@ -145,6 +162,9 @@ void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_in
             .count = 1,
             .is_written = program.info.stores_global_memory,
         });
+        if (!extras.empty() || global_stores) {
+            extras.push_back(global_stores ? global_extra : StorageWriteExtra{});
+        }
     }
     // A global access is left: it is routed by address into any bound buffer at any offset, so no
     // read extent of the program is known.

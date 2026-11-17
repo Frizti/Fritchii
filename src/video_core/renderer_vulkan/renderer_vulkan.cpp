@@ -115,10 +115,29 @@ std::string BuildCommaSeparatedExtensions(
 
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld, VkSurfaceKHR surface) {
     const std::vector<VkPhysicalDevice> devices = instance.EnumeratePhysicalDevices();
-    const u32 device_index = Settings::values.vulkan_device.GetValue();
-    if (device_index >= u32(devices.size())) {
-        LOG_ERROR(Render_Vulkan, "Invalid device index {}!", device_index);
+    if (devices.empty()) {
+        LOG_ERROR(Render_Vulkan, "No Vulkan device found");
         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+    }
+    const u32 saved_index = Settings::values.vulkan_device.GetValue();
+    const std::string saved_name = Settings::values.vulkan_device_name.GetValue();
+    const auto summaries = SummarizePhysicalDevices(dld, devices);
+    const PhysicalDevicePick pick = PickPhysicalDevice(summaries, saved_index, saved_name);
+    const size_t device_index = pick.index;
+    {
+        std::string list;
+        for (size_t i = 0; i < summaries.size(); ++i) {
+            const char* type =
+                summaries[i].type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? "discrete"
+                : summaries[i].type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
+                                                                              : "other";
+            list += fmt::format("{}{}: {} ({}, {} MiB)", i == 0 ? "" : "; ", i, summaries[i].name,
+                                type, summaries[i].local_memory >> 20);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Graphics card: {} ({}), {}; saved index {}, saved name \"{}\"{}; devices: {}",
+                 summaries[device_index].name, device_index, pick.reason, saved_index, saved_name,
+                 Settings::values.vulkan_device.UsingGlobal() ? "" : " (game setting)", list);
     }
     const vk::PhysicalDevice physical_device(devices[device_index], dld);
     return Device(*instance, physical_device, surface, dld);

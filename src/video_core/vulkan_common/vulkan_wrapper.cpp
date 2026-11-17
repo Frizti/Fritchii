@@ -5,14 +5,19 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
@@ -104,6 +109,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdBlitImage);
     X(vkCmdClearAttachments);
     X(vkCmdClearColorImage);
+    X(vkCmdClearDepthStencilImage);
     X(vkCmdCopyBuffer);
     X(vkCmdCopyBufferToImage);
     X(vkCmdCopyImage);
@@ -206,6 +212,11 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkDestroyImage);
     X(vkDestroyImageView);
     X(vkDestroyPipeline);
+    X(vkCreatePipelineBinariesKHR);
+    X(vkDestroyPipelineBinaryKHR);
+    X(vkGetPipelineBinaryDataKHR);
+    X(vkGetPipelineKeyKHR);
+    X(vkReleaseCapturedPipelineDataKHR);
     X(vkDestroyPipelineCache);
     X(vkDestroyPipelineLayout);
     X(vkDestroyQueryPool);
@@ -304,6 +315,17 @@ void SetObjectName(const DeviceDispatch* dld, VkDevice device, T handle, VkObjec
 
 } // Anonymous namespace
 
+void NoteNullTarget(const char* command, const std::source_location& site) noexcept {
+    static std::atomic<u64> skipped{};
+    const u64 count = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 16 || count % 1024 == 0) {
+        LOG_CRITICAL(Render_Vulkan,
+                     "Null GPU target: {} (it would reach device address 0 and lose the device); "
+                     "at {}:{} ({}); {} so far",
+                     command, site.file_name(), site.line(), site.function_name(), count);
+    }
+}
+
 bool Load(InstanceDispatch& dld) noexcept {
 #define X(name) Proc(dld.name, dld, #name)
     return X(vkCreateInstance) && X(vkEnumerateInstanceExtensionProperties) &&
@@ -344,12 +366,205 @@ const char* Exception::what() const noexcept {
     return string_VkResult(result);
 }
 
+namespace {
+
+// FRITCHII_RAM_VK_HOST_ALLOC: the driver's host allocations through allocation callbacks given at
+// vkCreateInstance and vkCreateDevice (their children are created with null callbacks, which
+// drivers serve from the parent's). The blocks come from a heap of our own and are counted, so the
+// census names the driver's host memory, and what the driver frees goes back to that heap instead
+// of staying in the driver's own reservations.
+struct HostAllocState {
+    std::array<std::atomic<u64>, 5> live{};     ///< Bytes asked for, per VkSystemAllocationScope
+    std::array<std::atomic<s64>, 5> internal{}; ///< The driver's own (notified), per scope
+    std::atomic<u64> blocks{};
+    std::atomic<u64> total{};
+    std::atomic<u64> peak{};
+    std::atomic<u64> failures{};
+    std::atomic<u64> foreign{};
+#ifdef _WIN32
+    HANDLE heap{};
+#endif
+};
+
+/// Sits right below each block handed out.
+struct HostBlockHeader {
+    void* raw;
+    u64 size;
+    u32 scope;
+    u32 magic;
+    u64 reserved;
+};
+static_assert(sizeof(HostBlockHeader) == 32);
+constexpr u32 HostBlockMagic = 0x46564b48; // "HKVF"
+
+HostAllocState& HostState() {
+    static HostAllocState state;
+    return state;
+}
+
+size_t ScopeIndex(VkSystemAllocationScope scope) {
+    return (std::min)(static_cast<size_t>(scope), size_t{4});
+}
+
+void* VKAPI_CALL HostAllocate(void* user, size_t size, size_t alignment,
+                              VkSystemAllocationScope scope) {
+    auto& state = *static_cast<HostAllocState*>(user);
+    if (size == 0) {
+        return nullptr;
+    }
+    alignment = (std::max)(alignment, size_t{16});
+    if ((alignment & (alignment - 1)) != 0) {
+        return nullptr;
+    }
+    // The heap's blocks are 16-byte aligned: the header and the alignment fit in this much.
+    const size_t total = size + sizeof(HostBlockHeader) + alignment - 16;
+#ifdef _WIN32
+    void* const raw = HeapAlloc(state.heap, 0, total);
+#else
+    void* const raw = std::malloc(total);
+#endif
+    if (raw == nullptr) {
+        state.failures.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    const uintptr_t first = reinterpret_cast<uintptr_t>(raw) + sizeof(HostBlockHeader);
+    const uintptr_t aligned = (first + alignment - 1) & ~(uintptr_t{alignment} - 1);
+    auto* const header = reinterpret_cast<HostBlockHeader*>(aligned) - 1;
+    const size_t index = ScopeIndex(scope);
+    *header = HostBlockHeader{raw, size, static_cast<u32>(index), HostBlockMagic, 0};
+    state.live[index].fetch_add(size, std::memory_order_relaxed);
+    state.blocks.fetch_add(1, std::memory_order_relaxed);
+    const u64 now = state.total.fetch_add(size, std::memory_order_relaxed) + size;
+    u64 peak = state.peak.load(std::memory_order_relaxed);
+    while (now > peak && !state.peak.compare_exchange_weak(peak, now, std::memory_order_relaxed)) {
+    }
+    return reinterpret_cast<void*>(aligned);
+}
+
+void VKAPI_CALL HostFree(void* user, void* memory) {
+    if (memory == nullptr) {
+        return;
+    }
+    auto& state = *static_cast<HostAllocState*>(user);
+    auto* const header = static_cast<HostBlockHeader*>(memory) - 1;
+    if (header->magic != HostBlockMagic) {
+        // Not one of ours: leaked rather than handed to a heap that never made it.
+        if (state.foreign.fetch_add(1, std::memory_order_relaxed) == 0) {
+            LOG_ERROR(Render_Vulkan, "FRITCHII_RAM_VK_HOST_ALLOC: the driver freed a block it did "
+                                     "not get from the callbacks; left alone");
+        }
+        return;
+    }
+    header->magic = 0;
+    state.live[header->scope].fetch_sub(header->size, std::memory_order_relaxed);
+    state.blocks.fetch_sub(1, std::memory_order_relaxed);
+    state.total.fetch_sub(header->size, std::memory_order_relaxed);
+#ifdef _WIN32
+    HeapFree(state.heap, 0, header->raw);
+#else
+    std::free(header->raw);
+#endif
+}
+
+void* VKAPI_CALL HostReallocate(void* user, void* original, size_t size, size_t alignment,
+                                VkSystemAllocationScope scope) {
+    if (original == nullptr) {
+        return HostAllocate(user, size, alignment, scope);
+    }
+    if (size == 0) {
+        HostFree(user, original);
+        return nullptr;
+    }
+    const auto* const header = static_cast<const HostBlockHeader*>(original) - 1;
+    if (header->magic != HostBlockMagic) {
+        return nullptr; // the original stays valid, as on a failed reallocation
+    }
+    void* const moved = HostAllocate(user, size, alignment, scope);
+    if (moved == nullptr) {
+        return nullptr;
+    }
+    std::memcpy(moved, original, (std::min)(static_cast<size_t>(header->size), size));
+    HostFree(user, original);
+    return moved;
+}
+
+void VKAPI_CALL HostInternalAllocation(void* user, size_t size, VkInternalAllocationType,
+                                       VkSystemAllocationScope scope) {
+    static_cast<HostAllocState*>(user)->internal[ScopeIndex(scope)].fetch_add(
+        static_cast<s64>(size), std::memory_order_relaxed);
+}
+
+void VKAPI_CALL HostInternalFree(void* user, size_t size, VkInternalAllocationType,
+                                 VkSystemAllocationScope scope) {
+    static_cast<HostAllocState*>(user)->internal[ScopeIndex(scope)].fetch_sub(
+        static_cast<s64>(size), std::memory_order_relaxed);
+}
+
+std::string HostAllocCensus() {
+    const HostAllocState& state = HostState();
+    const auto mib = [](u64 bytes) { return bytes >> 20; };
+    std::array<u64, 5> live{};
+    s64 internal = 0;
+    for (size_t i = 0; i < live.size(); ++i) {
+        live[i] = state.live[i].load(std::memory_order_relaxed);
+        internal += state.internal[i].load(std::memory_order_relaxed);
+    }
+    return fmt::format(
+        "Vulkan host allocations (FRITCHII_RAM_VK_HOST_ALLOC=1, their heap is in 'other heaps'): "
+        "{} MiB live in {} blocks (peak {}), by scope command {} object {} cache {} device {} "
+        "instance {}; the driver's own (notified) {} MiB; {} failed, {} foreign frees",
+        mib(state.total.load(std::memory_order_relaxed)),
+        state.blocks.load(std::memory_order_relaxed), mib(state.peak.load(std::memory_order_relaxed)),
+        mib(live[0]), mib(live[1]), mib(live[2]), mib(live[3]), mib(live[4]),
+        internal > 0 ? (static_cast<u64>(internal) >> 20) : 0,
+        state.failures.load(std::memory_order_relaxed),
+        state.foreign.load(std::memory_order_relaxed));
+}
+
+} // namespace
+
+const VkAllocationCallbacks* HostAllocator() noexcept {
+    static const VkAllocationCallbacks* const callbacks = []() -> const VkAllocationCallbacks* {
+        const char* const value = std::getenv("FRITCHII_RAM_VK_HOST_ALLOC");
+        if (value == nullptr || value[0] != '1') {
+            return nullptr;
+        }
+        HostAllocState& state = HostState();
+#ifdef _WIN32
+        state.heap = HeapCreate(0, 0, 0);
+        if (state.heap == nullptr) {
+            LOG_ERROR(Render_Vulkan, "FRITCHII_RAM_VK_HOST_ALLOC=1: HeapCreate failed ({}), off",
+                      GetLastError());
+            return nullptr;
+        }
+        ULONG low_fragmentation = 2;
+        HeapSetInformation(state.heap, HeapCompatibilityInformation, &low_fragmentation,
+                           sizeof(low_fragmentation));
+#endif
+        static const VkAllocationCallbacks table{
+            .pUserData = &state,
+            .pfnAllocation = HostAllocate,
+            .pfnReallocation = HostReallocate,
+            .pfnFree = HostFree,
+            .pfnInternalAllocation = HostInternalAllocation,
+            .pfnInternalFree = HostInternalFree,
+        };
+        LOG_INFO(Render_Vulkan, "FRITCHII_RAM_VK_HOST_ALLOC=1: the driver's host allocations "
+                                "(instance and device) go through Fritchii's own counted heap");
+        if (Common::MemCensus::Mode() != 0) {
+            Common::MemCensus::AddReporter(&state, [] { return HostAllocCensus(); });
+        }
+        return &table;
+    }();
+    return callbacks;
+}
+
 void Destroy(VkInstance instance, const InstanceDispatch& dld) noexcept {
-    dld.vkDestroyInstance(instance, nullptr);
+    dld.vkDestroyInstance(instance, HostAllocator());
 }
 
 void Destroy(VkDevice device, const InstanceDispatch& dld) noexcept {
-    dld.vkDestroyDevice(device, nullptr);
+    dld.vkDestroyDevice(device, HostAllocator());
 }
 
 void Destroy(VkDevice device, VkBuffer handle, const DeviceDispatch& dld) noexcept {
@@ -491,7 +706,7 @@ Instance Instance::Create(u32 version, Span<const char*> layers, Span<const char
         .ppEnabledExtensionNames = extensions.data(),
     };
     VkInstance instance;
-    Check(dispatch.vkCreateInstance(&ci, nullptr, &instance));
+    Check(dispatch.vkCreateInstance(&ci, HostAllocator(), &instance));
     if (!Proc(dispatch.vkDestroyInstance, dispatch, "vkDestroyInstance", instance)) {
         // We successfully created an instance but the destroy function couldn't be loaded.
         // This is a good moment to panic.
@@ -529,6 +744,19 @@ void Image::SetObjectNameEXT(const char* name) const {
 
 void Image::Release() const noexcept {
     if (handle) {
+        // FRITCHII_DEPTH_POOL_FIT: only read while padded images may exist.
+        if (allocation != nullptr &&
+            g_image_padding_bytes.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            VmaAllocationInfo info{};
+            vmaGetAllocationInfo(allocator, allocation, &info);
+            const u64 data = static_cast<u64>(reinterpret_cast<uintptr_t>(info.pUserData));
+            if ((data & ImageUserDataTag) != 0) {
+                const u64 padding = ((data >> 32) & 0x7FFF'FFFFULL) << 8;
+                if (padding != 0) {
+                    g_image_padding_bytes.fetch_sub(padding, std::memory_order_relaxed);
+                }
+            }
+        }
         vmaDestroyImage(allocator, handle, allocation);
     }
 }
@@ -751,7 +979,7 @@ Device Device::Create(VkPhysicalDevice physical_device, Span<VkDeviceQueueCreate
         .pEnabledFeatures = nullptr,
     };
     VkDevice device;
-    Check(dispatch.vkCreateDevice(physical_device, &ci, nullptr, &device));
+    Check(dispatch.vkCreateDevice(physical_device, &ci, HostAllocator(), &device));
     Load(device, dispatch);
     return Device(device, dispatch);
 }
@@ -759,6 +987,12 @@ Device Device::Create(VkPhysicalDevice physical_device, Span<VkDeviceQueueCreate
 Queue Device::GetQueue(u32 family_index) const noexcept {
     VkQueue queue;
     dld->vkGetDeviceQueue(handle, family_index, 0, &queue);
+    return Queue(queue, *dld);
+}
+
+Queue Device::GetQueue(u32 family_index, u32 queue_index) const noexcept {
+    VkQueue queue;
+    dld->vkGetDeviceQueue(handle, family_index, queue_index, &queue);
     return Queue(queue, *dld);
 }
 

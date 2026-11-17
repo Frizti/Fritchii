@@ -211,6 +211,14 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
             ExitContext();
         }
 
+        // Fritchii: a requested backtrace (ArmInterface::RequestBacktrace), with the registers
+        // synced now that the JIT returned.
+        if (const char* reason = interface->TakeBacktraceRequest()) [[unlikely]] {
+            LOG_CRITICAL(Core_ARM, "Guest backtrace ({}): core {}, guest thread {}", reason,
+                         m_core_index, thread->GetThreadId());
+            interface->LogBacktrace(process);
+        }
+
         // Determine why we stopped.
         // If a step completed successfully, skip other halt reason handlers
         // the step takes priority (e.g. step may also set InstructionBreakpoint
@@ -241,6 +249,17 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                 system.GetDebugger().NotifyThreadStopped(thread);
             } else {
                 interface->LogBacktrace(process);
+                // Without a debugger the thread stays suspended for good: on a console the game
+                // would have crashed here. The hang report names it.
+                Svc::ThreadContext context{};
+                interface->GetContext(context);
+                NoteGuestCrashForHangReport(thread->GetThreadId(), context.pc,
+                                            breakpoint ? "a breakpoint" : "a prefetch abort");
+                LOG_CRITICAL(Core_ARM,
+                             "Guest thread {} stopped for good on core {} after {} at pc {:#x} "
+                             "(the game crashed; without a debugger it stays suspended)",
+                             thread->GetThreadId(), m_core_index,
+                             breakpoint ? "a breakpoint" : "a prefetch abort", context.pc);
             }
             thread->RequestSuspend(kernel, SuspendType::Debug);
             return;
@@ -531,6 +550,15 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     m_stats_polled = 0;
     m_stats_poll_sum = {};
     wakes.clear();
+}
+
+u64 PhysicalCore::RequestBacktrace(const char* reason) {
+    ScopedGuard lk{*this};
+    if (m_arm_interface == nullptr || m_current_thread == nullptr) {
+        return ~u64{0};
+    }
+    m_arm_interface->RequestBacktrace(m_current_thread, reason);
+    return m_current_thread->GetThreadId();
 }
 
 bool PhysicalCore::IsInterrupted() const {

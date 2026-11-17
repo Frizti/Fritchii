@@ -65,8 +65,11 @@ ConfigureGraphics::ConfigureGraphics(
       records{records_}, expose_compute_option{expose_compute_option_},
       update_aspect_ratio{update_aspect_ratio_}, system{system_},
       combobox_translations{builder.ComboboxTranslations()} {
-    vulkan_device = Settings::values.vulkan_device.GetValue();
     RetrieveVulkanDevices();
+    // The card a game would run on: without a saved choice, the automatic pick (so OK saves it).
+    vulkan_device = static_cast<u32>(VkDeviceInfo::PickedIndex(
+        records, Settings::values.vulkan_device.GetValue(),
+        Settings::values.vulkan_device_name.GetValue()));
 
     ui->setupUi(this);
 
@@ -553,6 +556,7 @@ void ConfigureGraphics::ApplyConfiguration() {
     Settings::RefreshNvidiaDlssRuntimeSettings();
 
     Settings::values.vulkan_device.SetGlobal(true);
+    Settings::values.vulkan_device_name.SetGlobal(true);
     auto const index = Settings::EnumMetadata<Settings::RendererBackend>::Index();
     if (Settings::IsConfiguringGlobal() ||
         (!Settings::IsConfiguringGlobal() && api_restore_global_button->isEnabled())) {
@@ -566,6 +570,12 @@ void ConfigureGraphics::ApplyConfiguration() {
         case Settings::RendererBackend::Vulkan:
             Settings::values.vulkan_device.SetGlobal(Settings::IsConfiguringGlobal());
             Settings::values.vulkan_device.SetValue(vulkan_device_combobox->currentIndex());
+            // The name too: a changed device order finds the same card again.
+            Settings::values.vulkan_device_name.SetGlobal(Settings::IsConfiguringGlobal());
+            if (const int picked = vulkan_device_combobox->currentIndex();
+                picked >= 0 && size_t(picked) < records.size()) {
+                Settings::values.vulkan_device_name.SetValue(records[picked].device_name);
+            }
             break;
         case Settings::RendererBackend::OpenGL_GLSL:
         case Settings::RendererBackend::OpenGL_SPIRV:
@@ -601,7 +611,9 @@ void ConfigureGraphics::UpdateBackgroundColorButton(QColor color) {
 void ConfigureGraphics::UpdateAPILayout() {
     bool runtime_lock = !system.IsPoweredOn();
     bool need_global = !(Settings::IsConfiguringGlobal() || api_restore_global_button->isEnabled());
-    vulkan_device = Settings::values.vulkan_device.GetValue(need_global);
+    vulkan_device = static_cast<u32>(VkDeviceInfo::PickedIndex(
+        records, Settings::values.vulkan_device.GetValue(need_global),
+        Settings::values.vulkan_device_name.GetValue(need_global)));
     vulkan_device_widget->setEnabled(!need_global && runtime_lock);
 
     const auto current_backend = GetCurrentGraphicsBackend();

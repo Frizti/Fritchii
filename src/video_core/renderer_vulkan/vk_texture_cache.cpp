@@ -24,6 +24,7 @@
 #include "common/div_ceil.h"
 #include "common/nx2_timeline.h"
 #include "common/literals.h"
+#include "common/memory_detect.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "shader_recompiler/byte_addressed_image.h"
@@ -31,6 +32,7 @@
 
 #include "video_core/fsr.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
@@ -1302,6 +1304,21 @@ void UseBc3ForSwitch2OnSmallCards(const Device& device) {
                 memory >> 20);
     Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
 }
+
+// FRITCHII_BC1_KEEPS_ALPHA (boot, default 0; 1 on): BC1 for every ASTC image turns alpha into a
+// 1-bit cutout (punch-through, black texels where the alpha holds mask data: dark faces and
+// banding in OoT). The BC3 path already sends the images its opaque scan clears to BC1 and keeps
+// the others in BC3, so with the switch on the BC1 setting runs that path for this session.
+void UseOpaqueScanForBc1(const Device& device) {
+    const char* value = std::getenv("FRITCHII_BC1_KEEPS_ALPHA");
+    if (value == nullptr || value[0] != '1' || device.IsOptimalAstcSupported() ||
+        Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "FRITCHII_BC1_KEEPS_ALPHA: ASTC recompression BC1 runs the BC3 path "
+                            "(opaque textures BC1, textures with alpha BC3) for this session");
+    Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
+}
 } // Anonymous namespace
 
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -1322,6 +1339,7 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
                                     device.GetMaxFramebufferHeight()});
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
+    UseOpaqueScanForBc1(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
     if (Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu ||
         !device.IsOptimalAstcSupported()) {
@@ -2879,6 +2897,93 @@ void TextureCacheRuntime::LimitKeptBlocks(u64 budget, u64 critical) const {
     device.LimitKeptBlocks(budget, critical);
 }
 
+bool TextureCacheRuntime::MainHeapNumbers(u64& size, u64& usage, u64& budget) const {
+    return device.MainHeapNumbers(size, usage, budget);
+}
+
+std::optional<u64> TextureCacheRuntime::OtherProcessesVideoMemory() const {
+    if (luid_state == 0) {
+        luid_state = device.GetDeviceLuid(luid_low, luid_high) ? 1 : 2;
+    }
+    if (luid_state != 1) {
+        return std::nullopt;
+    }
+    const auto sample = Common::GetAdapterVideoMemory(luid_low, luid_high);
+    if (!sample) {
+        return std::nullopt;
+    }
+    return sample->adapter_dedicated -
+           (std::min)(sample->adapter_dedicated, sample->process_dedicated);
+}
+
+std::string TextureCacheRuntime::VramOwnersText(u64 texture_image_bytes, u64 deleted_bytes) {
+    // FRITCHII_VRAM_OWNERS: who holds the main device-local heap. Images are made by the main
+    // allocator; buffers by the buffer allocator when it is split off (else by the main one too).
+    u64 size{};
+    u64 usage{};
+    u64 budget{};
+    device.MainHeapNumbers(size, usage, budget);
+    const size_t heap = device.GetMainHeap();
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> main_budgets{};
+    vmaGetHeapBudgets(device.GetAllocator(), main_budgets.data());
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> buffer_budgets{};
+    if (device.HasSplitAllocators()) {
+        device.BufferHeapBudgets(buffer_budgets.data());
+    }
+    const VmaStatistics& images = main_budgets[heap].statistics;
+    const VmaStatistics& buffers = buffer_budgets[heap].statistics;
+    const u64 blocks = images.blockBytes + buffers.blockBytes;
+    const u64 allocated = images.allocationBytes + buffers.allocationBytes;
+    const u64 pool = image_pool_bytes;
+    const u64 frees = PendingImageFreeBytes();
+    // The image allocations the texture cache does not name are mostly in the main allocator;
+    // what is left of both allocators' allocations is the buffers (buffer cache, stream and
+    // device-local staging buffers) and the rest.
+    const u64 named = texture_image_bytes + deleted_bytes + pool + frees;
+    const u64 rest = allocated - (std::min)(allocated, named);
+    const u64 staging = staging_buffer_pool.CachedBytes(MemoryUsage::Upload) +
+                        staging_buffer_pool.CachedBytes(MemoryUsage::Download) +
+                        staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) +
+                        staging_buffer_pool.StreamBufferBytes();
+    // Kept blocks (FRITCHII_KEEP_BLOCKS) are memory VMA gave back that is kept from the driver.
+    const u64 kept = device.KeptBlockBytes();
+    const u64 held = blocks + kept;
+    // Where the unused space in the blocks lies, per allocator and pool (a walk of every block,
+    // every 10 s). The buffer allocator only on its user's thread (memory stage spec 5.3).
+    std::string slack = "main allocator " + VramSlackText(device, device.GetAllocator(),
+                                                          static_cast<u32>(heap));
+    if (device.HasSplitAllocators()) {
+        slack += VideoCommon::MemoryStageLink::IsCacheUser()
+                     ? "; buffer allocator " +
+                           VramSlackText(device, device.GetBufferAllocator(),
+                                         static_cast<u32>(heap))
+                     : std::string{"; buffer allocator not walked (the memory stage holds it)"};
+    }
+    // FRITCHII_DEPTH_POOL_FIT: its padding is allocated to VMA but holds nothing.
+    if (const std::string fit = DepthFitText(); !fit.empty()) {
+        slack += "; " + fit;
+    }
+    // FRITCHII_VRAM_HOLES (live, default 0): what the holes are and what holds the half-empty
+    // blocks, for the main allocator (images, depth pools). Builds VMA's detailed map: ms of
+    // work every owners line, so a diagnostic only.
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_holes,
+                                         "FRITCHII_VRAM_HOLES") != 0) {
+        slack += "; holes (FRITCHII_VRAM_HOLES) main allocator: " +
+                 VramHolesText(device.GetAllocator(), static_cast<u32>(heap));
+    }
+    return fmt::format(
+        "main heap {} of {} MiB budget ({} MiB heap): texture cache images {} MiB, deleted images "
+        "still allocated {} MiB, image pool {} MiB, frees in flight {} MiB, buffers and the rest "
+        "{} MiB (buffer allocator {} MiB in {} allocations), unused space in allocator blocks {} "
+        "MiB, kept blocks {} MiB, outside the allocators {} MiB (the driver's: pipelines, "
+        "descriptors, swapchain, its own); staging pool {} MiB (any heap); block slack by pool: "
+        "{}",
+        usage >> 20, budget >> 20, size >> 20, texture_image_bytes >> 20, deleted_bytes >> 20,
+        pool >> 20, frees >> 20, rest >> 20, buffers.allocationBytes >> 20,
+        buffers.allocationCount, (blocks - (std::min)(blocks, allocated)) >> 20, kept >> 20,
+        (usage - (std::min)(usage, held)) >> 20, staging >> 20, slack);
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
@@ -3224,6 +3329,59 @@ void TextureCacheRuntime::SampleVramReport() {
     vram_report_seen_failed = failed;
 }
 
+void TextureCacheRuntime::TickVramTrim() {
+    // FRITCHII_VRAM_TRIM (live, default 1 = auto: 90 with the small card profile on, else off;
+    // 0 off; 2-100 = percent of the budget, on any card): every 60 frames, while the main heap's
+    // usage is at or above that share of its budget, each allocator gives back the empty block
+    // VMA keeps in each block vector (each memory type's default blocks and the depth, colour,
+    // sparse and buffer pools: up to 32-64 MiB each). VMA frees them by itself only once the
+    // usage passed the budget, when Windows may already be moving memory to system RAM. The
+    // memory held nothing; the cost is a driver allocation if that vector needs a block again.
+    if (vram_trim_frames++ % 60 != 0) {
+        return;
+    }
+    const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_trim,
+                                                       "FRITCHII_VRAM_TRIM", 1);
+    u64 percent = 0;
+    if (value == 1) {
+        percent = VideoCore::SmallCard::Active() ? 90 : 0;
+    } else if (value >= 2) {
+        percent = (std::min)(static_cast<u64>(value), u64{100});
+    }
+    if (percent == 0) {
+        return;
+    }
+    u64 usage{};
+    u64 budget{};
+    if (!device.MainHeapUsage(usage, budget) || budget == 0 || usage * 100 < budget * percent) {
+        return;
+    }
+    const u32 heap = static_cast<u32>(device.GetMainHeap());
+    const u64 main = TrimEmptyBlocks(device, device.GetAllocator(), heap);
+    u64 buffers = 0;
+    // The buffer allocator only on its user's thread (memory stage spec 5.3); at
+    // FRITCHII_MEMSTAGE_THREAD=1 it is trimmed when the back holds it at this point.
+    if (device.HasSplitAllocators() && VideoCommon::MemoryStageLink::IsCacheUser()) {
+        buffers = TrimEmptyBlocks(device, device.GetBufferAllocator(), heap);
+    }
+    if (main + buffers == 0) {
+        return;
+    }
+    ++vram_trim_events;
+    vram_trim_bytes += main + buffers;
+    const auto now = std::chrono::steady_clock::now();
+    if (vram_trim_events > 8 && now - vram_trim_logged < std::chrono::seconds{10}) {
+        return;
+    }
+    vram_trim_logged = now;
+    LOG_INFO(Render_Vulkan,
+             "VRAM trim (FRITCHII_VRAM_TRIM at {}% of the budget): main heap {} of {} MiB, gave "
+             "back {} MiB of empty blocks (main allocator {} MiB, buffer allocator {} MiB); "
+             "session {} MiB in {} trims",
+             percent, usage >> 20, budget >> 20, (main + buffers) >> 20, main >> 20,
+             buffers >> 20, vram_trim_bytes >> 20, vram_trim_events);
+}
+
 void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
     // EDEN_NX2_EXP99 (live, 0 = off; fable52_answer_chicken 1): an evicted pool image is
     // destroyed on the image free thread instead of here, on the GPU back thread at the frame's
@@ -3412,13 +3570,17 @@ void TextureCacheRuntime::TickFrame() {
         image_pool_seen_failed = failed;
         // FRITCHII_KEEP_BLOCKS: kept blocks go before any pooled image, then one is trimmed a
         // frame while they hold more than the cap and the budget's limit allow.
-        if (short_of_memory) {
+        // FRITCHII_VRAM_BUDGET_MODE: while the texture cache's live budget cap binds, kept blocks
+        // are memory the driver counts against a budget that is already short.
+        if (short_of_memory || budget_pressure) {
             device.ReleaseKeptBlocks();
         }
         device.TickKeptBlocks();
         // FRITCHII_VRAM_POOL_FIT (live, default 0): the pool's cap follows the room under the
-        // budget, re-read every 30 frames.
-        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_fit,
+        // budget, re-read every 30 frames. Also while the budget cap binds (budget_pressure):
+        // deleted images went to the pool, so its memory stayed counted, and the cap went on down.
+        if (!budget_pressure &&
+            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_fit,
                                              "FRITCHII_VRAM_POOL_FIT") == 0) {
             pool_fit_cap = ~u64{0};
             pool_fit_frames = 0;
@@ -3437,6 +3599,7 @@ void TextureCacheRuntime::TickFrame() {
             small_pool_cap = budget != 0 ? (std::max)(budget / 16, u64{256} << 20) : ~u64{0};
         }
         SampleVramReport();
+        TickVramTrim();
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
         if (pool_switch == 0 || short_of_memory) {
             TrimImagePool(0);
@@ -3948,6 +4111,78 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
 
 void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
     UploadMemory(map.buffer, map.offset, copies);
+}
+
+void Image::ClearToZero(bool current) {
+    // As UploadMemory: the upload it stands in for leaves no resolve shadow behind.
+    if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
+        runtime->InvalidateResolveShadow(Handle());
+    }
+    scheduler->RequestOutsideRenderPassOperationContext();
+    // current: the image in use (the scaled one when rescaled), for FRITCHII_STALE_ZERO.
+    const VkImage vk_image = current ? Handle() : *original_image;
+    const VkImageAspectFlags vk_aspect_mask = aspect_mask;
+    const bool was_initialized = std::exchange(initialized, true);
+    scheduler->Record([vk_image, vk_aspect_mask, was_initialized](vk::CommandBuffer cmdbuf) {
+        // CopyBufferToImage's barriers, over every level and layer (the upload's copies cover
+        // all of them).
+        static constexpr VkAccessFlags WRITE_ACCESS_FLAGS =
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        static constexpr VkAccessFlags READ_ACCESS_FLAGS =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+        const VkImageSubresourceRange range{
+            .aspectMask = vk_aspect_mask,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
+        const VkImageMemoryBarrier to_transfer{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = WRITE_ACCESS_FLAGS,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = was_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        const VkImageMemoryBarrier to_general{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = WRITE_ACCESS_FLAGS | READ_ACCESS_FLAGS,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, to_transfer);
+        if ((vk_aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+            // All bytes zero: 0 in every numeric format (float, norm, int, sRGB, packed).
+            cmdbuf.ClearColorImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   VkClearColorValue{}, range);
+        } else {
+            // Depth 0.0 and stencil 0: all bytes zero in every depth and stencil format.
+            cmdbuf.ClearDepthStencilImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          VkClearDepthStencilValue{.depth = 0.0f, .stencil = 0},
+                                          range);
+        }
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                               0, to_general);
+    });
 }
 
 void Image::DownloadMemory(VkBuffer buffer, size_t offset,
@@ -5366,8 +5601,10 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
             const bool dlaa = backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
                               Settings::GetNvidiaDlssRuntimeSettings().quality ==
                                   Settings::NvidiaDlssQuality::Native;
+            // FRITCHII_FSR_OUTPUT: FSR draws the game's own 1440p picture, not a 4K one.
+            const bool output_4k = max_resolution && !OcarinaFsrOutputsGameSize(backend);
             const u32 output_height =
-                dlaa ? render_height : std::max(render_height, max_resolution ? 2160U : 1440U);
+                dlaa ? render_height : std::max(render_height, output_4k ? 2160U : 1440U);
             const bool dlss_jitter =
                 VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());
             const int mode = VideoCommon::OcarinaLodRatioMode();

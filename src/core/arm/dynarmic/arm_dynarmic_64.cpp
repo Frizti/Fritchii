@@ -35,6 +35,29 @@ using namespace Common::Literals;
 namespace {
 // EDEN_NX2_GUEST_THREAD_STATS: the JIT's dispatcher counters of each core's JITs (one per process).
 std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_counters{};
+
+// Guest code invalidations (kernel code mapping, nn::ro, gdbstub, guest IC ops) and the page
+// copies one raced. Logged at 1, 2, 4, 8... so a log shows whether code changes.
+std::atomic<u64> g_code_invalidations{};
+std::atomic<u64> g_code_page_races{};
+
+void CountCodeInvalidation(std::size_t core, u64 addr, std::size_t size) {
+    const u64 n = g_code_invalidations.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0) {
+        LOG_INFO(Core_ARM, "JIT guest code invalidation #{} (core {}): {:#x}, {:#x} bytes", n, core,
+                 addr, size);
+    }
+}
+
+void CountCodePageRace(u64 page) {
+    const u64 n = g_code_page_races.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0) {
+        LOG_WARNING(Core_ARM,
+                    "JIT code page {:#x} copied while it was invalidated: refetched (invalidation "
+                    "races avoided: {})",
+                    page, n);
+    }
+}
 } // Anonymous namespace
 
 DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process)
@@ -56,8 +79,26 @@ u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
     // With memory aborts ignored the guest keeps running on zeros: say where it read from.
     if (auto& unmapped = Core::Memory::UnmappedReadFlag(); unmapped != 0) {
         unmapped = 0;
+        // 32 lines a burst (reads a second or more after the previous one start a new burst),
+        // and the first 32 bursts each get a guest backtrace from the core's thread once the JIT
+        // returns (the pc here is the block's, the backtrace the real call chain). Damage's
+        // Jabu-Jabu log (2026-11-17) spent the old 32-a-process budget on the first of three
+        // null-object bursts, at area loads; the third ended in the game's crash.
         static std::atomic<u32> logged{};
-        if (logged.fetch_add(1) < 32) {
+        static std::atomic<u64> last_ns{};
+        static std::atomic<u32> bursts{};
+        const u64 now_ns = Common::Nx2Hitch::NowNs();
+        if (now_ns - last_ns.exchange(now_ns, std::memory_order_relaxed) > 1'000'000'000ULL) {
+            logged.store(0, std::memory_order_relaxed);
+            const u32 burst = bursts.fetch_add(1, std::memory_order_relaxed) + 1;
+            LOG_ERROR(Core_ARM, "Unmapped read burst #{} begins (guest pointer from zeros or "
+                                "wrong data; ignore_memory_aborts keeps the game running)",
+                      burst);
+            if (burst <= 32) {
+                m_parent.RequestBacktrace(nullptr, "unmapped read burst");
+            }
+        }
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
             LOG_ERROR(Core_ARM, "Unmapped read {:#x} ({} bytes) at pc {:#x} lr {:#x} sp {:#x}", vaddr, size,
                       m_parent.m_jit->GetPC(), m_parent.m_jit->GetRegister(30), m_parent.m_jit->GetSP());
         }
@@ -76,9 +117,16 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         return m_memory.Read32(vaddr);
     }
     auto const aligned_vaddr = vaddr & ~Core::Memory::YUZU_PAGEMASK;
-    if (last_code_addr != aligned_vaddr) {
+    const u32 generation = code_generation.load(std::memory_order_acquire);
+    if (last_code_addr != aligned_vaddr || cached_code_generation != generation) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
+        cached_code_generation = generation;
+        if (code_generation.load(std::memory_order_acquire) != generation) [[unlikely]] {
+            // An invalidation landed during the copy: the old reset could be lost here and the
+            // page copy reused with old code; now the next read fetches the page again.
+            CountCodePageRace(aligned_vaddr);
+        }
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
@@ -616,7 +664,7 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
 
 ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
-    , m_cb(std::make_optional<DynarmicCallbacks64>(*this, process))
+    , m_cb(std::in_place, *this, process) // not movable (atomic code_generation)
     , m_core_index{core_index}
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
@@ -671,7 +719,7 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->ClearCache();
 }
 
@@ -757,8 +805,10 @@ std::size_t ArmDynarmic64::PackHotCode(const std::atomic<bool>& stop) {
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
-    // into or removed from that page).
-    m_cb->last_code_addr = u64(-1);
+    // into or removed from that page). Usually called from another core's thread (kernel code
+    // mapping, nn::ro), so it bumps the generation instead of writing the owner's page tag.
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
+    CountCodeInvalidation(m_core_index, addr, size);
     m_jit->InvalidateCacheRange(addr, size);
 }
 

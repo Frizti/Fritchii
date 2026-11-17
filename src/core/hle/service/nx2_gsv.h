@@ -4636,11 +4636,21 @@ private:
     }
 
     // Mirrors the emulator's guest syncpoint values into the shared RO page. Returns true if any changed.
-    bool UpdateSyncptValues() {
+    // `changed_ids` (PollSyncpts only, on the timing thread): a bit per syncpoint whose value moved
+    // since the previous poll. Compared with the poll's own snapshot, not the page: the mirror
+    // (FRITCHII_SYNCPT_MIRROR) already wrote the new value there, so the page shows no change.
+    bool UpdateSyncptValues(std::array<u64, 0x40>* changed_ids = nullptr) {
         auto& manager = system.Host1x().GetSyncpointManager();
         bool changed = false;
         for (u32 id = 0; id < std::min(m_syncpt_count, HostSyncpoints); ++id) {
             const u64 value = manager.GetGuestSyncpointValue(id);
+            if (changed_ids != nullptr) {
+                const u32 value32 = static_cast<u32>(value);
+                if (m_syncpt_polled_values[id] != value32) {
+                    (*changed_ids)[id / 64] |= u64{1} << (id % 64);
+                    m_syncpt_polled_values[id] = value32;
+                }
+            }
             const u64 address = m_syncpt_ro + SyncptValuesOffset + id * 8;
             if (m_syncpt_mirror) {
                 // The mirror writes too: only ever forward, so a value read here before a newer
@@ -4705,20 +4715,48 @@ private:
         for (u32 w = 0; w < words; ++w) {
             armed[w] = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwBitsOffset + w * 8);
         }
-        UpdateSyncptValues();
+        std::array<u64, 0x40> changed_ids{};
+        UpdateSyncptValues(&changed_ids);
         bool acked = false;
+        bool rearmed_moved = false;
         for (u32 w = 0; w < words; ++w) {
             const u64 ro_address = m_syncpt_ro + SyncptRoBitsOffset + w * 8;
             if (m_syncpt_memory->Read64(ro_address) != armed[w]) {
                 m_syncpt_memory->Write64(ro_address, armed[w]);
                 acked = true;
             }
+            // A client that rechecks its threshold and rearms leaves its armed bit as it was, so
+            // the bits alone never answer it again: its syncpoint moving does.
+            if ((armed[w] & changed_ids[w]) != 0) {
+                rearmed_moved = true;
+            }
         }
         m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoSummaryOffset,
                                  m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwSummaryOffset));
+        if (rearmed_moved && !acked && SyncptRearmNotifyEnabled()) {
+            acked = true;
+            // Waits that only this answered: before, they slept until another bit changed or
+            // their own timeout ran out.
+            const u64 n = ++m_syncpt_rearm_notified;
+            if ((n & (n - 1)) == 0) {
+                LOG_INFO(Service,
+                         "nx2:gsv rearmed syncpoint waits notified (FRITCHII_SYNCPT_REARM_NOTIFY): "
+                         "{} so far (armed bits unchanged, their syncpoint moved)",
+                         n);
+            }
+        }
         if (acked) {
             m_syncpt_events[1]->Signal(system.Kernel());
         }
+    }
+
+    /// FRITCHII_SYNCPT_REARM_NOTIFY (boot, default 1): docs/fritchii/switches.md.
+    static bool SyncptRearmNotifyEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("FRITCHII_SYNCPT_REARM_NOTIFY");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
     }
 
     // nn::gsv::shim::CalculateRequirements(u64* size, u64* alignment, preference, u32): the 0x40-byte
@@ -5161,6 +5199,9 @@ private:
     u64 m_syncpt_rw{};
     u64 m_syncpt_ro{};
     u32 m_syncpt_count{};
+    /// Each syncpoint's value at the previous PollSyncpts (timing thread only).
+    std::array<u32, HostSyncpoints> m_syncpt_polled_values{};
+    u64 m_syncpt_rearm_notified{}; ///< FRITCHII_SYNCPT_REARM_NOTIFY: polls only it answered
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll;
     bool m_syncpt_mirror{}; ///< FRITCHII_SYNCPT_MIRROR: the syncpoint manager mirrors increments
     /// EDEN_NX2_EXP37: PollSyncpts at once after a guest syncpoint increment (OnGuestIncrement),

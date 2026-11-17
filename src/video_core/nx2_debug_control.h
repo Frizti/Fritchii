@@ -136,6 +136,14 @@ inline std::atomic<int> g_handle_prog_keep{-1};
 /// FRITCHII_FILL_BRACKET_LEAN (live, default 0): fable_b 25.2 cut h, E's tracker record only for the
 /// slots R can read, ring B's push without the window counters (1 on, 2 verify, 3 dry count).
 inline std::atomic<int> g_fill_bracket_lean{-1};
+/// FRITCHII_REPORT_WAIT (live, default 0 = EXP30 decides, as before): a macro read's wait for
+/// pending query reports (FlushQueryResults). 1 = wait for those reports only (EXP30's wait),
+/// 2 = verify: that wait, then the old one, the words read after each compared (must be 0).
+inline std::atomic<int> g_report_wait{-1};
+/// FRITCHII_OCCL_LEAN (live, default 0; fritchii_occl_lean.h): a draw that writes no colour takes
+/// its pipeline without the pixel program when that program can change nothing else (1 on,
+/// 2 verify: siblings made and compared, the full pipeline draws, 3 dry: census and timer only).
+inline std::atomic<int> g_occl_lean{-1};
 /// EDEN_NX2_FEED_MEMORY_OVERLAY: docs/fritchii/switches.md.
 inline std::atomic<int> g_feed_memory_overlay{-1};
 /// EDEN_NX2_QMD_3D_PATCH: docs/fritchii/switches.md.
@@ -230,6 +238,51 @@ inline std::atomic<int> g_vram_pool_fit{-1};
 inline std::atomic<int> g_vram_critical_fit{-1};
 /// FRITCHII_VRAM_REPORT: docs/fritchii/switches.md.
 inline std::atomic<int> g_vram_report{-1};
+/// FRITCHII_VRAM_BUDGET_MODE: docs/fritchii/switches.md. 0 fixed, 1 vk, 2 os.
+inline std::atomic<int> g_vram_budget_mode{-1};
+/// FRITCHII_VRAM_BUDGET_MODE (live, default vk): where the texture cache's live budget cap comes
+/// from. The environment takes a name (fixed, vk, os) or its number; the debug server's `switch`
+/// takes the number.
+[[nodiscard]] inline int VramBudgetMode() {
+    int current = g_vram_budget_mode.load(std::memory_order_relaxed);
+    if (current < 0) [[unlikely]] {
+        int initial = 1;
+        if (const char* value = std::getenv("FRITCHII_VRAM_BUDGET_MODE"); value != nullptr) {
+            const std::string_view text{value};
+            if (text == "fixed" || text == "off") {
+                initial = 0;
+            } else if (text == "vk") {
+                initial = 1;
+            } else if (text == "os") {
+                initial = 2;
+            } else {
+                initial = std::atoi(value);
+            }
+            initial = initial < 0 ? 0 : (initial > 2 ? 2 : initial);
+        }
+        int unset = -1;
+        if (g_vram_budget_mode.compare_exchange_strong(unset, initial,
+                                                       std::memory_order_relaxed)) {
+            BumpSwitchGeneration();
+        }
+        current = g_vram_budget_mode.load(std::memory_order_relaxed);
+    }
+    return current;
+}
+/// FRITCHII_VRAM_HEADROOM_MIB: docs/fritchii/switches.md (0 = auto).
+inline std::atomic<int> g_vram_headroom_mib{-1};
+/// FRITCHII_TC_CRITICAL_ENFORCE: docs/fritchii/switches.md.
+inline std::atomic<int> g_tc_critical_enforce{-1};
+/// FRITCHII_VRAM_OWNERS: docs/fritchii/switches.md (seconds between lines, 0 = off).
+inline std::atomic<int> g_vram_owners{-1};
+/// FRITCHII_VRAM_PACK: docs/fritchii/switches.md (0 off, 1 on, 2 auto = with the small card).
+inline std::atomic<int> g_vram_pack{-1};
+/// FRITCHII_VRAM_TRIM: docs/fritchii/switches.md (0 off, 1 auto, 2-100 percent of the budget).
+inline std::atomic<int> g_vram_trim{-1};
+/// FRITCHII_DEPTH_POOL_FIT: docs/fritchii/switches.md (bits: 1 size classes, 2 small depth pool).
+inline std::atomic<int> g_depth_pool_fit{-1};
+/// FRITCHII_VRAM_HOLES: docs/fritchii/switches.md (1 = hole and pinner histograms in the owners line).
+inline std::atomic<int> g_vram_holes{-1};
 /// FRITCHII_E2C_ON_E: docs/fritchii/switches.md.
 inline std::atomic<int> g_e2c_on_e{-1};
 /// FRITCHII_STAMP_READ_PAGES: docs/fritchii/switches.md.
@@ -248,12 +301,16 @@ inline std::atomic<int> g_gather_empty_test{-1};
 inline std::atomic<int> g_oot_bypass_sampled{-1};
 /// FRITCHII_SCALED_EXTENT_CAP: docs/fritchii/switches.md.
 inline std::atomic<int> g_scaled_extent_cap{-1};
+/// FRITCHII_SCALE_DEPTH_MAX: docs/fritchii/switches.md.
+inline std::atomic<int> g_scale_depth_max{-1};
 /// FRITCHII_FENCE_COMMIT_FAST: docs/fritchii/switches.md.
 inline std::atomic<int> g_fence_commit_fast{-1};
 /// FRITCHII_PIPELINE_KEY_HASH: docs/fritchii/switches.md.
 inline std::atomic<int> g_pipeline_key_hash{-1};
 /// FRITCHII_CB_WORDS_BLOCK: docs/fritchii/switches.md.
 inline std::atomic<int> g_cb_words_block{-1};
+/// FRITCHII_CB_MERGE (live, default 0; 1 = dry count): docs/fritchii/switches.md.
+inline std::atomic<int> g_cb_merge{-1};
 /// FRITCHII_BANK_CENSUS: docs/fritchii/switches.md.
 inline std::atomic<int> g_bank_census{-1};
 /// FRITCHII_BANK_FLAGGED: docs/fritchii/switches.md.
@@ -276,6 +333,9 @@ inline std::atomic<int> g_jit_hot_pack{-1};
 /// prepared pipelines again; -1 = unset, see PipelineCache::AsyncRedrawnOn):
 /// docs/fritchii/switches.md.
 inline std::atomic<int> g_async_redrawn{-1};
+/// FRITCHII_ASYNC_COMPUTE_SKIP (live, default 0; 2 = dry): docs/fritchii/switches.md
+/// (renderer_vulkan/vk_async_compute_skip.h).
+inline std::atomic<int> g_async_compute_skip{-1};
 /// FRITCHII_OCCLUSION_VISIBLE (live, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_occlusion_visible{-1};
 /// FRITCHII_UNSWIZZLE_IN_PLACE (live, default 0): docs/fritchii/switches.md.
@@ -284,16 +344,46 @@ inline std::atomic<int> g_unswizzle_in_place{-1};
 inline std::atomic<int> g_keep_blocks{-1};
 /// FRITCHII_STAGING_RING (boot size, live use, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_staging_ring{-1};
+/// FRITCHII_ZERO_UPLOAD (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_zero_upload{-1};
 /// FRITCHII_HOSTTIMING_SPIN_BUDGET (live, percent, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_hosttiming_spin_budget{-1};
+/// FRITCHII_HOSTTIMING_PRIORITY (live, default 0): docs/fritchii/switches.md (core_timing.cpp).
+inline std::atomic<int> g_hosttiming_priority{-1};
+/// FRITCHII_HOSTTIMING_OFF_GPU (live, default 0): docs/fritchii/switches.md (core_timing.cpp).
+inline std::atomic<int> g_hosttiming_off_gpu{-1};
+/// FRITCHII_QUERY_FLUSH_DRY (live, default 0): docs/fritchii/switches.md (vk_rasterizer.cpp).
+inline std::atomic<int> g_query_flush_dry{-1};
+/// FRITCHII_QUERY_LEND_DRY (live, default 0): docs/fritchii/switches.md (vk_rasterizer.cpp).
+inline std::atomic<int> g_query_lend_dry{-1};
+/// FRITCHII_EXTENT_CENSUS (live, default 0): docs/fritchii/switches.md (buffer_cache.h).
+inline std::atomic<int> g_extent_census{-1};
+/// FRITCHII_EXTENT_CBUF (live, default 0; =3's read counts need it at boot): docs/fritchii/
+/// switches.md (buffer_cache.h, read_run_stats.h).
+inline std::atomic<int> g_extent_cbuf{-1};
+/// FRITCHII_EXTENT_SHARED (live, default 0; =3's read counts need it at boot): docs/fritchii/
+/// switches.md (buffer_cache.h, read_run_stats.h).
+inline std::atomic<int> g_extent_shared{-1};
+/// FRITCHII_EXTENT_GUARD (live, default 0; =3's read counts need it at boot): docs/fritchii/
+/// switches.md (buffer_cache.h, read_run_stats.h).
+inline std::atomic<int> g_extent_guard{-1};
+/// FRITCHII_STORE_FOOTPRINT (live 0/1/2/3 once armed: non-zero at boot; default 0): docs/fritchii/
+/// switches.md (store_footprint_live.h, buffer_cache.h).
+inline std::atomic<int> g_store_footprint_live{-1};
 /// FRITCHII_GPU_PRIORITY (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
 inline std::atomic<int> g_gpu_priority{-1};
 /// FRITCHII_THREAD_QOS (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
 inline std::atomic<int> g_thread_qos{-1};
+/// FRITCHII_GPU_SIBLINGS_FREE (live, default 0): docs/fritchii/switches.md (common/thread.cpp,
+/// KeepOffGpuCores).
+inline std::atomic<int> g_gpu_siblings_free{-1};
 /// FRITCHII_FOCUS_GRAB (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
 inline std::atomic<int> g_focus_grab{-1};
 /// FRITCHII_ONEF_RAISE_AFTER_LEND (live, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_onef_raise_after_lend{-1};
+/// FRITCHII_PACE_FIX (live, default 0): docs/fritchii/switches.md (vk_host_pacer.cpp,
+/// vk_present_manager.cpp).
+inline std::atomic<int> g_pace_fix{-1};
 /// FRITCHII_ONEF (boot): one follower step 1, the render thread R (one_follower.h).
 inline std::atomic<int> g_onef{-1};
 /// FRITCHII_ONEF_VIEW (live): step 2, needs FRITCHII_ONEF=1.
@@ -395,6 +485,21 @@ inline std::atomic<int> g_onef_post_idle{-1};
 /// FRITCHII_ONEF_POST_FENCE_REPORT (live, default 0; with POST_FENCE): fence-flagged counter
 /// reports posted as the rasterizer's fences are.
 inline std::atomic<int> g_onef_post_fence_report{-1};
+/// FRITCHII_ONEF_SIGNAL_ON_R (live, default 0; with SEM_E): the guest-visible signals SEM_E
+/// would make at E's place happen at R's played place instead: a payload release is a posted op
+/// R writes when it plays it (E goes on), a fence-flagged payload is written by R in its posted
+/// fence, a sync point is signalled by R (posted fence kind 0), a SignalFence callback is lent.
+/// The guest then never sees work done that R has not recorded yet (AMD tester, test 4 §5c).
+inline std::atomic<int> g_onef_signal_on_r{-1};
+/// FRITCHII_ONEF_WAITS_R (live, default 0): the front's waits that FRITCHII_ONEF_WAITS_E (and
+/// SEM_E's lagged acquire check) end at E's position end at R's played position instead; the
+/// same as WAITS_E=0 plus SEM_E's lagged check on R, as one override over a preset.
+inline std::atomic<int> g_onef_waits_r{-1};
+/// FRITCHII_ONEF_MIRROR_STOP (live, default 0): "a samples report: E's mirror started, R's
+/// counter not" (R skipped a draw E's mirror counted). 1 = stop POST_FENCE for the session, as
+/// the opposite case does; 2 = when R skipped a draw with the samples count on since the last
+/// samples report, counted as explained (no must-be-0 note; E's mirror is a superset there).
+inline std::atomic<int> g_onef_mirror_stop{-1};
 /// FRITCHII_ONEF_CLEAR_NODEFER (live, default 0): diagnostic, a posted clear on R is never
 /// deferred into the next render pass's load op (the lean darkness of 15 Nov).
 inline std::atomic<int> g_onef_clear_nodefer{-1};
@@ -492,6 +597,9 @@ inline std::atomic<int> g_noted_overflow{-1};
 /// FRITCHII_STEP_LEAN (live, default 0): F6, the list-wait line's clock read every 256th entry
 /// and the command list storage recycled to the submitter (dma_pusher.h).
 inline std::atomic<int> g_step_lean{-1};
+/// FRITCHII_REFRESH_LEAN (live, default 0): a list refresh translates each command page once
+/// (1), 2 = verify (dma_pusher.cpp, docs/fritchii/switches.md).
+inline std::atomic<int> g_refresh_lean{-1};
 /// FRITCHII_S4_COUNT (live, default 0): fable_b2 3.3's S4 counter, dry (fritchii_s4_count.h):
 /// 1 = count the fill's uniform binds by page, list entry and cause of change, 2 = also compare
 /// a sample of ranges at the front's list entry parse with E's bind in that entry.
@@ -536,6 +644,11 @@ inline std::atomic<int> g_esplit_bind_batch{-1};
 /// how far a storage binding of a bare pointer (no size word) reaches, in MiB, 8 to 1024. 8 (or
 /// 0) is the old cap. Written bindings stop at 16 at most. docs/fritchii/switches.md.
 inline std::atomic<int> g_bare_ssbo_mib{-1};
+/// FRITCHII_BARE_SSBO_CLAMP (live, default 0): a bare pointer's storage binding stops at the
+/// first device page with no host backing (read as zeros today); one with none at its start is
+/// the null binding. Not exact for written bindings (writes past the end are dropped, reads past
+/// it are robust-access values, not the zeros the host buffer held), hence off by default.
+inline std::atomic<int> g_bare_ssbo_clamp{-1};
 /// The bare pointer reach in bytes (FRITCHII_BARE_SSBO_MIB).
 [[nodiscard]] inline u32 BareStorageReach() {
     int mib = g_bare_ssbo_mib.load(std::memory_order_relaxed);

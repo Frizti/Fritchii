@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vertex_repack.h"
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/early_compute.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -133,6 +134,10 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
 void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
     tracker.Track(offset, size);
     last_usage_tick = clock->Now();
+    // FRITCHII_EARLY_COMPUTE (dry): every use, for the write-after-read test.
+    if (VideoCommon::EarlyCompute::g_early) [[unlikely]] {
+        VideoCommon::EarlyCompute::NoteUse(CpuAddr() + offset, size, last_usage_tick);
+    }
 }
 
 VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {
@@ -677,6 +682,98 @@ void BufferCacheRuntime::WaitForHostRead(u64 stamp) {
     AsyncReadback::Add(AsyncReadback::g_counters.to_submitted_ns, submitted - start);
     master.Wait(tick);
     AsyncReadback::Add(AsyncReadback::g_counters.on_card_ns, AsyncReadback::Now() - submitted);
+}
+
+BufferCacheRuntime::ReadTicks BufferCacheRuntime::ReadWriterTicks(u64 stamp) {
+    auto& master = scheduler.GetMasterSemaphore();
+    master.Refresh();
+    return ReadTicks{
+        .write = clock.TickOf(stamp),
+        .current = master.CurrentTick(),
+        .known = master.KnownGpuTick(),
+    };
+}
+
+BufferCacheRuntime::AheadTimes BufferCacheRuntime::MeasureSubmissions(u64 first, u64 last) {
+    const SubmitTimes::Span span =
+        scheduler.GetSubmitTimes().Measure(first, last, scheduler.GetMasterSemaphore());
+    return AheadTimes{
+        .submissions = span.submissions,
+        .resolved = span.resolved,
+        .busy_ns = span.busy_ns,
+        .gap_ns = span.gap_ns,
+        .overlap_ns = span.overlap_ns,
+        .span_ns = span.span_ns,
+    };
+}
+
+bool BufferCacheRuntime::SideCopyReady() {
+    if (!device.HasSideQueue() || !device.HasTimelineSemaphore()) {
+        return false;
+    }
+    std::call_once(side_queue_once, [this] {
+        try {
+            side_queue = std::make_unique<SideQueue>(device, scheduler.GetMasterSemaphore());
+        } catch (const vk::Exception& error) {
+            LOG_ERROR(Render_Vulkan, "FRITCHII_READ_SIDE_COPY: no side queue ({})", error.what());
+        }
+    });
+    return side_queue != nullptr;
+}
+
+u64 BufferCacheRuntime::SideCopy(u64 main_tick, std::span<const SideCopyRegion> regions) {
+    if (!SideCopyReady()) {
+        return 0;
+    }
+    boost::container::small_vector<SideQueue::Copy, 8> copies;
+    for (const SideCopyRegion& region : regions) {
+        copies.push_back(SideQueue::Copy{
+            .src = region.src,
+            .dst = region.dst,
+            .region =
+                VkBufferCopy{
+                    .srcOffset = region.src_offset,
+                    .dstOffset = region.dst_offset,
+                    .size = region.size,
+                },
+        });
+    }
+    return side_queue->Submit(main_tick, copies);
+}
+
+bool BufferCacheRuntime::SideDone(u64 value) {
+    return side_queue == nullptr || side_queue->IsDone(value);
+}
+
+BufferCacheRuntime::SideQueueStats BufferCacheRuntime::TakeSideQueueStats() {
+    SideQueueStats stats{};
+    if (side_queue != nullptr) {
+        const SideQueue::Stats side = side_queue->TakeStats();
+        stats.raised = side.raised;
+        stats.slow_waits = side.slow_waits;
+        stats.not_queued = side.not_queued;
+    }
+    const MasterSemaphore::SideStats main = scheduler.GetMasterSemaphore().TakeSideStats();
+    stats.main_waits = main.waits;
+    stats.unsubmitted = main.unsubmitted;
+    return stats;
+}
+
+void BufferCacheRuntime::WaitSide(u64 value) {
+    if (side_queue != nullptr) {
+        side_queue->Wait(value);
+    }
+}
+
+bool BufferCacheRuntime::WaitTickIfSubmitted(u64 tick) {
+    if (!scheduler.IsSubmitted(tick)) {
+        return false;
+    }
+    auto& master = scheduler.GetMasterSemaphore();
+    if (!master.IsFree(tick)) {
+        master.Wait(tick);
+    }
+    return true;
 }
 
 bool BufferCacheRuntime::IsFreeNow(u64 stamp) {

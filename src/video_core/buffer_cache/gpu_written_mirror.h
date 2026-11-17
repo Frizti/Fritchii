@@ -179,6 +179,20 @@ private:
     std::unique_ptr<std::atomic<u64>[]> words;
 };
 
+/// FRITCHII_STORE_FOOTPRINT: told about every Add, Subtract and Clear of the range set it follows
+/// (MirroredRangeSet::SetFollower), so a second record of who made the bytes GPU-modified
+/// (BufferCache's FootprintShadow) can never hold bytes the set no longer holds.
+class RangeSetFollower {
+public:
+    /// An Add without a footprint claim (MirroredRangeSet::Add with claimed == false)
+    virtual void FollowAdd(u64 begin, u64 size) = 0;
+    virtual void FollowSubtract(u64 begin, u64 size) = 0;
+    virtual void FollowClear() = 0;
+
+protected:
+    ~RangeSetFollower() = default;
+};
+
 /// A Common::RangeSet whose Add, Subtract and Clear keep a PageBitmap equal to "the set holds a
 /// byte on this page" (fable52_answer_gpuwritten 2.5): Add sets every page it touches; Subtract
 /// clears the pages wholly inside it and asks the set about the two edge pages. Without a bitmap
@@ -191,7 +205,18 @@ public:
         seq = seq_;
     }
 
-    void Add(AddressType base_address, size_t size) {
+    /// FRITCHII_STORE_FOOTPRINT: the follower from now on (null: none). Its caller hands it the
+    /// set's current ranges first.
+    void SetFollower(RangeSetFollower* follower_) {
+        follower = follower_;
+    }
+
+    /// `claimed`: FRITCHII_STORE_FOOTPRINT, the caller recorded the range's footprint claim with
+    /// the follower itself (it is not told about this Add).
+    void Add(AddressType base_address, size_t size, bool claimed = false) {
+        if (follower != nullptr && !claimed) [[unlikely]] {
+            follower->FollowAdd(static_cast<u64>(base_address), size);
+        }
         ranges.Add(base_address, size);
         const AddressType end_address = base_address + static_cast<AddressType>(size);
         if (bitmap == nullptr || end_address <= base_address) {
@@ -201,6 +226,9 @@ public:
     }
 
     void Subtract(AddressType base_address, size_t size) {
+        if (follower != nullptr) [[unlikely]] {
+            follower->FollowSubtract(static_cast<u64>(base_address), size);
+        }
         ranges.Subtract(base_address, size);
         const AddressType end_address = base_address + static_cast<AddressType>(size);
         if (bitmap == nullptr || end_address <= base_address) {
@@ -233,6 +261,9 @@ public:
     }
 
     void Clear() {
+        if (follower != nullptr) [[unlikely]] {
+            follower->FollowClear();
+        }
         if (bitmap != nullptr) {
             ranges.ForEach([&](AddressType lower, AddressType upper) {
                 bitmap->Clear(lower, upper - lower, *seq);
@@ -263,6 +294,7 @@ private:
     Common::RangeSet<AddressType> ranges;
     PageBitmap* bitmap = nullptr;
     MirrorSeq* seq = nullptr;
+    RangeSetFollower* follower = nullptr;
 };
 
 /// The three page mirrors of the buffer cache (fable52_answer_gpuwritten 2.1) and their counter.

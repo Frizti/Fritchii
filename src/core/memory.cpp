@@ -134,9 +134,16 @@ struct Memory::Impl {
 
         u64 protect_bytes = 0, protect_begin = 0;
 
-        current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr + size) >> YUZU_PAGEBITS);
+        // FRITCHII_RAM_PT_LAZY: read through the committed bits (an uncommitted page is unmapped)
+        // instead of committing the range's table pages to read zeros from them.
+        const bool lazy = Common::RamTableLazy();
+        if (!lazy) {
+            current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr + size) >> YUZU_PAGEBITS, "protect");
+        }
         for (u64 addr = vaddr; addr < vaddr + size; addr += YUZU_PAGESIZE) {
-            const Common::PageType page_type = current_page_table->entries.GetUnchecked(addr >> YUZU_PAGEBITS).Type();
+            const Common::PageType page_type =
+                lazy ? std::as_const(current_page_table->entries)[addr >> YUZU_PAGEBITS].Type()
+                     : current_page_table->entries.GetUnchecked(addr >> YUZU_PAGEBITS).Type();
             switch (page_type) {
             case Common::PageType::RasterizerCachedMemory:
                 if (protect_bytes > 0) {
@@ -294,11 +301,16 @@ struct Memory::Impl {
         std::size_t page_offset = addr & YUZU_PAGEMASK;
         bool user_accessible = true;
 
-        current_page_table->entries.CommitRegion(page_index, page_index + (size >> YUZU_PAGEBITS) + 1);
+        const bool lazy = Common::RamTableLazy(); // FRITCHII_RAM_PT_LAZY, as ProtectRegion
+        if (!lazy) {
+            current_page_table->entries.CommitRegion(page_index, page_index + (size >> YUZU_PAGEBITS) + 1, "walk");
+        }
         while (remaining_size != 0) {
             const std::size_t copy_amount = (std::min)(std::size_t(YUZU_PAGESIZE) - page_offset, remaining_size);
             const auto current_vaddr = u64((page_index << YUZU_PAGEBITS) + page_offset);
-            const auto [pointer, type, _] = current_page_table->entries.GetUnchecked(page_index).PointerTypeBlock();
+            const auto [pointer, type, _] =
+                lazy ? std::as_const(current_page_table->entries)[page_index].PointerTypeBlock()
+                     : current_page_table->entries.GetUnchecked(page_index).PointerTypeBlock();
             switch (type) {
             case Common::PageType::Unmapped: {
                 user_accessible = false;
@@ -496,8 +508,16 @@ struct Memory::Impl {
 
         const u64 num_pages = ((vaddr + size - 1) >> YUZU_PAGEBITS) - (vaddr >> YUZU_PAGEBITS) + 1;
 
-        current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr >> YUZU_PAGEBITS) + num_pages);
+        const bool lazy = Common::RamTableLazy(); // FRITCHII_RAM_PT_LAZY, as ProtectRegion
+        if (!lazy) {
+            current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr >> YUZU_PAGEBITS) + num_pages, "mark debug");
+        }
         for (u64 i = 0; i < num_pages; ++i, vaddr += YUZU_PAGESIZE) {
+            if (lazy && !current_page_table->entries.IsCommittedAt(vaddr >> YUZU_PAGEBITS)) {
+                // Unmapped, as below
+                ASSERT(false && "Attempted to mark unmapped pages as debug or non-debug");
+                continue;
+            }
             auto& entry = current_page_table->entries.GetUnchecked(vaddr >> YUZU_PAGEBITS);
             const auto [pointer, type, block] = entry.PointerTypeBlock(true);
             if (debug) {
@@ -619,8 +639,14 @@ struct Memory::Impl {
         // is different). This assumes the specified GPU address region is contiguous as well.
 
         const u64 num_pages = ((vaddr + size - 1) >> YUZU_PAGEBITS) - (vaddr >> YUZU_PAGEBITS) + 1;
-        current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr >> YUZU_PAGEBITS) + num_pages);
+        const bool lazy = Common::RamTableLazy(); // FRITCHII_RAM_PT_LAZY, as ProtectRegion
+        if (!lazy) {
+            current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr >> YUZU_PAGEBITS) + num_pages, "mark cached");
+        }
         for (u64 i = 0; i < num_pages; ++i, vaddr += YUZU_PAGESIZE) {
+            if (lazy && !current_page_table->entries.IsCommittedAt(vaddr >> YUZU_PAGEBITS)) {
+                continue; // Unmapped: left alone either way, as below
+            }
             auto& entry = current_page_table->entries.GetUnchecked(vaddr >> YUZU_PAGEBITS);
             const Common::PageType page_type = entry.Type();
             if (cached) {
@@ -785,6 +811,11 @@ struct Memory::Impl {
                        "Mapping memory page without a pointer @ {:016x}", base * YUZU_PAGESIZE);
 
             page_table.entries.ZeroRegion(base, end);
+            // FRITCHII_RAM_PT_TRIM: table pages left all zero leave RAM. Under the kernel page
+            // table lock (Operate), which every map into this table holds.
+            if (Common::RamTableTrim()) {
+                page_table.entries.DiscardZeroPages(base, end);
+            }
         } else {
             u64 mapping_id = block_count.load(std::memory_order_relaxed);
             constexpr u64 exhausted_count =
@@ -800,7 +831,7 @@ struct Memory::Impl {
                             "Page table block ids are exhausted; validating spans page by page");
             }
 
-            page_table.entries.CommitRegion(base, end);
+            page_table.entries.CommitRegion(base, end, "map");
             while (base != end) {
                 auto host_ptr = reinterpret_cast<u64>(system.DeviceMemory().GetPointer<u8>(target)) - (base << YUZU_PAGEBITS);;
                 auto& entry = page_table.entries.GetUnchecked(base);

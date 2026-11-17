@@ -8,9 +8,11 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "common/fritchii_lock_census.h"
 #include "common/host_memory.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/small_card.h"
+#include "video_core/texture_cache/lost_contents.h"
 
 namespace VideoCore::Nx2Debug {
 namespace {
@@ -336,6 +338,23 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_FILL_BRACKET_LEAN") {
         return &g_fill_bracket_lean;
     }
+    if (name == "FRITCHII_REPORT_WAIT") {
+        return &g_report_wait;
+    }
+    if (name == "FRITCHII_OCCL_LEAN") {
+        return &g_occl_lean;
+    }
+    if (name == "FRITCHII_LOCK_CENSUS") {
+        // Lives in common (the cache locks' contended path); -1 until its first read.
+        return &Common::LockCensus::g_mode;
+    }
+    if (name == "FRITCHII_FENCE_YIELD_E") {
+        return &Common::LockCensus::g_fence_yield_e;
+    }
+    if (name == "FRITCHII_FENCE_COPY_UNLOCKED") {
+        // Lives in common (the census line's E waits); -1 until its first read.
+        return &Common::LockCensus::g_fence_copy_unlocked;
+    }
     if (name == "EDEN_NX2_FEED_MEMORY_OVERLAY") {
         return &g_feed_memory_overlay;
     }
@@ -477,6 +496,30 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_VRAM_REPORT") {
         return &g_vram_report;
     }
+    if (name == "FRITCHII_VRAM_BUDGET_MODE") {
+        return &g_vram_budget_mode;
+    }
+    if (name == "FRITCHII_VRAM_HEADROOM_MIB") {
+        return &g_vram_headroom_mib;
+    }
+    if (name == "FRITCHII_TC_CRITICAL_ENFORCE") {
+        return &g_tc_critical_enforce;
+    }
+    if (name == "FRITCHII_VRAM_OWNERS") {
+        return &g_vram_owners;
+    }
+    if (name == "FRITCHII_VRAM_PACK") {
+        return &g_vram_pack;
+    }
+    if (name == "FRITCHII_VRAM_TRIM") {
+        return &g_vram_trim;
+    }
+    if (name == "FRITCHII_DEPTH_POOL_FIT") {
+        return &g_depth_pool_fit;
+    }
+    if (name == "FRITCHII_VRAM_HOLES") {
+        return &g_vram_holes;
+    }
     if (name == "FRITCHII_SMALL_CARD") {
         return &SmallCard::g_small_card;
     }
@@ -507,6 +550,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_SCALED_EXTENT_CAP") {
         return &g_scaled_extent_cap;
     }
+    if (name == "FRITCHII_SCALE_DEPTH_MAX") {
+        return &g_scale_depth_max;
+    }
     if (name == "FRITCHII_FENCE_COMMIT_FAST") {
         return &g_fence_commit_fast;
     }
@@ -515,6 +561,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_CB_WORDS_BLOCK") {
         return &g_cb_words_block;
+    }
+    if (name == "FRITCHII_CB_MERGE") {
+        return &g_cb_merge;
     }
     if (name == "FRITCHII_BANK_CENSUS") {
         return &g_bank_census;
@@ -546,6 +595,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ASYNC_REDRAWN") {
         return &g_async_redrawn;
     }
+    if (name == "FRITCHII_ASYNC_COMPUTE_SKIP") {
+        return &g_async_compute_skip;
+    }
     if (name == "FRITCHII_OCCLUSION_VISIBLE") {
         return &g_occlusion_visible;
     }
@@ -558,8 +610,44 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_STAGING_RING") {
         return &g_staging_ring;
     }
+    if (name == "FRITCHII_ZERO_UPLOAD") {
+        return &g_zero_upload;
+    }
+    if (name == "FRITCHII_STALE_ZERO") {
+        return &g_stale_zero;
+    }
+    if (name == "FRITCHII_LOST_WRITEBACK") {
+        return &g_lost_writeback;
+    }
     if (name == "FRITCHII_HOSTTIMING_SPIN_BUDGET") {
         return &g_hosttiming_spin_budget;
+    }
+    if (name == "FRITCHII_HOSTTIMING_PRIORITY") {
+        return &g_hosttiming_priority;
+    }
+    if (name == "FRITCHII_HOSTTIMING_OFF_GPU") {
+        return &g_hosttiming_off_gpu;
+    }
+    if (name == "FRITCHII_QUERY_FLUSH_DRY") {
+        return &g_query_flush_dry;
+    }
+    if (name == "FRITCHII_QUERY_LEND_DRY") {
+        return &g_query_lend_dry;
+    }
+    if (name == "FRITCHII_EXTENT_CENSUS") {
+        return &g_extent_census;
+    }
+    if (name == "FRITCHII_EXTENT_CBUF") {
+        return &g_extent_cbuf;
+    }
+    if (name == "FRITCHII_EXTENT_SHARED") {
+        return &g_extent_shared;
+    }
+    if (name == "FRITCHII_EXTENT_GUARD") {
+        return &g_extent_guard;
+    }
+    if (name == "FRITCHII_STORE_FOOTPRINT") {
+        return &g_store_footprint_live;
     }
     if (name == "FRITCHII_GPU_PRIORITY") {
         return &g_gpu_priority;
@@ -567,14 +655,24 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_THREAD_QOS") {
         return &g_thread_qos;
     }
+    if (name == "FRITCHII_GPU_SIBLINGS_FREE") {
+        return &g_gpu_siblings_free;
+    }
     if (name == "FRITCHII_FOCUS_GRAB") {
         return &g_focus_grab;
     }
     if (name == "FRITCHII_ONEF_RAISE_AFTER_LEND") {
         return &g_onef_raise_after_lend;
     }
+    if (name == "FRITCHII_PACE_FIX") {
+        return &g_pace_fix;
+    }
     if (name == "FRITCHII_PROTECT_UNLOCKED") {
         return &Common::g_protect_unlocked;
+    }
+    if (name == "FRITCHII_ZERO_TRIM_CHUNK") {
+        // Lives in common (the zero-page pass); -1 until the first pass reads it.
+        return &Common::g_zero_trim_chunk;
     }
     // FRITCHII_ONEF and FRITCHII_ONEF_PIN are boot switches: not live.
     if (name == "FRITCHII_ONEF_VIEW") {
@@ -691,6 +789,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_POST_FENCE_REPORT") {
         return &g_onef_post_fence_report;
     }
+    if (name == "FRITCHII_ONEF_SIGNAL_ON_R") {
+        return &g_onef_signal_on_r;
+    }
+    if (name == "FRITCHII_ONEF_WAITS_R") {
+        return &g_onef_waits_r;
+    }
+    if (name == "FRITCHII_ONEF_MIRROR_STOP") {
+        return &g_onef_mirror_stop;
+    }
     if (name == "FRITCHII_ONEF_CLEAR_NODEFER") {
         return &g_onef_clear_nodefer;
     }
@@ -745,6 +852,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_BARE_SSBO_MIB") {
         return &g_bare_ssbo_mib;
     }
+    if (name == "FRITCHII_BARE_SSBO_CLAMP") {
+        return &g_bare_ssbo_clamp;
+    }
     if (name == "FRITCHII_TC_COLLECT_OVER") {
         return &g_tc_collect_over;
     }
@@ -768,6 +878,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_STEP_LEAN") {
         return &g_step_lean;
+    }
+    if (name == "FRITCHII_REFRESH_LEAN") {
+        return &g_refresh_lean;
     }
     if (name == "FRITCHII_S4_COUNT") {
         return &g_s4_count;

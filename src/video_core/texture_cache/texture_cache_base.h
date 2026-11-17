@@ -53,6 +53,7 @@
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/lost_contents.h"
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
@@ -170,6 +171,48 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// FRITCHII_SMALL_CARD (part Fit): room for the device memory the usage leaves out
     /// (UncountedDeviceBytes), smoothed like slack_margin; 0 while the part is off.
     u64 held_margin{};
+    /// FRITCHII_VRAM_BUDGET_MODE: the thresholds as ApplyThresholdOverrides left them, before
+    /// the live budget cap (budget_cap, ~0 while it does not bind) lowers them.
+    u64 base_expected_memory{};
+    u64 base_critical_memory{};
+    u64 base_minimum_memory{};
+    u64 budget_cap{~0ULL};
+    bool budget_pressure{}; ///< budget_cap binds: the driver's usage passed the budget less headroom
+    std::chrono::steady_clock::time_point budget_control_time{};
+    /// FRITCHII_SCALE_DEPTH_MAX: depth images kept native (each counted once).
+    struct DepthNativeStats {
+        u32 window{}; ///< since the last 10 s line
+        u64 total{};
+        std::chrono::steady_clock::time_point last_log{};
+    };
+    DepthNativeStats depth_native_stats;
+    /// What BudgetControl saw last, for the owners line.
+    struct BudgetSeen {
+        int mode{-1};
+        u64 heap_size{};
+        u64 usage{};
+        u64 vk_budget{};
+        u64 os_budget{}; ///< 0 without an OS sample
+        u64 others{};    ///< other processes' dedicated video memory (OS counters)
+        u64 budget{};    ///< the one in use
+        u64 headroom{};
+        u64 peak_usage{};       ///< since the last owners line
+        u64 lowest_budget{~0ULL}; ///< since the last owners line
+        u32 over_seconds{};     ///< samples over budget less headroom since the last owners line
+        u32 spill_seconds{};    ///< samples over the budget itself since the last owners line
+    } budget_seen;
+    /// FRITCHII_TC_CRITICAL_ENFORCE: evictions made before creating an image.
+    struct CreateEnforceStats {
+        u64 passes{};
+        u64 deleted{};
+        u64 freed{};
+        u64 capped{};  ///< passes refused by the per-frame cap
+        u64 short_of{}; ///< passes that ended still over critical
+    } create_enforce_stats;
+    u64 create_enforce_frame{~0ULL};
+    u32 create_enforce_frame_deletes{};
+    std::vector<ImageId> create_enforce_candidates;
+    std::chrono::steady_clock::time_point vram_owners_time{};
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;
@@ -204,6 +247,14 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     /// Splits large 2D image uploads into smaller chunks, avoiding multi-hundred MiB staging buffers.
     bool UploadInChunks(Image& image);
+
+    /// FRITCHII_ZERO_UPLOAD (live, default 0): a whole upload whose guest bytes are all zero
+    /// becomes a GPU clear to zero (no staging buffer, no untiling, no copy). True when the
+    /// image was cleared (mode 1); mode 2 only counts.
+    bool TryZeroUpload(Image& image);
+
+    /// The 10 s line of FRITCHII_ZERO_UPLOAD (TickFrame).
+    void LogZeroUploads();
 
     /// Large layered images whose refresh can decode only the layers written since the last one.
     [[nodiscard]] bool UploadsByLayer(const ImageBase& image) const noexcept;
@@ -452,6 +503,22 @@ public:
     [[nodiscard]] bool IsRescaling() const noexcept;
 
     [[nodiscard]] bool IsRescaling(const ImageViewBase& image_view) const noexcept;
+
+    /// FRITCHII_EARLY_COMPUTE (dry): whether the view's image has a GPU write the host GPU has
+    /// not run yet (its MarkModification tick; with the switch on only).
+    [[nodiscard]] bool EarlyImageWritePending(ImageViewId id) noexcept;
+
+    /// FRITCHII_ASYNC_COMPUTE_SKIP (renderer_vulkan/vk_async_compute_skip.h), the lock held:
+    /// what the images on [addr, addr + size) hold, for a written storage image there.
+    enum class SkipImageState : u8 {
+        Redrawn,     ///< one image covers the range; every image there holds GPU writes only,
+                     ///< written in each of the last REDRAWN_WRITE_FRAMES render frames (up to
+                     ///< this one or the one before)
+        NoImage,     ///< no image covers the range (the dispatch would make one)
+        NoGpuData,   ///< an image there is not GPU-modified, or has CPU writes to upload
+        NotRedrawn,  ///< an image there was not written in every one of those frames
+    };
+    [[nodiscard]] SkipImageState ComputeSkipImageState(DAddr addr, u64 size);
 
     /// Create channel state.
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
@@ -1396,6 +1463,18 @@ private:
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
 
+    /// FRITCHII_VRAM_BUDGET_MODE: the base thresholds lowered to budget_cap (no-op at ~0).
+    void ApplyBudgetCap();
+    /// FRITCHII_VRAM_BUDGET_MODE (live): once a second, the driver's usage of the main heap
+    /// against the budget (vk: the driver's; os: also the heap less what other processes hold)
+    /// less FRITCHII_VRAM_HEADROOM_MIB; past it the cap comes down, with room it goes back up.
+    void BudgetControl();
+    /// FRITCHII_TC_CRITICAL_ENFORCE (live): before an image of about `incoming` bytes is made
+    /// past the critical memory, clean images idle 10+ frames are deleted (no downloads).
+    void EnforceCriticalAtCreate(u64 incoming);
+    /// FRITCHII_VRAM_OWNERS (live, seconds, default 10): one line with who holds device memory.
+    void LogVramOwners();
+
     /// FRITCHII_SMALL_CARD (part Fit): device memory the driver counts that TickFrame leaves out
     /// of total_used_memory (deleted images still in flight, collector downloads, frees handed to
     /// the free thread, the image pool).
@@ -1436,6 +1515,112 @@ private:
     u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
     u64 tc_stale_skip_bytes{};
     u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
+    /// Some page of [addr, addr + size) is marked stale.
+    [[nodiscard]] bool IsAnyStale(DAddr addr, size_t size) const;
+
+    /// Lost contents (the dialogue text corruption, zortos293/Lichii #1310): an image made where
+    /// a GPU-written image was dropped without a write-back starts with bytes that are not the
+    /// GPU's: undefined device memory (the stale skip; with the EXP42 pool, another image's
+    /// texels) or guest bytes older than the GPU's writes. Harmless when the game overwrites it
+    /// whole; corruption on screen when it is sampled first. Counted per image at its first
+    /// sampled use, with the drop that left the memory stale.
+    enum LostBits : u8 {
+        LostSkipped = 1,  ///< Upload skipped as all stale (undefined unless FRITCHII_STALE_ZERO)
+        LostUploaded = 2, ///< Uploaded guest bytes some of which a dropped image left stale
+        LostZeroed = 4,   ///< FRITCHII_STALE_ZERO cleared it instead of leaving it undefined
+        LostDrawn = 8,    ///< Drawn into since without a clear of the whole image
+    };
+    /// FRITCHII_LOST_WRITEBACK's drop paths (CollectDownload::lost_path).
+    static constexpr u8 LostPathCollector = 1; ///< The collector's bad overlaps
+    static constexpr u8 LostPathCold = 2;      ///< The cold sweep (EXP58's superseded deletes too)
+    static constexpr u8 LostPathSuperseded = 3; ///< FRITCHII_SWEEP_SUPERSEDED
+    static constexpr u8 LostPathSlot = 4;      ///< EXP64's slot retire
+    static constexpr size_t LostPathCount = 5;
+    /// The last GPU-written images dropped without a write-back (MarkStale), for attribution.
+    struct StaleDrop {
+        DAddr cpu_addr;
+        u64 size;
+        GPUVAddr gpu_addr;
+        u64 frame;
+        u32 format;
+        u32 width;
+        u32 height;
+        u8 reason;   ///< DeleteReason, or LostReasonRelocate
+        u8 guard;    ///< The image's relocation_guard_noted
+        u64 shape_key; ///< RelocationShapeKey (a relocation's loss guards the shape)
+    };
+    static constexpr u8 LostReasonRelocate = 0x40;
+    static constexpr size_t StaleDropRing = 1024;
+    std::array<StaleDrop, StaleDropRing> stale_drops{};
+    size_t stale_drop_next{};
+    size_t stale_drop_count{};
+    bool marking_relocation{};
+    struct LostContentStats {
+        u64 made_skipped{};      ///< Images whose upload the stale skip dropped
+        u64 made_zeroed{};       ///< Of them, cleared to zero (FRITCHII_STALE_ZERO)
+        u64 made_uploaded{};     ///< Images uploaded over stale pages (some or all)
+        u64 overwritten{};       ///< Cleared whole before any sampled use: harmless
+        u64 sampled_undrawn{};   ///< Sampled before anything drew into them
+        u64 sampled_drawn{};     ///< Sampled after draws that did not clear them whole
+        u64 sampled_bytes{};
+        std::array<u64, 10> sampled_by_reason{}; ///< DeleteReason (8 = relocation, 9 = unknown)
+        u64 sampled_guarded{};   ///< Of the sampled: the dropped image had been read in a later frame
+        u64 relocation_guards{}; ///< Shapes guarded from relocation after a loss it caused
+        /// FRITCHII_LOST_WRITEBACK, by LostPath: queued, landed (and bytes), refused (a newer
+        /// write-back or a since-downloaded overlap owns bytes: deleted as before), kept for a
+        /// later pass (queue full), over the size cap (deleted as before).
+        std::array<u64, LostPathCount> wb_queued{};
+        std::array<u64, LostPathCount> wb_landed{};
+        std::array<u64, LostPathCount> wb_landed_bytes{};
+        std::array<u64, LostPathCount> wb_refused{};
+        std::array<u64, LostPathCount> wb_kept{};
+        std::array<u64, LostPathCount> wb_over_cap{};
+        u64 logged{};
+        u64 last_log_ns{};
+    } lost_stats;
+    /// The drop that left [addr, addr + size) stale, newest first (nullptr: none recorded).
+    [[nodiscard]] const StaleDrop* FindStaleDrop(DAddr addr, size_t size) const;
+    void RecordStaleDrop(const ImageBase& image);
+    /// FRITCHII_STALE_ZERO: clears an image whose upload the stale skip dropped to zero (every
+    /// level and layer) instead of leaving it undefined; false where it cannot (then undefined).
+    bool ClearLostToZero(Image& image);
+    /// PrepareImage: counts a lost-contents image's first sampled use (or its whole overwrite).
+    void NoteLostContents(ImageBase& image, bool is_modification, bool invalidate);
+    /// The 10 s "Lost contents" line (TickFrame), when anything happened.
+    void LogLostContents();
+    /// FRITCHII_LOST_WRITEBACK (live, default 1): a GPU-written image a drop path is about to
+    /// delete is written back to guest memory first, on the collector's queue (EXP121's): the
+    /// landing deletes it and clears its stale marks, so an image made there later uploads the
+    /// GPU's pixels. Queued: the caller leaves it to the landing. Keep: no room in the queue,
+    /// the caller keeps it for a later pass. Drop: delete as before (switch off, nothing GPU-only
+    /// in it, over the size cap, a newer write-back owns some of its bytes, no queue).
+    enum class LostWriteback : u8 { Drop, Queued, Keep };
+    LostWriteback QueueLostWriteback(ImageId image_id, Image& image, u8 path);
+    /// Recent collector write-backs (device range, the image's modification_tick): an older
+    /// image's write-back must not land over a newer one's bytes.
+    struct RecentWriteback {
+        DAddr cpu_addr;
+        u64 size;
+        u64 modification;
+    };
+    static constexpr size_t RecentWritebackRing = 256;
+    std::array<RecentWriteback, RecentWritebackRing> recent_writebacks{};
+    size_t recent_writeback_next{};
+    void NoteWriteback(const ImageBase& image);
+    [[nodiscard]] bool NewerWritebackOver(const ImageBase& image) const;
+
+    /// FRITCHII_ZERO_UPLOAD counters (the 10 s line).
+    struct ZeroUploadStats {
+        u64 zero_images{};     ///< All zero (cleared in mode 1, counted in mode 2)
+        u64 zero_bytes{};      ///< Their guest bytes
+        u64 zero_ns{};         ///< Their checks
+        u64 data_images{};     ///< Checked, not all zero: uploaded as before
+        u64 data_bytes{};      ///< Bytes looked at before the first non-zero one
+        u64 data_ns{};
+        u64 sparse_skipped{};  ///< Eligible but sparse in guest memory (footprint over 2x)
+        s64 last_log_ns{};
+        u32 logged{};          ///< Per-image lines so far (the first 40 of 4 MiB or more)
+    } zero_upload;
 
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
@@ -1553,6 +1738,7 @@ private:
         u64 staging_bytes;
         u64 memory_bytes;      ///< device memory counted as freed while queued
         bool cpu_modified;     ///< the image was CpuModified then (a CPU write since drops it)
+        u8 lost_path;          ///< FRITCHII_LOST_WRITEBACK's drop path (0 = the collector's own)
     };
     std::deque<CollectDownload> collect_downloads;
     u64 collect_download_staging{};

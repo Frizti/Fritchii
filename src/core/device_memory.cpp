@@ -107,6 +107,16 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         return total;
     };
     const std::chrono::seconds max_interval = idle_timing ? 300s : 60s;
+    // FRITCHII_ZERO_TRIM_CHUNK's part of the pass lines (helper CR): with either value, the
+    // longest VirtualUnlock call and the guest map/unmap/protect calls made while the pass
+    // unlocked (the longest is what a frame can wait for).
+    const auto chunk_text = [](const Common::HostMemory::ZeroTrimPhases& phases) {
+        return fmt::format("; FRITCHII_ZERO_TRIM_CHUNK={}: {} unlock calls, longest {:.1f} ms; "
+                           "guest map/protect calls meanwhile {}, longest {:.1f} ms",
+                           phases.chunk_mode, phases.unlock_calls,
+                           static_cast<double>(phases.longest_call_us) / 1e3, phases.guest_calls,
+                           static_cast<double>(phases.longest_guest_us) / 1e3);
+    };
     while (true) {
         {
             std::unique_lock lock{mutex};
@@ -163,11 +173,12 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                 LOG_INFO(HW_Memory,
                          "Zero-page pass: {} MiB trimmed of {} MiB resident in {} ms (next in {} s); "
                          "working set query {} ms, page reads {} ms, {} unlock runs {} ms "
-                         "(longest {:.1f})",
+                         "(longest {:.1f}){}",
                          trimmed >> 20, resident >> 20, ms,
                          (std::min)(interval * 2, std::chrono::seconds{max_interval}).count(),
                          phases.query_us / 1000, phases.scan_us / 1000, phases.unlock_runs,
-                         phases.unlock_us / 1000, static_cast<double>(phases.longest_unlock_us) / 1e3);
+                         phases.unlock_us / 1000, static_cast<double>(phases.longest_unlock_us) / 1e3,
+                         chunk_text(phases));
             }
             interval = (std::min)(interval * 2, std::chrono::seconds{max_interval});
             continue;
@@ -182,10 +193,11 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         LOG_INFO(HW_Memory,
                  "Trimmed {} MiB of all-zero guest pages out of {} MiB resident in {} ms; the kernel "
                  "zero-filled {} MiB so far; working set query {} ms, page reads {} ms, {} unlock "
-                 "runs {} ms (longest {:.1f})",
+                 "runs {} ms (longest {:.1f}){}",
                  trimmed >> 20, resident >> 20, ms, Common::HostMemory::ZeroFilledBytes() >> 20,
                  phases.query_us / 1000, phases.scan_us / 1000, phases.unlock_runs,
-                 phases.unlock_us / 1000, static_cast<double>(phases.longest_unlock_us) / 1e3);
+                 phases.unlock_us / 1000, static_cast<double>(phases.longest_unlock_us) / 1e3,
+                 chunk_text(phases));
     }
 }
 

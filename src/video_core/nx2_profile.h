@@ -156,6 +156,13 @@ enum class Zone : u32 {
     ESplitJob,      ///< E2 runs a piece of E's work E1 handed over
     ESplitWait,     ///< E2 waits for work
     ESplitHandOver, ///< E1 hands work to E2 and waits for it, or for E2's room (S2)
+    // Helper CP (Kakariko): E's draw method outside the fill (0x585's "method" share, 1.1 us a
+    // draw), fine zones. E's lookup is "pipeline lookup", its TickWork "tick work".
+    DrawRoute,     ///< E: RouteDraw's tests before the fill (Classify, the mask, UnlentBlocker)
+    DrawFlush,     ///< E: the stream's invalidations before the fill (FlushCaching)
+    DrawHandles,   ///< E: the draw's raw handle values read (FillGraphicsHandleValues)
+    DrawFillSetup, ///< E: FillRing's own work (facts, room tests, the cache lock, repack, record)
+    DrawPush,      ///< E: R's packet packed and pushed (OneFollower::PushDraw)
     Count,
 };
 
@@ -186,6 +193,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "setup handle values", "fill ranges", "fill bind setup", "fill geometry", "fill stage buffers",
     "fill packet", "front methods", "publish", "publish wake", "parked in lends",
     "e split job", "e split E2 wait", "e split hand-over",
+    "draw route", "draw flush caching", "draw handle values", "draw fill setup", "draw push",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 

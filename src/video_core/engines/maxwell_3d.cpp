@@ -3088,8 +3088,11 @@ NX2_PROFILE_FORCEINLINE void Maxwell3D::FrontWriteSend(VideoCommon::GpuSplit& sp
     // plain load and a branch.
     VideoCommon::FrontSplit::StageScope send_stage{VideoCommon::FrontSplit::Stage::RingSend};
     if (cb_block != 0) {
+        // FRITCHII_CB_MERGE=2: the front's address too, marked before a joined run's first word.
+        const GPUVAddr merge_address =
+            VideoCommon::GpuSplit::CbMergeMode() == 2 ? *cb_write : GPUVAddr{0};
         split.CbWord(this, method, argument, from_macro || is_last_call, from_macro, effect,
-                     cb_block == 2 ? cb_write : nullptr);
+                     cb_block == 2 ? cb_write : nullptr, merge_address);
         fs.sink_pending = false; // The back's block consumes the sink first, as each entry did
     } else if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
         if (fs.packet_on && IsDrawPacketMethod(method)) [[unlikely]] {
@@ -3108,8 +3111,19 @@ NX2_PROFILE_FORCEINLINE void Maxwell3D::FrontWriteSend(VideoCommon::GpuSplit& sp
         // EDEN_NX2_RING_PAIRS: the same writes as pairs, applied the same way (ApplyPairs) when
         // the back reaches them, which is never later than the sink would.
         if (!execution_mask[method] && VideoCommon::GpuSplit::RingPairs()) {
-            split.PairWrite(this, method, argument);
-            fs.sink_pending = false; // The back's Pairs entry consumes the sink first
+            // FRITCHII_CB_MERGE >= 2: a constant buffer size/address/offset write joins the open
+            // CbWords block (GpuSplit::CbJoinPair) instead of ending it; else the Pairs entry.
+            constexpr u32 cb_size = MAXWELL3D_REG_INDEX(const_buffer.size);
+            bool joined = false;
+            if (method - cb_size <= 3) [[unlikely]] {
+                if (const int merge = VideoCommon::GpuSplit::CbMergeMode(); merge >= 2) {
+                    joined = split.CbJoinPair(this, method, argument, merge);
+                }
+            }
+            if (!joined) {
+                split.PairWrite(this, method, argument);
+            }
+            fs.sink_pending = false; // The back's Pairs entry (or the block) consumes the sink first
         } else {
             split.Method(this, method, argument, is_last_call, nullptr, effect);
             fs.sink_pending = !execution_mask[method];

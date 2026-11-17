@@ -147,6 +147,11 @@ inline void RenderOwned(const char* where) noexcept {
 /// page with a report a posted fence lands, not yet played by R, waits for R to play it.
 inline std::atomic<bool> g_report_landing_watch{};
 void WaitReportLanding(u64 address, u64 size) noexcept;
+/// FRITCHII_QUERY_FLUSH_DRY (helper DE), E: no page of [address, address + size) has a report
+/// since the last fence, or one a posted fence lands that R has not played. The same pages
+/// WaitReportLanding would wait for, without waiting. Not proof that R's query cache holds no
+/// report there (the dry line counts where they disagree).
+[[nodiscard]] bool ReportLandingClear(u64 address, u64 size) noexcept;
 inline void BeforeEngineRead(u64 address, u64 size) noexcept {
     if (g_report_landing_watch.load(std::memory_order_relaxed) && Detail::t_engine) [[unlikely]] {
         WaitReportLanding(address, size);

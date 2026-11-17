@@ -161,6 +161,14 @@ struct Impl {
     u64 op_bytes_logged{};
     std::array<std::atomic<u64>, 3> mirror_count{}; ///< compared, E set R not, R set E not
     std::atomic<bool> post_fence_stopped{};
+    /// FRITCHII_ONEF_MIRROR_STOP=2 (R only): R skipped a draw with the samples count on since
+    /// its last samples report; and how many "E set, R not" it explained so far.
+    bool skipped_samples_draw{};
+    std::atomic<u64> mirror_explained{};
+    u64 mirror_explained_logged{};
+    /// FRITCHII_ONEF_SIGNAL_ON_R (E counts): payload writes and sync points R made for E.
+    std::atomic<u64> signals_on_r{};
+    u64 signals_on_r_logged{};
     // FRITCHII_ONEF_OP_DISPATCH (E counts; the frame-end line reads them).
     std::array<std::atomic<u64>, static_cast<size_t>(DispatchCount::Count)> dispatch_count{};
     std::array<u64, static_cast<size_t>(DispatchCount::Count)> dispatch_logged{};
@@ -889,14 +897,26 @@ void LogQueryKinds() {
             g.idle_decisions_logged[i] = count;
         }
         const u64 superset = g.sync_target_superset.load(std::memory_order_relaxed);
+        const u64 on_r = g.signals_on_r.load(std::memory_order_relaxed);
+        const u64 explained = g.mirror_explained.load(std::memory_order_relaxed);
+        namespace Debug = VideoCore::Nx2Debug;
         LOG_INFO(HW_GPU,
-                 "One follower fence decisions (POST_FENCE={}, SEM_E={}) {:.0f} s: {}; samples "
-                 "sync targets R did not need, E's mirror ahead {:.1f}/s; waits for idle "
-                 "(POST_IDLE={}): {}",
-                 PostFenceOn() ? 1 : 0, g_sem_e.load(std::memory_order_relaxed) ? 1 : 0, seconds,
-                 text, static_cast<double>(superset - g.sync_target_superset_logged) / seconds,
-                 PostIdleOn(), idle);
+                 "One follower fence decisions (POST_FENCE={}, SEM_E={}, SIGNAL_ON_R={}, "
+                 "WAITS_R={}, MIRROR_STOP={}) {:.0f} s: {}; samples sync targets R did not need, "
+                 "E's mirror ahead {:.1f}/s; waits for idle (POST_IDLE={}): {}; signals made on "
+                 "R for E {:.0f}/s; E's mirror ahead after a skipped draw {:.1f}/s",
+                 PostFenceOn() ? 1 : 0, g_sem_e.load(std::memory_order_relaxed) ? 1 : 0,
+                 Debug::SwitchValue(Debug::g_onef_signal_on_r, "FRITCHII_ONEF_SIGNAL_ON_R"),
+                 WaitsR() ? 1 : 0,
+                 Debug::SwitchValue(Debug::g_onef_mirror_stop, "FRITCHII_ONEF_MIRROR_STOP"),
+                 seconds, text,
+                 static_cast<double>(superset - g.sync_target_superset_logged) / seconds,
+                 PostIdleOn(), idle,
+                 static_cast<double>(on_r - g.signals_on_r_logged) / seconds,
+                 static_cast<double>(explained - g.mirror_explained_logged) / seconds);
         g.sync_target_superset_logged = superset;
+        g.signals_on_r_logged = on_r;
+        g.mirror_explained_logged = explained;
     }
     if (SyncMirrorOn()) {
         std::array<double, 3> rates{};
@@ -2057,8 +2077,15 @@ bool WaitGuestWriteOps() noexcept {
 }
 
 bool WaitsE() noexcept {
-    return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_waits_e,
-                                                     "FRITCHII_ONEF_WAITS_E") != 0;
+    return g.on &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_waits_e,
+                                            "FRITCHII_ONEF_WAITS_E") != 0 &&
+           !WaitsR();
+}
+
+bool WaitsR() noexcept {
+    return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_waits_r,
+                                                     "FRITCHII_ONEF_WAITS_R") != 0;
 }
 
 u64 GuestWriteOpMark() noexcept {
@@ -2296,6 +2323,24 @@ bool SemOnE() noexcept {
     return on;
 }
 
+bool SignalOnR() noexcept {
+    return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_signal_on_r,
+                                                     "FRITCHII_ONEF_SIGNAL_ON_R") != 0;
+}
+
+void CountSignalOnR() noexcept {
+    g.signals_on_r.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteReportLandsAtLastPush(u64 device) noexcept {
+    // The op is the newest packet E pushed (no carry): its number is `pushed`. Erased once R
+    // played it (WaitReportLanding) or at the next lent fence (NoteFenceLent).
+    const u64 number = g.pushed;
+    g.landing_pages[device >> 12] = number;
+    g.landing_max = (std::max)(g.landing_max, number);
+    g_report_landing_watch.store(true, std::memory_order_relaxed);
+}
+
 bool SoftReleaseOnE() noexcept {
     return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_soft_release_e,
                                                     "FRITCHII_ONEF_SOFT_RELEASE_E") != 0;
@@ -2512,6 +2557,30 @@ void NoteFenceLent() noexcept {
     g_report_landing_watch.store(false, std::memory_order_relaxed);
 }
 
+bool ReportLandingClear(u64 address, u64 size) noexcept {
+    if (size == 0) {
+        return true;
+    }
+    const u64 first = address >> 12;
+    const u64 last = (address + size - 1) >> 12;
+    for (const u64 page : g.landing_unassigned) {
+        if (page >= first && page <= last) {
+            return false;
+        }
+    }
+    if (g.landing_pages.empty()) {
+        return true;
+    }
+    const u64 played = g.played.load(std::memory_order_acquire);
+    for (u64 page = first; page <= last; ++page) {
+        const auto it = g.landing_pages.find(page);
+        if (it != g.landing_pages.end() && played < it->second) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void WaitReportLanding(u64 address, u64 size) noexcept {
     if (size == 0 || g.landing_pages.empty()) {
         g_report_landing_watch.store(!g.landing_pages.empty(), std::memory_order_relaxed);
@@ -2543,6 +2612,7 @@ bool PostFenceOn() noexcept {
 
 void CountSyncMirror(bool engine_bit, bool render_bit) noexcept {
     g.mirror_count[0].fetch_add(1, std::memory_order_relaxed);
+    const bool skipped = std::exchange(g.skipped_samples_draw, false); // R: since its last report
     if (engine_bit == render_bit) {
         return;
     }
@@ -2551,9 +2621,34 @@ void CountSyncMirror(bool engine_bit, bool render_bit) noexcept {
         LOG_CRITICAL(HW_GPU, "One follower: R's samples counter ran where E's mirror had it "
                              "stopped; FRITCHII_ONEF_POST_FENCE stops for this session");
     }
+    // FRITCHII_ONEF_MIRROR_STOP (live, default 0): E's mirror started, R's counter not. A superset
+    // (E lists the report for a sync R then does not need: OneFollowerCloseTargets counts it), the
+    // kind a draw R skipped makes (E's mirror counts every lent draw with the count on; R starts
+    // its counter only for a draw it records). 1: stop posting fences as the opposite case does;
+    // 2: explained, no must-be-0 note, when R skipped such a draw since its last samples report.
+    if (engine_bit) {
+        const int mirror_stop = VideoCore::Nx2Debug::SwitchValue(
+            VideoCore::Nx2Debug::g_onef_mirror_stop, "FRITCHII_ONEF_MIRROR_STOP");
+        if (mirror_stop == 1 && !g.post_fence_stopped.exchange(true, std::memory_order_relaxed)) {
+            LOG_CRITICAL(HW_GPU, "One follower: E's samples mirror started where R's counter did "
+                                 "not{}; FRITCHII_ONEF_POST_FENCE stops for this session "
+                                 "(FRITCHII_ONEF_MIRROR_STOP=1)",
+                         skipped ? " (after a draw R skipped)" : "");
+        }
+        if (mirror_stop == 2 && skipped) {
+            g.mirror_explained.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
     g.mirror_count[engine_bit ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
     Note(Check::SyncMirror, engine_bit ? "a samples report: E's mirror started, R's counter not"
                                        : "a samples report: R's counter started, E's mirror not");
+}
+
+void NoteSkippedSamplesDraw() noexcept {
+    if (g.on && OnRenderThread()) {
+        g.skipped_samples_draw = true;
+    }
 }
 
 bool FlushOnEngine() noexcept {

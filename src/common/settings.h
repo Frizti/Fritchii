@@ -353,6 +353,10 @@ struct Values {
 #endif
         "backend", Category::Renderer};
     SwitchableSetting<u32> vulkan_device{linkage, 0, "vulkan_device", Category::Renderer, Specialization::RuntimeList};
+    // The picked card's name, saved with its index: a changed device order finds it again by
+    // name, and empty means no choice yet (Vulkan::PickPhysicalDevice).
+    SwitchableSetting<std::string> vulkan_device_name{linkage, std::string(), "vulkan_device_name",
+                                                      Category::Renderer};
 
     // Graphics Settings
     ResolutionScalingInfo resolution_info{};

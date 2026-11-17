@@ -31,6 +31,7 @@
 #include "video_core/buffer_cache/mem_read_log.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/early_compute.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -187,9 +188,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         // the next image (zortos #1306, RX 9070 XT). So one more delete per 2 MiB over the
         // critical memory (up to 1,024 more), and from 1 GiB over, images unused for 3 frames go
         // too instead of 10.
+        // FRITCHII_VRAM_BUDGET_MODE: also while the budget is short (budget_pressure).
         if (aggressive_mode && total_used_memory > critical_memory &&
-            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_collect_over,
-                                             "FRITCHII_TC_COLLECT_OVER") != 0) {
+            (budget_pressure ||
+             VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_collect_over,
+                                              "FRITCHII_TC_COLLECT_OVER") != 0)) {
             const u64 over = total_used_memory - critical_memory;
             const size_t extra = static_cast<size_t>((std::min)(over / 2_MiB, u64{1024}));
             num_iterations += extra;
@@ -263,6 +266,21 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         // when the GPU has written it out (LandCollectDownloads), instead of waiting here. An
         // allocation that failed needs the memory now, so it still waits.
         bool queued = false;
+        // FRITCHII_LOST_WRITEBACK (default 1; zortos293/Lichii #1501's idea): a GPU-written bad
+        // overlap is written back before it goes, through the same queue; it was dropped, and the
+        // next image there showed other memory (the dialogue text corruption, #1310). An
+        // allocation that failed needs the memory now: dropped as before.
+        if (!must_download && !out_of_memory && True(image.flags & ImageFlagBits::BadOverlap)) {
+            switch (QueueLostWriteback(image_id, image, LostPathCollector)) {
+            case LostWriteback::Queued:
+                queued = true;
+                break;
+            case LostWriteback::Keep:
+                return false;
+            case LostWriteback::Drop:
+                break;
+            }
+        }
         if (must_download && VideoCore::Nx2Debug::Experiment(121) != 0) {
             if (out_of_memory) {
                 ++collect_stats.fallback_oom;
@@ -290,6 +308,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
                 ++gc_download_deletes;
+                NoteWriteback(image); // FRITCHII_LOST_WRITEBACK's order check
                 unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
                 // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
                 image.flags &= ~ImageFlagBits::GpuModified;
@@ -446,6 +465,7 @@ bool TextureCache<P>::QueueCollectDownload(ImageId image_id) {
             .staging_bytes = staging_bytes,
             .memory_bytes = memory_bytes,
             .cpu_modified = True(image.flags & ImageFlagBits::CpuModified),
+            .lost_path = 0,
         });
         image.flags |= ImageFlagBits::CollectPending;
         collect_download_staging += staging_bytes;
@@ -515,7 +535,9 @@ void TextureCache<P>::LandCollectDownloads() {
                 // guest memory, its own download lands over ours later, and one that lands first
                 // drops ours (DropCollectDownloadsIn), so landing ours is what the waiting path
                 // does. Dropped, the image stayed and the next pass queued it again.
-                const bool land_under = VideoCore::Nx2Debug::SwitchValue(
+                // FRITCHII_LOST_WRITEBACK's entries always land under such overlaps.
+                const bool land_under = entry.lost_path != 0 ||
+                                        VideoCore::Nx2Debug::SwitchValue(
                                             VideoCore::Nx2Debug::g_collect_land_under,
                                             "FRITCHII_COLLECT_LAND_UNDER") > 0;
                 const ImageId self = entry.image_id;
@@ -533,7 +555,10 @@ void TextureCache<P>::LandCollectDownloads() {
                                          overlap_written = true;
                                      });
             }
-            if (overlap_written) {
+            // FRITCHII_LOST_WRITEBACK: a newer write-back landed over some of its bytes since.
+            const bool newer_landed = entry.lost_path != 0 && !written && !overlap_written &&
+                                      runtime.IsFree(entry.tick) && NewerWritebackOver(image);
+            if (overlap_written || newer_landed) {
                 // FRITCHII_COVERED_RETIRE: newer GPU writes cover all of it, so nothing of it is
                 // left to land: deleted now instead of kept for the next pass to queue again.
                 if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_covered_retire,
@@ -549,6 +574,22 @@ void TextureCache<P>::LandCollectDownloads() {
                 }
                 written = true;
                 ++collect_stats.dropped_under;
+                if (entry.lost_path != 0) {
+                    // FRITCHII_LOST_WRITEBACK: newer bytes in its memory now; deleted without the
+                    // write-back, as before (queued again, it would download every pass).
+                    const ImageId image_id = entry.image_id;
+                    ++lost_stats.wb_refused[entry.lost_path];
+                    DropCollectDownload(i);
+                    ++collect_stats.dropped_written;
+                    MarkStale(image); // before UntrackImage (see MarkStale)
+                    if (True(image.flags & ImageFlagBits::Tracked)) {
+                        UntrackImage(image, image_id);
+                    }
+                    ++gc_deletes;
+                    UnregisterImage(image_id);
+                    DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+                    continue;
+                }
             }
             if (written) {
                 DropCollectDownload(i);
@@ -579,6 +620,11 @@ void TextureCache<P>::LandCollectDownloads() {
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
             ++collect_stats.landed;
+            NoteWriteback(image); // FRITCHII_LOST_WRITEBACK's order check
+            if (entry.lost_path != 0) {
+                ++lost_stats.wb_landed[entry.lost_path];
+                lost_stats.wb_landed_bytes[entry.lost_path] += image.guest_size_bytes;
+            }
             collect_stats.landed_under += landed_under ? 1 : 0;
             collect_stats.land_frames += frame_tick - entry.frame;
             unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
@@ -607,6 +653,9 @@ void TextureCache<P>::UpdateStaleTracking(u64 run_begin, u64 run_pages, s32 delt
 
 template <class P>
 void TextureCache<P>::MarkStale(const ImageBase& image) {
+    if (True(image.flags & ImageFlagBits::GpuModified)) {
+        RecordStaleDrop(image); // the lost contents counter's attribution
+    }
     if (!TcSkipStale() || False(image.flags & ImageFlagBits::GpuModified) ||
         True(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::Unbacked)) ||
         image.guest_size_bytes == 0) {
@@ -734,6 +783,243 @@ bool TextureCache<P>::IsAllStale(DAddr addr, size_t size) const {
 }
 
 template <class P>
+bool TextureCache<P>::IsAnyStale(DAddr addr, size_t size) const {
+    if (stale_page_count == 0 || size == 0) {
+        return false;
+    }
+    const u64 first = addr >> STALE_PAGE_BITS;
+    const u64 end = (std::min<u64>)((addr + size + (u64{1} << STALE_PAGE_BITS) - 1) >>
+                                        STALE_PAGE_BITS,
+                                    stale_bits.size() * 64);
+    for (u64 page = first; page < end;) {
+        const u64 word = stale_bits[page / 64];
+        if (page % 64 == 0 && page + 64 <= end) {
+            if (word != 0) {
+                return true;
+            }
+            page += 64;
+            continue;
+        }
+        if (((word >> (page % 64)) & 1) != 0) {
+            return true;
+        }
+        ++page;
+    }
+    return false;
+}
+
+template <class P>
+void TextureCache<P>::RecordStaleDrop(const ImageBase& image) {
+    if (image.guest_size_bytes == 0 || True(image.flags & ImageFlagBits::Sparse)) {
+        return;
+    }
+    // DeleteImage marks again what its caller just marked: one entry per drop.
+    if (stale_drop_count != 0) {
+        const StaleDrop& last = stale_drops[(stale_drop_next + StaleDropRing - 1) % StaleDropRing];
+        if (last.cpu_addr == image.cpu_addr && last.size == image.guest_size_bytes &&
+            last.frame == frame_tick) {
+            return;
+        }
+    }
+    stale_drops[stale_drop_next] = StaleDrop{
+        .cpu_addr = image.cpu_addr,
+        .size = image.guest_size_bytes,
+        .gpu_addr = image.gpu_addr,
+        .frame = frame_tick,
+        .format = static_cast<u32>(image.info.format),
+        .width = image.info.size.width,
+        .height = image.info.size.height,
+        .reason = marking_relocation ? LostReasonRelocate : static_cast<u8>(delete_reason),
+        .guard = image.relocation_guard_noted,
+        .shape_key = RelocationShapeKey(image.info),
+    };
+    stale_drop_next = (stale_drop_next + 1) % StaleDropRing;
+    stale_drop_count = (std::min)(stale_drop_count + 1, StaleDropRing);
+}
+
+template <class P>
+auto TextureCache<P>::FindStaleDrop(DAddr addr, size_t size) const -> const StaleDrop* {
+    // A join copied its overlaps into the new image before deleting them: another drop there,
+    // if any, is the one that lost data.
+    const StaleDrop* join = nullptr;
+    for (size_t i = 0; i < stale_drop_count; ++i) {
+        const StaleDrop& drop =
+            stale_drops[(stale_drop_next + StaleDropRing - 1 - i) % StaleDropRing];
+        if (drop.cpu_addr < addr + size && addr < drop.cpu_addr + drop.size) {
+            if (drop.reason != static_cast<u8>(DeleteReason::Join)) {
+                return &drop;
+            }
+            join = join != nullptr ? join : &drop;
+        }
+    }
+    return join;
+}
+
+template <class P>
+void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, bool invalidate) {
+    LostContentStats& s = lost_stats;
+    if (invalidate) {
+        // Overwritten whole (a full clear, a copy over all of it): nothing lost shows.
+        ++s.overwritten;
+        image.lost_contents = 0;
+        return;
+    }
+    if (is_modification) {
+        image.lost_contents |= LostDrawn;
+        return;
+    }
+    const u8 bits = image.lost_contents;
+    image.lost_contents = 0; // counted once
+    ++((bits & LostDrawn) != 0 ? s.sampled_drawn : s.sampled_undrawn);
+    s.sampled_bytes += image.guest_size_bytes;
+    const StaleDrop* const drop = FindStaleDrop(image.cpu_addr, image.guest_size_bytes);
+    const size_t reason = drop == nullptr                         ? 9
+                          : drop->reason == LostReasonRelocate     ? 8
+                          : (std::min<size_t>)(drop->reason, 7);
+    ++s.sampled_by_reason[reason];
+    if (drop != nullptr && (drop->guard & (GuardSampled | GuardLoaded)) != 0) {
+        ++s.sampled_guarded;
+    }
+    // A relocation moved the image away while its old address was still read: that shape and
+    // address never relocate again (as the sampled guard does when it sees the read in time).
+    if (drop != nullptr && reason == 8 &&
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
+                                         "FRITCHII_LOST_WRITEBACK", 1024) > 0) {
+        relocation_guarded_addresses[drop->gpu_addr] |= GuardSampled;
+        relocation_shapes[drop->shape_key].guard |= GuardSampled;
+        ++s.relocation_guards;
+    }
+    if (s.logged < 40) {
+        ++s.logged;
+        static constexpr std::array<const char*, 10> names{
+            "other",       "garbage collect", "cold sweep",       "unmap",      "join",
+            "slot retire", "unmap sweep",     "superseded sweep", "relocation", "not recorded"};
+        LOG_WARNING(HW_GPU,
+                    "Lost contents sampled: format {} {}x{} levels {} at {:#x} ({} KiB), {}{}{}; "
+                    "the memory's GPU data was dropped by: {} (format {} {}x{} at {:#x}, {} "
+                    "frames ago, guard {:#x})",
+                    static_cast<u32>(image.info.format), image.info.size.width,
+                    image.info.size.height, image.info.resources.levels, image.gpu_addr,
+                    image.guest_size_bytes >> 10,
+                    (bits & LostSkipped) != 0 ? "upload skipped as stale" : "stale guest bytes uploaded",
+                    (bits & LostZeroed) != 0 ? ", cleared to zero" : "",
+                    (bits & LostDrawn) != 0 ? ", drawn into without a full clear" : ", not drawn into",
+                    names[reason], drop ? drop->format : 0u, drop ? drop->width : 0u,
+                    drop ? drop->height : 0u, drop ? drop->gpu_addr : GPUVAddr{0},
+                    drop ? frame_tick - drop->frame : 0, drop ? drop->guard : u8{0});
+    }
+}
+
+template <class P>
+void TextureCache<P>::LogLostContents() {
+    LostContentStats& s = lost_stats;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (s.last_log_ns == 0) {
+        s.last_log_ns = now;
+        return;
+    }
+    if (now - s.last_log_ns < 10'000'000'000) {
+        return;
+    }
+    s.last_log_ns = now;
+    const u64 sampled = s.sampled_undrawn + s.sampled_drawn;
+    u64 wb_any = 0;
+    for (size_t i = 0; i < LostPathCount; ++i) {
+        wb_any += s.wb_queued[i] + s.wb_landed[i] + s.wb_refused[i] + s.wb_kept[i] +
+                  s.wb_over_cap[i];
+    }
+    if (s.made_skipped + s.made_uploaded + sampled + wb_any != 0) {
+        const auto& r = s.sampled_by_reason;
+        // queued/landed (MiB) refused R kept K over cap C, per path.
+        std::string wb;
+        static constexpr std::array<const char*, LostPathCount> paths{
+            "", "collector", "cold sweep", "superseded sweep", "slot retire"};
+        for (size_t i = 1; i < LostPathCount; ++i) {
+            wb += fmt::format("{}{} {}/{} ({:.1f} MiB) refused {} kept {} over cap {}",
+                              i == 1 ? "" : "; ", paths[i], s.wb_queued[i], s.wb_landed[i],
+                              static_cast<double>(s.wb_landed_bytes[i]) / (1024.0 * 1024.0),
+                              s.wb_refused[i], s.wb_kept[i], s.wb_over_cap[i]);
+        }
+        LOG_INFO(HW_GPU,
+                 "Lost contents in 10 s (FRITCHII_STALE_ZERO={}, FRITCHII_LOST_WRITEBACK={}): "
+                 "images made over memory whose GPU data was dropped: {} upload skipped ({} "
+                 "cleared to zero), {} uploaded stale guest bytes; {} overwritten whole first; "
+                 "SAMPLED with lost contents: {} ({} not drawn into, {} drawn over; {} KiB; {} "
+                 "were read in a later frame before the drop) by drop: collector {}, cold sweep "
+                 "{}, superseded sweep {}, slot retire {}, join {}, relocation {}, unmap {}/{}, "
+                 "other {}, not recorded {}; relocation guards {}; write-backs queued/landed: {}",
+                 VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_stale_zero,
+                                                  "FRITCHII_STALE_ZERO", 1),
+                 VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
+                                                  "FRITCHII_LOST_WRITEBACK", 1024),
+                 s.made_skipped, s.made_zeroed, s.made_uploaded, s.overwritten, sampled,
+                 s.sampled_undrawn, s.sampled_drawn, s.sampled_bytes >> 10, s.sampled_guarded,
+                 r[1], r[2], r[7], r[5], r[4], r[8], r[3], r[6], r[0], r[9], s.relocation_guards,
+                 wb);
+    }
+    const u64 last = s.last_log_ns;
+    const u64 logged = s.logged;
+    s = {};
+    s.last_log_ns = last;
+    s.logged = logged;
+}
+
+template <class P>
+auto TextureCache<P>::QueueLostWriteback(ImageId image_id, Image& image, u8 path)
+    -> LostWriteback {
+    // 1 (default): every image; N > 1: only images up to N KiB (larger ones dropped as before).
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
+                                                      "FRITCHII_LOST_WRITEBACK", 1024);
+    if (mode <= 0 || False(image.flags & ImageFlagBits::GpuModified) ||
+        True(image.flags & ImageFlagBits::CollectPending) || !IsDownloadable(image)) {
+        return LostWriteback::Drop;
+    }
+    if constexpr (!requires { runtime.CurrentTick(); }) {
+        return LostWriteback::Drop; // no queue (OpenGL)
+    } else {
+        LostContentStats& s = lost_stats;
+        if (mode > 1 && image.guest_size_bytes > u64{static_cast<u32>(mode)} * 1024) {
+            ++s.wb_over_cap[path];
+            return LostWriteback::Drop;
+        }
+        // Bytes a newer image already wrote back: landing this one would put older bytes there.
+        if (NewerWritebackOver(image)) {
+            ++s.wb_refused[path];
+            return LostWriteback::Drop;
+        }
+        if (!QueueCollectDownload(image_id)) {
+            ++s.wb_kept[path];
+            return LostWriteback::Keep;
+        }
+        collect_downloads.back().lost_path = path;
+        ++s.wb_queued[path];
+        return LostWriteback::Queued;
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteWriteback(const ImageBase& image) {
+    recent_writebacks[recent_writeback_next] = RecentWriteback{
+        .cpu_addr = image.cpu_addr,
+        .size = image.guest_size_bytes,
+        .modification = image.modification_tick,
+    };
+    recent_writeback_next = (recent_writeback_next + 1) % RecentWritebackRing;
+}
+
+template <class P>
+bool TextureCache<P>::NewerWritebackOver(const ImageBase& image) const {
+    for (const RecentWriteback& w : recent_writebacks) {
+        if (w.size != 0 && w.modification > image.modification_tick &&
+            w.cpu_addr < image.cpu_addr + image.guest_size_bytes &&
+            image.cpu_addr < w.cpu_addr + w.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
 u64 TextureCache<P>::UncountedDeviceBytes() const {
     // The same subtractions TickFrame makes from the driver's usage.
     u64 bytes = std::accumulate(sentenced_image_bytes.begin(), sentenced_image_bytes.end(),
@@ -810,9 +1096,309 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
             *target = std::strtoull(value, nullptr, 10) << 20;
         }
     }
+    // FRITCHII_VRAM_BUDGET_MODE: these are the base thresholds; the live budget cap only ever
+    // lowers them, and goes when the room under the budget is back.
+    base_expected_memory = expected_memory;
+    base_critical_memory = critical_memory;
+    base_minimum_memory = minimum_memory;
+    ApplyBudgetCap();
     if (log) {
         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
+    }
+}
+
+template <class P>
+void TextureCache<P>::ApplyBudgetCap() {
+    if (base_critical_memory == 0) {
+        return;
+    }
+    critical_memory = base_critical_memory;
+    expected_memory = base_expected_memory;
+    minimum_memory = base_minimum_memory;
+    if (budget_cap >= critical_memory) {
+        return;
+    }
+    // The cap keeps the base thresholds' distance (1.5 GiB with Fritchii's ceiling) between
+    // expected and critical, at least 256 MiB and at most half the cap.
+    const u64 gap = base_critical_memory - (std::min)(base_critical_memory, base_expected_memory);
+    critical_memory = budget_cap;
+    expected_memory = (std::min)(
+        expected_memory,
+        critical_memory - (std::min)(critical_memory / 2, (std::max)(gap, u64{256_MiB})));
+    minimum_memory =
+        (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
+}
+
+template <class P>
+void TextureCache<P>::BudgetControl() {
+    // FRITCHII_VRAM_BUDGET_MODE (live; 0 fixed, 1 vk = default, 2 os). The thresholds above follow
+    // the budget only as far as Fritchii's ceiling (EDEN_NX2_TC_CEILING_MIB, 7680) and the 5/8 cap
+    // allow, and they count the cache's view of the usage: the image pool, deleted images still in
+    // flight, the unused space in the allocators' blocks and whatever the driver holds outside
+    // them are left out. A 16 GB RX 9070 XT at 4K (zortos tester, 2026-11-16) kept the cache's
+    // critical at 7,680 MiB while the driver's count for the process reached the budget, the
+    // driver lowered the budget to it and moved ~10 GB to system RAM (freezes of 15-16 s; a 1365^2
+    // image create took 11.9 s). With a 5-7 GiB hog on the card the budget fell to ~11.6 GB and
+    // nothing followed it.
+    //
+    // Here the driver's own count of the main heap (all of this process's memory in it) is held
+    // under the budget less a headroom: once a second, past it the cache's critical memory comes
+    // down by the excess (at most 1 GiB a second, never under half the budget), with room again it
+    // goes back up (256 MiB a second) until the base thresholds rule again. While the cap binds
+    // (budget_pressure) the collector deletes past critical as with FRITCHII_TC_COLLECT_OVER, the
+    // image pool fits the room (FRITCHII_VRAM_POOL_FIT), kept blocks go back, and images made past
+    // critical first delete clean idle ones (FRITCHII_TC_CRITICAL_ENFORCE). Nothing changes while
+    // the usage stays under the budget less the headroom: an RTX 4080 at 1080p sits ~7 GB under it.
+    // os also counts what other processes hold on the adapter (PDH, sampled on a thread of its
+    // own): Windows' budget for the process in front assumes it can push the others out, which a
+    // program that keeps using its memory defeats (the tester's VRAM hog).
+    if constexpr (requires(u64 value) { runtime.MainHeapNumbers(value, value, value); }) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - budget_control_time < std::chrono::seconds{1}) {
+            return;
+        }
+        budget_control_time = now;
+        const int mode = VideoCore::Nx2Debug::VramBudgetMode();
+        u64 size{};
+        u64 usage{};
+        u64 vk_budget{};
+        if (!runtime.MainHeapNumbers(size, usage, vk_budget) || vk_budget == 0) {
+            return;
+        }
+        BudgetSeen& seen = budget_seen;
+        seen.heap_size = size;
+        seen.usage = usage;
+        seen.vk_budget = vk_budget;
+        seen.os_budget = 0;
+        seen.others = 0;
+        u64 budget = vk_budget;
+        if (mode == 2) {
+            if (const std::optional<u64> others = runtime.OtherProcessesVideoMemory()) {
+                seen.others = *others;
+                seen.os_budget = size - (std::min)(size, *others);
+                budget = (std::min)(budget, seen.os_budget);
+            }
+        }
+        const int headroom_mib = VideoCore::Nx2Debug::SwitchValue(
+            VideoCore::Nx2Debug::g_vram_headroom_mib, "FRITCHII_VRAM_HEADROOM_MIB", 0);
+        // Auto: 1/16 of the budget, 256 MiB to 1 GiB (~950 MiB on a 16 GB card, ~450 on 8 GB).
+        const u64 headroom = headroom_mib > 0
+                                 ? u64{static_cast<u32>(headroom_mib)} << 20
+                                 : std::clamp(budget / 16, u64{256_MiB}, u64{1_GiB});
+        const u64 target = budget - (std::min)(budget, headroom);
+        seen.budget = budget;
+        seen.headroom = headroom;
+        seen.peak_usage = (std::max)(seen.peak_usage, usage);
+        seen.lowest_budget = (std::min)(seen.lowest_budget, budget);
+        seen.over_seconds += usage > target ? 1 : 0;
+        seen.spill_seconds += usage > budget ? 1 : 0;
+        if (mode != seen.mode) {
+            LOG_INFO(HW_GPU,
+                     "VRAM budget control: FRITCHII_VRAM_BUDGET_MODE={} (0 fixed, 1 vk, 2 os), "
+                     "headroom {} MiB; main heap {} MiB, driver budget {} MiB, usage {} MiB",
+                     mode, headroom >> 20, size >> 20, vk_budget >> 20, usage >> 20);
+            seen.mode = mode;
+        }
+        const bool was_pressure = budget_pressure;
+        const u64 old_cap = budget_cap;
+        if (mode == 0) {
+            budget_cap = ~0ULL;
+        } else if (usage > target) {
+            const u64 over = usage - target;
+            const u64 from = (std::min)(budget_cap, total_used_memory);
+            budget_cap = (std::max)(from - (std::min)(from, (std::min)(over, u64{1_GiB})),
+                                    budget / 2);
+        } else if (budget_cap != ~0ULL) {
+            // A dead band of half the headroom, so the cap does not chase the usage up and down.
+            const u64 room = target - usage;
+            if (room > headroom / 2) {
+                budget_cap += (std::min)(room - headroom / 2, u64{256_MiB});
+            }
+        }
+        if (budget_cap >= base_critical_memory) {
+            budget_cap = ~0ULL;
+        }
+        // The pressure also holds while the usage is past the target with the cap at its floor
+        // or above the base (a 16 GB card: half the budget is over Fritchii's 7,680 MiB ceiling,
+        // so the 4K session's spill came with the cache already past a critical it could not
+        // hold): the collector's extra deletes, the fitted pool and the evictions before creates
+        // then act on the base thresholds. It ends half a headroom under the target.
+        const bool over_target = mode != 0 && usage > target;
+        const bool well_under = usage + headroom / 2 <= target;
+        budget_pressure =
+            budget_cap != ~0ULL || over_target || (budget_pressure && mode != 0 && !well_under);
+        if constexpr (requires { runtime.SetBudgetPressure(true); }) {
+            runtime.SetBudgetPressure(budget_pressure);
+        }
+        ApplyBudgetCap();
+        const u64 change = budget_cap > old_cap ? budget_cap - old_cap : old_cap - budget_cap;
+        if (budget_pressure != was_pressure ||
+            (budget_cap != ~0ULL && old_cap != ~0ULL && change >= 256_MiB) ||
+            ((budget_cap == ~0ULL) != (old_cap == ~0ULL))) {
+            LOG_INFO(HW_GPU,
+                     "VRAM budget control ({}): driver usage {} MiB of budget {} MiB (vk {} MiB, "
+                     "os {} MiB, other processes {} MiB), headroom {} MiB: {}; texture cache "
+                     "{} MiB, expected {} MiB, critical {} MiB (base {} MiB)",
+                     mode == 2 ? "os" : (mode == 1 ? "vk" : "fixed"), usage >> 20, budget >> 20,
+                     vk_budget >> 20, seen.os_budget >> 20, seen.others >> 20, headroom >> 20,
+                     !budget_pressure ? "pressure off, cap off"
+                     : budget_cap == ~0ULL
+                         ? "pressure on, no cap under the base thresholds"
+                         : (old_cap == ~0ULL ? "pressure on, cap on" : "pressure on, cap moved"),
+                     total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20,
+                     base_critical_memory >> 20);
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::EnforceCriticalAtCreate(u64 incoming) {
+    // FRITCHII_TC_CRITICAL_ENFORCE (live; 0 off, 1 = default: while the budget cap binds, 2: past
+    // critical at any time). The collector runs once a frame and deletes a bounded number of
+    // images; an area load makes dozens in one frame, each on top of a card already at its budget
+    // (the 11.9 s image create above was the driver making room). Before such an image is made,
+    // clean images (no GPU writes, so no download and no wait) idle for 10+ frames are deleted
+    // until the cache is back under critical with room for it: at most 32 a pass and 256 a frame,
+    // looking at most 512 of the oldest. Images used in the last 10 frames are never taken (what
+    // the draw being set up prepared was touched in this frame), nor bound render targets.
+    // Deleting here is what a join does in the middle of a lookup already (has_deleted_images:
+    // every caller of InsertImage looks up again or gives up the operation).
+    const int enforce = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_tc_critical_enforce, "FRITCHII_TC_CRITICAL_ENFORCE", 1);
+    if (enforce <= 0 || (enforce == 1 && !budget_pressure) ||
+        total_used_memory + incoming <= critical_memory) [[likely]] {
+        return;
+    }
+    static const u64 min_age = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+    }();
+    const u64 idle_frames = (std::max)(u64{10}, min_age);
+    constexpr u32 MaxPerFrame = 256;
+    constexpr size_t MaxPerPass = 32;
+    constexpr size_t MaxLooked = 512;
+    if (create_enforce_frame != frame_tick) {
+        create_enforce_frame = frame_tick;
+        create_enforce_frame_deletes = 0;
+    }
+    auto& stats = create_enforce_stats;
+    if (create_enforce_frame_deletes >= MaxPerFrame) {
+        ++stats.capped;
+        return;
+    }
+    if (frame_tick <= idle_frames) {
+        return;
+    }
+    ++stats.passes;
+    // Render targets bound now are kept whatever their age: RescaleRenderTargets binds a target it
+    // found and keeps its id while it looks up the next one (which may get here), and touches
+    // them only after.
+    std::array<ImageId, NUM_RT + 1> bound{};
+    const auto bound_image = [this](ImageViewId view_id) {
+        return view_id != NULL_IMAGE_VIEW_ID && view_id != ImageViewId{}
+                   ? slot_image_views[view_id].image_id
+                   : ImageId{};
+    };
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        bound[index] = bound_image(render_targets.color_buffer_ids[index]);
+    }
+    bound[NUM_RT] = bound_image(render_targets.depth_buffer_id);
+    auto& candidates = create_enforce_candidates;
+    candidates.clear();
+    size_t looked = 0;
+    lru_cache.ForEachItemBelow(frame_tick - idle_frames, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (False(image.flags & (ImageFlagBits::IsDecoding | ImageFlagBits::CollectPending |
+                                 ImageFlagBits::GpuModified | ImageFlagBits::BadOverlap)) &&
+            std::ranges::find(bound, image_id) == bound.end()) {
+            candidates.push_back(image_id);
+        }
+        return candidates.size() >= MaxPerPass || ++looked >= MaxLooked;
+    });
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::GarbageCollect};
+    for (const ImageId image_id : candidates) {
+        if (total_used_memory + incoming <= critical_memory ||
+            create_enforce_frame_deletes >= MaxPerFrame) {
+            break;
+        }
+        auto& image = slot_images[image_id];
+        const u64 before = total_used_memory;
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        UnregisterImage(image_id);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        ++stats.deleted;
+        ++create_enforce_frame_deletes;
+        stats.freed += before - (std::min)(before, total_used_memory);
+    }
+    if (total_used_memory + incoming > critical_memory) {
+        ++stats.short_of;
+    }
+}
+
+template <class P>
+void TextureCache<P>::LogVramOwners() {
+    // FRITCHII_VRAM_OWNERS (live, seconds between lines, default 10, 0 = off): who holds device
+    // memory, next to the budget. A walk of the live images (a few thousand) every 10 s.
+    if constexpr (requires { runtime.VramOwnersText(u64{}, u64{}); }) {
+        const int seconds = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_owners,
+                                                             "FRITCHII_VRAM_OWNERS", 10);
+        if (seconds <= 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (vram_owners_time == std::chrono::steady_clock::time_point{}) {
+            vram_owners_time = now;
+            return;
+        }
+        if (now - vram_owners_time < std::chrono::seconds{seconds}) {
+            return;
+        }
+        vram_owners_time = now;
+        u64 image_bytes{};
+        u64 gpu_written_bytes{};
+        size_t images{};
+        size_t unbacked{};
+        for (const auto [image_id, image] : slot_images) {
+            ++images;
+            if (True(image->flags & ImageFlagBits::Unbacked)) {
+                ++unbacked;
+                continue;
+            }
+            const u64 bytes = ImageMemoryBytes(*image);
+            image_bytes += bytes;
+            if (True(image->flags & ImageFlagBits::GpuModified)) {
+                gpu_written_bytes += bytes;
+            }
+        }
+        const u64 deleted = std::accumulate(sentenced_image_bytes.begin(),
+                                            sentenced_image_bytes.end(), gpu_sentenced_bytes);
+        BudgetSeen& seen = budget_seen;
+        auto& enforce = create_enforce_stats;
+        LOG_INFO(HW_GPU,
+                 "VRAM owners: {}; texture cache {} images ({} MiB GPU-written, {} unbacked), "
+                 "its view {} MiB, expected {} MiB, critical {} MiB (base {} MiB{}); budget mode {} "
+                 "(0 fixed, 1 vk, 2 os), budget {} MiB (vk {} MiB, os {} MiB, other processes {} "
+                 "MiB), headroom {} MiB, last {} s: peak usage {} MiB, lowest budget {} MiB, {} s "
+                 "over budget less headroom, {} s over the budget; evictions before creates {} "
+                 "passes, {} images, {} MiB, {} short, {} at the frame cap",
+                 runtime.VramOwnersText(image_bytes, deleted), images, gpu_written_bytes >> 20,
+                 unbacked, total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20,
+                 base_critical_memory >> 20, budget_pressure ? ", budget cap on" : "",
+                 seen.mode, seen.budget >> 20, seen.vk_budget >> 20, seen.os_budget >> 20,
+                 seen.others >> 20, seen.headroom >> 20, seconds, seen.peak_usage >> 20,
+                 seen.lowest_budget == ~0ULL ? 0 : seen.lowest_budget >> 20, seen.over_seconds,
+                 seen.spill_seconds, enforce.passes, enforce.deleted, enforce.freed >> 20,
+                 enforce.short_of, enforce.capped);
+        seen.peak_usage = 0;
+        seen.lowest_budget = ~0ULL;
+        seen.over_seconds = 0;
+        seen.spill_seconds = 0;
+        enforce = {};
     }
 }
 
@@ -823,6 +1409,22 @@ void TextureCache<P>::TickFrame() {
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
         if (scratch->capacity() > LargeScratchCapacity) {
             scratch->release();
+        }
+    }
+    LogZeroUploads();
+    LogLostContents();
+    if (depth_native_stats.window != 0) {
+        // FRITCHII_SCALE_DEPTH_MAX: depth images kept native, at most one line per 10 s.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - depth_native_stats.last_log >= std::chrono::seconds{10}) {
+            LOG_INFO(HW_GPU,
+                     "Scale depth max (FRITCHII_SCALE_DEPTH_MAX={}): {} depth images kept at "
+                     "native size in the last 10 s, {} this session",
+                     VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_scale_depth_max,
+                                                      "FRITCHII_SCALE_DEPTH_MAX", 8192),
+                     depth_native_stats.window, depth_native_stats.total);
+            depth_native_stats.window = 0;
+            depth_native_stats.last_log = now;
         }
     }
     // EXP121: before the usage is read below, so landed images leave the queued bytes.
@@ -1039,6 +1641,10 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
         }
     }
+    // FRITCHII_VRAM_BUDGET_MODE / FRITCHII_VRAM_OWNERS: once a second / every 10 s, with the
+    // usage just read (the collector below already sees a moved cap).
+    BudgetControl();
+    LogVramOwners();
     // EDEN_NX2_MEM_TRACE=1 (ported): every 2 s, what the cache holds next to
     // what the process and the driver report (memory climbs).
     static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
@@ -1546,11 +2152,22 @@ void TextureCache<P>::SweepSuperseded() {
             ++s.kept_busy;
             continue;
         }
+        // FRITCHII_LOST_WRITEBACK: written back first (the landing deletes it), or kept for a
+        // later pass while the queue is full.
+        const LostWriteback writeback = QueueLostWriteback(image_id, image, LostPathSuperseded);
+        if (writeback == LostWriteback::Keep) {
+            ++s.kept_busy;
+            continue;
+        }
         s.deleted_bytes += ImageMemoryBytes(image);
         if (superseded_swept.size() >= 65536) {
             superseded_swept.clear(); // the oldest are the least likely to be read again
         }
         superseded_swept[image.gpu_addr] = frame_tick;
+        if (writeback == LostWriteback::Queued) {
+            ++s.deleted;
+            continue;
+        }
         MarkStale(image); // before UntrackImage (see MarkStale)
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
@@ -1585,7 +2202,7 @@ void TextureCache<P>::SweepColdImages() {
         ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
         ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
         ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
-        ImageFlagBits::CostlyLoad;
+        ImageFlagBits::CostlyLoad | ImageFlagBits::CollectPending;
     const auto queued = [](ImageId image_id, const auto& downloads) {
         return std::ranges::any_of(downloads, [image_id](const auto& download) {
             return download.is_swizzle && download.object_id == image_id;
@@ -1739,6 +2356,21 @@ void TextureCache<P>::SweepColdImages() {
             }
             ++index; // FRITCHII_COVERED_RETIRE: the rest still get their coverage checks
             continue;
+        }
+        // FRITCHII_LOST_WRITEBACK (default 1): written back to guest memory first, and deleted
+        // when that lands. Dropped, an image made there later (the dialogue box's text read
+        // again after the UI was hidden: OoT draws it once) had no contents (#1310).
+        switch (QueueLostWriteback(image_id, image, LostPathCold)) {
+        case LostWriteback::Queued:
+            ++deleted;
+            cold_superseded += superseded ? 1 : 0;
+            drop(); // the landing deletes it; used again first, it stays
+            continue;
+        case LostWriteback::Keep:
+            ++index; // the queue is full: a later frame
+            continue;
+        case LostWriteback::Drop:
+            break;
         }
         // As the collector deletes an image it does not download.
         MarkStale(image); // before UntrackImage (see MarkStale)
@@ -4009,10 +4641,25 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         if (!Tegra::Nx2MayBeGpuWritten(image.cpu_addr, image.guest_size_bytes)) {
             ++tc_stale_skips;
             tc_stale_skip_bytes += image.guest_size_bytes;
-            runtime.TransitionImageLayout(image);
+            ++lost_stats.made_skipped;
+            image.lost_contents = LostSkipped;
+            // FRITCHII_STALE_ZERO (live, default 1): zero instead of undefined. A new image's
+            // memory often held another image (the EXP42 pool hands out deleted targets'
+            // VkImages): where the game samples before drawing it whole, that image's texels
+            // showed (other text over a dialogue box, zortos293/Lichii #1310).
+            if (ClearLostToZero(image)) {
+                ++lost_stats.made_zeroed;
+                image.lost_contents |= LostZeroed;
+            } else {
+                runtime.TransitionImageLayout(image);
+            }
             return;
         }
         ++tc_stale_gpu_written;
+    } else if (stale_page_count != 0 && IsAnyStale(image.cpu_addr, image.guest_size_bytes)) {
+        // The upload below brings guest bytes older than the dropped image's GPU writes.
+        ++lost_stats.made_uploaded;
+        image.lost_contents = LostUploaded;
     }
 
     if (True(image.flags & ImageFlagBits::SparseLayers)) {
@@ -4093,7 +4740,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     // Page faults of the whole process meanwhile: ~256 per MiB when the guest memory was paged
     // out (cold-hinted) or the staging memory is new.
     const u64 faults_begin = upload_trace ? Common::GetProcessPageFaults() : 0;
-    if (!UploadInChunks(image)) {
+    if (TryZeroUpload(image)) {
+        // FRITCHII_ZERO_UPLOAD: cleared on the GPU, what the upload of these bytes writes.
+    } else if (!UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         if (upload_trace) [[unlikely]] {
             staging_end = std::chrono::steady_clock::now();
@@ -4150,6 +4799,168 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             uploaded_ranges.emplace_back(image.cpu_addr, image.guest_size_bytes);
         }
     }
+}
+
+/// FRITCHII_ZERO_UPLOAD: bytes looked at until the first non-zero one (all of them when zero).
+[[nodiscard]] inline size_t ZeroPrefixBytes(std::span<const u8> bytes) noexcept {
+    const u8* const data = bytes.data();
+    const size_t size = bytes.size();
+    // 4 KiB at a time: OR-ing words vectorizes; a block with data stops the walk.
+    constexpr size_t Block = 4096;
+    size_t offset = 0;
+    for (; offset + Block <= size; offset += Block) {
+        u64 bits = 0;
+        for (size_t i = 0; i < Block; i += sizeof(u64)) {
+            u64 word;
+            std::memcpy(&word, data + offset + i, sizeof(word));
+            bits |= word;
+        }
+        if (bits != 0) {
+            return offset;
+        }
+    }
+    for (; offset < size; ++offset) {
+        if (data[offset] != 0) {
+            return offset;
+        }
+    }
+    return size;
+}
+
+template <class P>
+bool TextureCache<P>::TryZeroUpload(Image& image) {
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_zero_upload,
+                                                      "FRITCHII_ZERO_UPLOAD");
+    if (mode <= 0) {
+        return false;
+    }
+    if constexpr (!requires { image.ClearToZero(); }) {
+        return false;
+    } else {
+        // Only where zero guest bytes upload as zero texels in every level and layer and the
+        // upload covers the whole host image: plain (not converted, not GPU-decoded), uncompressed
+        // single-sample images whose host image is the guest image (not scaled, padded or
+        // sparse), not a buffer.
+        constexpr ImageFlagBits excluded =
+            ImageFlagBits::AcceleratedUpload | ImageFlagBits::Converted |
+            ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+            ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels |
+            ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding |
+            ImageFlagBits::ZeroFilled | ImageFlagBits::UnwrittenSparse | ImageFlagBits::Rescaled |
+            ImageFlagBits::HostPadded | ImageFlagBits::ScaleLimited;
+        constexpr u64 MinBytes = 256_KiB;
+        if (True(image.flags & excluded) || image.info.type == ImageType::Buffer ||
+            image.info.num_samples != 1 || image.host_level_offset != 0 ||
+            image.guest_size_bytes < MinBytes ||
+            VideoCore::Surface::DefaultBlockWidth(image.info.format) != 1 ||
+            VideoCore::Surface::DefaultBlockHeight(image.info.format) != 1) {
+            return false;
+        }
+        // A slice of a deep block-linear 3D texture spans 16x its texels in guest memory: looking
+        // at all of it costs more than the upload's own read.
+        if (u64{image.guest_size_bytes} > 2 * u64{image.unswizzled_size_bytes}) {
+            ++zero_upload.sparse_skipped;
+            return false;
+        }
+        const u64 start = Common::Nx2Hitch::NowNs();
+        // The bytes the upload would read (GpuGuestMemory, unmapped pages as zeros), in pieces so
+        // a range that is not contiguous copies at most one piece.
+        constexpr size_t Piece = 4_MiB;
+        const size_t total = image.guest_size_bytes;
+        size_t looked = 0;
+        bool zero = true;
+        for (size_t offset = 0; offset < total; offset += Piece) {
+            const size_t size = (std::min)(Piece, total - offset);
+            Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> bytes(
+                *gpu_memory, image.gpu_addr + offset, size, &swizzle_data_buffer);
+            const size_t prefix = ZeroPrefixBytes(std::span<const u8>(bytes.data(), size));
+            looked += prefix;
+            if (prefix != size) {
+                zero = false;
+                break;
+            }
+        }
+        const u64 ns = Common::Nx2Hitch::NowNs() - start;
+        Common::Nx2Hitch::Add(Common::Nx2Hitch::Cause::ZeroUpload, ns, looked);
+        if (!zero) {
+            ++zero_upload.data_images;
+            zero_upload.data_bytes += looked;
+            zero_upload.data_ns += ns;
+            return false;
+        }
+        ++zero_upload.zero_images;
+        zero_upload.zero_bytes += total;
+        zero_upload.zero_ns += ns;
+        if (total >= 4_MiB && zero_upload.logged < 40) {
+            ++zero_upload.logged;
+            LOG_INFO(HW_GPU,
+                     "Zero upload (FRITCHII_ZERO_UPLOAD={}): format {} type {} {}x{}x{} levels {} "
+                     "layers {} at {:#x}, {} KiB guest all zero, {} (checked in {:.2f} ms)",
+                     mode, static_cast<u32>(image.info.format), static_cast<u32>(image.info.type),
+                     image.info.size.width, image.info.size.height, image.info.size.depth,
+                     image.info.resources.levels, image.info.resources.layers, image.gpu_addr,
+                     total >> 10, mode == 1 ? "cleared on the GPU" : "uploaded (count only)",
+                     static_cast<double>(ns) / 1e6);
+        }
+        if (mode != 1) {
+            return false; // 2: count only, the upload runs as before
+        }
+        image.ClearToZero();
+        return true;
+    }
+}
+
+template <class P>
+bool TextureCache<P>::ClearLostToZero(Image& image) {
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_stale_zero, "FRITCHII_STALE_ZERO",
+                                         1) <= 0) {
+        return false;
+    }
+    if constexpr (!requires { image.ClearToZero(true); }) {
+        return false;
+    } else {
+        // Formats a transfer clear can write (uncompressed, not converted), single-sample.
+        constexpr ImageFlagBits excluded =
+            ImageFlagBits::Converted | ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+            ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked |
+            ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding;
+        if (True(image.flags & excluded) || image.info.type == ImageType::Buffer ||
+            image.info.num_samples != 1 ||
+            VideoCore::Surface::DefaultBlockWidth(image.info.format) != 1 ||
+            VideoCore::Surface::DefaultBlockHeight(image.info.format) != 1) {
+            return false;
+        }
+        image.ClearToZero(true); // the image in use, scaled or not
+        return true;
+    }
+}
+
+template <class P>
+void TextureCache<P>::LogZeroUploads() {
+    ZeroUploadStats& s = zero_upload;
+    const s64 now = static_cast<s64>(Common::Nx2Hitch::NowNs());
+    if (s.last_log_ns == 0) {
+        s.last_log_ns = now;
+        return;
+    }
+    if (now - s.last_log_ns < 10'000'000'000) {
+        return;
+    }
+    s.last_log_ns = now;
+    if (s.zero_images + s.data_images + s.sparse_skipped != 0) {
+        const int mode = VideoCore::Nx2Debug::g_zero_upload.load(std::memory_order_relaxed);
+        LOG_INFO(HW_GPU,
+                 "Zero uploads in 10 s (FRITCHII_ZERO_UPLOAD={}): {} uploads all zero ({} MiB "
+                 "guest, checked in {:.1f} ms), {}; {} had data ({} MiB looked at before the first "
+                 "non-zero byte, {:.1f} ms); {} not checked (3D slices, guest footprint over 2x)",
+                 mode, s.zero_images, s.zero_bytes >> 20, static_cast<double>(s.zero_ns) / 1e6,
+                 mode == 1 ? "cleared on the GPU" : "uploaded as before (count only)",
+                 s.data_images, s.data_bytes >> 20, static_cast<double>(s.data_ns) / 1e6,
+                 s.sparse_skipped);
+    }
+    s.zero_images = s.zero_bytes = s.zero_ns = 0;
+    s.data_images = s.data_bytes = s.data_ns = 0;
+    s.sparse_skipped = 0;
 }
 
 template <class P>
@@ -4712,6 +5523,35 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
             return false;
         }
     }
+    // FRITCHII_SCALE_DEPTH_MAX (default 8192, 0 off): a depth/stencil image whose scaled width or
+    // height would pass N stays at native size. OoT's 12288x12288 D16 sun shadow map (288 MiB
+    // native, made on every Castle Town load) is 648 MiB at 1.5x and 1.15 GiB at 2x on NVIDIA
+    // (32768 limit, so the extent cap above keeps scaling it), and 450 MiB at 1.25x on AMD.
+    // A shadow map that size gains nothing visible from scaling; its memory is what tips a card
+    // over the budget. Same native path as the extent cap: the render target set of that pass
+    // stays native, samplers, copies and blits handle a native image next to scaled ones as for
+    // any image that is not rescaleable. Like the cap, checked before the cached answer.
+    if (const int depth_max = VideoCore::Nx2Debug::SwitchValue(
+            VideoCore::Nx2Debug::g_scale_depth_max, "FRITCHII_SCALE_DEPTH_MAX", 8192);
+        depth_max > 0 && GetFormatType(image.info.format) != SurfaceType::ColorTexture &&
+        !ScaledImageFits(image.info, Settings::values.resolution_info,
+                         static_cast<u32>(depth_max))) {
+        if (False(image.flags & ImageFlagBits::DepthNative)) {
+            image.flags |= ImageFlagBits::DepthNative;
+            ++depth_native_stats.window;
+            if (const u64 n = ++depth_native_stats.total; n <= 16) {
+                LOG_INFO(HW_GPU,
+                         "Depth image {}x{} (format {}, {} samples) stays at native size: scaled "
+                         "it would be {}x{}, past {} (FRITCHII_SCALE_DEPTH_MAX, {} so far)",
+                         image.info.size.width, image.info.size.height,
+                         static_cast<u32>(image.info.format), image.info.num_samples,
+                         Settings::values.resolution_info.ScaleUp(image.info.size.width),
+                         Settings::values.resolution_info.ScaleUp(image.info.size.height),
+                         depth_max, n);
+            }
+        }
+        return false;
+    }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
     }
@@ -5032,7 +5872,11 @@ std::optional<DAddr> TextureCache<P>::ImageCpuAddress(GPUVAddr gpu_addr, size_t 
 template <class P>
 ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                      RelaxedOptions options) {
-    std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
+    // FRITCHII_TC_CRITICAL_ENFORCE: room first when the cache is past critical and the budget is
+    // short (the guest size stands in for the host image's).
+    const auto guest_size = CalculateGuestSizeInBytes(info);
+    EnforceCriticalAtCreate(guest_size);
+    std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, guest_size);
     if (!cpu_addr) {
         const DAddr fake_addr = ~(1ULL << 40ULL) + virtual_invalid_space;
         virtual_invalid_space += Common::AlignUp(CalculateGuestSizeInBytes(info), 32);
@@ -7120,7 +7964,9 @@ template <class P>
 void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr cpu_addr) {
     Image& image = slot_images[image_id];
     // 1. The GPU's data at the old address is lost, as when the collector deletes the image.
+    marking_relocation = true; // the lost contents counter's attribution
     MarkStale(image); // before UntrackImage (see MarkStale)
+    marking_relocation = false;
     if (True(image.flags & ImageFlagBits::Tracked)) {
         UntrackImage(image, image_id);
     }
@@ -7168,6 +8014,7 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
     image.last_write_frame = ~u64{0};
     image.write_streak = 0;
     image.relocation_guard_noted = 0;
+    image.lost_contents = 0;
     // A new target to the asynchronous shaders' skip rule too: its draws wait until it was
     // cleared at this address in two render frames (ClassifyDrawTargets).
     image.last_clear_frame = ~u64{0};
@@ -7308,6 +8155,52 @@ void TextureCache<P>::CountGpuModified(ImageBase& image) noexcept {
 }
 
 template <class P>
+bool TextureCache<P>::EarlyImageWritePending(ImageViewId id) noexcept {
+    if constexpr (requires { runtime.IsFree(u64{}); }) {
+        const ImageViewBase& view = slot_image_views[id];
+        if (!view.image_id) {
+            return false;
+        }
+        const ImageBase& image = slot_images[view.image_id];
+        return image.early_write_tick != 0 && !runtime.IsFree(image.early_write_tick);
+    }
+    return false;
+}
+
+template <class P>
+auto TextureCache<P>::ComputeSkipImageState(DAddr addr, u64 size) -> SkipImageState {
+    const u64 render_frame = RenderFrame();
+    const DAddr end = addr + size;
+    bool covered = false;
+    SkipImageState state = SkipImageState::Redrawn;
+    ForEachImageInRegion(addr, size, [&](ImageId, ImageBase& image) {
+        if (state != SkipImageState::Redrawn) {
+            return;
+        }
+        if (False(image.flags & ImageFlagBits::GpuModified) ||
+            True(image.flags & ImageFlagBits::CpuModified)) {
+            state = SkipImageState::NoGpuData;
+            return;
+        }
+        // Written in this frame and the 7 before, or in the last frame and the 7 before that.
+        const bool streak_now =
+            IsRedrawnTarget(image.last_write_frame, image.write_streak, render_frame);
+        const bool streak_before = render_frame != 0 &&
+                                   IsRedrawnTarget(image.last_write_frame, image.write_streak,
+                                                   render_frame - 1);
+        if (!streak_now && !streak_before) {
+            state = SkipImageState::NotRedrawn;
+            return;
+        }
+        covered = covered || (image.cpu_addr <= addr && end <= image.cpu_addr_end);
+    });
+    if (state == SkipImageState::Redrawn && !covered) {
+        return SkipImageState::NoImage;
+    }
+    return state;
+}
+
+template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     CountGpuModified(image); // EXP100
@@ -7315,6 +8208,11 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.nx2_content_hash_lo = 0;
     image.nx2_content_hash_hi = 0;
     image.modification_tick = ++modification_tick;
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        if (VideoCommon::EarlyCompute::g_early) [[unlikely]] {
+            image.early_write_tick = runtime.CurrentTick();
+        }
+    }
     const u64 render_frame = RenderFrame();
     image.write_streak = NextWriteStreak(image.last_write_frame, image.write_streak, render_frame);
     image.last_write_frame = render_frame;
@@ -7424,6 +8322,15 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
         retire.push_back(overlap_id);
     }
     slot_clears += seen ? 1 : 0;
+    // FRITCHII_LOST_WRITEBACK (default 1): written back first, deleted when that lands; until then
+    // it stays a bad overlap of the new image (so it leaves the retire list), as one the queue
+    // has no room for.
+    retire.erase(std::remove_if(retire.begin(), retire.end(),
+                                [this](ImageId old_id) {
+                                    return QueueLostWriteback(old_id, slot_images[old_id],
+                                                              LostPathSlot) != LostWriteback::Drop;
+                                }),
+                 retire.end());
     for (const ImageId old_id : retire) {
         // As EXP43=1 and the cold sweep delete one (no download: the contents have no reader).
         Image& old = slot_images[old_id];
@@ -7802,6 +8709,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         if (!image.aliased_images.empty()) {
             SynchronizeAliases(image_id);
         }
+    }
+    if (image.lost_contents != 0) [[unlikely]] {
+        NoteLostContents(image, is_modification, invalidate);
     }
     if (is_modification) {
         if constexpr (requires { &Image::BackTilesWhole; }) {

@@ -72,6 +72,8 @@ enum class ImageFlagBits : u32 {
     /// FRITCHII_SCALED_EXTENT_CAP: its scaled size would pass the device's limits, so it stays
     /// native; logged once.
     ScaleLimited = 1 << 27,
+    /// FRITCHII_SCALE_DEPTH_MAX: a depth image kept native for its scaled size; counted once.
+    DepthNative = 1 << 28,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -150,6 +152,8 @@ struct ImageBase {
     VAddr cpu_addr_end = 0;
 
     u64 modification_tick = 0;
+    /// FRITCHII_EARLY_COMPUTE (dry): the scheduler tick of its last GPU write (MarkModification).
+    u64 early_write_tick = 0;
     size_t lru_index = SIZE_MAX;
     /// The frame tick of the last LRU touch (TextureCache::TouchImageLru, EDEN_NX2_EXP90); reset
     /// when the image gets a new LRU node.
@@ -165,6 +169,9 @@ struct ImageBase {
     /// overlap in JoinImages), and the frame its coverage was last checked.
     u64 covered_overlap_frame = 0;
     u64 covered_check_frame = 0;
+    /// Made where a GPU-written image was dropped without a write-back (TextureCache's lost
+    /// contents counter): bits of TextureCache::LostBits, 0 once counted or overwritten whole.
+    u8 lost_contents = 0;
 
     /// Unmapped images (TextureCache::UnmapGPUMemory): the frame + 1 at which an unmap of its GPU
     /// memory flagged it Remapped (0 = none did, or it was found again since) and its device

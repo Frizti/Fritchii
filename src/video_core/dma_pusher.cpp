@@ -28,6 +28,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/dma_pusher.h"
+#include "video_core/back_read_audit.h"
 #include "video_core/command_fetch_order.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/fermi_2d.h"
@@ -1439,38 +1440,186 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
 }
 
+namespace {
+
+/// FRITCHII_REFRESH_LEAN (live, default 0; helper CG): the words a list refresh copies again
+/// (RefreshSnapshot after a resume, RefreshDeferredEntries after a map). Old: ReadBlockUnsafe per
+/// entry, which translates the entry's page (GPU page table, then device to host) every time:
+/// ~0.9% of the front sampled in GetPointer alone (v4 sample, 2026-11-15), with the entries of a
+/// list mostly side by side on the same pages. 1 = each 4 KiB GPU page is translated once per
+/// refresh and the entry copied from the host pointer (GetPointer of the page plus the offset,
+/// which is what ReadBlockUnsafe's own one-page path reads); a page without a host pointer
+/// (unmapped, sparse without memory, outside the address space) sends the entry the old way.
+/// 2 = verify: the same copy into a scratch buffer, then the old copy into the list (the words
+/// used are the old path's), every byte compared (differ must be 0). Line every 10 s while on.
+struct RefreshLeanStats {
+    std::chrono::steady_clock::time_point since{};
+    u64 refreshes{};
+    u64 entries{};
+    u64 bytes{};
+    u64 translated{}; ///< pages translated
+    u64 reused{};     ///< page copies served by the refresh's last translation
+    u64 old_way{};    ///< entries a page without a host pointer sent through ReadBlockUnsafe
+    u64 compared{};
+    u64 differ{};
+    u64 differ_session{};
+};
+thread_local RefreshLeanStats t_refresh_lean;
+
+int RefreshLeanMode() {
+    if (VideoCommon::BackReadAudit::enabled) [[unlikely]] {
+        return 0; // The audit sees every read the old way
+    }
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_refresh_lean,
+                                            "FRITCHII_REFRESH_LEAN");
+}
+
+/// The refresh's last translated 4 KiB GPU page.
+struct RefreshPageCache {
+    GPUVAddr page = ~GPUVAddr{0};
+    const u8* host = nullptr;
+};
+
+/// Copies `bytes` at `address` page by page through `cache`. False: a page has no host pointer
+/// (what was copied so far is left for the caller's old-way copy to overwrite).
+bool CopyRefreshCached(const Tegra::MemoryManager& memory, RefreshPageCache& cache,
+                       GPUVAddr address, u8* dest, size_t bytes, RefreshLeanStats& s) {
+    constexpr GPUVAddr PageSize = 0x1000;
+    while (bytes != 0) {
+        const GPUVAddr page = address & ~(PageSize - 1);
+        const size_t offset = static_cast<size_t>(address - page);
+        const size_t chunk = (std::min)(bytes, static_cast<size_t>(PageSize) - offset);
+        if (page != cache.page) {
+            ++s.translated;
+            cache.host = memory.GetPointer(page);
+            if (cache.host == nullptr) {
+                cache.page = ~GPUVAddr{0};
+                return false;
+            }
+            cache.page = page;
+        } else {
+            ++s.reused;
+        }
+        std::memcpy(dest, cache.host + offset, chunk);
+        dest += chunk;
+        address += chunk;
+        bytes -= chunk;
+    }
+    return true;
+}
+
+void MaybeLogRefreshLean(int mode) {
+    RefreshLeanStats& s = t_refresh_lean;
+    const auto now = std::chrono::steady_clock::now();
+    if (s.since == std::chrono::steady_clock::time_point{}) {
+        s.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - s.since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "Refresh lean (FRITCHII_REFRESH_LEAN={}) {:.0f} s: refreshes {:.0f}/s, entries "
+             "{:.0f}/s, {:.0f} KiB/s; pages translated {:.0f}/s, reused {:.0f}/s, entries the old "
+             "way {:.0f}/s; verify: {:.0f} entries compared/s, {} differ (must be 0, {} this "
+             "session)",
+             mode, seconds, static_cast<double>(s.refreshes) / seconds,
+             static_cast<double>(s.entries) / seconds,
+             static_cast<double>(s.bytes) / 1024.0 / seconds,
+             static_cast<double>(s.translated) / seconds, static_cast<double>(s.reused) / seconds,
+             static_cast<double>(s.old_way) / seconds, static_cast<double>(s.compared) / seconds,
+             s.differ, s.differ_session);
+    const u64 differ_session = s.differ_session;
+    s = RefreshLeanStats{};
+    s.since = now;
+    s.differ_session = differ_session;
+}
+
+} // namespace
+
+void DmaPusher::RefreshEntryWords(CommandList& list, size_t i, int lean_mode, void* page_cache) {
+    if (i >= list.command_lists.size() || i >= list.submitted_offsets.size()) {
+        return;
+    }
+    const CommandListHeader& entry = list.command_lists[i];
+    const u32 offset = list.submitted_offsets[i];
+    if (offset + entry.size > list.submitted_words.size()) {
+        return;
+    }
+    CommandHeader* const dest = list.submitted_words.data() + offset;
+    const size_t bytes = static_cast<size_t>(entry.size) * sizeof(u32);
+    if (lean_mode == 0) {
+        memory_manager.ReadBlockUnsafe(entry.addr, dest, bytes);
+        return;
+    }
+    RefreshLeanStats& s = t_refresh_lean;
+    ++s.entries;
+    s.bytes += bytes;
+    auto& cache = *static_cast<RefreshPageCache*>(page_cache);
+    if (lean_mode == 2) {
+        thread_local std::vector<u8> scratch;
+        scratch.resize(bytes);
+        const bool cached =
+            CopyRefreshCached(memory_manager, cache, entry.addr, scratch.data(), bytes, s);
+        memory_manager.ReadBlockUnsafe(entry.addr, dest, bytes);
+        if (!cached) {
+            ++s.old_way;
+            return;
+        }
+        ++s.compared;
+        if (bytes != 0 && std::memcmp(scratch.data(), dest, bytes) != 0) {
+            ++s.differ;
+            if (++s.differ_session <= 8) {
+                LOG_WARNING(HW_GPU,
+                            "Refresh lean (FRITCHII_REFRESH_LEAN=2, must be 0): the entry of {} "
+                            "words at {:#x} differs from ReadBlockUnsafe's copy",
+                            static_cast<u32>(entry.size), static_cast<u64>(entry.addr));
+            }
+        }
+        return;
+    }
+    if (!CopyRefreshCached(memory_manager, cache, entry.addr, reinterpret_cast<u8*>(dest), bytes,
+                           s)) {
+        ++s.old_way;
+        memory_manager.ReadBlockUnsafe(entry.addr, dest, bytes);
+    }
+}
+
 void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, size_t first_entry) {
     list.snapshot_suspensions = now;
     if (VideoCommon::FrontSplit::g_state != 0) [[unlikely]] {
         ++list.refreshes; // FRITCHII_FRONT_SPLIT_COUNT's "re-read twice" (Step)
     }
+    // FRITCHII_REFRESH_LEAN: one relaxed load per refresh while off.
+    const int lean_mode = RefreshLeanMode();
+    RefreshPageCache cache;
+    if (lean_mode != 0) [[unlikely]] {
+        ++t_refresh_lean.refreshes;
+    }
     for (size_t i = first_entry; i < list.command_lists.size() && i < list.submitted_offsets.size();
          ++i) {
-        const CommandListHeader& entry = list.command_lists[i];
-        const u32 offset = list.submitted_offsets[i];
-        if (offset + entry.size > list.submitted_words.size()) {
-            continue;
-        }
-        memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
-                                       entry.size * sizeof(u32));
+        RefreshEntryWords(list, i, lean_mode, &cache);
     }
     list.deferred_entries.clear();
+    if (lean_mode != 0) [[unlikely]] {
+        MaybeLogRefreshLean(lean_mode);
+    }
 }
 
 void DmaPusher::RefreshDeferredEntries(CommandList& list) {
+    const int lean_mode = RefreshLeanMode();
+    RefreshPageCache cache;
+    if (lean_mode != 0) [[unlikely]] {
+        ++t_refresh_lean.refreshes;
+    }
     for (const u32 i : list.deferred_entries) {
-        if (i >= list.command_lists.size() || i >= list.submitted_offsets.size()) {
-            continue;
-        }
-        const CommandListHeader& entry = list.command_lists[i];
-        const u32 offset = list.submitted_offsets[i];
-        if (offset + entry.size > list.submitted_words.size()) {
-            continue;
-        }
-        memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
-                                       entry.size * sizeof(u32));
+        RefreshEntryWords(list, i, lean_mode, &cache);
     }
     list.deferred_entries.clear();
+    if (lean_mode != 0) [[unlikely]] {
+        MaybeLogRefreshLean(lean_mode);
+    }
 }
 
 bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {

@@ -46,6 +46,7 @@ add_library(video_core STATIC
     dirty_flags.h
     dma_pusher.cpp
     dma_pusher.h
+    early_compute.h
     engines/sw_blitter/blitter.cpp
     engines/sw_blitter/blitter.h
     engines/sw_blitter/converter.cpp
@@ -118,6 +119,7 @@ add_library(video_core STATIC
     fritchii_e_split_thread.cpp
     fritchii_e_split_thread.h
     fritchii_fill_cuts.h
+    fritchii_occl_lean.h
     fritchii_front_split.cpp
     fritchii_front_split.h
     fritchii_focus.h
@@ -258,6 +260,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_dlss_network_probe.h
     renderer_vulkan/vk_ocarina_camera_motion.cpp
     renderer_vulkan/vk_ocarina_camera_motion.h
+    renderer_vulkan/vk_async_compute_skip.h
     renderer_vulkan/vk_compute_pipeline.cpp
     renderer_vulkan/vk_compute_pipeline.h
     renderer_vulkan/vk_cooperative_hmma_test.cpp
@@ -286,6 +289,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_mem_stage_shadow.h
     renderer_vulkan/vk_one_follower_draw.cpp
     renderer_vulkan/vk_one_follower_draw.h
+    renderer_vulkan/vk_pipeline_binary.cpp
+    renderer_vulkan/vk_pipeline_binary.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_pipeline_translate_queue.cpp
@@ -314,8 +319,12 @@ add_library(video_core STATIC
     renderer_vulkan/vk_shader_util.h
     renderer_vulkan/vk_staging_buffer_pool.cpp
     renderer_vulkan/vk_staging_buffer_pool.h
+    renderer_vulkan/vk_side_queue.cpp
+    renderer_vulkan/vk_side_queue.h
     renderer_vulkan/vk_state_tracker.cpp
     renderer_vulkan/vk_state_tracker.h
+    renderer_vulkan/vk_submit_times.cpp
+    renderer_vulkan/vk_submit_times.h
     renderer_vulkan/vk_swapchain.cpp
     renderer_vulkan/vk_swapchain.h
     renderer_vulkan/vk_texture_cache.cpp
@@ -392,6 +401,8 @@ add_library(video_core STATIC
     texture_cache/samples_helper.h
     texture_cache/texture_cache.cpp
     texture_cache/texture_cache.h
+    test_watermark.cpp
+    test_watermark.h
     texture_cache/texture_cache_base.h
     texture_cache/types.h
     texture_cache/util.cpp

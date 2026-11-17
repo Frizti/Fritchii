@@ -15,11 +15,12 @@
 #include <string>
 #include <system_error>
 #include <thread>
-#include <unordered_set>
+#include <unordered_map>
 
 #include <fmt/format.h>
 
 #include "common/fritchii_jit_list.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/thread.h"
 
@@ -44,18 +45,29 @@ constexpr std::uintmax_t MaxFileBytes = std::uintmax_t{64} << 20;
 constexpr u32 MaxCores = 8;
 constexpr auto WriteEvery = std::chrono::seconds{10};
 
+/// The writer line's split of the compiles the game waited for (Note).
+enum DemandKind : std::size_t {
+    DemandNotListed,     ///< new to the list
+    DemandListed,        ///< listed, the warm-up had not compiled it yet
+    DemandEarlier,       ///< compiled earlier this launch (dropped since, or a core was on it)
+    DemandOutsideImage,  ///< outside the code image (never listed)
+};
+
 struct State {
     std::mutex mutex;
     u64 base{};
     u64 size{};
     std::filesystem::path path;
-    std::unordered_set<u64> known; ///< Entries listed or recorded
-    std::vector<u64> list;         ///< Location keys to warm up, in list order
+    /// Entries listed or recorded -> 1 when listed (the file or the seed), 0 when recorded now
+    std::unordered_map<u64, u8> known;
+    std::vector<u64> list; ///< Location keys to warm up, in list order
     std::array<std::size_t, MaxCores> cursor{};
     std::vector<u64> pending; ///< Entries to append to the file
     std::size_t loaded{};
     std::size_t recorded{};
     std::size_t written{};
+    /// Compiles while the game waited since the writer's last line, by DemandKind
+    std::array<u64, 4> demand{};
     bool file_ok{};
     bool stopping{};
     std::condition_variable cv;
@@ -142,20 +154,27 @@ void WriterLoop() {
         std::size_t total = 0;
         std::array<std::size_t, MaxCores> cursor{};
         std::size_t list_size = 0;
+        std::array<u64, 4> demand{};
         {
             std::unique_lock lock{state.mutex};
             state.cv.wait_for(lock, WriteEvery, [&state] { return state.stopping; });
             stop = state.stopping;
-            if (!state.file_ok || state.pending.empty()) {
+            if (!state.file_ok) {
                 continue;
             }
+            demand = state.demand;
+            state.demand = {};
             batch.swap(state.pending);
             path = state.path;
             total = state.known.size();
             cursor = state.cursor;
             list_size = state.list.size();
         }
-        const bool ok = AppendEntries(path, batch);
+        const bool any_demand = demand[0] + demand[1] + demand[2] + demand[3] != 0;
+        if (batch.empty() && !any_demand) {
+            continue;
+        }
+        const bool ok = batch.empty() || AppendEntries(path, batch);
         {
             std::scoped_lock lock{state.mutex};
             if (ok) {
@@ -165,11 +184,18 @@ void WriterLoop() {
             }
         }
         if (ok) {
+            // The tail (2026-11-17): what the game waited for in this window, so a hitch wave
+            // says whether the list missed it (not listed), the warm-up missed it (listed), or
+            // the code cache dropped it (earlier). The head stays as it was (log scripts).
             LOG_INFO(Core_ARM,
                      "JIT block list (FRITCHII_JIT_BLOCK_LIST={}): {} new blocks written, {} "
-                     "listed; warm-up handed out {}/{}/{}/{} of {} loaded",
+                     "listed; warm-up handed out {}/{}/{}/{} of {} loaded; compiles the game "
+                     "waited for: not listed {}, listed but not warmed yet {}, compiled earlier "
+                     "this launch (dropped since, or another core was compiling it) {}, outside "
+                     "the code image {}",
                      Mode(), batch.size(), total, cursor[0], cursor[1], cursor[2], cursor[3],
-                     list_size);
+                     list_size, demand[DemandNotListed], demand[DemandListed],
+                     demand[DemandEarlier], demand[DemandOutsideImage]);
         } else {
             LOG_WARNING(Core_ARM, "JIT block list: could not write {}, recording stops",
                         path.string());
@@ -188,6 +214,85 @@ std::string BuildIdText(std::span<const u8> build_id) {
         text += fmt::format("{:02X}", build_id[i]);
     }
     return text;
+}
+
+/// The whole file when its size can hold a list (empty otherwise).
+std::vector<u8> ReadAll(const std::filesystem::path& path) {
+    std::error_code error;
+    const std::uintmax_t file_size = std::filesystem::file_size(path, error);
+    std::vector<u8> data;
+    if (!error && file_size >= HeaderSize && file_size <= MaxFileBytes) {
+        std::ifstream file{path, std::ios::binary};
+        data.resize(static_cast<std::size_t>(file_size));
+        if (!file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()))) {
+            data.clear();
+        }
+    }
+    return data;
+}
+
+bool HeaderMatches(const std::filesystem::path& path, const std::vector<u8>& header) {
+    std::ifstream file{path, std::ios::binary};
+    std::array<char, HeaderSize> head{};
+    return file.read(head.data(), static_cast<std::streamsize>(head.size())) &&
+           std::memcmp(head.data(), header.data(), HeaderSize) == 0;
+}
+
+/// Lists the entries of `data` (a list file) that are not known yet, for the image in `state`.
+/// Returns how many leading bytes of it are good: 0 when its header is not `header`.
+std::size_t ListEntries(State& state, const std::vector<u8>& data, const std::vector<u8>& header) {
+    if (data.size() < HeaderSize || std::memcmp(data.data(), header.data(), HeaderSize) != 0) {
+        return 0;
+    }
+    std::size_t valid_bytes = HeaderSize;
+    std::size_t offset = HeaderSize;
+    while (offset + ChunkHeaderSize <= data.size() && state.known.size() < MaxEntries) {
+        const u32 count = Get<u32>(data, offset);
+        const u64 sum = Get<u64>(data, offset + 8);
+        const std::size_t bytes = std::size_t{count} * sizeof(u64);
+        if (count == 0 || count > MaxChunkEntries ||
+            offset + ChunkHeaderSize + bytes > data.size() ||
+            Checksum(data.data() + offset + ChunkHeaderSize, bytes) != sum) {
+            break;
+        }
+        bool chunk_ok = true;
+        for (u32 i = 0; i < count; ++i) {
+            const u64 entry = Get<u64>(data, offset + ChunkHeaderSize + i * sizeof(u64));
+            if ((entry & PcMask) >= state.size || (entry & SingleStepBit) != 0) {
+                chunk_ok = false;
+                break;
+            }
+        }
+        if (!chunk_ok) {
+            break;
+        }
+        for (u32 i = 0; i < count && state.known.size() < MaxEntries; ++i) {
+            const u64 entry = Get<u64>(data, offset + ChunkHeaderSize + i * sizeof(u64));
+            if (state.known.try_emplace(entry, u8{1}).second) {
+                state.list.push_back(((state.base + (entry & PcMask)) & PcMask) |
+                                     (entry & ~PcMask));
+            }
+        }
+        offset += ChunkHeaderSize + bytes;
+        valid_bytes = offset;
+    }
+    return valid_bytes;
+}
+
+/// FRITCHII_JIT_LIST_SEED (boot): the directory of shipped lists, empty when off.
+std::filesystem::path SeedDir() {
+    const char* const value = std::getenv("FRITCHII_JIT_LIST_SEED");
+    if (value == nullptr || value[0] == '\0' || (value[0] == '0' && value[1] == '\0')) {
+        return {};
+    }
+    if (value[0] == '1' && value[1] == '\0') {
+#ifdef _WIN32
+        return Common::FS::GetExeDirectory() / "jit";
+#else
+        return {};
+#endif
+    }
+    return std::filesystem::path{value};
 }
 
 } // Anonymous namespace
@@ -216,60 +321,37 @@ void Begin(u64 program_id, std::span<const u8> build_id, u64 image_base, u64 ima
     state.cursor = {};
     state.pending.clear();
     state.loaded = state.recorded = state.written = 0;
+    state.demand = {};
     state.stopping = false;
     state.file_ok = false;
 
     std::error_code error;
     const std::filesystem::path dir = cache_dir / "jit";
     std::filesystem::create_directories(dir, error);
-    state.path = dir / fmt::format("{:016X}-{}.blocks", program_id, BuildIdText(build_id));
+    // One file per code layout (2026-11-17): a mod that adds a module changes the image size, and
+    // one shared file was rewritten from zero at every switch between the two layouts.
+    const std::string title_name = fmt::format("{:016X}-{}", program_id, BuildIdText(build_id));
+    const std::string file_name = fmt::format("{}-{:X}.blocks", title_name, image_size);
+    state.path = dir / file_name;
     const std::vector<u8> header = MakeHeader(program_id, build_id, image_size);
 
+    // A per-title file of earlier builds moves to this layout's name when it is this layout's;
+    // another layout's stays where it is for that layout's next launch.
+    bool renamed = false;
+    {
+        const std::filesystem::path old_path = dir / (title_name + ".blocks");
+        std::error_code exists_error;
+        if (!std::filesystem::exists(state.path, exists_error) &&
+            std::filesystem::exists(old_path, exists_error) && HeaderMatches(old_path, header)) {
+            std::error_code rename_error;
+            std::filesystem::rename(old_path, state.path, rename_error);
+            renamed = !rename_error;
+        }
+    }
+
     // Read what earlier launches recorded.
-    std::size_t valid_bytes = 0;
-    std::vector<u8> data;
-    const std::uintmax_t file_size = std::filesystem::file_size(state.path, error);
-    if (!error && file_size >= HeaderSize && file_size <= MaxFileBytes) {
-        std::ifstream file{state.path, std::ios::binary};
-        data.resize(static_cast<std::size_t>(file_size));
-        if (!file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()))) {
-            data.clear();
-        }
-    }
-    if (data.size() >= HeaderSize && std::memcmp(data.data(), header.data(), HeaderSize) == 0) {
-        valid_bytes = HeaderSize;
-        std::size_t offset = HeaderSize;
-        while (offset + ChunkHeaderSize <= data.size() && state.known.size() < MaxEntries) {
-            const u32 count = Get<u32>(data, offset);
-            const u64 sum = Get<u64>(data, offset + 8);
-            const std::size_t bytes = std::size_t{count} * sizeof(u64);
-            if (count == 0 || count > MaxChunkEntries ||
-                offset + ChunkHeaderSize + bytes > data.size() ||
-                Checksum(data.data() + offset + ChunkHeaderSize, bytes) != sum) {
-                break;
-            }
-            bool chunk_ok = true;
-            for (u32 i = 0; i < count; ++i) {
-                const u64 entry = Get<u64>(data, offset + ChunkHeaderSize + i * sizeof(u64));
-                if ((entry & PcMask) >= image_size || (entry & SingleStepBit) != 0) {
-                    chunk_ok = false;
-                    break;
-                }
-            }
-            if (!chunk_ok) {
-                break;
-            }
-            for (u32 i = 0; i < count && state.known.size() < MaxEntries; ++i) {
-                const u64 entry = Get<u64>(data, offset + ChunkHeaderSize + i * sizeof(u64));
-                if (state.known.insert(entry).second) {
-                    state.list.push_back(((image_base + (entry & PcMask)) & PcMask) |
-                                         (entry & ~PcMask));
-                }
-            }
-            offset += ChunkHeaderSize + bytes;
-            valid_bytes = offset;
-        }
-    }
+    const std::vector<u8> data = ReadAll(state.path);
+    const std::size_t valid_bytes = ListEntries(state, data, header);
     state.loaded = state.list.size();
     if (valid_bytes == 0) {
         // No list for this image yet (or another build's): start one.
@@ -278,21 +360,39 @@ void Begin(u64 program_id, std::span<const u8> build_id, u64 image_base, u64 ima
                    static_cast<std::streamsize>(header.size()));
         state.file_ok = static_cast<bool>(file);
     } else {
+        std::error_code resize_error;
         if (valid_bytes < data.size()) {
-            std::filesystem::resize_file(state.path, valid_bytes, error); // a torn tail
+            std::filesystem::resize_file(state.path, valid_bytes, resize_error); // a torn tail
         }
-        state.file_ok = !error;
+        state.file_ok = !resize_error;
+    }
+
+    // FRITCHII_JIT_LIST_SEED: a shipped list's blocks this user's list lacks, warmed after it.
+    std::size_t seeded = 0;
+    std::filesystem::path seed_path;
+    if (mode == 1) {
+        seed_path = SeedDir();
+        if (!seed_path.empty()) {
+            seed_path /= file_name;
+            const std::size_t before = state.list.size();
+            static_cast<void>(ListEntries(state, ReadAll(seed_path), header));
+            seeded = state.list.size() - before;
+        }
     }
     if (mode != 1) {
         state.list.clear(); // record only
     }
     LOG_INFO(Core_ARM,
-             "JIT block list (FRITCHII_JIT_BLOCK_LIST={}): {} blocks loaded from {} ({} bytes "
-             "kept of {}), image {:#x} size {:#x}, {}",
-             mode, state.loaded, state.path.string(), valid_bytes, data.size(), image_base,
-             image_size,
+             "JIT block list (FRITCHII_JIT_BLOCK_LIST={}): {} blocks loaded from {}{} ({} bytes "
+             "kept of {}), image {:#x} size {:#x}, {}{}",
+             mode, state.loaded, state.path.string(),
+             renamed ? " (renamed from the per-title file)" : "", valid_bytes, data.size(),
+             image_base, image_size,
              !state.file_ok ? "cannot write it, not recording"
-                            : (mode == 1 ? "warming up from it and recording" : "recording only"));
+                            : (mode == 1 ? "warming up from it and recording" : "recording only"),
+             seed_path.empty() ? std::string{}
+                               : fmt::format("; seed (FRITCHII_JIT_LIST_SEED) {}: {} more blocks",
+                                             seed_path.string(), seeded));
     if (state.file_ok) {
         state.writer = std::thread{WriterLoop};
     }
@@ -321,21 +421,34 @@ void End() {
     state.pending.clear();
 }
 
-void Note(u64 key) {
+Seen Note(u64 key, bool compiled_earlier) {
     if (!g_recording.load(std::memory_order_relaxed) || (key & SingleStepBit) != 0) {
-        return;
+        return Seen::Off;
     }
     State& state = GetState();
     std::scoped_lock lock{state.mutex};
     const u64 pc = key & PcMask;
-    if (pc < state.base || pc - state.base >= state.size || state.known.size() >= MaxEntries) {
-        return;
+    if (pc < state.base || pc - state.base >= state.size) {
+        ++state.demand[DemandOutsideImage];
+        return Seen::Off;
     }
     const u64 entry = (pc - state.base) | (key & ~PcMask);
-    if (state.known.insert(entry).second) {
-        state.pending.push_back(entry);
-        ++state.recorded;
+    Seen seen;
+    if (const auto it = state.known.find(entry); it != state.known.end()) {
+        seen = it->second != 0 ? Seen::Listed : Seen::Recorded;
+    } else {
+        seen = Seen::New;
+        if (state.known.size() < MaxEntries) {
+            state.known.emplace(entry, u8{0});
+            state.pending.push_back(entry);
+            ++state.recorded;
+        }
     }
+    ++state.demand[compiled_earlier       ? DemandEarlier
+                   : seen == Seen::Listed ? DemandListed
+                   : seen == Seen::New    ? DemandNotListed
+                                          : DemandEarlier];
+    return seen;
 }
 
 std::size_t TakePreload(u32 core, std::vector<u64>& out, std::size_t max) {

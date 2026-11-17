@@ -13,6 +13,7 @@
 #include <thread>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <memory>
 #include <limits>
 #include <cstdio>
@@ -37,6 +38,7 @@
 #include "common/memory_detect.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_uniform_keep_pages.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -98,6 +100,7 @@
 #include "video_core/memstage_shadow.h"
 #include "video_core/memstage_shadow_engine.h"
 #include "video_core/memstage_stats.h"
+#include "video_core/fritchii_report_wait.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
 #include "video_core/nx2_debug_control.h"
@@ -619,6 +622,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
+    // FRITCHII_LOCK_CENSUS: the two cache locks by name (before any other thread uses them).
+    buffer_cache.mutex.SetCensusName("buffer cache");
+    texture_cache.mutex.SetCensusName("texture cache");
     scheduler.SetQueryCache(query_cache);
     // The memory seam's read log asks this cache's tracker.
     mem_stage.Attach(buffer_cache);
@@ -2332,6 +2338,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 
     const auto report_failure = [&](std::string_view reason) {
         TraceDrawFailure(reason);
+        // One follower (FRITCHII_ONEF_MIRROR_STOP=2): E's samples mirror counted this draw, R's
+        // counter does not start for it (CounterEnable is past the skip).
+        if (VideoCommon::OneFollower::On() && maxwell3d->regs.zpass_pixel_count_enable)
+            [[unlikely]] {
+            VideoCommon::OneFollower::NoteSkippedSamplesDraw();
+        }
         static std::set<std::tuple<u64, u64, std::string_view>> seen;
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
@@ -4104,6 +4116,13 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
     }
     OneF::CountFenceDecision(committed ? OneF::FenceDecision::PostedWithCommit
                                        : OneF::FenceDecision::Posted);
+    // FRITCHII_ONEF_SIGNAL_ON_R: a fence-flagged payload is written by R in the op below, at its
+    // played place; its page is one this fence lands (NoteFencePosted below), E's reads of it wait.
+    const bool note_on_r = note != nullptr && OneF::SignalOnR();
+    if (note_on_r) {
+        OneF::CountSignalOnR();
+        OneF::NoteReportPage(note->device);
+    }
     // fable_b 16.4: the query cache's FinishReads, E's half: the reports this fence lands (those
     // since the last fence, a counter fence report's own) get the guest reads' downloads over
     // them landed here, so R writes them without waiting for the buffer lock (FinishRead).
@@ -4118,13 +4137,54 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
     if (e_callback != nullptr) {
         (*e_callback)();
     }
-    if (note != nullptr) {
+    if (note != nullptr && !note_on_r) {
         OneF::BeforeEngineRead(note->device, 16);
         query_cache.WritePayloadNow(note->device, note->gpu_addr, note->payload,
                                     note->has_timestamp, true);
     }
+    // FRITCHII_ONEF_SEM_E_LANDED (Damage's Jabu-Jabu freezes, 2026-11-17): the host increment
+    // ends the game's wait on the sync point, and the game may then free and reuse memory the
+    // fence's downloads still land in (R's fence release, later): an old landing over the game's
+    // new objects. 1: the increment moves to R's fence (after its landings) while committed
+    // buffer downloads are pending; 2: always (as with FRITCHII_ONEF_SEM_E=0, the guest increment
+    // stays on E). 0 (default): on E as before.
+    bool host_on_r = false;
     if (kind == 3) {
-        fence_manager.OneFollowerSyncPointHost(value);
+        static const int landed_mode = [] {
+            const char* const switch_value = std::getenv("FRITCHII_ONEF_SEM_E_LANDED");
+            return switch_value != nullptr ? std::atoi(switch_value) : 0;
+        }();
+        if (landed_mode >= 2) {
+            host_on_r = true;
+        } else if (landed_mode == 1) {
+            if (committed) {
+                host_on_r = true;
+            } else {
+                std::scoped_lock lock{buffer_cache.mutex};
+                host_on_r = buffer_cache.HasPendingDownloads();
+            }
+        }
+        if (landed_mode != 0) {
+            static std::atomic<u64> on_e{};
+            static std::atomic<u64> on_r{};
+            static std::atomic<u64> last_log_ns{};
+            (host_on_r ? on_r : on_e).fetch_add(1, std::memory_order_relaxed);
+            const u64 now_ns = Common::Nx2Hitch::NowNs();
+            u64 last = last_log_ns.load(std::memory_order_relaxed);
+            if (now_ns - last >= 10'000'000'000ULL &&
+                last_log_ns.compare_exchange_strong(last, now_ns, std::memory_order_relaxed)) {
+                if (last != 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "Sync point increments (FRITCHII_ONEF_SEM_E_LANDED={}) 10 s: {} on E, "
+                             "{} moved to R's fence (downloads still to land)",
+                             landed_mode, on_e.exchange(0, std::memory_order_relaxed),
+                             on_r.exchange(0, std::memory_order_relaxed));
+                }
+            }
+        }
+        if (!host_on_r) {
+            fence_manager.OneFollowerSyncPointHost(value);
+        }
     }
     // The closing gather, E's half at this place (GATHER_E's path, or lent).
     InvalidateGPUCache();
@@ -4134,9 +4194,11 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
         u32 value;
         u8 kind;
         bool committed;
+        bool note_on_r; ///< kind 5: R writes the payload (FRITCHII_ONEF_SIGNAL_ON_R)
+        bool host_on_r; ///< kind 3: R's fence runs the host increment (FRITCHII_ONEF_SEM_E_LANDED)
         OneFollowerPayloadNote note;
         OneFollowerFenceReport report;
-    } const op{this, targets, value, kind, committed,
+    } const op{this, targets, value, kind, committed, note_on_r, host_on_r,
                note != nullptr ? *note : OneFollowerPayloadNote{},
                report != nullptr ? *report : OneFollowerFenceReport{}};
     static_assert(sizeof(Op) <= OneF::MaxOpPayloadBytes, "a fence op over the payload limit");
@@ -4145,7 +4207,8 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
                       : kind == 2 ? "ReleaseFences (posted)"
                       : kind == 3 ? "SignalSyncPoint (posted, increments on E)"
                       : kind == 4 ? "SignalFence (posted, callback on E)"
-                      : kind == 5 ? "payload fence (posted, written on E)"
+                      : kind == 5 ? (note_on_r ? "payload fence (posted, written on R)"
+                                               : "payload fence (posted, written on E)")
                                   : "fence report (posted)");
     OneF::PushOp(
         OneF::LentOp::Fence,
@@ -4168,8 +4231,20 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
             case 0:
                 self.fence_manager.SignalSyncPoint(a.value);
                 break;
-            case 1:
             case 3:
+                if (a.host_on_r) {
+                    // FRITCHII_ONEF_SEM_E_LANDED: the host increment at this fence's release,
+                    // after its downloads (and every earlier fence's) landed.
+                    auto* const fences = &self.fence_manager;
+                    const u32 syncpoint = a.value;
+                    std::function<void()> increment(
+                        [fences, syncpoint] { fences->OneFollowerSyncPointHost(syncpoint); });
+                    self.fence_manager.SignalFence(std::move(increment));
+                    break;
+                }
+                self.fence_manager.SignalReference();
+                break;
+            case 1:
             case 4:
                 // An empty callback (3, 4: E ran the increments or the callback).
                 self.fence_manager.SignalReference();
@@ -4190,7 +4265,12 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
                 break;
             }
             case 5:
-                // E wrote the payload: the streamer's pending sync, then the fence.
+                // E wrote the payload (or R here, SIGNAL_ON_R): the streamer's pending sync,
+                // then the fence.
+                if (a.note_on_r) {
+                    self.query_cache.WritePayloadNow(a.note.device, a.note.gpu_addr,
+                                                     a.note.payload, a.note.has_timestamp, true);
+                }
                 self.query_cache.NotePayloadWritten(a.note.device, a.note.has_timestamp,
                                                     a.note.payload, a.note.subreport);
                 self.fence_manager.SignalReference();
@@ -4202,7 +4282,7 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
                 break;
             }
         },
-        &op, sizeof(op));
+        &op, sizeof(op), note_on_r);
     // fable_b 13.0: the reports since the last fence may land at this one, at R's place.
     OneF::NoteFencePosted(OneF::PushedNow());
 }
@@ -4384,6 +4464,14 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         OneF::CountDispatch(why);
         return false;
     };
+    // FRITCHII_ASYNC_COMPUTE_SKIP: an unbuilt pipeline's dispatch is decided in the lent call
+    // (DispatchCompute's SkipUnbuiltDispatch), before anything is filled or marked here.
+    if (AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+        if (async_compute_skip.CountsUnbuilt(*pipeline)) {
+            return lend_with(Count::Unbuilt);
+        }
+        async_compute_skip.NoteRan(*pipeline);
+    }
     const MemStage::DispatchFacts facts = pipeline->MemFacts();
     if (facts.has_texel_buffers) {
         return lend_with(Count::TexelBuffers);
@@ -4476,6 +4564,15 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         if (number != 0) {
             list_copies = buffer_cache.Nx2HasListCopyRequests();
             probes = buffer_cache.HasUnrecordedExtentProbes();
+            // FRITCHII_ASYNC_COMPUTE_SKIP: its written ranges' streaks, stamped in R's frame
+            // when R plays the packet (OneFollowerPlayDispatch).
+            if (AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+                boost::container::small_vector<AsyncComputeSkip::Range, 8> writes;
+                static_cast<void>(CollectComputeWrites(writes));
+                if (!writes.empty()) {
+                    async_compute_skip.QueueWrites(number, writes);
+                }
+            }
         }
         if (!list_copies) {
             buffer_cache.Nx2CollectListCopies(false);
@@ -4693,6 +4790,7 @@ void RasterizerVulkan::OneFollowerPlayDispatch(ComputePipeline* pipeline, u64 nu
     }
     // However this ends, the packet is played whole: the cache believes its uploads recorded.
     const MemStage::RestAtEnd rest{mem_stage};
+    async_compute_skip.PlayedWrites(number); // FRITCHII_ASYNC_COMPUTE_SKIP's streaks (E's fill)
     if (channel_state == nullptr || gpu_memory == nullptr) [[unlikely]] {
         OneF::Note(OneF::Check::PlayedDispatch, "a played dispatch with no channel bound");
         OneF::StopPostDispatch("a played dispatch with no channel bound");
@@ -5229,6 +5327,116 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 }
 
+bool RasterizerVulkan::CollectComputeWrites(
+    boost::container::small_vector<AsyncComputeSkip::Range, 8>& ranges) {
+    ranges.clear();
+    return buffer_cache.ForEachComputeWriteMark([&](DAddr addr, u64 size) {
+        ranges.push_back({addr, size, AsyncComputeSkip::Kind::Buffer});
+    });
+}
+
+bool RasterizerVulkan::SkipUnbuiltDispatch(ComputePipeline& pipeline, bool indirect,
+                                           bool special_pass) {
+    // FRITCHII_ASYNC_COMPUTE_SKIP (vk_async_compute_skip.h; idea and rules from
+    // zortos293/Lichii #2104 by zortos293). Both caches' locks are held, nothing of this
+    // dispatch is filled yet. The guards in order: G4 (shape, then extents), G3, G1, G2.
+    using Skip = AsyncComputeSkip;
+    const int mode = Skip::Mode();
+    const auto run = [&](Skip::Refusal why) {
+        async_compute_skip.NoteRefusal(why);
+        return false;
+    };
+    const MemStage::DispatchFacts facts = pipeline.MemFacts();
+    // G4: a plain native direct dispatch. Global stores have no binding to judge; texel buffers
+    // bind through image views (made by the texture cache); the packed R16 path makes its own
+    // shadow; the OoT upscaler and effects passes have hooks of their own.
+    if (!kepler_compute->IsNativeMode() || indirect || special_pass || frame_dump.Capturing() ||
+        facts.has_texel_buffers || facts.info->stores_global_memory ||
+        pipeline.WritesByteAddressedImages()) {
+        return run(Skip::Refusal::Shape); // Configure binds as always
+    }
+    // Configure's pointer binds, ahead (they resolve the written ranges and mark nothing). From
+    // here a dispatch that runs keeps them: Configure does not bind again.
+    pipeline.BindStoragePointers(buffer_cache);
+    const auto run_bound = [&](Skip::Refusal why) {
+        pipeline.UsePreboundPointers();
+        return run(why);
+    };
+    boost::container::small_vector<Skip::Range, 8> ranges;
+    bool bounded = CollectComputeWrites(ranges);
+    if (bounded && pipeline.WritesImages()) {
+        // The written images' guest ranges from their descriptors, as E records them for EXP10
+        // (DescribeWrittenImage): read, nothing made.
+        thread_local std::vector<u32> values;
+        pipeline.MakeHandleValues(*kepler_compute, *gpu_memory,
+                                  VideoCore::Nx2Debug::Experiment(21) != 0, values);
+        const bool visited = pipeline.VisitWrittenImageHandles(values, [&](u32 raw) {
+            Tegra::Texture::TICEntry tic{};
+            GPUVAddr tic_address{};
+            bool null_view{};
+            const auto range =
+                DescribeWrittenImage(*gpu_memory, *kepler_compute, raw, tic, tic_address, null_view);
+            if (range) {
+                ranges.push_back({range->device, range->size, Skip::Kind::Image});
+            } else if (!null_view) {
+                bounded = false; // not one device range, or a buffer image
+            }
+        });
+        bounded = bounded && visited;
+    }
+    if (!bounded) {
+        return run_bound(Skip::Refusal::Extent);
+    }
+    for (const Skip::Range& range : ranges) {
+        // G3: never a page the guest reads back (this file's sticky reads, and the buffer
+        // cache's Preflushable marks, CPU-read ranges and read downloads).
+        const auto buffer_facts = buffer_cache.ComputeSkipRangeFacts(range.addr, range.size);
+        if (buffer_facts.read_back || async_compute_skip.GuestReadSeen(range)) {
+            return run_bound(Skip::Refusal::ReadBack);
+        }
+        if (range.kind == Skip::Kind::Buffer) {
+            // G1: every byte GPU-written, no CPU write to upload. G2: every frame.
+            if (!buffer_facts.all_gpu_written || buffer_facts.cpu_modified) {
+                return run_bound(Skip::Refusal::NoHistory);
+            }
+            if (!async_compute_skip.BufferStreakHolds(pipeline, range)) {
+                return run_bound(Skip::Refusal::NotEveryFrame);
+            }
+            continue;
+        }
+        using State = TextureCache::SkipImageState;
+        switch (texture_cache.ComputeSkipImageState(range.addr, range.size)) {
+        case State::Redrawn:
+            break;
+        case State::NoImage:
+        case State::NoGpuData:
+            return run_bound(Skip::Refusal::NoHistory);
+        case State::NotRedrawn:
+            if (!async_compute_skip.ChainHolds(pipeline, range)) {
+                return run_bound(Skip::Refusal::NotEveryFrame);
+            }
+            break;
+        }
+    }
+    if (mode == 2) {
+        // Dry: it waits as before; counted as a skip mode 1 would make.
+        async_compute_skip.NoteSkip(pipeline, ranges, true);
+        pipeline.UsePreboundPointers();
+        return false;
+    }
+    // A pipeline really building (not the test delay's) starts on a spare thread now, and may
+    // still make it within what is left of the frame's wait budget.
+    if (!pipeline.IsBuilt()) {
+        async_compute_skip.Kick(pipeline);
+        if (pipeline_cache.WaitComputeWithinBudget(pipeline)) {
+            pipeline.UsePreboundPointers();
+            return false;
+        }
+    }
+    async_compute_skip.NoteSkip(pipeline, ranges, false);
+    return true;
+}
+
 void RasterizerVulkan::DispatchCompute() {
     // FRITCHII_DELAY_DISPATCH_US (live, 0 = off): the delay test "K", on the back thread only.
     // Off: one load and a branch.
@@ -5432,7 +5640,34 @@ void RasterizerVulkan::DispatchCompute() {
     // work; Configure plays it and RestAtEnd what is left, however Configure ends (true, false
     // or an exception: the native R16 shadow checks throw).
     // A played dispatch's packet is held already (TakeRingDispatch): E filled it.
-    if (onef_play == nullptr) {
+    // FRITCHII_ASYNC_COMPUTE_SKIP (vk_async_compute_skip.h): a pipeline still building is decided
+    // here, before the fill marks or uploads anything. Skipped, the dispatch returns as if the
+    // guest had not run it; its QMD releases are the engine's (KeplerCompute, after this call)
+    // and still happen. Run, it takes Configure's own path (no fill: the decision bound its
+    // storage pointers already, or Configure binds them) and waits for the build as before.
+    bool unbuilt_decided = false;
+    if (onef_play == nullptr && AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+        if (async_compute_skip.CountsUnbuilt(*pipeline)) {
+            unbuilt_decided = true;
+            constexpr u64 DepthReaderShader = 0x1fc7a0423116281fULL;
+            const u64 hash = pipeline->ShaderHash();
+            const bool special_pass =
+                can_replace || pipeline->CanReplaceOcarinaUpscale() ||
+                hash == ComputePipeline::OcarinaFullSizeShader ||
+                hash == ComputePipeline::Ocarina1440pShader || hash == ThreeQuarterShader ||
+                hash == DepthReaderShader || (marking_effects && pipeline->WritesImages());
+            if (SkipUnbuiltDispatch(*pipeline, indirect_address.has_value(), special_pass)) {
+                // EXP10: the dispatch writes nothing.
+                if (VideoCommon::GpuSplit::RecordingDispatch()) {
+                    VideoCommon::GpuSplit::Get().ConfirmDispatch();
+                }
+                return;
+            }
+        } else {
+            async_compute_skip.NoteRan(*pipeline);
+        }
+    }
+    if (onef_play == nullptr && !unbuilt_decided) {
         mem_stage.FillDispatch(buffer_cache, pipeline->MemFacts());
     }
     bool configured{};
@@ -5454,6 +5689,15 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
+    // FRITCHII_ASYNC_COMPUTE_SKIP: the written ranges' streaks (G2), for a dispatch recorded
+    // here; a played one's came from E's fill (QueueWrites).
+    const auto note_write_streaks = [&] {
+        if (onef_play == nullptr && AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+            boost::container::small_vector<AsyncComputeSkip::Range, 8> writes;
+            static_cast<void>(CollectComputeWrites(writes));
+            async_compute_skip.NoteWrites(writes);
+        }
+    };
     // A played dispatch: E confirmed it (it writes no image and is direct).
     // A played dispatch writes images exactly when E saw it would (bit 2: E recorded them as
     // unbounded at its place, and the packed R16 path stays lent).
@@ -5627,6 +5871,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
         dispatch_kinds.recorded = true;
         dispatch_kinds.indirect = true;
+        note_write_streaks();
         return;
     }
     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
@@ -5645,6 +5890,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
         return;
     }
+    note_write_streaks();
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.NoteComputeWrites();
     // The upscaler's evaluation or the effects mark may be recorded next, before the dispatch:
@@ -5807,10 +6053,95 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
     }
 }
 
+namespace {
+/// FRITCHII_QUERY_LEND_DRY=1 (live, default 0; helper DE round 5, a dry timer that changes
+/// nothing). kaksample2: E parked ~23 ms/s in Query lends. Per lent Query: why it was lent (the
+/// rule that kept it from the posted paths), E's parked time, and whether its report page is one
+/// the front's DMA reads snapshot (FrontReadPagesAny: a posted report there would be read stale
+/// by the front unless it waited for R; must be 0 for a kind to be posted as is).
+struct QueryLendDry {
+    enum Why : u8 {
+        Other,
+        FencePayloadRule,     ///< fence payload: SEM_E's path off (not synced, EXP33, SEM_E off)
+        FencePayloadNotClean, ///< fence payload: no device address or the fence not clean
+        FenceCounterSwitch,   ///< fence counter report: POST_FENCE_REPORT off or EXP33
+        FenceCounterAtOnce,   ///< fence counter report of a type that lands at once
+        FenceCounterNotClean, ///< fence counter report: no device address or not clean
+        PayloadRelease,       ///< plain payload release lent
+        PlainReport,          ///< plain report (no streamer under SEM_E, or QUERY_OPS off)
+        BufferPage,           ///< plain report on a registered buffer page
+        Count,
+    };
+    static constexpr std::array<const char*, Count> names{
+        "other",
+        "fence payload: SEM_E path off",
+        "fence payload: not clean",
+        "fence counter: switch off",
+        "fence counter: lands at once",
+        "fence counter: not clean",
+        "payload release",
+        "plain report",
+        "report on buffer page"};
+    static bool On() {
+        return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_query_lend_dry,
+                                                "FRITCHII_QUERY_LEND_DRY") != 0;
+    }
+    static u64 Now() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+    void Note(u8 why, bool front_page, u64 parked_ns, u64 now) {
+        const size_t i = why < Count ? why : Other;
+        ++count[i];
+        parked[i] += parked_ns;
+        front[i] += front_page ? 1 : 0;
+        if (since == 0) {
+            since = now;
+            return;
+        }
+        if (now - since < 10'000'000'000ULL) {
+            return;
+        }
+        const double seconds = static_cast<double>(now - since) / 1e9;
+        std::string text;
+        u64 all = 0;
+        u64 all_ns = 0;
+        for (size_t k = 0; k < Count; ++k) {
+            all += count[k];
+            all_ns += parked[k];
+            if (count[k] == 0) {
+                continue;
+            }
+            text += fmt::format("; {} {:.0f}/s {:.1f} ms/s (front read page {:.0f}/s)", names[k],
+                                static_cast<double>(count[k]) / seconds,
+                                static_cast<double>(parked[k]) / 1e6 / seconds,
+                                static_cast<double>(front[k]) / seconds);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Query lends (FRITCHII_QUERY_LEND_DRY=1) {:.0f} s: {:.0f}/s, E parked {:.1f} ms/s "
+                 "by why lent{}",
+                 seconds, static_cast<double>(all) / seconds,
+                 static_cast<double>(all_ns) / 1e6 / seconds, text);
+        count = {};
+        parked = {};
+        front = {};
+        since = now;
+    }
+    u64 since{};
+    std::array<u64, Count> count{};
+    std::array<u64, Count> parked{};
+    std::array<u64, Count> front{};
+};
+QueryLendDry g_query_lend_timer;    ///< E only
+thread_local u8 t_query_lend_why{}; ///< E: why this Query is lent (set where its kind is)
+} // Anonymous namespace
+
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         namespace OneF = VideoCommon::OneFollower;
+        t_query_lend_why = QueryLendDry::Other;
         // FRITCHII_ONEF_DRY_RELEASE (fable_b 19.5 step 3): E passes this release.
         if (OneF::DryReleaseOn()) [[unlikely]] {
             if (const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(gpu_addr)) {
@@ -5868,7 +6199,9 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                         *device, gpu_addr, payload, subreport,
                         True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)};
                     OneF::CountQueryKind(OneF::QueryKind::PayloadFenceOnE);
-                    OneF::NoteEngineSignal("a fence-flagged payload write");
+                    if (!OneF::SignalOnR()) { // else R writes it (OneFollowerPostFence)
+                        OneF::NoteEngineSignal("a fence-flagged payload write");
+                    }
                     OneFollowerPostFence(5, 0, nullptr, &note);
                     return;
                 }
@@ -5898,6 +6231,20 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             }
             OneFollowerFenceLent(); // its fence (R's, E parked) syncs and lands all before it
             OneF::SetQueryKind(OneF::QueryKind::FenceReport); // lent (fable_b item 4)
+            if (QueryLendDry::On()) [[unlikely]] {
+                const bool exp33 = VideoCore::Nx2Debug::Experiment(33) != 0;
+                if (type == VideoCommon::QueryType::Payload) {
+                    t_query_lend_why = synced && !exp33 && OneF::SemOnE()
+                                           ? QueryLendDry::FencePayloadNotClean
+                                           : QueryLendDry::FencePayloadRule;
+                } else if (!OneF::PostFenceReportOn() || exp33) {
+                    t_query_lend_why = QueryLendDry::FenceCounterSwitch;
+                } else if (!query_cache.ReportLandsLater(type)) {
+                    t_query_lend_why = QueryLendDry::FenceCounterAtOnce;
+                } else {
+                    t_query_lend_why = QueryLendDry::FenceCounterNotClean;
+                }
+            }
         } else if (type == VideoCommon::QueryType::Payload) {
             // FRITCHII_ONEF_SEM_E (fable_b 19.4): a payload release CounterReport writes at once
             // (not Accurate) is written here, at E's place (after its page's landings), and
@@ -5907,6 +6254,46 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                 OneF::SemOnE() && !VideoCore::Nx2Debug::AccuratePart(1)
                     ? gpu_memory->GpuToCpuAddress(gpu_addr)
                     : std::nullopt;
+            if (device && OneF::SignalOnR()) {
+                // FRITCHII_ONEF_SIGNAL_ON_R (AMD tester, test 4 §5c): the same write at R's
+                // played place. E goes on (a posted op, not a lend); the guest sees the release
+                // only once R recorded everything before it, as with one GPU thread. The front's
+                // E-position waits wait for the op (lands_in_memory), E's reads of the page too
+                // (NoteReportLandsAtLastPush). R plays in order: no earlier landing to wait for.
+                const bool has_timestamp =
+                    True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
+                if (VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0)
+                    [[unlikely]] {
+                    // As OneFollowerPostFence does for its landing pages (fable_b 16.4).
+                    buffer_cache.FinishReadDownloads(*device & ~u64{0xfff}, u64{1} << 12);
+                }
+                struct Op {
+                    RasterizerVulkan* self;
+                    DAddr device;
+                    GPUVAddr gpu_addr;
+                    u32 payload;
+                    u32 subreport;
+                    bool has_timestamp;
+                } const op{this, *device, gpu_addr, payload, subreport, has_timestamp};
+                OneF::CountSignalOnR();
+                OneF::SetQueryKind(OneF::QueryKind::PayloadReleaseOnR);
+                static_assert(sizeof(Op) <= OneF::MaxOpPayloadBytes,
+                              "an op over the payload limit");
+                OneF::SetLendSite("payload release (written on R, SIGNAL_ON_R)");
+                OneF::PushOp(
+                    OneF::LentOp::Query,
+                    [](void* raw) {
+                        Op a;
+                        std::memcpy(&a, raw, sizeof(a));
+                        a.self->query_cache.WritePayloadNow(a.device, a.gpu_addr, a.payload,
+                                                            a.has_timestamp, false);
+                        a.self->query_cache.NotePayloadWritten(a.device, a.has_timestamp,
+                                                               a.payload, a.subreport);
+                    },
+                    &op, sizeof(op), true);
+                OneF::NoteReportLandsAtLastPush(*device);
+                return;
+            }
             if (device) {
                 const bool has_timestamp =
                     True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
@@ -5936,12 +6323,15 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                 return;
             }
             OneF::SetQueryKind(OneF::QueryKind::PayloadRelease); // lent (fable_b item 4)
+            t_query_lend_why = QueryLendDry::PayloadRelease;
         } else if (OneF::SemOnE() && !query_cache.ReportLandsLater(type)) {
             // FRITCHII_ONEF_SEM_E: a type without a streamer becomes a payload write inside
             // CounterReport: lent, so every payload write is E's or lent (one home).
             OneF::SetQueryKind(OneF::QueryKind::PlainReport);
+            t_query_lend_why = QueryLendDry::PlainReport;
         } else if (!OneF::QueryOps()) {
             OneF::SetQueryKind(OneF::QueryKind::PlainReport);
+            t_query_lend_why = QueryLendDry::PlainReport;
         } else {
             // fable_b 11.1 item 1(c): a plain report is a render op, translated here at E's
             // stream place. Guard: a target the buffer cache has registered stays lent (E's
@@ -5963,6 +6353,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             if (registered && !buffer_page_op) {
                 // A lend reason, not a must-be-0: OoT's reports often land in buffers.
                 OneF::SetQueryKind(OneF::QueryKind::ReportOnBufferPage);
+                t_query_lend_why = QueryLendDry::BufferPage;
             } else {
                 OneF::SetQueryKind(buffer_page_op ? OneF::QueryKind::BufferPageOp
                                                   : OneF::QueryKind::PlainReport);
@@ -6018,6 +6409,19 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         type == VideoCommon::QueryType::ZPassPixelCount64) [[unlikely]] {
         onef_mirror_lent_valid = true; // read by R in the lent call (E parked)
         onef_mirror_lent_bit = onef_samples_started;
+    }
+    if (VideoCommon::OneFollower::ShouldLend() && QueryLendDry::On()) [[unlikely]] {
+        // FRITCHII_QUERY_LEND_DRY: the same lend as ONEF_LEND below, timed and classified.
+        const auto device = gpu_memory->GpuToCpuAddress(gpu_addr);
+        const bool front_page = device && VideoCommon::OneFollower::FrontReadPagesAny(*device, 16);
+        const u8 why = t_query_lend_why;
+        const u64 start = QueryLendDry::Now();
+        VideoCommon::OneFollower::SetLendSite(__func__);
+        auto onef_call = [&] { Query(gpu_addr, type, flags, payload, subreport); };
+        VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::Query, onef_call);
+        const u64 now = QueryLendDry::Now();
+        g_query_lend_timer.Note(why, front_page, now - start, now);
+        return;
     }
     ONEF_LEND(Query, Query(gpu_addr, type, flags, payload, subreport))
     if (onef_mirror_lent_valid && VideoCommon::OneFollower::RenderInLentCall()) [[unlikely]] {
@@ -6476,6 +6880,11 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
                            texture_cache.sparse_page_filter.Any(addr, size);
     const bool image_ever = texture_cache.page_filter.Any(addr, size);
     const bool gpu_written = MayBeGpuModified(page_begin, page_end - page_begin);
+    // FRITCHII_ASYNC_COMPUTE_SKIP: guest reads of pages the GPU wrote or an image was on never
+    // see a skipped dispatch's output (sticky; must-be-0 count when one does).
+    if ((image_ever || gpu_written) && AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+        async_compute_skip.NoteGuestRead(addr, size);
+    }
     // EDEN_NX2_EXP36=1 turns this off (live), for the washed-out scene hunt.
     if (VideoCore::Nx2Debug::Experiment(36) == 0 && !(by_count ? image_now : image_ever) &&
         !gpu_written) {
@@ -7557,7 +7966,10 @@ void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
         // FRITCHII_ONEF_SEM_E (fable_b 19.6): with fences not delayed the callback runs at once
         // inside SignalFence (a QMD reduction or max release, the GP sync): E runs it at the
         // fence's place and posts the fence with an empty one.
-        if (VideoCommon::OneFollower::SemOnE() && OneFollowerFenceClean()) {
+        // FRITCHII_ONEF_SIGNAL_ON_R: the callback writes game memory the guest acts on; it runs
+        // on R at R's place, which (the callback may touch E's caches) means lent.
+        if (VideoCommon::OneFollower::SemOnE() && !VideoCommon::OneFollower::SignalOnR() &&
+            OneFollowerFenceClean()) {
             VideoCommon::OneFollower::NoteEngineSignal("a SignalFence callback");
             OneFollowerPostFence(4, 0, &func);
             return;
@@ -7597,7 +8009,10 @@ void RasterizerVulkan::SignalSyncPoint(u32 value) {
             // place; R makes an empty fence. The game's wait on the sync point then ends when E
             // passes it. Bound: the frame end stays lent (E parks there until R played the
             // frame), so E is at most a frame ahead of R.
-            if (VideoCommon::OneFollower::SemOnE()) {
+            // FRITCHII_ONEF_SIGNAL_ON_R: R increments both at its played place (kind 0 below).
+            if (VideoCommon::OneFollower::SemOnE() && VideoCommon::OneFollower::SignalOnR()) {
+                VideoCommon::OneFollower::CountSignalOnR();
+            } else if (VideoCommon::OneFollower::SemOnE()) {
                 VideoCommon::OneFollower::NoteEngineSignal("a sync point increment");
                 if (fence_manager.OneFollowerSyncPointGuest(value)) {
                     OneFollowerPostFence(3, value);
@@ -7654,15 +8069,181 @@ u64 RasterizerVulkan::FenceWorkEpoch() const {
     return fence_manager.FenceWorkEpoch();
 }
 
+namespace {
+/// FRITCHII_QUERY_FLUSH_DRY=1 (live, default 0; helper DE, a dry timer that changes nothing).
+/// kaksample2 (Kakariko, unprofiled CPU sample): E parked ~30 ms/s in FlushQueryResults lends
+/// (the front's report DMA flush runs, QueryDma::FlushPending) while the report waits line shows
+/// R finding something to wait for under 1 time a second; the profile's lends line does not list
+/// these lends at all. Per lend: E's parked time, whether R's query cache had reports in the
+/// range (SemiFlushRegion), and whether E's own report-landing pages call the range clear
+/// (OneFollower::ReportLandingClear). The lever would skip the lend where E can prove R has
+/// nothing; "clear but R found" must be 0 for E's pages to be that proof. Only E touches it.
+struct QueryFlushDry {
+    static bool On() {
+        return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_query_flush_dry,
+                                                "FRITCHII_QUERY_FLUSH_DRY") != 0;
+    }
+    static u64 Now() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+    void Note(bool clear, bool found, u64 parked_ns, u64 now) {
+        ++lends;
+        parked += parked_ns;
+        if (found) {
+            ++found_count;
+            found_parked += parked_ns;
+        }
+        if (clear) {
+            ++clear_count;
+            clear_parked += parked_ns;
+            if (found) {
+                ++clear_found;
+            } else {
+                ceiling += parked_ns;
+            }
+        }
+        if (since == 0) {
+            since = now;
+            return;
+        }
+        if (now - since < 10'000'000'000ULL) {
+            return;
+        }
+        const double seconds = static_cast<double>(now - since) / 1e9;
+        const auto rate = [&](u64 count) { return static_cast<double>(count) / seconds; };
+        const auto ms = [&](u64 ns) { return static_cast<double>(ns) / 1e6 / seconds; };
+        LOG_INFO(Render_Vulkan,
+                 "Query flush lends (FRITCHII_QUERY_FLUSH_DRY=1) {:.0f} s: {:.0f}/s, E parked "
+                 "{:.1f} ms/s ({:.0f} us each); R found reports in {:.0f}/s ({:.1f} ms/s); E's "
+                 "landing pages clear for {:.0f}/s ({:.1f} ms/s), R found reports in {:.0f}/s of "
+                 "them (must be 0 to skip on it; {} since boot); ceiling (clear, nothing found) "
+                 "{:.1f} ms/s",
+                 seconds, rate(lends), ms(parked),
+                 lends != 0 ? static_cast<double>(parked) / 1e3 / static_cast<double>(lends) : 0.0,
+                 rate(found_count), ms(found_parked), rate(clear_count), ms(clear_parked),
+                 rate(clear_found), clear_found_total + clear_found, ms(ceiling));
+        clear_found_total += clear_found;
+        const u64 total = clear_found_total;
+        *this = {};
+        clear_found_total = total;
+        since = now;
+    }
+    u64 since{};
+    u64 lends{};
+    u64 parked{};
+    u64 found_count{};
+    u64 found_parked{};
+    u64 clear_count{};
+    u64 clear_parked{};
+    u64 clear_found{};
+    u64 ceiling{};
+    u64 clear_found_total{};
+};
+QueryFlushDry g_query_flush_timer;
+/// R writes it in the lent call (SemiFlushRegion found reports); E reads it after the lend.
+std::atomic<bool> g_query_flush_found{};
+} // Anonymous namespace
+
 void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (VideoCommon::OneFollower::ShouldLend() && QueryFlushDry::On()) [[unlikely]] {
+        // FRITCHII_QUERY_FLUSH_DRY: the same lend as ONEF_LEND below, timed and classified.
+        const DAddr begin = addr >= 12 ? addr - 12 : DAddr{0};
+        const bool clear = VideoCommon::OneFollower::ReportLandingClear(begin, addr + size - begin);
+        g_query_flush_found.store(false, std::memory_order_relaxed);
+        const u64 start = QueryFlushDry::Now();
+        VideoCommon::OneFollower::SetLendSite(__func__);
+        auto onef_call = [&] { FlushQueryResults(addr, size); };
+        VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::ReadBack, onef_call);
+        const u64 now = QueryFlushDry::Now();
+        g_query_flush_timer.Note(clear, g_query_flush_found.load(std::memory_order_acquire),
+                               now - start, now);
+        return;
+    }
     ONEF_LEND(ReadBack, FlushQueryResults(addr, size))
     if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
         return;
     }
+    g_query_flush_found.store(true, std::memory_order_release);
     // GPU profile zone "query DMA wait": these waits per second and their ms per second, either
     // way below (the A/B measure for EXP30).
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::QueryDmaWait};
-    if (VideoCore::Nx2Debug::Experiment(30) != 0) {
+    // FRITCHII_REPORT_WAIT (live, default 0; fritchii_report_wait.h): 0 = EXP30 decides (as
+    // before), 1 = the lean wait below, 2 = verify (the lean wait, then the old one, the words
+    // compared). Every value times the wait for the "Report waits" line.
+    namespace ReportWait = VideoCommon::ReportWait;
+    int report_wait = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_report_wait,
+                                                       "FRITCHII_REPORT_WAIT");
+    if (report_wait < 0 || report_wait > 2) {
+        report_wait = 0;
+    }
+    ReportWait::MaybeReport(report_wait);
+    const u64 wait_start = ReportWait::NowNs();
+    // From 12 bytes before the read: a 16-byte report (value, then timestamp) starting there
+    // still has words in it, and its slot is the one before the read's.
+    const DAddr wait_begin = addr >= 12 ? addr - 12 : DAddr{0};
+    const u64 wait_bytes = addr + size - wait_begin;
+    // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
+    // queued behind the pending report writes instead. On the split's back the fence's
+    // submission may be deferred, and the fencing thread would wait for this thread to submit it.
+    const auto old_wait = [&] {
+        std::mutex wait_mutex;
+        std::condition_variable wait_cv;
+        bool written{};
+        fence_manager.SyncOperation([&] {
+            std::scoped_lock lock{wait_mutex};
+            written = true;
+            wait_cv.notify_all();
+        });
+        fence_manager.SignalFence([] {});
+        scheduler.FlushDeferred();
+        std::unique_lock lock{wait_mutex};
+        wait_cv.wait(lock, [&written] { return written; });
+    };
+    if (report_wait == 2) [[unlikely]] {
+        // Verify: the lean wait (polled, so a range that never settles is counted and handed to
+        // the old wait instead of hanging), the words, the old wait, the words again.
+        fence_manager.SignalFence([] {});
+        scheduler.FlushDeferred();
+        constexpr u64 lean_limit_ns = 200'000'000;
+        bool settled = true;
+        while (!Tegra::Nx2AsyncReportsSettled(wait_begin, wait_bytes)) {
+            if (ReportWait::NowNs() - wait_start > lean_limit_ns) {
+                settled = false;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        const u64 lean_end = ReportWait::NowNs();
+        // The read FlushPending serves is one page at most.
+        const size_t bytes = static_cast<size_t>((std::min<u64>)(size, 0x1000));
+        std::array<u8, 0x1000> lean_words;
+        std::array<u8, 0x1000> old_words;
+        device_memory.ReadBlockUnsafe(addr, lean_words.data(), bytes);
+        old_wait();
+        const u64 old_end = ReportWait::NowNs();
+        device_memory.ReadBlockUnsafe(addr, old_words.data(), bytes);
+        const bool differs =
+            !settled || std::memcmp(lean_words.data(), old_words.data(), bytes) != 0;
+        if (ReportWait::NoteVerify(lean_end - wait_start, old_end - wait_start, differs))
+            [[unlikely]] {
+            size_t first = 0;
+            while (first + 1 < bytes && lean_words[first] == old_words[first]) {
+                ++first;
+            }
+            LOG_ERROR(HW_GPU,
+                      "Report waits (FRITCHII_REPORT_WAIT=2, must be 0): the read of {} bytes at "
+                      "{:#x} {} after the lean wait ({:.2f} ms); first different byte {} ({:#x} "
+                      "after the lean wait, {:#x} after the old one)",
+                      bytes, addr, settled ? "changed" : "did not settle in 200 ms",
+                      static_cast<double>(lean_end - wait_start) / 1e6, first, lean_words[first],
+                      old_words[first]);
+        }
+        ReportWait::NoteWait(old_end - wait_start, true);
+        return;
+    }
+    if (report_wait == 1 || VideoCore::Nx2Debug::Experiment(30) != 0) {
         // EXP30: the fence carries the reports still waiting for one; on
         // the split's back its submission may be deferred, and the fencing thread would wait
         // for this thread to submit it. Then wait for the reports themselves, not for an
@@ -7670,28 +8251,16 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
         // time while walking) cannot write them.
         fence_manager.SignalFence([] {});
         scheduler.FlushDeferred();
-        // From 12 bytes before the read: a 16-byte report (value, then timestamp) starting there
-        // still has words in it, and its slot is the one before the read's.
-        const DAddr wait_begin = addr >= 12 ? addr - 12 : DAddr{0};
-        VideoCommon::BackWaitScope wait_scope{"RasterizerVulkan::FlushQueryResults (own reports)"};
-        Tegra::Nx2WaitAsyncReportsSettled(wait_begin, addr + size - wait_begin);
+        {
+            VideoCommon::BackWaitScope wait_scope{
+                "RasterizerVulkan::FlushQueryResults (own reports)"};
+            Tegra::Nx2WaitAsyncReportsSettled(wait_begin, wait_bytes);
+        }
+        ReportWait::NoteWait(ReportWait::NowNs() - wait_start, true);
         return;
     }
-    // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
-    // queued behind the pending report writes instead. On the split's back the fence's
-    // submission may be deferred, and the fencing thread would wait for this thread to submit it.
-    std::mutex wait_mutex;
-    std::condition_variable wait_cv;
-    bool written{};
-    fence_manager.SyncOperation([&] {
-        std::scoped_lock lock{wait_mutex};
-        written = true;
-        wait_cv.notify_all();
-    });
-    fence_manager.SignalFence([] {});
-    scheduler.FlushDeferred();
-    std::unique_lock lock{wait_mutex};
-    wait_cv.wait(lock, [&written] { return written; });
+    old_wait();
+    ReportWait::NoteWait(ReportWait::NowNs() - wait_start, false);
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
@@ -8404,7 +8973,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     const bool native_resolution =
         oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
         Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
-    const bool upscale_4k = pass_1440p && !native_resolution;
+    // FRITCHII_FSR_OUTPUT: FSR may draw the game's own 1440p picture instead of a 4K one.
+    const bool upscale_4k =
+        pass_1440p && !native_resolution && !OcarinaFsrOutputsGameSize(*oot_backend);
     const auto read_tic = [this](u32 index) -> std::optional<Tegra::Texture::TICEntry> {
         const auto& table = kepler_compute->regs.tic;
         using Entry = Tegra::Texture::TICEntry;
@@ -8704,8 +9275,107 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 
 void NoteDrawReuseProbeFrame(); // vk_graphics_pipeline.cpp
 
+namespace {
+/// FRITCHII_FRAME_END_TIMES=1 (boot, default 0; helper DE, a dry timer that changes nothing):
+/// where TickFrame's time goes, by part, with the thread that ran it (R in one follower's lend,
+/// while E is parked: the "TickFrame (frame end)" lend, 5 ms/s at Kakariko, 7-31 ms/s at the
+/// market). The E-owned part (buffer cache) is what a posted frame end would still run in order
+/// on E; the rest is the posting ceiling. One line every 10 s.
+class FrameEndTimes {
+public:
+    enum Part : size_t {
+        Head,     ///< focus, stats, debug requests, frame dump, upscaler trace, protect sweep
+        Pipeline, ///< pipeline_cache.TickFrame
+        Queues,   ///< descriptor queues and ring
+        Fences,   ///< fence_manager.TickFrame
+        Staging,  ///< staging pools
+        Textures, ///< texture cache lock + TickFrame
+        MemStage, ///< mem_stage.TickFrame
+        Buffers,  ///< buffer cache lock + TickFrame (E's cache)
+        Count,
+    };
+
+    static bool On() {
+        static const bool on = [] {
+            const char* const value = std::getenv("FRITCHII_FRAME_END_TIMES");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        return on;
+    }
+
+    void Begin() {
+        mark = Now();
+        begin = mark;
+    }
+
+    void End(Part part) {
+        const u64 now = Now();
+        ns[part] += now - mark;
+        mark = now;
+    }
+
+    void Finish(bool on_render_thread) {
+        const u64 total = mark - begin;
+        ++calls;
+        calls_on_r += on_render_thread ? 1 : 0;
+        total_ns += total;
+        longest_ns = (std::max)(longest_ns, total);
+        if (window_start == 0) {
+            window_start = mark;
+            return;
+        }
+        const u64 span = mark - window_start;
+        if (span < 10'000'000'000ULL) {
+            return;
+        }
+        static constexpr std::array<const char*, Count> names{
+            "head", "pipeline cache", "descriptor queues", "fence manager", "staging",
+            "texture cache", "memory seam", "buffer cache (E's)"};
+        const double seconds = static_cast<double>(span) / 1e9;
+        std::string parts;
+        for (size_t i = 0; i < Count; ++i) {
+            parts += fmt::format("{}{} {:.2f}", i == 0 ? "" : ", ", names[i],
+                                 static_cast<double>(ns[i]) / 1e6 / seconds);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Frame end times (FRITCHII_FRAME_END_TIMES=1) 10 s: {:.1f} calls/s ({:.0f}% on "
+                 "GPURender), {:.2f} ms/s, {:.0f} us each, longest {:.0f} us; by part ms/s: {}",
+                 static_cast<double>(calls) / seconds,
+                 calls != 0 ? 100.0 * static_cast<double>(calls_on_r) / calls : 0.0,
+                 static_cast<double>(total_ns) / 1e6 / seconds,
+                 calls != 0 ? static_cast<double>(total_ns) / 1e3 / calls : 0.0,
+                 static_cast<double>(longest_ns) / 1e3, parts);
+        ns = {};
+        calls = calls_on_r = total_ns = longest_ns = 0;
+        window_start = mark;
+    }
+
+private:
+    static u64 Now() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+
+    std::array<u64, Count> ns{};
+    u64 mark{};
+    u64 begin{};
+    u64 window_start{};
+    u64 calls{};
+    u64 calls_on_r{};
+    u64 total_ns{};
+    u64 longest_ns{};
+};
+FrameEndTimes g_frame_end_times; ///< only TickFrame touches it (one thread at a time: R or E)
+} // Anonymous namespace
+
 void RasterizerVulkan::TickFrame() {
     ONEF_LEND(FrameEnd, TickFrame())
+    async_compute_skip.TickFrame(); // FRITCHII_ASYNC_COMPUTE_SKIP's frame clock and 10 s line
+    const bool frame_end_times = FrameEndTimes::On();
+    if (frame_end_times) [[unlikely]] {
+        g_frame_end_times.Begin();
+    }
 #ifdef _WIN32
     // EXP111 (live; 0 = Windows' default, 1 = above normal, 2 = high): the process priority
     // class. The owner sees more fps with the window focused: Windows boosts the foreground
@@ -8859,25 +9529,42 @@ void RasterizerVulkan::TickFrame() {
         device_memory.UpdatePagesCachedCount(page_address, Core::DEVICE_PAGESIZE, delta);
     });
     device_memory.ReleaseLingering();
+    // FRITCHII_FRAME_END_TIMES: the parts' boundaries (nothing when off).
+    const auto part_done = [frame_end_times](FrameEndTimes::Part part) {
+        if (frame_end_times) [[unlikely]] {
+            g_frame_end_times.End(part);
+        }
+    };
+    part_done(FrameEndTimes::Head);
     pipeline_cache.TickFrame();
+    part_done(FrameEndTimes::Pipeline);
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();
     descriptor_buffer_ring.TickFrame();
+    part_done(FrameEndTimes::Queues);
     fence_manager.TickFrame();
+    part_done(FrameEndTimes::Fences);
     staging_pool.TickFrame();
     if (split_buffer_staging) {
         split_buffer_staging->TickFrame();
     }
+    part_done(FrameEndTimes::Staging);
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.TickFrame();
     }
+    part_done(FrameEndTimes::Textures);
     // SEAM (EXP123) is read here, once a frame, with nothing pending.
     mem_stage.TickFrame();
+    part_done(FrameEndTimes::MemStage);
     {
         std::scoped_lock lock{buffer_cache.mutex};
         MemStage::FillPlay seam{mem_stage, MemStage::Site::Frame};
         buffer_cache.TickFrame();
+    }
+    if (frame_end_times) [[unlikely]] {
+        g_frame_end_times.End(FrameEndTimes::Buffers);
+        g_frame_end_times.Finish(VideoCommon::OneFollower::OnRenderThread());
     }
 }
 
@@ -9590,6 +10277,20 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
     const auto [buffer, offset] = buffer_cache.runtime.Seam().Ref(MemStage::Site::ImageCopy, [&] {
         return buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op);
     });
+    if (buffer->Handle() == VK_NULL_HANDLE) [[unlikely]] {
+        // The buffer operand is unmapped (ObtainBuffer's null buffer, which has no VkBuffer with
+        // nullDescriptor on): a GPU copy would use device address 0. The engine's own copy does
+        // it through guest memory instead, which skips the unmapped pages.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "DMA {} at unmapped GPU address {:#x} ({} bytes): left to the engine's "
+                        "copy (no GPU copy into the null buffer)",
+                        IS_IMAGE_UPLOAD ? "buffer to image" : "image to buffer",
+                        buffer_operand.address, buffer_size);
+        }
+        return false;
+    }
 
     const auto [image, copy] = texture_cache.DmaBufferImageCopy(
         copy_info, buffer_operand, image_operand, image_id, IS_IMAGE_UPLOAD);

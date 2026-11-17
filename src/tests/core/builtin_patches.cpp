@@ -640,6 +640,136 @@ TEST_CASE("Pickup counter built-in hooks the indicator's cut in both modes", "[p
     }
 }
 
+TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_manager]") {
+    constexpr std::string_view Fixes = "High refresh fixes (built-in)";
+    constexpr size_t Code = sizeof(Loader::NSOHeader);
+    struct Hook {
+        size_t offset;
+        u32 original;
+        u32 branch;
+    };
+    // The game's word at each hook and the branch to its stub.
+    constexpr std::array Hooks{
+        Hook{0x415300, 0xD503237F, 0x14E0C428}, // sound job entry: pacibsp -> b 0x3c463a0
+        Hook{0x415334, 0xBD401100, 0x14E0C43F}, // its step load -> b 0x3c46430
+        Hook{0x3293410, 0x1E390008, 0x1426CC3C}, // ocarina playback tick -> b 0x3c46500
+        Hook{0x2F53268, 0x5EA1B900, 0x1433CCBA}, // step rate countdown -> b 0x3c46550
+        // the words that stub skips: checked, kept
+        Hook{0x2F5326C, 0x1E380109, 0x1E380109},
+        Hook{0x2F53270, 0x5E21D800, 0x5E21D800},
+        Hook{0x2F53274, 0x1E203900, 0x1E203900},
+        Hook{0x2F53278, 0x1E302000, 0x1E302000},
+        Hook{0x2F5327C, 0x540017AA, 0x540017AA},
+        Hook{0x2F53280, 0x1E312000, 0x1E312000},
+        Hook{0x2F53284, 0x54001809, 0x54001809},
+        Hook{0x2F53288, 0xB9409B0A, 0xB9409B0A},
+        Hook{0x2F5328C, 0x7100053F, 0x7100053F},
+        Hook{0x2F53290, 0x1A9FC529, 0x1A9FC529},
+        Hook{0x53F914, 0x1100077A, 0x14DC1B27}, // ambient wave phase -> b 0x3c465b0
+        Hook{0x13A06C, 0x1E212000, 0x1E212000}, // fcmp s0, s1 (kept)
+        Hook{0x13A070, 0x5400196C, 0x14EC3168}, // ground velocity b.gt -> b 0x3c46610
+        Hook{0x13D70C, 0x1E212000, 0x1E212000},
+        Hook{0x13D710, 0x54001E2C, 0x14EC23D0}, // -> b 0x3c46650
+        Hook{0x389AC28, 0x1E212000, 0x1E212000},
+        Hook{0x389AC2C, 0x540017CC, 0x140EAE99}, // -> b 0x3c46690
+        Hook{0x261EB18, 0x1E210801, 0x14589EEE}, // turn speed fmul -> b 0x3c466d0
+        Hook{0x261EB1C, 0x1E280800, 0x1E280800}, // the second fmul (kept)
+        Hook{0x3B5C7C8, 0x11000508, 0x1403A7D6}, // movie frame count -> b 0x3c46720
+        Hook{0x3296B08, 0x1E390008, 0x1426BF22}, // Scarecrow's Song, held -> b 0x3c46790
+        Hook{0x32926C8, 0x1E390008, 0x1426D046}, // Scarecrow's Song, last note -> b 0x3c467e0
+        Hook{0x14632C, 0xBD466D00, 0x14EC0141}, // cloth time step loads -> b 0x3c46830
+        Hook{0x2AB804, 0x1E270100, 0x14E66C23}, // -> b 0x3c46890
+        Hook{0x2C207A4, 0xBD466D00, 0x14409853}, // -> b 0x3c468f0
+        Hook{0x2C2208C, 0xBD466D02, 0x14409231}, // -> b 0x3c46950
+    };
+    // Each stub's first and last word.
+    struct Stub {
+        size_t offset;
+        size_t size;
+        u32 first;
+        u32 last;
+    };
+    constexpr std::array Stubs{
+        Stub{0x3C463A0, 0x88, 0xA9BF47F0, 0xD65F03C0}, // sound gate: stp x16, x17 ... ret
+        Stub{0x3C46430, 0x38, 0xBD401100, 0x171F3BB5}, // sound feed: ldr s0 ... b 0x415338
+        Stub{0x3C46470, 0x88, 0xADBF07E0, 0xD65F03C0}, // step ticks: stp q0, q1 ... ret
+        Stub{0x3C46500, 0x50, 0xA9BF47F0, 0x17D933B2}, // playback ... b 0x3293414
+        Stub{0x3C46550, 0x60, 0xA9BF47F0, 0x17CC3330}, // countdown ... b 0x2f5326c
+        Stub{0x3C465B0, 0x60, 0xA9BF47F0, 0x1723E4C3}, // ambient ... b 0x53f918
+        Stub{0x3C46610, 0x38, 0x5400004C, 0x1713CF56}, // ground a: b.gt +8 ... b 0x13a39c
+        Stub{0x3C46650, 0x38, 0x5400004C, 0x1713DD14}, // ground b ... b 0x13dad4
+        Stub{0x3C46690, 0x38, 0x5400004C, 0x17F15218}, // ground c ... b 0x389af24
+        Stub{0x3C466D0, 0x48, 0xA9BF47F0, 0x17A76103}, // turn speed ... b 0x261eb20
+        Stub{0x3C46720, 0x64, 0xA9BF47F0, 0x17FC5813}, // movie ... b 0x3b5c7cc
+        Stub{0x3C46790, 0x50, 0xA9BF47F0, 0x17D940CC}, // Scarecrow held ... b 0x3296b0c
+        Stub{0x3C467E0, 0x50, 0xA9BF47F0, 0x17D92FA8}, // Scarecrow last ... b 0x32926cc
+        Stub{0x3C46830, 0x5C, 0xA9BF47F0, 0x1713FEAA}, // cloth a ... b 0x146330
+        Stub{0x3C46890, 0x5C, 0xA9BF47F0, 0x171993C8}, // cloth b ... b 0x2ab808
+        Stub{0x3C468F0, 0x5C, 0xA9BF47F0, 0x17BF6798}, // cloth c ... b 0x2c207a8
+        Stub{0x3C46950, 0x5C, 0xA9BF47F0, 0x17BF6DBA}, // cloth d ... b 0x2c22090
+    };
+    constexpr u32 GateCallWord = 0xB94CC610; // ldr w16, [x16, #0xcc4] (the frame step's call)
+    const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
+        u32 word;
+        std::memcpy(&word, nso.data() + offset, sizeof(word));
+        return word;
+    };
+    struct RestoreSetting {
+        ~RestoreSetting() {
+            Settings::values.oot_high_refresh.SetValue(false);
+        }
+    } restore;
+
+    PatchManagerTestContext context;
+    auto nso = MakeOcarinaMain();
+    for (const Hook& hook : Hooks) {
+        std::memcpy(nso.data() + Code + hook.offset, &hook.original, sizeof(u32));
+    }
+    const auto applied = [&](const std::vector<u8>& patched) {
+        return std::ranges::all_of(Hooks,
+                                   [&](const Hook& hook) {
+                                       return word_at(patched, Code + hook.offset) == hook.branch;
+                                   }) &&
+               std::ranges::all_of(Stubs, [&](const Stub& stub) {
+                   return word_at(patched, Code + stub.offset) == stub.first &&
+                          word_at(patched, Code + stub.offset + stub.size - 4) == stub.last;
+               });
+    };
+
+    SECTION("Dark's mode and the high refresh mode both get it, gated on the call word") {
+        Settings::values.oot_high_refresh.SetValue(false);
+        const auto dark = context.Manager().PatchNSO(nso, "main");
+        REQUIRE(applied(dark));
+        REQUIRE(word_at(dark, Code + Stubs[0].offset + 8) == GateCallWord);
+        Settings::values.oot_high_refresh.SetValue(true);
+        REQUIRE(applied(context.Manager().PatchNSO(nso, "main")));
+    }
+
+    SECTION("Another word at a hook, a stub word in use, or off in Add-Ons: skipped whole") {
+        SECTION("first hook") {
+            std::memcpy(nso.data() + Code + Hooks.front().offset, &NopInstruction, sizeof(u32));
+        }
+        SECTION("last hook") {
+            std::memcpy(nso.data() + Code + Hooks.back().offset, &NopInstruction, sizeof(u32));
+        }
+        SECTION("a word the countdown stub skips") {
+            std::memcpy(nso.data() + Code + 0x2F53290, &NopInstruction, sizeof(u32));
+        }
+        SECTION("stub") {
+            nso[Code + Stubs.back().offset + Stubs.back().size - 4] = 1;
+        }
+        SECTION("Add-Ons") {
+            Settings::values.disabled_addons[OcarinaTitleId] = {std::string{Fixes}};
+        }
+        const auto patched = context.Manager().PatchNSO(nso, "main");
+        Settings::values.disabled_addons.erase(OcarinaTitleId);
+        for (const Hook& hook : Hooks) {
+            REQUIRE(word_at(patched, Code + hook.offset) == word_at(nso, Code + hook.offset));
+        }
+        REQUIRE(word_at(patched, Code + Stubs.front().offset) == 0);
+    }
+}
+
 TEST_CASE("Dark's standalone Dynamic FPS mod is skipped and hidden for the built-in",
           "[patch_manager]") {
     constexpr std::string_view DynamicFps = "Dynamic FPS by Dark (built-in)";

@@ -18,8 +18,10 @@ namespace {
 // binds_unmapped_pointer_word. TextureDescriptor's is_descriptor_array and handle_is_pointer_word
 // (only set with EDEN_NX2_LIGHT_TABLE_ARRAYS) are stored in is_depth's byte (VisitTexture).
 // binds_unmapped_pointer_word is not stored: only the original's cached-record drop reads it,
-// which is not ported.
-static_assert(sizeof(Info) == 7016,
+// which is not ported. 7040: + 24 for storage_write_extras (FRITCHII_EXTENT_CENSUS and
+// FRITCHII_EXTENT_CBUF), not stored either: empty for an info from the precompiled cache, so the
+// format and Magic stay.
+static_assert(sizeof(Info) == 7040,
               "Shader::Info changed: list the new fields in VisitInfo, then update this size");
 // The descriptors are held in vectors, so a field they grow does not change sizeof(Info).
 static_assert(sizeof(ConstantBufferDescriptor) == 8 && sizeof(StorageBufferDescriptor) == 80 &&

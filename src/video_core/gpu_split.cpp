@@ -694,8 +694,14 @@ bool GpuSplit::SiteOnEngine(DrainSite site) noexcept {
 
 bool GpuSplit::UsesEngine(DrainSite site) const {
     // LaggedCheckEngine is chosen by FRITCHII_ONEF_SEM_E itself, not WAITS_E.
-    return two_positions && SiteOnEngine(site) &&
-           (site == DrainSite::LaggedCheckEngine || OneFollower::WaitsE());
+    // FRITCHII_ONEF_WAITS_R (live, default 0) overrides both: R's played position.
+    if (!two_positions || !SiteOnEngine(site)) {
+        return false;
+    }
+    if (site == DrainSite::LaggedCheckEngine) {
+        return !OneFollower::WaitsR();
+    }
+    return OneFollower::WaitsE(); // false with WAITS_R on
 }
 
 bool GpuSplit::Reached(u64 target, bool on_engine, std::memory_order order) const {
@@ -3645,6 +3651,13 @@ u64 GpuSplit::SettleWrites() {
     return consumed_cache;
 }
 
+namespace {
+/// A counter with one writer (the back): a plain load and store.
+void CbBump(std::atomic<u64>& counter, u64 amount = 1) {
+    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+} // Anonymous namespace
+
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
     const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
@@ -3794,8 +3807,34 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::OtherEngine);
         }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        // FRITCHII_CB_MERGE=1 (dry): a block of only constant buffer offset/address/size writes
+        // (what splits two CbWords blocks), timed 1 in 16.
+        u64 gap_start = 0;
+        if (engine == cb_merge_back_3d && CbMergeOn()) [[unlikely]] {
+            using Tegra::Engines::Maxwell3D;
+            constexpr u32 cb_size = MAXWELL3D_REG_INDEX(const_buffer.size);
+            constexpr u32 cb_offset = MAXWELL3D_REG_INDEX(const_buffer.offset);
+            bool cb_only = count != 0;
+            for (u32 i = 0; i < count && cb_only; ++i) {
+                const u32 method = static_cast<u32>(entry[1 + i] & 0xffff);
+                cb_only = method >= cb_size && method <= cb_offset;
+            }
+            if (cb_only) {
+                CbBump(cb_merge_back.gap_entries);
+                if (cb_merge_sample_left == 0) {
+                    cb_merge_sample_left = 15;
+                    gap_start = Nx2Profile::Ticks();
+                } else {
+                    --cb_merge_sample_left;
+                }
+            }
+        }
         engine->ConsumeSink(*system);
         engine->ApplyPairs(*system, entry + 1, count);
+        if (gap_start != 0) [[unlikely]] {
+            CbBump(cb_merge_back.gap_samples);
+            CbBump(cb_merge_back.gap_ticks, Nx2Profile::Ticks() - gap_start);
+        }
         return 1 + size_t{count};
     }
     case Kind::StateDelta: {
@@ -3819,19 +3858,33 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 count = static_cast<u32>(head >> 32);
         const bool verify = (head & CbVerify) != 0;
         const size_t first = verify ? 2 : 1;
+        cb_merge_back_3d = back_engine; // only the 3D engine sends blocks
+        // FRITCHII_CB_MERGE >= 2: a block with joined register writes (never with CbVerify).
+        if ((head & CbJoined) != 0) {
+            ExecuteCbJoined(entry + first, count);
+            return first + size_t{count};
+        }
+        // FRITCHII_CB_MERGE=1/2 (dry): the block's time by its size, 1 in 16.
+        u64 block_start = 0;
+        if (CbMergeOn()) [[unlikely]] {
+            if (cb_merge_sample_left == 0) {
+                cb_merge_sample_left = 15;
+                block_start = Nx2Profile::Ticks();
+            } else {
+                --cb_merge_sample_left;
+            }
+        }
         ExecuteCbWords(entry + first, count, verify ? entry + 1 : nullptr);
+        if (block_start != 0) [[unlikely]] {
+            const size_t bucket = count <= 1 ? 0 : count == 2 ? 1 : count <= 4 ? 2 : 3;
+            CbBump(cb_merge_back.block_samples[bucket]);
+            CbBump(cb_merge_back.block_ticks[bucket], Nx2Profile::Ticks() - block_start);
+        }
         return first + size_t{count};
     }
     }
     return 1;
 }
-
-namespace {
-/// A counter with one writer (the back): a plain load and store.
-void CbBump(std::atomic<u64>& counter, u64 amount = 1) {
-    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
-}
-} // Anonymous namespace
 
 size_t GpuSplit::PlainEntrySize(u64 head) {
     switch (static_cast<Kind>(head & 0xf)) {
@@ -4084,10 +4137,178 @@ void GpuSplit::VerifyCbWords(const u64* words, u32 count, u64 front_address) {
     }
 }
 
+bool GpuSplit::CbJoinPair(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                          int mode) {
+    const size_t index = write_position & RingMask;
+    if (cb_header == nullptr || cb_verify || pending_flush != nullptr || engine != front_engine ||
+        write_position != cb_end || index == 0 || cb_count >= MaxCbWords ||
+        write_position + 1 - consumed_cache > RingWords) {
+        return false; // no open block at the ring's end: sent as before (not counted)
+    }
+    if (MemoryStageLink::RingActive() || ESplit::g_records || ESplit::ThreadWanted()) {
+        ++cb_join.refused;
+        return false;
+    }
+    ring[index] = static_cast<u64>(Kind::Method) | Sink | (u64{method & 0xffff} << 8) |
+                  (u64{argument} << 32);
+    ++cb_count;
+    *cb_header = (*cb_header & 0xffff'ffffULL) | CbJoined | (u64{cb_count} << 32);
+    ++cb_join.joined;
+    CountBatched(Batched::Pairs);
+    // Mode 2: the next word (the joined run's first) carries the front's address before it.
+    cb_merge_mark_next = mode == 2;
+    Commit(1, Effect::None); // A publish here ends the block (Publish)
+    cb_end = write_position;
+    return true;
+}
+
+void GpuSplit::ExecuteCbJoined(const u64* words, u32 count) {
+    using Tegra::Engines::Maxwell3D;
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    constexpr u32 cb_size = MAXWELL3D_REG_INDEX(const_buffer.size);
+    constexpr u32 cb_offset = MAXWELL3D_REG_INDEX(const_buffer.offset);
+    CbBump(cb_back.blocks);
+    CbBump(cb_join_back.blocks);
+    const auto is_data = [&](u64 word) {
+        return static_cast<Kind>(word & 0xf) == Kind::Method &&
+               (word & (HasSegment | Sink)) == 0 &&
+               static_cast<u32>((word >> 8) & 0xffff) - cb_data < 16;
+    };
+    for (u32 i = 0; i < count;) {
+        const u64 word = words[i];
+        if (is_data(word)) {
+            // A run of constant buffer words, as ExecuteCbWords runs a block of them.
+            u32 end = i + 1;
+            while (end < count && is_data(words[end])) {
+                ++end;
+            }
+            CbBump(cb_back.words, end - i);
+            for (u32 done = i; done < end;) {
+                done += static_cast<u32>(Execute(words + done, end - done));
+            }
+            i = end;
+            continue;
+        }
+        const u32 method = static_cast<u32>((word >> 8) & 0xffff);
+        const bool tagged = static_cast<Kind>(word & 0xf) == Kind::Method && (word & Sink) != 0 &&
+                            (word & HasSegment) == 0;
+        if (tagged && method == CbMarkMethod && i + 1 < count) {
+            // FRITCHII_CB_MERGE=2: where the next run's first word goes on the back (the sink
+            // first, as that word does) against the front's address for it.
+            back_engine->ConsumeSink(*system);
+            if (auto* const maxwell3d = dynamic_cast<Maxwell3D*>(back_engine)) {
+                const auto& regs = maxwell3d->regs;
+                const GPUVAddr back_address =
+                    regs.const_buffer.Address() + regs.const_buffer.offset;
+                CbBump(cb_join_back.checked);
+                if (back_address != words[i + 1]) {
+                    CbBump(cb_join_back.differ);
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        LOG_ERROR(HW_GPU,
+                                  "CB merge (FRITCHII_CB_MERGE=2): a joined run goes to {:#x} on "
+                                  "the back, the front noted {:#x}",
+                                  back_address, words[i + 1]);
+                    }
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if (tagged && method >= cb_size && method <= cb_offset) {
+            // A joined register write, as its own Pairs entry ran it.
+            const u64 pair = u64{method} | (word & 0xffff'ffff'0000'0000ULL);
+            CbBump(cb_join_back.writes);
+            back_engine->ConsumeSink(*system);
+            back_engine->ApplyPairs(*system, &pair, 1);
+            ++i;
+            continue;
+        }
+        // Must be 0: nothing else is joined. Run it as its own entry would, if it is one.
+        CbBump(cb_join_back.bad);
+        CbBump(cb_back.bad);
+        if (static_cast<Kind>(word & 0xf) == Kind::Method && (word & HasSegment) == 0) {
+            Execute(words + i, 1);
+        }
+        ++i;
+    }
+}
+
+void GpuSplit::NoteCbMergeGap(Tegra::Engines::EngineInterface* engine) {
+    // FRITCHII_CB_MERGE=1 (dry): the ring words since the previous CbWords block's last word
+    // (cb_end; the front's own, not yet overwritten: at most 32 looked at). Joinable when they
+    // are only 3D constant buffer offset (and address/size) register writes: one entry could
+    // carry both blocks with their offsets.
+    using Tegra::Engines::Maxwell3D;
+    constexpr u32 cb_size = MAXWELL3D_REG_INDEX(const_buffer.size);
+    constexpr u32 cb_offset = MAXWELL3D_REG_INDEX(const_buffer.offset);
+    const bool same_engine = cb_last_engine == engine;
+    cb_last_engine = engine;
+    if (!same_engine || cb_end == 0 || engine != front_engine) {
+        return;
+    }
+    ++cb_merge.opens;
+    if (write_position < cb_end) {
+        ++cb_merge.blocked;
+        return;
+    }
+    const u64 gap = write_position - cb_end;
+    if (gap == 0) {
+        ++cb_merge.publish;
+        return;
+    }
+    if (gap > 32) {
+        ++cb_merge.blocked;
+        return;
+    }
+    bool rebind = false;
+    u64 pairs = 0;
+    const auto cb_register = [&](u32 method) {
+        if (method < cb_size || method > cb_offset) {
+            return false;
+        }
+        rebind |= method != cb_offset;
+        ++pairs;
+        return true;
+    };
+    for (u64 at = cb_end; at < write_position;) {
+        const u64 head = ring[at & RingMask];
+        u64 size = 0;
+        bool ok = false;
+        switch (static_cast<Kind>(head & 0xf)) {
+        case Kind::Pairs: {
+            const u32 count = static_cast<u32>(head >> 32);
+            size = 1 + u64{count};
+            ok = count != 0 && at + size <= write_position;
+            for (u32 i = 0; i < count && ok; ++i) {
+                ok = cb_register(static_cast<u32>(ring[(at + 1 + i) & RingMask] & 0xffff));
+            }
+            break;
+        }
+        case Kind::Method:
+            size = (head & HasSegment) != 0 ? 2 : 1;
+            ok = at + size <= write_position &&
+                 cb_register(static_cast<u32>((head >> 8) & 0xffff));
+            break;
+        default:
+            break;
+        }
+        if (!ok) {
+            ++cb_merge.blocked;
+            return;
+        }
+        at += size;
+    }
+    ++(rebind ? cb_merge.rebind : cb_merge.offset);
+    cb_merge.gap_pairs += pairs;
+}
+
 void GpuSplit::ReportCbWords() {
     const auto now = std::chrono::steady_clock::now();
     if (cb_since == std::chrono::steady_clock::time_point{}) {
         cb_since = now;
+        cb_merge_ticks_at = Nx2Profile::Ticks(); // FRITCHII_CB_MERGE's tick clock
+        cb_merge_clock_at = now;
         cb_reported = cb_stats;
         cb_reported_overflows = ranged_overflow_count;
         return;
@@ -4123,6 +4344,88 @@ void GpuSplit::ReportCbWords() {
                  back(cb_back.applied_twice), back(cb_back.apply_differ),
                  back(cb_back.apply_skipped));
     }
+    // FRITCHII_CB_MERGE=1 (dry): how many block pairs one entry could carry and what E would save.
+    // A merged entry still writes every word and offset, so the saving is the per-block fixed
+    // part (2 x a 1-word block - a 2-word block, from the sampled times) and, at most, the
+    // separating offset entry's own time.
+    const u64 ticks_now = Nx2Profile::Ticks();
+    if (CbMergeOn() || cb_merge.opens != 0) {
+        double ns_per_tick = 0.0;
+        if (cb_merge_ticks_at != 0 && ticks_now > cb_merge_ticks_at) {
+            ns_per_tick = std::chrono::duration<double, std::nano>(now - cb_merge_clock_at).count() /
+                          static_cast<double>(ticks_now - cb_merge_ticks_at);
+        }
+        std::array<double, 4> block_ns{};
+        std::array<u64, 4> block_counts{};
+        for (size_t i = 0; i < 4; ++i) {
+            const u64 samples = back(cb_merge_back.block_samples[i]);
+            const u64 ticks = back(cb_merge_back.block_ticks[i]);
+            block_counts[i] = samples - cb_merge_last_samples[i];
+            block_ns[i] = block_counts[i] != 0
+                              ? static_cast<double>(ticks - cb_merge_last_ticks[i]) * ns_per_tick /
+                                    static_cast<double>(block_counts[i])
+                              : 0.0;
+            cb_merge_last_samples[i] = samples;
+            cb_merge_last_ticks[i] = ticks;
+        }
+        const u64 gap_entries = back(cb_merge_back.gap_entries);
+        const u64 gap_samples = back(cb_merge_back.gap_samples);
+        const u64 gap_ticks = back(cb_merge_back.gap_ticks);
+        const u64 gap_sampled = gap_samples - cb_merge_last_gap_samples;
+        const double gap_ns = gap_sampled != 0
+                                  ? static_cast<double>(gap_ticks - cb_merge_last_gap_ticks) *
+                                        ns_per_tick / static_cast<double>(gap_sampled)
+                                  : 0.0;
+        const double gap_rate =
+            static_cast<double>(gap_entries - cb_merge_last_gap_entries) / seconds;
+        cb_merge_last_gap_entries = gap_entries;
+        cb_merge_last_gap_samples = gap_samples;
+        cb_merge_last_gap_ticks = gap_ticks;
+        const double fixed_ns = (std::max)(0.0, 2.0 * block_ns[0] - block_ns[1]);
+        const double joinable = static_cast<double>(cb_merge.offset + cb_merge.rebind) / seconds;
+        LOG_INFO(HW_GPU,
+                 "CB merge (FRITCHII_CB_MERGE=1, dry) {:.0f} s: blocks opened after a block "
+                 "{:.0f}/s: joinable {:.0f}/s (offset only {:.0f}, with address/size {:.0f}; "
+                 "{:.2f} writes between), nothing between {:.0f}/s, blocked by other entries "
+                 "{:.0f}/s; E, sampled 1 in 16: blocks of 1/2/3-4/5+ words {:.0f}/{:.0f}/{:.0f}/"
+                 "{:.0f} ns, offset-only pair entries {:.0f}/s at {:.0f} ns; fixed part a block "
+                 "{:.0f} ns; E saving if joined {:.1f} to {:.1f} ms/s",
+                 seconds,
+                 static_cast<double>(cb_merge.opens) / seconds, joinable,
+                 static_cast<double>(cb_merge.offset) / seconds,
+                 static_cast<double>(cb_merge.rebind) / seconds,
+                 cb_merge.offset + cb_merge.rebind != 0
+                     ? static_cast<double>(cb_merge.gap_pairs) /
+                           static_cast<double>(cb_merge.offset + cb_merge.rebind)
+                     : 0.0,
+                 static_cast<double>(cb_merge.publish) / seconds,
+                 static_cast<double>(cb_merge.blocked) / seconds, block_ns[0], block_ns[1],
+                 block_ns[2], block_ns[3], gap_rate, gap_ns, fixed_ns,
+                 joinable * fixed_ns / 1e6, joinable * (fixed_ns + gap_ns) / 1e6);
+        cb_merge = {};
+    }
+    // FRITCHII_CB_MERGE >= 2: what was joined, and the verify counts (must be 0).
+    if (const int merge_mode = CbMergeMode(); merge_mode >= 2 || cb_join.joined != 0) {
+        const u64 blocks = back(cb_join_back.blocks);
+        const u64 writes = back(cb_join_back.writes);
+        LOG_INFO(HW_GPU,
+                 "CB merge (FRITCHII_CB_MERGE={}) {:.0f} s: front joined writes {:.0f}/s, refused "
+                 "(memory stage ring or E split) {:.0f}/s, run marks {:.0f}/s (not marked: at the "
+                 "ring's end or block full {:.0f}/s); E: joined blocks {:.0f}/s, joined writes "
+                 "{:.0f}/s; session: runs checked {}, must be 0: differ {}, bad words {}",
+                 merge_mode, seconds, static_cast<double>(cb_join.joined) / seconds,
+                 static_cast<double>(cb_join.refused) / seconds,
+                 static_cast<double>(cb_join.marks) / seconds,
+                 static_cast<double>(cb_join.marks_skipped) / seconds,
+                 static_cast<double>(blocks - cb_join_last_blocks) / seconds,
+                 static_cast<double>(writes - cb_join_last_writes) / seconds,
+                 back(cb_join_back.checked), back(cb_join_back.differ), back(cb_join_back.bad));
+        cb_join = {};
+        cb_join_last_blocks = blocks;
+        cb_join_last_writes = writes;
+    }
+    cb_merge_ticks_at = ticks_now;
+    cb_merge_clock_at = now;
     cb_since = now;
     cb_reported = cb_stats;
     cb_reported_overflows = ranged_overflow_count;

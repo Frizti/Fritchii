@@ -15,6 +15,7 @@
 #include "video_core/renderer_opengl/present/layer.h"
 #include "video_core/renderer_opengl/present/present_uniforms.h"
 #include "video_core/renderer_opengl/present/window_adapt_pass.h"
+#include "video_core/test_watermark.h"
 
 namespace OpenGL {
 
@@ -116,6 +117,27 @@ void WindowAdaptPass::DrawToFramebuffer(ProgramManager& program_manager, std::li
         glProgramUniformMatrix3x2fv(vert.handle, ModelViewMatrixLocation, 1, GL_FALSE, matrices[i].data());
         glNamedBufferSubData(vertex_buffer.handle, 0, sizeof(vertices[i]), std::data(vertices[i]));
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+
+    // Stamped test copies: their mark, inside the game picture (video_core/test_watermark.cpp).
+    // Scissor 0 is marked dirty by BlitScreen::DrawScreen, so the next draw sets it again.
+    const auto& mark = VideoCore::TestWatermark::Build(layout.screen, layout.width, layout.height);
+    if (!mark.text.empty()) {
+        glEnablei(GL_SCISSOR_TEST, 0);
+        const auto clear_blocks = [&](const std::vector<VideoCore::TestWatermark::Block>& blocks,
+                                      const float (&c)[4]) {
+            glClearColor(c[0], c[1], c[2], c[3]);
+            for (const auto& b : blocks) {
+                const GLint y = invert_y ? static_cast<GLint>(b.y)
+                                         : static_cast<GLint>(layout.height - b.y - b.height);
+                glScissorIndexed(0, static_cast<GLint>(b.x), y, static_cast<GLsizei>(b.width),
+                                 static_cast<GLsizei>(b.height));
+                glClear(GL_COLOR_BUFFER_BIT);
+            }
+        };
+        clear_blocks(mark.shadow, VideoCore::TestWatermark::ShadowColor);
+        clear_blocks(mark.text, VideoCore::TestWatermark::TextColor);
+        glDisablei(GL_SCISSOR_TEST, 0);
     }
 }
 

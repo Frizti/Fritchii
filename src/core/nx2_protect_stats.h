@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/one_follower_hooks.h"
 
 namespace Core::Nx2ProtectStats {
 
@@ -80,6 +81,13 @@ struct State {
     std::atomic<u64> linger_mapping{};    ///< Uncached at once by Map, Unmap or UnregisterProcess
     std::atomic<u64> linger_held{};       ///< Lingering after the last sweep
     std::atomic<u64> linger_left_after_unmap{}; ///< Verify: must stay 0
+    // Round 5 (helper DE): the calls one follower's engine thread E (GPUBack) makes, and E's
+    // protects of pages it unprotected 0-1 frames before (what EXP89=1 would not call, with
+    // their unprotects): E's share of the cycle, the wall thread's ceiling for EXP89.
+    std::atomic<u64> e_calls[2]{};
+    std::atomic<u64> e_ns[2]{};
+    std::atomic<u64> e_repeat_calls{};
+    std::atomic<u64> e_repeat_ns{};
     std::atomic<s64> next_report_ns{};
 };
 
@@ -192,6 +200,26 @@ inline void Report(State& state, s64 now) {
              frames_ago[0], frames_ago[1], frames_ago[2], frames_ago[3], frames_ago[4],
              frames_ago[5], frames_ago[6], frames_ago[7], share(1), share(2), share(3), share(4),
              share(5), last_unprotect_kept);
+    {
+        const u64 e_u = take(state.e_calls[0]);
+        const u64 e_p = take(state.e_calls[1]);
+        const u64 e_ns_u = take(state.e_ns[0]);
+        const u64 e_ns_p = take(state.e_ns[1]);
+        const u64 e_rep = take(state.e_repeat_calls);
+        const u64 e_rep_ns = take(state.e_repeat_ns);
+        // The unprotect each repeat protect pairs with, priced at E's average unprotect.
+        const double pair_ns =
+            static_cast<double>(e_rep_ns) +
+            (e_u != 0 ? static_cast<double>(e_rep) * static_cast<double>(e_ns_u) / e_u : 0.0);
+        LOG_INFO(HW_GPU,
+                 "Page protection on GPUBack (E, 5 s, per second): protect {:.0f} calls {:.2f} ms, "
+                 "unprotect {:.0f} calls {:.2f} ms; protects of a page E unprotected 0-1 frames "
+                 "before {:.0f} calls {:.2f} ms, with their unprotects ~{:.2f} ms (EXP89=1's "
+                 "ceiling on E; its cost is the guest's trapped stores on lingering pages, the "
+                 "Store memo line)",
+                 e_p / 5.0, e_ns_p / 5e6, e_u / 5.0, e_ns_u / 5e6, e_rep / 5.0, e_rep_ns / 5e6,
+                 pair_ns / 5e6);
+    }
     LOG_INFO(HW_GPU,
              "Lingering protection (EXP89, 5 s, pages per second): unprotects cancelled {:.0f}, "
              "protects cancelled {:.0f}, released by the sweep {:.0f}, by map/unmap {:.0f}; held "
@@ -217,6 +245,8 @@ inline void Count(u64 vaddr, u64 bytes, bool cached, Func&& call) {
     call();
     const s64 end = NowNs();
     const size_t kind = cached ? 1 : 0;
+    const bool on_e = VideoCommon::OneFollower::Detail::t_engine;
+    bool repeat = false;
     state.calls[kind].fetch_add(1, std::memory_order_relaxed);
     state.bytes[kind].fetch_add(bytes, std::memory_order_relaxed);
     state.ns[kind].fetch_add(static_cast<u64>(end - start), std::memory_order_relaxed);
@@ -236,12 +266,21 @@ inline void Count(u64 vaddr, u64 bytes, bool cached, Func&& call) {
                 size_t bucket = FramesAgoBuckets - 1; // never (or trimmed)
                 if (it != state.last_unprotect.end()) {
                     bucket = FramesAgoBucket(frame > it->second ? frame - it->second : 0);
+                    repeat |= frame <= it->second + 1;
                 }
                 state.frames_ago[bucket].fetch_add(1, std::memory_order_relaxed);
             } else {
                 ++count.unprotects;
                 state.last_unprotect[page] = frame;
             }
+        }
+    }
+    if (on_e) {
+        state.e_calls[kind].fetch_add(1, std::memory_order_relaxed);
+        state.e_ns[kind].fetch_add(static_cast<u64>(end - start), std::memory_order_relaxed);
+        if (repeat) {
+            state.e_repeat_calls.fetch_add(1, std::memory_order_relaxed);
+            state.e_repeat_ns.fetch_add(static_cast<u64>(end - start), std::memory_order_relaxed);
         }
     }
     Report(state, end);

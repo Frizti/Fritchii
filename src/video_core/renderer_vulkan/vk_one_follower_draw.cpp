@@ -44,6 +44,7 @@
 #include "video_core/fritchii_e_split.h"
 #include "video_core/fritchii_e_split_thread.h"
 #include "video_core/fritchii_fill_cuts.h"
+#include "video_core/fritchii_occl_lean.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -53,6 +54,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_indirect_grid.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/one_follower_stats.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -70,6 +72,7 @@ std::atomic<OneFollowerDraw*> g_instance{nullptr};
 } // Anonymous namespace
 
 namespace OneF = VideoCommon::OneFollower;
+namespace Profile = VideoCommon::Nx2Profile;
 using OneF::Check;
 using OneF::LentOp;
 using OneF::StepLevel;
@@ -517,6 +520,7 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     const bool price_handles =
         !esplit_async && VideoCommon::FritchiiPrice::On() && pipeline != nullptr;
     const u64 handle_start = price_handles ? VideoCommon::FritchiiPrice::Ticks() : 0;
+    std::optional<Profile::FineScope> handles_zone{std::in_place, Profile::Zone::DrawHandles};
     // FRITCHII_HANDLE_PROG_KEEP (fable_b 25.2 cut g): a pipeline with handle programs keeps their
     // results while every word they read is unchanged.
     const int program_keep =
@@ -537,6 +541,7 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
             r.device.GetStorageBufferAlignment(), null_pointer_handles,
             [this](u32 raw) { handle_values.push_back(raw); });
     }
+    handles_zone.reset(); // helper CP: "draw handle values"
     if (price_handles) [[unlikely]] {
         PriceHandleValues(engine, handle_infos, pipeline,
                           VideoCommon::FritchiiPrice::Ticks() - handle_start);
@@ -896,6 +901,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         // Today's PrepareDraw head, E's half: the stream's invalidations before the fill.
         const ESplit::Carve flush_carve{ESplit::Class::E2, esplit};
         const ESplit::FlagProbe flush_probe{engine, ESplit::FlagSite::StreamFlush, esplit};
+        const Profile::FineScope flush_zone{Profile::Zone::DrawFlush}; // helper CP
         engine.GetMemoryManager().FlushCaching();
     }
     // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looks the pipeline up itself, at its own position,
@@ -910,7 +916,10 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         const ESplit::LookupScope esplit_lookup;
         const ESplit::FlagProbe lookup_probe{engine, ESplit::FlagSite::Lookup, esplit};
         const auto flags_before = engine.dirty.flags;
-        pipeline = rasterizer.pipeline_cache.CurrentGraphicsPipeline();
+        {
+            const Profile::FineScope lookup_zone{Profile::Zone::PipelineLookup}; // helper CP
+            pipeline = rasterizer.pipeline_cache.CurrentGraphicsPipeline();
+        }
         engine.dirty.flags |= flags_before;
         ESplit::NoteLookup(esplit); // E1's lookup: after an E2 shader page write it would wait
         // fable_b 18.4, must be 0 (FRITCHII_ONEF_LOOKUP_CHECK, every Nth unlent draw): the parts
@@ -946,6 +955,16 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         if (pipeline->IsEmulatedMesh()) [[unlikely]] {
             reason = LentReason::NoPath;
             return false;
+        }
+    }
+    // FRITCHII_OCCL_LEAN (helper CS, fritchii_occl_lean.h): a draw that writes no colour takes
+    // the same pipeline without its pixel program when that program can change nothing else; the
+    // fill below then has no pixel stage and R binds no pixel textures. Off: one relaxed load.
+    VideoCommon::OcclLean::DrawNote occl_note{};
+    if (pipeline != nullptr) {
+        if (const int occl_mode = VideoCommon::OcclLean::Mode(); occl_mode != 0) [[unlikely]] {
+            pipeline = rasterizer.pipeline_cache.OcclLeanPipeline(pipeline, engine.regs,
+                                                                  occl_mode, occl_note);
         }
     }
     const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
@@ -1068,16 +1087,31 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     // The fill, ring B's packet, R's packet (its span packing is E1's, carved in PushDraw) and
     // TickWork: E2's.
     const ESplit::Carve fill_carve{ESplit::Class::E2, esplit};
-    if (!FillRing(engine, pipeline, is_indexed, position, seq, buffer_number, reason, list)) {
-        return false;
+    // FRITCHII_OCCL_LEAN's timer (1 in 16 of the draws the cut can take): the fill and the push.
+    const u64 occl_start = occl_note.timed ? VideoCommon::OcclLean::NowNs() : 0;
+    {
+        // Helper CP: FillRing's own work; the handle values and the fill ("memory fill" and
+        // its fine zones) are nested zones of their own.
+        const Profile::FineScope setup_zone{Profile::Zone::DrawFillSetup};
+        if (!FillRing(engine, pipeline, is_indexed, position, seq, buffer_number, reason,
+                      list)) {
+            return false;
+        }
     }
-    OneF::PushDraw(engine, seq, buffer_number, push_flags, pipeline);
+    {
+        const Profile::FineScope push_zone{Profile::Zone::DrawPush}; // helper CP
+        OneF::PushDraw(engine, seq, buffer_number, push_flags, pipeline);
+    }
+    if (occl_note.timed) [[unlikely]] {
+        VideoCommon::OcclLean::NoteFill(occl_note, VideoCommon::OcclLean::NowNs() - occl_start);
+    }
     // E is its only writer: a relaxed load and store, no locked instruction per draw.
     counts.pushed.store(counts.pushed.load(std::memory_order_relaxed) + 1,
                         std::memory_order_relaxed);
     // PrepareDraw's tail, E's half (read-backs wait on E's work).
     {
         const ESplit::FlagProbe tick_probe{engine, ESplit::FlagSite::TickWork, esplit};
+        const Profile::FineScope tick_zone{Profile::Zone::TickWork}; // helper CP
         rasterizer.gpu.TickWork();
     }
     ESplit::NoteDrawFilled(esplit);
@@ -1115,7 +1149,11 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
         return true;
     }
     filled_refused = false;
-    LentReason reason = UnlentBlocker(engine, is_indexed, instance_count, kind);
+    LentReason reason;
+    {
+        const Profile::FineScope route_zone{Profile::Zone::DrawRoute}; // helper CP
+        reason = UnlentBlocker(engine, is_indexed, instance_count, kind);
+    }
     // Mesh: native task/mesh pipelines only (the emulation's buffers are not R's alone). Without
     // VK_EXT_mesh_shader every mesh pipeline is emulated or skipped.
     if (reason == LentReason::Count && kind == OneF::Mesh &&

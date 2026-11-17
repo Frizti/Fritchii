@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_mem_stage_hook.h"
+#include "video_core/renderer_vulkan/vk_submit_times.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCommon {
@@ -358,6 +359,11 @@ public:
         return *master_semaphore;
     }
 
+    /// FRITCHII_SUBMIT_TIMES: per-submission GPU timestamps (Measure is safe on any thread).
+    [[nodiscard]] const SubmitTimes& GetSubmitTimes() const noexcept {
+        return submit_times;
+    }
+
     std::mutex submit_mutex;
 
 private:
@@ -556,6 +562,8 @@ private:
     /// for. Worker thread only.
     void BudgetGpuSubmission();
     void ReadBudgetResults();
+    /// FRITCHII_SUBMIT_TIMES: the worker's per-submission GPU timestamps (GetSubmitTimes).
+    SubmitTimes submit_times;
     static constexpr u32 BudgetSlots = 256;
     vk::QueryPool budget_pool;
     std::array<u64, BudgetSlots> budget_ticks{}; ///< each pending slot's tick

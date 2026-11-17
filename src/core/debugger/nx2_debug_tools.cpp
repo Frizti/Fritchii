@@ -474,7 +474,23 @@ json SetSwitch(ToolState&, const json& params) {
         value->store(params.at("value").get<int>(), std::memory_order_relaxed);
         VideoCore::Nx2Debug::BumpSwitchGeneration();
     }
-    return {{"name", name}, {"previous", previous}, {"value", value->load()}};
+    // -1 is "not read yet" (a switch is read from the environment on its first use, and some
+    // never are: the one follower's on AMD's proprietary driver). "effective" is what that
+    // first read takes: the environment's value (nx2_switches.txt sets it at boot), else the
+    // code's default (null here: each call site names its own).
+    const int current = value->load(std::memory_order_relaxed);
+    json result = {{"name", name}, {"previous", previous}, {"value", current}};
+    if (current >= 0) {
+        result["effective"] = current;
+        result["source"] = params.contains("value") ? "set live" : "read";
+    } else if (std::getenv(name.c_str()) != nullptr) {
+        result["effective"] = VideoCore::Nx2Debug::EnvSwitch(name.c_str());
+        result["source"] = "environment, not read yet";
+    } else {
+        result["effective"] = nullptr;
+        result["source"] = "code default, not read yet";
+    }
+    return result;
 }
 
 // Ocarina of Time's high refresh rate mode, switched live for tests without saving the setting

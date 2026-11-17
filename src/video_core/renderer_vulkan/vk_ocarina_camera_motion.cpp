@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <optional>
+#include <string>
+
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -14,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
 #include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
+#include "video_core/renderer_vulkan/vk_host_pacer.h"
 #include "video_core/host_shaders/ocarina_dlss_color_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_output_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_composite_comp_spv.h"
@@ -1130,6 +1135,20 @@ VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) 
         return VideoCommon::OcarinaUpscaleBackend::Native;
     }
     return backend;
+}
+
+bool OcarinaFsrOutputsGameSize(VideoCommon::OcarinaUpscaleBackend backend) {
+    static const int mode = VideoCommon::OcarinaFsrOutputMode();
+    static const u32 display_height = mode == 2 ? PrimaryDisplayHeight() : 0;
+    const bool game_size = VideoCommon::OcarinaFsrOutputsGameSize(mode, backend, display_height);
+    static std::atomic<bool> logged{false};
+    if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr && mode != 0 && !logged.exchange(true)) {
+        LOG_INFO(Render_Vulkan, "Ocarina FSR output (FRITCHII_FSR_OUTPUT={}): {}{}", mode,
+                 game_size ? "the game's 2560x1440 picture, no 4K composite" : "3840x2160",
+                 mode == 2 ? fmt::format(" (primary display {} pixels tall)", display_height)
+                           : std::string{});
+    }
+    return game_size;
 }
 
 } // namespace Vulkan

@@ -90,13 +90,35 @@ namespace {
 // its unlock runs (fable52_answer_backdraw (b) fix 1: host unmap/protect stalled up to 12.2 ms
 // during a pass in the Stalchild fight, 424.55 s and 440.35 s).
 std::atomic<int> g_guest_mapping_in_flight{};
+// FRITCHII_ZERO_TRIM_CHUNK's numbers (helper CR): while a pass makes its VirtualUnlock calls, the
+// guest map/unmap/protect calls that start are timed (count, longest), for the pass line. One
+// relaxed load per call otherwise.
+std::atomic<bool> g_zero_trim_unlocking{false};
+std::atomic<u64> g_guest_calls_in_unlock{0};
+std::atomic<u64> g_longest_guest_in_unlock_ns{0};
 struct GuestMappingInFlight {
     GuestMappingInFlight() noexcept {
         g_guest_mapping_in_flight.fetch_add(1, std::memory_order_relaxed);
+        if (g_zero_trim_unlocking.load(std::memory_order_relaxed)) [[unlikely]] {
+            start = std::chrono::steady_clock::now();
+            timed = true;
+        }
     }
     ~GuestMappingInFlight() {
         g_guest_mapping_in_flight.fetch_sub(1, std::memory_order_relaxed);
+        if (timed) [[unlikely]] {
+            const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - start)
+                                                .count());
+            g_guest_calls_in_unlock.fetch_add(1, std::memory_order_relaxed);
+            u64 longest = g_longest_guest_in_unlock_ns.load(std::memory_order_relaxed);
+            while (ns > longest && !g_longest_guest_in_unlock_ns.compare_exchange_weak(
+                                       longest, ns, std::memory_order_relaxed)) {
+            }
+        }
     }
+    std::chrono::steady_clock::time_point start{};
+    bool timed = false;
     GuestMappingInFlight(const GuestMappingInFlight&) = delete;
     GuestMappingInFlight& operator=(const GuestMappingInFlight&) = delete;
 };
@@ -1430,34 +1452,70 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
         }
     };
     u64 unlock_us = 0;
+    // FRITCHII_ZERO_TRIM_CHUNK (live, read once per pass; helper CR, 2026-11-16): one VirtualUnlock
+    // over a long run holds the address space for the whole call, and a guest VirtualProtect that
+    // lands in it waits: the first big pass after an area load (~530 MiB trimmed, 88 s after
+    // boot) had runs of 30-46 ms and the GPU-cache write traps stalled as long (host protect
+    // longest 21.6 / 19.1 / 45.7 ms in the market, Castle Town and night market hitches of 62,
+    // 53 and 71 ms, b18-reg logs). With 1, a run goes in calls of at most 256 pages (1 MiB); with
+    // N >= 2, of N pages. The same pages leave the working set (the calls cover exactly the run),
+    // contents untouched: nothing for a verify mode to compare. The give-way check runs before
+    // every call, so a guest call waits for at most one chunk.
+    int chunk_mode = g_zero_trim_chunk.load(std::memory_order_relaxed);
+    if (chunk_mode < 0) {
+        const char* const value = std::getenv("FRITCHII_ZERO_TRIM_CHUNK");
+        int unset = -1;
+        g_zero_trim_chunk.compare_exchange_strong(
+            unset, value != nullptr ? (std::max)(0, std::atoi(value)) : 0,
+            std::memory_order_relaxed);
+        chunk_mode = g_zero_trim_chunk.load(std::memory_order_relaxed);
+    }
+    const uintptr_t chunk_bytes = chunk_mode <= 0   ? ~uintptr_t{0}
+                                  : chunk_mode == 1 ? uintptr_t{256} * PageAlignment
+                                                    : uintptr_t(chunk_mode) * PageAlignment;
+    phases.chunk_mode = (std::max)(0, chunk_mode);
+    g_guest_calls_in_unlock.store(0, std::memory_order_relaxed);
+    g_longest_guest_in_unlock_ns.store(0, std::memory_order_relaxed);
     // Takes the pages in `pages` (sorted and deduplicated here) out of the working set, run by run.
     const auto unlock_all = [&](std::vector<uintptr_t>& pages) {
         const auto unlock_start = std::chrono::steady_clock::now();
         std::sort(pages.begin(), pages.end());
         pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+        g_zero_trim_unlocking.store(true, std::memory_order_relaxed);
         for (size_t i = 0; i < pages.size();) {
             size_t j = i + 1;
             while (j < pages.size() && pages[j] == pages[j - 1] + PageAlignment) {
                 ++j;
             }
-            // Give way to a guest map/unmap/protect under way (they share the address space lock
-            // with VirtualUnlock): at most 20 ms per run, so a game that maps nonstop does not
-            // hold the pass.
-            if (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0) {
-                const auto give_way_start = std::chrono::steady_clock::now();
-                while (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0 &&
-                       std::chrono::steady_clock::now() - give_way_start <
-                           std::chrono::milliseconds{20}) {
-                    SwitchToThread();
+            const uintptr_t run_end = pages[j - 1] + PageAlignment;
+            u64 run_us = 0; // the run's calls, without the give-way waits (as before the chunks)
+            for (uintptr_t begin = pages[i]; begin < run_end;) {
+                const uintptr_t end =
+                    run_end - begin > chunk_bytes ? begin + chunk_bytes : run_end;
+                // Give way to a guest map/unmap/protect under way (they share the address space
+                // lock with VirtualUnlock): at most 20 ms per call, so a game that maps nonstop
+                // does not hold the pass.
+                if (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0) {
+                    const auto give_way_start = std::chrono::steady_clock::now();
+                    while (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0 &&
+                           std::chrono::steady_clock::now() - give_way_start <
+                               std::chrono::milliseconds{20}) {
+                        SwitchToThread();
+                    }
                 }
+                const auto call_start = std::chrono::steady_clock::now();
+                unlock(begin, end);
+                const u64 call_us = MicrosSince(call_start);
+                phases.longest_call_us = (std::max)(phases.longest_call_us, call_us);
+                run_us += call_us;
+                ++phases.unlock_calls;
+                begin = end;
             }
-            const auto run_start = std::chrono::steady_clock::now();
-            unlock(pages[i], pages[j - 1] + PageAlignment);
-            phases.longest_unlock_us =
-                (std::max)(phases.longest_unlock_us, MicrosSince(run_start));
+            phases.longest_unlock_us = (std::max)(phases.longest_unlock_us, run_us);
             ++phases.unlock_runs;
             i = j;
         }
+        g_zero_trim_unlocking.store(false, std::memory_order_relaxed);
         unlock_us += MicrosSince(unlock_start);
     };
     // FRITCHII_ZERO_TRIM_BATCH (boot, default 0; docs/fritchii/switches.md): the backing pages a
@@ -1507,6 +1565,8 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
     phases.scan_us = MicrosSince(phase_start) - unlock_us;
     unlock_all(trim);
     phases.unlock_us = unlock_us;
+    phases.guest_calls = g_guest_calls_in_unlock.load(std::memory_order_relaxed);
+    phases.longest_guest_us = g_longest_guest_in_unlock_ns.load(std::memory_order_relaxed) / 1000;
     g_zero_trim_phases = phases;
     return {(backing_pages.size() + view_pages.size()) * PageAlignment, zero_bytes};
 #else

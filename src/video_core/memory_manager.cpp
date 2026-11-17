@@ -82,6 +82,41 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& 
     Common::MemCensus::Tag("GPU page entries", entries.Data(), entries.Bytes());
     Common::MemCensus::Tag("GPU big page entries", big_entries.data(),
                            big_entries.size() * sizeof(u64));
+    page_table.SetCensusName("GPU page table");
+    big_page_table_dev.SetCensusName("GPU big page table");
+    if (Common::MemCensus::Mode() != 0 && page_bits != big_page_bits) {
+        // The small-page table: committed 64 KiB at a time for each 64 MiB of address space a map
+        // reaches, resident where entries were written or read. "Without a mapped page" is what
+        // FRITCHII_RAM_PT_TRIM gives back.
+        Common::MemCensus::AddReporter(this, [this] {
+            constexpr u64 PerPage = 4096 / sizeof(u32);
+            const u64 bytes = page_table.ReservedBytes();
+            const std::vector<u8> resident = Common::MemCensus::ResidentPages(page_table.data(), bytes);
+            const u64 words = entries.Bytes() / sizeof(u64);
+            u64 committed = 0;
+            u64 in_ram = 0;
+            u64 unmapped = 0;
+            for (u64 page = 0; page < bytes / 4096; ++page) {
+                if (!page_table.IsCommittedAt(page * PerPage)) {
+                    continue;
+                }
+                ++committed;
+                if (page >= resident.size() || resident[page] == 0) {
+                    continue;
+                }
+                ++in_ram;
+                bool mapped = false;
+                for (u64 word = page * PerPage / 32; word < (page + 1) * PerPage / 32 && word < words; ++word) {
+                    mapped |= (entries[word] & 0xAAAAAAAAAAAAAAAAULL) != 0;
+                }
+                unmapped += mapped ? 0 : 1;
+            }
+            return fmt::format("GPU page table {}: {} MiB reserved, {} committed, {} resident, {} "
+                               "of it without a mapped page",
+                               unique_identifier, bytes >> 20, committed >> 8, in_ram >> 8,
+                               unmapped >> 8);
+        });
+    }
     BackReadAudit::Init();
 }
 
@@ -129,6 +164,7 @@ void MemoryManager::SetNativeSyncpointShim(GPUVAddr address) {
 }
 
 MemoryManager::~MemoryManager() {
+    Common::MemCensus::RemoveReporter(this);
     Common::MemCensus::Untag(entries.Data());
     Common::MemCensus::Untag(big_entries.data());
 }
@@ -220,6 +256,42 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
         remaining_size -= page_size;
     }
     flush_modified();
+    // FRITCHII_RAM_PT_TRIM: the 4 KiB pages of the small-page table (1,024 entries, 4 MiB of
+    // address space) this change leaves without a mapped page leave RAM. Their entries are read
+    // only for mapped pages, and the map that maps one writes it first. Every change holds
+    // page_table_lock exclusively (Map, MapSparse, Unmap), so no map lands in between.
+    if (entry_type != EntryType::Mapped && size != 0 && page_bits != big_page_bits &&
+        Common::RamTableTrim()) {
+        constexpr u64 PerPage = 4096 / sizeof(u32);
+        const u64 words = entries.Bytes() / sizeof(u64);
+        const u64 first = PageEntryIndex(gpu_addr, false) / PerPage;
+        const u64 last = PageEntryIndex(gpu_addr + size - 1, false) / PerPage;
+        u64 run_first = 0;
+        u64 run_end = 0;
+        const auto flush_run = [&] {
+            if (run_end != run_first) {
+                page_table.DiscardEntries(run_first, run_end);
+            }
+            run_first = run_end = 0;
+        };
+        for (u64 page = first; page <= last; ++page) {
+            const u64 first_entry = page * PerPage;
+            bool keep = !page_table.IsCommittedAt(first_entry);
+            for (u64 word = first_entry / 32; !keep && word < (first_entry + PerPage) / 32 && word < words; ++word) {
+                keep = (entries[word] & 0xAAAAAAAAAAAAAAAAULL) != 0; // a Mapped (2) entry
+            }
+            if (keep) {
+                flush_run();
+                continue;
+            }
+            if (run_end != first_entry) {
+                flush_run();
+                run_first = first_entry;
+            }
+            run_end = first_entry + PerPage;
+        }
+        flush_run();
+    }
     {
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);

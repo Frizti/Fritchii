@@ -31,6 +31,8 @@ add_library(
     bit_field.h
     bit_util.h
     bounded_threadsafe_queue.h
+    build_stamp.cpp
+    build_stamp.h
     cityhash.cpp
     cityhash.h
     common_funcs.h
@@ -52,6 +54,8 @@ add_library(
     nx2_hitch.h
     nx2_sampler.cpp
     nx2_sampler.h
+    fritchii_lock_census.cpp
+    fritchii_lock_census.h
     nx2_gpu_write_listener.h
     nx2_uniform_keep_pages.h
     fritchii_switch_defaults.cpp
@@ -197,7 +201,8 @@ if(WIN32)
         windows/fritchii_focus.h
         windows/timer_resolution.cpp
         windows/timer_resolution.h)
-    # pdh: the machine pulse's clock and thermal counters (nx2_hitch.cpp)
+    # pdh: the machine pulse's clock and thermal counters (nx2_hitch.cpp) and the GPU memory
+    # counters of FRITCHII_VRAM_BUDGET_MODE=os (memory_detect.cpp)
     target_link_libraries(common PRIVATE ntdll pdh)
 endif()
 

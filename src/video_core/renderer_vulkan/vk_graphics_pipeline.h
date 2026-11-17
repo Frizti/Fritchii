@@ -135,6 +135,8 @@ struct MeshEmulationSetup {
     u32 max_primitives{}; ///< primitives per mesh workgroup
     /// Vertices per primitive: 3 triangles, 2 lines, 1 points (the draw's topology).
     u32 primitive_vertices{3};
+    /// Generic location carrying the mesh program's PrimitiveId to the pixel program, ~0 if none
+    u32 primitive_id_location{~0U};
     // With a task program (stage 0, the mesh program at mesh_stage): its payload buffer and the
     // distribution pass's offsets and arguments (Shader::RuntimeInfo), and that pass's shader.
     bool has_task{};
@@ -475,10 +477,23 @@ public:
         transition_keys.clear();
         transition_hashes.clear();
         transitions.clear();
+        occl_sibling = nullptr; // FRITCHII_OCCL_LEAN: found again by key
     }
+
+    /// FRITCHII_OCCL_LEAN (fritchii_occl_lean.h; the pipeline cache's, E only): 0 not classed
+    /// yet, else OcclLean::PipelineClass + 1; and the same key without the pixel program once
+    /// found or made (cleared with the transitions, as the cache may evict it).
+    u8 occl_class{};
+    GraphicsPipeline* occl_sibling{};
 
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
+    }
+
+    /// FRITCHII_PIPELINE_WAIT_BUDGET: waits at most `timeout` for the build (never building it
+    /// on the calling thread). True once built.
+    [[nodiscard]] bool WaitBuiltFor(std::chrono::nanoseconds timeout) const {
+        return build->WaitFor(timeout);
     }
 
     /// The programs' shader info, by stage (EDEN_NX2_FASTDRAW_COUNT reads the handle words).
