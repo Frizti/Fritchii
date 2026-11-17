@@ -238,26 +238,36 @@ void PruneUnreadGeometryOutputs(Shader::IR::Program& geometry, const Shader::IR:
     }
 }
 
-/// FRITCHII_AMD_NOPERSPECTIVE=1 on an AMD driver (see MakeRuntimeInfo). Read once, after
-/// nx2_switches.txt was applied (the first pipeline build).
-bool AmdNoPerspectiveFix(const Vulkan::Device& device) {
-    static const bool on = [&device] {
-        const char* const value = std::getenv("FRITCHII_AMD_NOPERSPECTIVE");
-        const VkDriverId driver = device.GetDriverID();
-        const bool amd = driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
-                         driver == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-                         driver == VK_DRIVER_ID_MESA_RADV;
-        const bool enabled = amd && value != nullptr && value[0] == '1';
-        if (amd) {
+/// FRITCHII_AMD_NOPERSPECTIVE as it applies to this device (see MakeRuntimeInfo): 0 off, 1 on
+/// (every pipeline but tessellation ones), 2 on including tessellation pipelines. On by default
+/// (1) on AMD drivers (RADV, AMD proprietary, AMDVLK), always 0 on other vendors.
+u32 AmdNoPerspectiveMode(const Vulkan::Device& device) {
+    if (!device.IsAmdDriver()) {
+        return 0;
+    }
+    const char* const value = std::getenv("FRITCHII_AMD_NOPERSPECTIVE");
+    if (value == nullptr || value[0] == '\0') {
+        return 1;
+    }
+    return value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
+}
+
+/// AmdNoPerspectiveMode read once, after nx2_switches.txt was applied (the first pipeline build).
+u32 AmdNoPerspectiveFix(const Vulkan::Device& device) {
+    static const u32 mode = [&device] {
+        const u32 value = AmdNoPerspectiveMode(device);
+        if (device.IsAmdDriver()) {
             LOG_INFO(Render_Vulkan,
                      "FRITCHII_AMD_NOPERSPECTIVE={}: noperspective varyings {} (red flash fix "
                      "for water on AMD)",
-                     enabled ? 1 : 0,
-                     enabled ? "interpolated perspective-correct" : "left native");
+                     value,
+                     value == 0   ? "left native"
+                     : value == 1 ? "interpolated perspective-correct (tessellation native)"
+                                  : "interpolated perspective-correct (tessellation too)");
         }
-        return enabled;
+        return value;
     }();
-    return on;
+    return mode;
 }
 
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
@@ -425,38 +435,90 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     }
     info.force_early_z = key.state.early_z != 0;
     info.y_negate = key.state.y_negate != 0;
-    // FRITCHII_AMD_NOPERSPECTIVE=1 (off by default, AMD drivers only): noperspective varyings
-    // written times Position.w and read perspective-correct times FragCoord.w (port of
+    // FRITCHII_AMD_NOPERSPECTIVE (on by default on AMD drivers only, =0 off): noperspective
+    // varyings written times Position.w and read perspective-correct times FragCoord.w (port of
     // zortos293/Lichii#820, reverted for every GPU in 9b30eec8ca after white fog at the Hyrule
-    // Field drawbridge on an RTX 4080). OoT's water volumes write a screen-space coordinate as a
-    // noperspective varying; AMD's driver interpolates it wrongly when a primitive is clipped close
-    // to the camera, and an exp2 overflows to the R11G11B10 maximum: red flashes (CheezyEmu
-    // re-applied it on AMD for that). Transform feedback would capture the scaled values, a
-    // passthrough geometry shader doesn't scale the outputs it writes itself, and indexed attribute
-    // reads in the fragment stage don't undo the scaling, so all three keep native noperspective.
-    if (AmdNoPerspectiveFix(device)) {
-        const bool geometry_passthrough{key.unique_hashes[4] != 0 &&
-                                        programs[4].is_geometry_passthrough};
-        if (key.unique_hashes[5] != 0 && !geometry_passthrough && key.state.xfb_enabled == 0 &&
-            !programs[5].info.loads_indexed_attributes) {
-            const bool has_tess{key.unique_hashes[3] != 0};
+    // Field drawbridge on an RTX 4080; other vendors never get it). OoT's water volumes write a
+    // screen-space coordinate as a noperspective varying; AMD's driver interpolates it wrongly when
+    // a primitive is clipped close to the camera, and the puddle shader's exp2 overflows to the
+    // R11G11B10 maximum: red flashes over wet ground and water. The last pre-rasterization stage
+    // scales: the vertex shader, the tessellation evaluation shader, a geometry shader (a lowered
+    // passthrough one too: it scales what it copies and what it writes itself at EmitVertex), or a
+    // mesh program (OoT's native path: its epilogue; the mesh emulation's vertex shader). The
+    // layer emulation's generated geometry shader only copies the vertex shader's scaled outputs.
+    // Left native: transform feedback (it would capture the scaled values), a passthrough
+    // geometry shader the host runs natively (NVIDIA only: no IR writes its outputs), indexed
+    // attribute reads in the fragment stage (they don't undo the scaling) and, unless =2,
+    // tessellation pipelines (an AMD tessellation crash in shader preparation was blamed on #820).
+    if (const u32 mode = AmdNoPerspectiveFix(device); mode != 0 && key.unique_hashes[5] != 0) {
+        bool has_tess{};
+        bool has_mesh{};
+        const Shader::IR::Program* geometry{};
+        for (size_t index = 1; index + 1 < Maxwell::MaxShaderProgram; ++index) {
+            if (key.unique_hashes[index] == 0) {
+                continue;
+            }
+            switch (programs[index].stage) {
+            case Shader::Stage::TessellationControl:
+            case Shader::Stage::TessellationEval:
+                has_tess = true;
+                break;
+            case Shader::Stage::Task:
+            case Shader::Stage::Mesh:
+                has_mesh = true;
+                break;
+            case Shader::Stage::Geometry:
+                geometry = &programs[index];
+                break;
+            default:
+                break;
+            }
+        }
+        const bool native_passthrough{geometry != nullptr && geometry->is_geometry_passthrough &&
+                                      device.IsNvGeometryShaderPassthroughSupported()};
+        const Shader::Info& fragment_info{programs[5].info};
+        const bool reads_noperspective{std::ranges::any_of(
+            fragment_info.interpolation,
+            [](Shader::Interpolation value) { return value == Shader::Interpolation::NoPerspective; })};
+        if (has_tess && mode < 2 && reads_noperspective) {
+            static std::atomic_flag logged{};
+            if (!logged.test_and_set()) {
+                LOG_INFO(Render_Vulkan, "FRITCHII_AMD_NOPERSPECTIVE: tessellation pipelines keep "
+                                        "native noperspective varyings (=2 includes them)");
+            }
+        }
+        if (reads_noperspective && !native_passthrough && key.state.xfb_enabled == 0 &&
+            !fragment_info.loads_indexed_attributes && !(has_tess && mode < 2) &&
+            !(has_mesh && (has_tess || geometry != nullptr))) {
+            const bool geometry_last{geometry != nullptr};
             const bool last_pre_raster{
-                (stage == Shader::Stage::VertexB && !has_tess && !has_geometry) ||
-                (stage == Shader::Stage::TessellationEval && !has_geometry) ||
-                (stage == Shader::Stage::Geometry && has_geometry)};
+                (stage == Shader::Stage::VertexB && !has_tess && !geometry_last && !has_mesh) ||
+                (stage == Shader::Stage::TessellationEval && !geometry_last) ||
+                (stage == Shader::Stage::Geometry && geometry_last && &program == geometry) ||
+                stage == Shader::Stage::Mesh};
             if (stage == Shader::Stage::Fragment) {
                 info.scaled_noperspective_inputs =
                     previous_program &&
                     (previous_program->stage == Shader::Stage::VertexB ||
                      previous_program->stage == Shader::Stage::TessellationEval ||
-                     previous_program->stage == Shader::Stage::Geometry);
+                     previous_program->stage == Shader::Stage::Geometry ||
+                     previous_program->stage == Shader::Stage::Mesh);
             }
             if (last_pre_raster) {
-                const auto& fragment_info{programs[5].info};
                 for (size_t index = 0; index < 32; ++index) {
                     if (fragment_info.interpolation[index] ==
                         Shader::Interpolation::NoPerspective) {
                         info.noperspective_outputs.set(index);
+                    }
+                }
+                if (stage == Shader::Stage::Mesh) {
+                    // Per-primitive generics reach the fragment stage flat, unscaled.
+                    for (const u32 line : program.mesh.primitive_lines) {
+                        const auto attribute{static_cast<Shader::IR::Attribute>(line)};
+                        if (Shader::IR::IsGeneric(attribute)) {
+                            info.noperspective_outputs.reset(
+                                Shader::IR::GenericAttributeIndex(attribute));
+                        }
                     }
                 }
             }
@@ -4552,7 +4614,7 @@ struct WarmStamp {
 /// packed: resolution scaling (the rescaling pass bakes its factors in), shader loop safety
 /// checks, the bloom fix and renderer debug. GPU accuracy is not here: no shader emission reads
 /// it. Markers written before this field no longer match, so those warm-ups run once more.
-u64 SpirvSettingsStamp() {
+u64 SpirvSettingsStamp(const Device& device) {
     const auto& resolution = Settings::values.resolution_info;
     u64 bits = static_cast<u64>(resolution.up_scale & 0xFF);
     bits |= static_cast<u64>(resolution.down_shift & 0xFF) << 8;
@@ -4561,10 +4623,13 @@ u64 SpirvSettingsStamp() {
             << 17;
     bits |= static_cast<u64>(Settings::values.fix_bloom_effects.GetValue() ? 1 : 0) << 18;
     bits |= static_cast<u64>(Settings::values.renderer_debug.GetValue() ? 1 : 0) << 19;
-    // FRITCHII_AMD_NOPERSPECTIVE=1 changes the SPIR-V of every stage pair with a noperspective
-    // varying (MakeRuntimeInfo), so kept modules of the other form are not used.
-    const char* const noperspective = std::getenv("FRITCHII_AMD_NOPERSPECTIVE");
-    bits |= static_cast<u64>(noperspective != nullptr && noperspective[0] == '1' ? 1 : 0) << 20;
+    // FRITCHII_AMD_NOPERSPECTIVE (on by default on AMD drivers, never on other vendors) changes
+    // the SPIR-V of every stage pair with a noperspective varying (MakeRuntimeInfo), so kept
+    // modules of the other form are not used: bit 20 on, bit 21 with tessellation pipelines (=2).
+    // Other vendors keep both bits 0, so their stamp stays what it was.
+    const u32 noperspective = AmdNoPerspectiveMode(device);
+    bits |= static_cast<u64>(noperspective != 0 ? 1 : 0) << 20;
+    bits |= static_cast<u64>(noperspective == 2 ? 1 : 0) << 21;
     return bits;
 }
 
@@ -4585,7 +4650,7 @@ std::optional<WarmStamp> CurrentStamp(const std::filesystem::path& file, const D
                      device.GetDriverVersion(),
                      device.GetDeviceID(),
                      CACHE_VERSION,
-                     SpirvSettingsStamp()};
+                     SpirvSettingsStamp(device)};
 }
 
 std::array<std::filesystem::path, 2> MarkerPaths(const std::filesystem::path& file,
@@ -6035,7 +6100,7 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // a light table shader). Named only when on, so the stamp with it off stays what it was.
     return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
                        "{}{}\n",
-                       prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(),
+                       prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(device),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
                        oot_visual_workaround ? 1 : 0, visual_workaround_title,
                        CanonicalKeys() ? 1 : 0,
@@ -8526,7 +8591,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
                     runtime_info.convert_depth_mode && !profile.support_native_ndc,
                     runtime_info.fixed_state_point_size.value_or(1.0f),
-                    mesh_emulation->primitive_id_location);
+                    mesh_emulation->primitive_id_location, runtime_info.noperspective_outputs);
             }
         }
         if (mesh_emulation && program.stage == Shader::Stage::Fragment) {

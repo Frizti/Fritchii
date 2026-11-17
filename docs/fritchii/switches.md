@@ -317,6 +317,32 @@ there). Why: on Intel Iris Xe (Windows driver 101.7092) every typeless image rea
 The driver reports formatless reads per format through format features 2. Check: an Intel Windows
 tester with the switch at 1, the warning gone and the scene drawn.
 
+### FRITCHII_AMD_NOPERSPECTIVE
+
+On by default on AMD drivers only (RADV, AMD proprietary, AMDVLK); other vendors never change,
+whatever the value (helper EA, 2026-11-18; port of zortos293/Lichii #820/#722, first added off by
+default in 4cdd0231c3). Boot. Red flash fix over wet ground and water: OoT's water volumes write a
+screen-space coordinate as a noperspective varying, AMD's driver interpolates it wrongly when a
+primitive is clipped close to the camera, the half-res water target gets bad "no water" texels next
+to water ones, and the puddle shader's exp2 overflows to the R11G11B10 maximum (pure red).
+- 1 (the AMD default): generic outputs the pixel program reads noperspective are written times
+  Position.w by the last pre-rasterization stage and read perspective-correct times FragCoord.w.
+  The scaling stage is the vertex shader, the tessellation evaluation shader, a geometry shader (a
+  lowered passthrough one too: it scales at each EmitVertex), or the mesh program: native mesh
+  shaders in their epilogue (OoT's path; the first version missed it, so =1 changed nothing for
+  OoT's mesh draws) and the mesh emulation's vertex shader. Per-primitive mesh outputs stay flat.
+  Left native: transform feedback, NVIDIA-native passthrough geometry shaders, pixel programs with
+  indexed attribute reads, and tessellation pipelines (an AMD tessellation crash in shader
+  preparation was blamed on #820 elsewhere); the log says once when a tessellation pipeline kept it.
+- 2: as 1, tessellation pipelines too.
+- 0: off, noperspective varyings stay native.
+
+Part of the SPIR-V settings stamp (bit 20 on, bit 21 for 2), so kept and warmed SPIR-V of the
+other form is not reused: AMD players prepare shaders once more after updating or toggling it.
+Other vendors keep the stamp they had. Log on AMD: "FRITCHII_AMD_NOPERSPECTIVE=N: noperspective
+varyings ...". Why not every vendor: white fog at the Hyrule Field drawbridge on an RTX 4080.
+Check: an AMD tester at a spot with the red line on the wet floor, the red gone.
+
 ### FRITCHII_TEST_MARK
 
 Boot. Only for stamped test copies (video_core/test_watermark.cpp); plain builds have no mark,
