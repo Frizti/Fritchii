@@ -132,23 +132,30 @@ private:
 /// The parts of Ocarina of Time's main (offsets after its NSO header) that its high refresh rate
 /// mode changes. Dark's 120-byte routine stays at main+0x3C46200 in both modes: other mods (the
 /// Hyrule Cheat Menu at main+0x3C46280..0x3C46398) put their code right after it, so ours lives in
-/// its own cave at the free end of that page. Off (Dark's Dynamic FPS, the default): the frame
-/// step's call to Dark's routine, the water renderer's own fcvtzs, our cave zero. On: the call to
-/// the high refresh routine at the start of our cave (its speed scale word at +0x88), a zero word,
-/// the water ripple accumulator at +0x90, and a branch to it in place of that fcvtzs.
+/// its own cave at the free end of that page. On: the call to the high refresh routine (our cave,
+/// its speed scale word at +0x88), and the water ripples: a call to the ripple routine at
+/// main+0x3C46F20 in place of the water renderer's fcvtzs and a nop in place of its mul. Off
+/// (Dark's Dynamic FPS, the default): the frame step's call to Dark's routine, with the rest as
+/// in On while the "Water ripples at any frame rate" built-in is on; with it off the water
+/// renderer's own fcvtzs and mul and both routines' places zero.
 struct OotHighRefreshCode {
     static constexpr size_t CallOffset = 0x6E6CC4;
     static constexpr size_t WaterOffset = 0x475F8;
+    static constexpr size_t WaterMulOffset = 0x4760C;
     static constexpr size_t DarkOffset = 0x3C46200;
     static constexpr size_t DarkSize = 120;
     static constexpr size_t CaveOffset = 0x3C46E00;
-    static constexpr size_t CaveSize = 0x110;
+    static constexpr size_t CaveSize = 0x8C;
     static constexpr size_t ScaleOffset = CaveOffset + 0x88;
+    static constexpr size_t RippleOffset = 0x3C46F20;
+    static constexpr size_t RippleSize = 148;
 
     std::array<u8, 4> call{};
     std::array<u8, 4> water{};
+    std::array<u8, 4> water_mul{};
     std::array<u8, DarkSize> dark{};
     std::array<u8, CaveSize> cave{};
+    std::array<u8, RippleSize> ripples{};
 };
 
 enum class OotHighRefreshLayout {
@@ -163,11 +170,13 @@ enum class OotHighRefreshLayout {
 [[nodiscard]] OotHighRefreshLayout GetOotHighRefreshLayout(const OotHighRefreshCode& code);
 /// `code` switched to the mode `on`: the bytes to write. `code` itself when it already is in that
 /// mode (its speed scale word kept), nullopt when it holds neither mode. `ripples`: whether
-/// Dark's mode keeps the water hook and cave (the "Water ripples at any frame rate" built-in,
-/// on unless turned off in Add-Ons); without it switching off clears them as before v5.8.
+/// Dark's mode keeps the water hook and nop, the cave and the ripple routine (the "Water ripples
+/// at any frame rate" built-in, on unless turned off in Add-Ons); without it switching off
+/// restores the fcvtzs and mul and clears both routines, as before v5.8.
 [[nodiscard]] std::optional<OotHighRefreshCode> SwitchOotHighRefreshCode(
     const OotHighRefreshCode& code, bool on, bool ripples = true);
-/// Whether the high refresh routine's state (Dark's timer state and the water ripple slots) lies
+/// Whether the high refresh routine's state (Dark's timer state, the water ripple slots and their
+/// next-slot word: main+0x4E9FE00..0x4E9FEB0) lies
 /// in the module's BSS, [bss_start, bss_end) in module offsets.
 [[nodiscard]] bool OotHighRefreshStateInBss(u64 bss_start, u64 bss_end);
 

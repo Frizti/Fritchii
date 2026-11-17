@@ -317,6 +317,26 @@ there). Why: on Intel Iris Xe (Windows driver 101.7092) every typeless image rea
 The driver reports formatless reads per format through format features 2. Check: an Intel Windows
 tester with the switch at 1, the warning gone and the scene drawn.
 
+### FRITCHII_TEST_MARK
+
+Boot. Only for stamped test copies (video_core/test_watermark.cpp); plain builds have no mark,
+create nothing for it and never log it. How the on-screen test mark is drawn:
+- 1 (default; any value other than 0 and 3): Vulkan draws the mark as one textured quad over its
+  bounding box. Its pixels (shadow, text, transparent elsewhere) go into a small float texture,
+  uploaded only when they change (a new layout or window size; moving to the next spot every
+  minute only moves the quad), sampled 1:1 with nearest filtering and blended "over", so colours
+  and position are the same as with 3.
+- 3: as before, two vkCmdClearAttachments calls inside the present render pass with one rect per
+  block (~370 rects). For an A/B: on an AMD RX 9070 XT at 4K this cost ~10 ms (up to ~17 ms) of
+  GPU time in the present submission every frame; NVIDIA barely noticed.
+- 0: no on-screen mark. Only the drawing is skipped: the stamp stays in the exe and the log's
+  "Build hash:" line is unchanged.
+
+OpenGL draws the mark with scissored clears for 1 and 3 and skips it for 0. The log says once,
+on the first frame with a mark, which way is used: "Test mark: one textured draw
+(FRITCHII_TEST_MARK=1)", "Test mark: two clears (FRITCHII_TEST_MARK=3)", "Test mark: off
+(FRITCHII_TEST_MARK=0)" or "Test mark: clears (OpenGL) (...)".
+
 ### FRITCHII_DEVICE_FAULT
 
 On by default (helper BH, 2026-11-16, port of the device fault part of zortos293/Lichii #512).
@@ -460,7 +480,7 @@ auto)". A value in the environment (nx2_switches.txt) or set live wins; storing 
 to the default and the auto rule. Only prepared (kept SPIR-V) builds count now; runtime pipelines a
 worker emits are new to every driver and no longer mix into the count. Compute dispatches still wait
 for their pipeline (skipping one would lose its results), unless FRITCHII_ASYNC_COMPUTE_SKIP below
-is on.
+is on; FRITCHII_COMPUTE_FAST_FIRST below makes that wait shorter.
 
 ### FRITCHII_ASYNC_COMPUTE_SKIP, FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS
 
@@ -537,6 +557,50 @@ unbuilt pipeline") in every mode while the delay is set. The pipelines are built
 budget wait. Test: one session at a pinned save, mode 2 first (no visual change, read the refusal
 split), then mode 1 with the delay; screenshot at 1 s and 10 s, compare the 10 s shot with mode 0;
 both must-be-0 counts 0.
+
+### FRITCHII_COMPUTE_FAST_FIRST
+
+Live, default 0. A dispatch whose compute pipeline is still building waits for it on the Vulkan
+worker, and every channel waits behind it: 0.6-5.5 s freezes on cold caches, many of them by
+programs whose output the guest reads back, so FRITCHII_ASYNC_COMPUTE_SKIP refuses them. With 1,
+that dispatch gets an unoptimized build of the same pipeline at once
+(VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT; same SPIR-V, layout and descriptors, so the same
+results, only more GPU time), and dispatches use it while the optimized build runs on its pipeline
+worker. Before its next bind after that build ends, the scheduler worker swaps the optimized
+pipeline in; the unoptimized one is freed once the GPU passed the tick it was swapped out at. The
+unoptimized build is never stored (no binary store, no pipeline cache), so the next session still
+gets the optimized one from the caches.
+
+- Only pipelines built at run time on a worker. Boot, warm-up and preparation builds, and the
+  programs always built unoptimized (BuildsUnoptimized), keep their path. Prepared (precompiled)
+  pipelines are included: their module is made by whichever build needs it first.
+- If the optimized build ends first, the unoptimized one is thrown away unused. If the unoptimized
+  build fails, the dispatch takes the optimized build as without the switch.
+- The one follower's posted dispatches, lent ones and FRITCHII_ASYNC_COMPUTE_SKIP all see the
+  unoptimized pipeline as built (IsBuilt, BuiltAt). The skip's kick makes the unoptimized build, so
+  a skip lasts only that long.
+- 2 (test): every program built at run time takes the path, waited for or not (its worker builds the
+  unoptimized pipeline first, then the optimized one, then the swap). Exercises the whole path on a
+  PC with warm caches; the compile times are only real on a cold driver cache.
+- Log: "Compute dispatch waited N ms for pipeline X (an unoptimized build, FRITCHII_COMPUTE_FAST_FIRST)";
+  per program (first 64 lines) "built unoptimized in A ms" and "optimized in B ms (unoptimized: A
+  ms)"; every 10 s while anything happened "Compute fast-first (FRITCHII_COMPUTE_FAST_FIRST=n) in the
+  last 10 s: f unoptimized builds served dispatches (x ms, y ms each), b beaten by the optimized
+  build, e failed; o optimized builds followed (g failed), those programs p ms unoptimized vs q ms
+  optimized; s swapped in; now w waiting for their optimized build, d built and not dispatched since;
+  must be 0: u programs unoptimized over 30 s (t since boot)". A must-be-0 hit also logs a warning
+  with the program. An optimized build that fails is logged and the program keeps the unoptimized
+  pipeline.
+- The optimized build waits its turn in the pipeline workers' queue (first in, first out). A busy
+  queue shows as w, and over 30 s as the must-be-0 count.
+
+### FRITCHII_COMPUTE_PREBUILD_FIRST
+
+Boot, default 1 (0 = as before). The boot build of the disk cache queues its compute records before
+its graphics records. The same builds on the same workers, only in another order. The boot waits for
+all of them before the game starts either way, so a dispatch never waits for a program the disk cache
+recorded in an earlier session (runtime-translated compute programs are recorded, as are prepared
+ones the game used); this only makes the compute records end earlier within the boot.
 
 ### FRITCHII_OCCLUSION_VISIBLE
 
@@ -7269,3 +7333,33 @@ compile time of =2 with less of its runtime cost (=2 measured ~1.7 fps lower at 
 fights); idea from tasarren/Lichii (compute compile 1.5-1.75 s -> 0.26-0.52 s on their path).
 Not measured on Fritchii yet. Changing it changes the SPIR-V, so the driver compiles those shaders
 again once.
+
+## OoT built-in patches (not switches)
+
+### Water ripples at any frame rate (built-in)
+
+On by default, in both frame step modes (Dark's Dynamic FPS and the high refresh mode); Add-Ons can
+turn it off. A port of Blitchii PR #1180 (480e01394 and its review follow-up), found and verified
+live by a tester (2026-11-17: a Hyrule Castle water room at a pinned step of 0.5, ripples jumping on
+camera turns with the earlier patch, steady with this one, the per-object rest within +-0.5).
+
+The water renderer (main+0x472E0) runs `iterations * trunc(step)` ripple passes a frame
+(iterations = 6, `fcvtzs w9, s0` at main+0x475F8, `mul w8, w8, w9` at main+0x4760C). Below a step
+of 1 (above 60 fps; the step is relative to 60 Hz) some or all frames run no pass, and the grid
+that follows Link still moves, so the surface jumps. The earlier Fritchii patch (an accumulator at
+main+0x3C46E90 returning `trunc(step + rest)`) kept the average rate but at a step of 0.5 still
+ran 0 and 6 passes in turn.
+
+Now: main+0x475F8 is `bl 0x3c46f20`, main+0x4760C is `nop`, and the 148-byte routine at
+main+0x3C46F20..0x3C46FB4 adds `iterations * step` to a rest kept per water object (x21), returns
+w8 = the rounded passes, at least 1 while the step is above 0 (0 while paused), and keeps
+`total - passes`, never below -0.5. At a step of 0.5: 3 passes every frame. The rests live in 8
+slots of {u64 object, f32 rest} at main+0x4E9FE20, the next slot to take at main+0x4E9FEA0 (the
+high refresh state is main+0x4E9FE00..0x4E9FEB0 now; +0x10 held the old accumulator's index and
+is unused). The routine clobbers x9-x12, s0-s2, the flags and x30; checked against the game's
+code: the function saves x30 in its prologue and none of those is read after the call before it
+is written. The old accumulator's spot (main+0x3C46E8C..0x3C46F10) is free again.
+
+Ctrl+U switches only the call word while the ripples are on. With the ripple built-in off,
+switching Dark's mode back restores both words and clears the routine; it waits while a guest
+thread stands in a routine or between the two water words.

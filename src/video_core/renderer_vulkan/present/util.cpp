@@ -580,6 +580,25 @@ vk::Pipeline CreateWrappedCoverageBlendingPipeline(
                                      color_blend_attachment_coverage);
 }
 
+vk::Pipeline CreateWrappedOverBlendingPipeline(
+    const Device& device, vk::RenderPass& renderpass, vk::PipelineLayout& layout,
+    std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders) {
+    constexpr VkPipelineColorBlendAttachmentState color_blend_attachment_over{
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+
+    return CreateWrappedPipelineImpl(device, renderpass, layout, shaders,
+                                     color_blend_attachment_over);
+}
+
 VkWriteDescriptorSet CreateWriteDescriptorSet(std::vector<VkDescriptorImageInfo>& images,
                                               VkSampler sampler, VkImageView view,
                                               VkDescriptorSet set, u32 binding) {

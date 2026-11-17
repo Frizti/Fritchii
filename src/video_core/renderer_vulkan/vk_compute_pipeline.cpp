@@ -195,7 +195,194 @@ void TraceUpscalerDispatch(UpscalerTrace& trace, const Shader::Info& info, u64 s
     log_views(info.texture_descriptors, "tex");
     log_views(info.image_descriptors, "img");
 }
+
+// FRITCHII_COMPUTE_FAST_FIRST's counts, logged every 10 s (ComputePipeline::ReportFastFirst).
+struct FastFirstWindow {
+    u64 served{};          ///< unoptimized builds that became the pipeline (dispatches used them)
+    double served_ms{};
+    u64 beaten{};          ///< unoptimized builds the optimized one beat (never bound, freed)
+    u64 failed{};          ///< unoptimized builds that made nothing (the optimized one served)
+    u64 optimized{};       ///< optimized builds of programs an unoptimized one served
+    u64 optimized_failed{};
+    double paired_fast_ms{};
+    double paired_optimized_ms{};
+    u64 swaps{};
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return served == 0 && beaten == 0 && failed == 0 && optimized == 0 &&
+               optimized_failed == 0 && swaps == 0;
+    }
+};
+
+/// A program an unoptimized build serves, until its optimized one is swapped in.
+struct FastFirstOpen {
+    const void* pipeline;
+    u64 hash;
+    std::chrono::steady_clock::time_point at;
+    bool optimized_done;
+    bool warned;
+};
+
+struct FastFirstState {
+    std::mutex mutex;
+    FastFirstWindow window;
+    std::vector<FastFirstOpen> open;
+    u64 stuck_total{};
+    u32 lines{};
+};
+
+/// Never destroyed: pipelines may be freed after static destruction began.
+FastFirstState& GetFastFirst() {
+    static FastFirstState* const state = new FastFirstState;
+    return *state;
+}
+
+/// Anything to report (ReportFastFirst returns at once while false).
+std::atomic_bool g_fast_first_seen{false};
+constexpr u32 FastFirstLineLimit = 64;
+
+void EraseOpenLocked(FastFirstState& state, const void* pipeline) {
+    std::erase_if(state.open,
+                  [pipeline](const FastFirstOpen& open) { return open.pipeline == pipeline; });
+}
+
+void ForgetFastFirst(const void* pipeline) {
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    EraseOpenLocked(state, pipeline);
+}
+
+void NoteFastBuild(const void* pipeline, u64 hash, bool served, double compile_ms,
+                   bool& fast_open) {
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    // Under the lock: ReportFastFirst clears it under the lock when nothing is left.
+    g_fast_first_seen.store(true, std::memory_order_relaxed);
+    if (!served) {
+        ++state.window.beaten;
+        return;
+    }
+    ++state.window.served;
+    state.window.served_ms += compile_ms;
+    state.open.push_back({pipeline, hash, std::chrono::steady_clock::now(), false, false});
+    fast_open = true;
+    if (state.lines < FastFirstLineLimit) {
+        ++state.lines;
+        LOG_INFO(Render_Vulkan,
+                 "Compute fast-first: pipeline {:016x} built unoptimized in {:.0f} ms "
+                 "(FRITCHII_COMPUTE_FAST_FIRST={}); its optimized build follows on its worker",
+                 hash, compile_ms, ComputePipeline::FastFirstMode());
+    }
+}
+
+void NoteFastFailed() {
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    g_fast_first_seen.store(true, std::memory_order_relaxed);
+    ++state.window.failed;
+}
+
+void NoteOptimizedAfterFast(const void* pipeline, u64 hash, bool ok, double fast_ms,
+                            double optimized_ms, bool& fast_open) {
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    if (!ok) {
+        ++state.window.optimized_failed;
+        EraseOpenLocked(state, pipeline);
+        fast_open = false;
+        LOG_WARNING(Render_Vulkan,
+                    "Compute fast-first: the optimized build of {:016x} failed, it keeps its "
+                    "unoptimized pipeline (same results, more GPU time)",
+                    hash);
+        return;
+    }
+    ++state.window.optimized;
+    state.window.paired_fast_ms += fast_ms;
+    state.window.paired_optimized_ms += optimized_ms;
+    for (FastFirstOpen& open : state.open) {
+        if (open.pipeline == pipeline) {
+            open.optimized_done = true;
+        }
+    }
+    if (state.lines < FastFirstLineLimit) {
+        ++state.lines;
+        LOG_INFO(Render_Vulkan,
+                 "Compute fast-first: pipeline {:016x} optimized in {:.0f} ms (unoptimized: {:.0f} "
+                 "ms), swapped in at its next dispatch",
+                 hash, optimized_ms, fast_ms);
+    }
+}
+
+void NoteFastSwap(const void* pipeline, bool& fast_open) {
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    ++state.window.swaps;
+    EraseOpenLocked(state, pipeline);
+    fast_open = false;
+}
 } // namespace
+
+void ComputePipeline::ReportFastFirst() {
+    if (!g_fast_first_seen.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // GPU thread only.
+    static std::chrono::steady_clock::time_point next_report{};
+    const auto now = std::chrono::steady_clock::now();
+    if (next_report == std::chrono::steady_clock::time_point{}) {
+        next_report = now + std::chrono::seconds{10};
+        return;
+    }
+    if (now < next_report) {
+        return;
+    }
+    next_report = now + std::chrono::seconds{10};
+    auto& state = GetFastFirst();
+    std::scoped_lock lock{state.mutex};
+    u64 waiting = 0;
+    u64 unswapped = 0;
+    u64 stuck = 0;
+    for (FastFirstOpen& open : state.open) {
+        if (open.optimized_done) {
+            ++unswapped; // built, not dispatched since
+            continue;
+        }
+        ++waiting;
+        if (now - open.at < std::chrono::seconds{30}) {
+            continue;
+        }
+        ++stuck;
+        if (!open.warned) {
+            open.warned = true;
+            ++state.stuck_total;
+            LOG_WARNING(Render_Vulkan,
+                        "Compute fast-first: pipeline {:016x} still runs unoptimized {:.0f} s "
+                        "after its unoptimized build, its optimized build has not ended (must "
+                        "be 0)",
+                        open.hash, std::chrono::duration<double>(now - open.at).count());
+        }
+    }
+    const FastFirstWindow window = std::exchange(state.window, FastFirstWindow{});
+    if (window.Empty() && stuck == 0) {
+        if (state.open.empty()) {
+            g_fast_first_seen.store(false, std::memory_order_relaxed);
+            next_report = {};
+        }
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Compute fast-first (FRITCHII_COMPUTE_FAST_FIRST={}) in the last 10 s: {} unoptimized "
+             "builds served dispatches ({:.0f} ms, {:.0f} ms each), {} beaten by the optimized "
+             "build, {} failed; {} optimized builds followed ({} failed), those programs {:.0f} ms "
+             "unoptimized vs {:.0f} ms optimized; {} swapped in; now {} waiting for their "
+             "optimized build, {} built and not dispatched since; must be 0: {} programs "
+             "unoptimized over 30 s ({} since boot)",
+             FastFirstMode(), window.served, window.served_ms,
+             window.served != 0 ? window.served_ms / static_cast<double>(window.served) : 0.0,
+             window.beaten, window.failed, window.optimized, window.optimized_failed,
+             window.paired_fast_ms, window.paired_optimized_ms, window.swaps, waiting, unswapped,
+             stuck, state.stuck_total);
+}
 
 void ComputePipeline::TickUpscalerTrace() {
     auto& trace{GetUpscalerTrace()};
@@ -216,10 +403,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
                                  vk::ShaderModule spv_module_, u64 shader_hash_,
                                  std::function<vk::ShaderModule()> make_module)
-    : device{device_},
+    : device{device_}, owner_scheduler{scheduler}, build_notify{shader_notify},
       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
+      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)),
+      make_module_fn(std::move(make_module)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -256,124 +444,46 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }
 
-    auto func{[this, shader_notify, pipeline_statistics, make_module = std::move(make_module)] {
-        if (make_module) {
-            // A precompiled pipeline's module, from the SPIR-V its preparation kept: made here,
-            // on the worker. Without one the build ends with no pipeline (BuildFailed), and the
-            // pipeline cache replaces it by a translated one at the next dispatch.
-            try {
-                spv_module = make_module();
-            } catch (const std::exception& exception) {
-                LOG_ERROR(Render_Vulkan, "Precompiled compute shader {:016X}: {}", shader_hash,
-                          exception.what());
-                std::scoped_lock lock{build_mutex};
-                is_built = true;
-                built_at.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                               std::memory_order::release);
-                build_condvar.notify_all();
-                if (shader_notify) {
-                    shader_notify->MarkShaderComplete();
-                }
-                return;
-            }
+    // FRITCHII_COMPUTE_FAST_FIRST: only builds queued at run time. The boot, warm-up and
+    // preparation builds run here on their own threads, and no dispatch waits for them. The
+    // programs always built unoptimized (BuildsUnoptimized) gain nothing from it.
+    fast_first_allowed = thread_worker != nullptr &&
+                         !BuildsUnoptimized(device.GetDriverID(), shader_hash);
+    auto func{[this, pipeline_statistics] {
+        if (!AcquireModule()) {
+            // No module (a precompiled one that could not be made): the build ends with no
+            // pipeline (BuildFailed), and the pipeline cache replaces it by a translated one at
+            // the next dispatch.
+            Publish(vk::Pipeline{}, true, 0.0);
+            return;
         }
-        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-            .pNext = nullptr,
-            .requiredSubgroupSize = GuestWarpSize,
-        };
-        // Only warp-level ops observe the subgroup size. Forcing 32 on other shaders makes Intel
-        // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
-        const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
-                                   info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
-                                   info.uses_quad_shuffles || info.uses_fswzadd ||
-                                   info.uses_cooperative_matrix;
-        // Shaders without them may be given a narrower size where the driver's choice spills
-        // (Intel, Device::NarrowComputeSubgroupSize).
-        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT narrow_subgroup_size_ci{
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-            .pNext = nullptr,
-            .requiredSubgroupSize = uses_warp_ops
-                                        ? 0
-                                        : device.NarrowComputeSubgroupSize(info.uses_global_memory),
-        };
-        const void* const stage_next =
-            device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
-                    device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
-                ? static_cast<const void*>(&subgroup_size_ci)
-            : narrow_subgroup_size_ci.requiredSubgroupSize != 0
-                ? static_cast<const void*>(&narrow_subgroup_size_ci)
-                : nullptr;
-        VkPipelineCreateFlags flags{};
-        if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
-            flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
-        }
-        if (uses_descriptor_buffer) {
-            flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
-        }
-        if (BuildsUnoptimized(device.GetDriverID(), shader_hash)) {
-            flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
-        }
-        const VkComputePipelineCreateInfo compute_ci{
-            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = flags,
-            .stage{
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = stage_next,
-                .flags = info.uses_cooperative_matrix
-                             ? VkPipelineShaderStageCreateFlags{
-                                   VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
-                             : VkPipelineShaderStageCreateFlags{},
-                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                .module = *spv_module,
-                .pName = "main",
-                .pSpecializationInfo = nullptr,
-            },
-            .layout = *pipeline_layout,
-            .basePipelineHandle = 0,
-            .basePipelineIndex = 0,
-        };
+        const auto begin = std::chrono::steady_clock::now();
+        vk::Pipeline made;
         try {
             // Through Fritchii's pipeline binary store when it is on (FRITCHII_PIPELINE_BINARY).
-            pipeline = PipelineBinary::CreateComputePipeline(device, compute_ci, *pipeline_cache);
+            made = CreateHandle(false);
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
-            std::scoped_lock lock{build_mutex};
-            is_built = true;
-            built_at.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                           std::memory_order::release);
-            build_condvar.notify_all();
-            if (shader_notify) {
-                shader_notify->MarkShaderComplete();
+        }
+        const double compile_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+                .count();
+        if (made) {
+            // Log compute pipeline creation
+            if (GPU::Logging::IsActive()) {
+                GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(
+                    "ComputePipeline created"
+                );
             }
-            return;
-        }
-
-        // Log compute pipeline creation
-        if (GPU::Logging::IsActive()) {
-            GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(
-                "ComputePipeline created"
-            );
-        }
-
-        if (pipeline_statistics) {
-            pipeline_statistics->Collect(device, *pipeline);
+            if (pipeline_statistics) {
+                pipeline_statistics->Collect(device, *made);
+            }
         }
         // Nothing reads the module once the pipeline exists; the driver keeps its SPIR-V while it
-        // lives.
-        spv_module.reset();
-        std::scoped_lock lock{build_mutex};
-        is_built = true;
-        built_at.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                       std::memory_order::release);
-        // All waiters: the scheduler's wait in Configure and FRITCHII_ASYNC_COMPUTE_SKIP's
-        // bounded wait on the GPU thread can wait at once.
-        build_condvar.notify_all();
-        if (shader_notify) {
-            shader_notify->MarkShaderComplete();
-        }
+        // lives. An unoptimized build still compiling from it lets go of it last.
+        ReleaseModule(true);
+        Publish(std::move(made), true, compile_ms);
     }};
     build_task = std::move(func);
     if (thread_worker) {
@@ -388,14 +498,243 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }
 }
 
+ComputePipeline::~ComputePipeline() {
+    if (fast_open) {
+        ForgetFastFirst(this);
+    }
+}
+
+vk::Pipeline ComputePipeline::CreateHandle(bool unoptimized) {
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .requiredSubgroupSize = GuestWarpSize,
+    };
+    // Only warp-level ops observe the subgroup size. Forcing 32 on other shaders makes Intel
+    // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
+    const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+                               info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
+                               info.uses_quad_shuffles || info.uses_fswzadd ||
+                               info.uses_cooperative_matrix;
+    // Shaders without them may be given a narrower size where the driver's choice spills
+    // (Intel, Device::NarrowComputeSubgroupSize).
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT narrow_subgroup_size_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .requiredSubgroupSize = uses_warp_ops
+                                    ? 0
+                                    : device.NarrowComputeSubgroupSize(info.uses_global_memory),
+    };
+    const void* const stage_next =
+        device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
+                device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
+            ? static_cast<const void*>(&subgroup_size_ci)
+        : narrow_subgroup_size_ci.requiredSubgroupSize != 0
+            ? static_cast<const void*>(&narrow_subgroup_size_ci)
+            : nullptr;
+    VkPipelineCreateFlags flags{};
+    if (!unoptimized && device.IsKhrPipelineExecutablePropertiesEnabled() &&
+        Settings::values.renderer_debug.GetValue()) {
+        flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
+    if (uses_descriptor_buffer) {
+        flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    }
+    if (unoptimized || BuildsUnoptimized(device.GetDriverID(), shader_hash)) {
+        flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    }
+    const VkComputePipelineCreateInfo compute_ci{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = flags,
+        .stage{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = stage_next,
+            .flags = info.uses_cooperative_matrix
+                         ? VkPipelineShaderStageCreateFlags{
+                               VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
+                         : VkPipelineShaderStageCreateFlags{},
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = *spv_module,
+            .pName = "main",
+            .pSpecializationInfo = nullptr,
+        },
+        .layout = *pipeline_layout,
+        .basePipelineHandle = 0,
+        .basePipelineIndex = 0,
+    };
+    if (unoptimized) {
+        // FRITCHII_COMPUTE_FAST_FIRST: never stored. Not through the binary store or a pipeline
+        // cache, which keep the optimized build of this program for the next session.
+        return device.GetLogical().CreateComputePipeline(compute_ci);
+    }
+    return PipelineBinary::CreateComputePipeline(device, compute_ci, *pipeline_cache);
+}
+
+bool ComputePipeline::AcquireModule() {
+    std::scoped_lock lock{module_mutex};
+    if (!spv_module && make_module_fn && !module_release_due) {
+        // A precompiled pipeline's module, from the SPIR-V its preparation kept: made by the
+        // first build that needs it (its worker, or a dispatch's unoptimized build).
+        auto make = std::move(make_module_fn);
+        make_module_fn = nullptr;
+        try {
+            spv_module = make();
+        } catch (const std::exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Precompiled compute shader {:016X}: {}", shader_hash,
+                      exception.what());
+        }
+    }
+    if (!spv_module) {
+        return false;
+    }
+    ++module_users;
+    return true;
+}
+
+void ComputePipeline::ReleaseModule(bool optimized_done) {
+    std::scoped_lock lock{module_mutex};
+    --module_users;
+    module_release_due = module_release_due || optimized_done;
+    if (module_release_due && module_users == 0) {
+        spv_module.reset();
+    }
+}
+
+bool ComputePipeline::Publish(vk::Pipeline made, bool optimized, double compile_ms) {
+    const bool made_ok = static_cast<bool>(made);
+    bool first = false;
+    bool after_fast = false;
+    double served_fast_ms = 0.0;
+    {
+        std::scoped_lock lock{build_mutex};
+        if (!is_built.load(std::memory_order::relaxed)) {
+            // Nothing binds `pipeline` before is_built: Configure's build wait precedes the bind.
+            pipeline = std::move(made);
+            has_pipeline.store(made_ok, std::memory_order::release);
+            running_optimized = optimized;
+            if (!optimized) {
+                fast_ms = compile_ms;
+            }
+            built_at.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                           std::memory_order::release);
+            is_built.store(true, std::memory_order::release);
+            // All waiters: the scheduler's wait in Configure and FRITCHII_ASYNC_COMPUTE_SKIP's
+            // bounded wait on the GPU thread can wait at once.
+            build_condvar.notify_all();
+            first = true;
+        } else if (optimized && !running_optimized) {
+            // An unoptimized build serves: this one is swapped in by the scheduler worker
+            // before its next bind (SwapInOptimized).
+            after_fast = true;
+            served_fast_ms = fast_ms;
+            if (made_ok) {
+                optimized_pipeline = std::move(made);
+                optimized_ready.store(true, std::memory_order::release);
+            }
+        }
+        // Otherwise `made` lost the race (an unoptimized build after the optimized one): it was
+        // never bound, and is destroyed when this returns.
+    }
+    if (first && build_notify) {
+        build_notify->MarkShaderComplete();
+    }
+    if (!optimized) {
+        NoteFastBuild(this, shader_hash, first, compile_ms, fast_open);
+    } else if (after_fast) {
+        NoteOptimizedAfterFast(this, shader_hash, made_ok, served_fast_ms, compile_ms, fast_open);
+    }
+    return first;
+}
+
+void ComputePipeline::SwapInOptimized() {
+    if (retired_fast && owner_scheduler.IsFree(retired_tick)) {
+        retired_fast.reset();
+    }
+    if (!optimized_ready.load(std::memory_order::acquire)) {
+        return;
+    }
+    {
+        std::scoped_lock lock{build_mutex};
+        // The unoptimized pipeline may be in command buffers the GPU has not finished: kept
+        // until it passed the recording thread's tick now, which is at or after the tick of the
+        // command buffer this worker records (one swap per pipeline).
+        retired_fast = std::move(pipeline);
+        retired_tick = owner_scheduler.CurrentTick();
+        pipeline = std::move(optimized_pipeline);
+        running_optimized = true;
+        optimized_ready.store(false, std::memory_order::release);
+    }
+    NoteFastSwap(this, fast_open);
+}
+
+int ComputePipeline::FastFirstMode() {
+    const int value = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_compute_fast_first, "FRITCHII_COMPUTE_FAST_FIRST", 0);
+    return value == 1 || value == 2 ? value : 0;
+}
+
+bool ComputePipeline::UsesFastFirst() const {
+    return fast_first_allowed && FastFirstMode() != 0;
+}
+
 void ComputePipeline::RunBuild() {
     // A draw or dispatch that needs the pipeline builds it on the scheduler thread instead of
     // waiting for the worker queue, which can hold hundreds of builds, to reach it.
     if (build_claimed.exchange(true)) {
         return;
     }
+    // FRITCHII_COMPUTE_FAST_FIRST=2 (test): the worker builds the unoptimized pipeline first, so
+    // every program built at run time is served by it until the optimized one is swapped in.
+    if (fast_first_allowed && FastFirstMode() == 2 &&
+        !fast_claimed.exchange(true, std::memory_order::acq_rel)) {
+        static_cast<void>(RunFastBuild());
+    }
     build_task();
     build_task = nullptr;
+}
+
+void ComputePipeline::RunNeededBuild() {
+    if (is_built.load(std::memory_order::acquire)) {
+        return;
+    }
+    if (UsesFastFirst()) {
+        if (fast_claimed.exchange(true, std::memory_order::acq_rel)) {
+            // Another thread's unoptimized build: the caller waits for it (that thread falls
+            // back to the optimized build itself when it makes nothing).
+            return;
+        }
+        // The optimized build stays with its worker (queued, or compiling there now).
+        if (RunFastBuild() || is_built.load(std::memory_order::acquire)) {
+            return;
+        }
+        // It made nothing: the optimized build here, as without the switch.
+    }
+    RunBuild();
+}
+
+bool ComputePipeline::RunFastBuild() {
+    if (is_built.load(std::memory_order::acquire) || !AcquireModule()) {
+        return false;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    vk::Pipeline made;
+    try {
+        made = CreateHandle(true);
+    } catch (const vk::Exception& exception) {
+        LOG_WARNING(Render_Vulkan, "Compute fast-first: the unoptimized build of {:016x} failed: {}",
+                    shader_hash, exception.what());
+    }
+    const double compile_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    ReleaseModule(false);
+    if (!made) {
+        NoteFastFailed();
+        return false;
+    }
+    static_cast<void>(Publish(std::move(made), false, compile_ms));
+    return true;
 }
 
 bool ComputePipeline::WaitBuiltFor(std::chrono::nanoseconds timeout) {
@@ -407,13 +746,17 @@ bool ComputePipeline::WaitBuiltFor(std::chrono::nanoseconds timeout) {
 void ComputePipeline::KickBuild(Common::ThreadWorker& worker) {
     // A claimed build runs already (a worker, the scheduler's wait, an earlier kick). The queued
     // pipeline worker's task finds the claim taken and returns at once when it gets there.
-    // kick_pending keeps the pipeline alive (IsBuildTaskDone) until the kick task is done.
-    if (build_claimed.load(std::memory_order::acquire) ||
+    // kick_pending keeps the pipeline alive (IsBuildTaskDone) until the kick task is done. With
+    // FRITCHII_COMPUTE_FAST_FIRST the kick makes the unoptimized build (its claim is the one
+    // that counts), so the skip ends after the short compile.
+    const bool claimed = UsesFastFirst() ? fast_claimed.load(std::memory_order::acquire)
+                                         : build_claimed.load(std::memory_order::acquire);
+    if (is_built.load(std::memory_order::acquire) || claimed ||
         kick_pending.exchange(true, std::memory_order::acq_rel)) {
         return;
     }
     worker.QueueWork([this] {
-        RunBuild();
+        RunNeededBuild();
         kick_pending.store(false, std::memory_order::release);
     });
 }
@@ -872,11 +1215,15 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         // Wait for the pipeline to be built
         scheduler.Record([this, test_deadline](vk::CommandBuffer) {
             const auto begin = std::chrono::steady_clock::now();
-            RunBuild();
+            // FRITCHII_COMPUTE_FAST_FIRST: the unoptimized build here, the optimized one on its
+            // worker; else the optimized build here unless a worker has it.
+            RunNeededBuild();
+            bool unoptimized = false;
             {
                 std::unique_lock lock{build_mutex};
                 build_condvar.wait(lock,
                                    [this] { return is_built.load(std::memory_order::relaxed); });
+                unoptimized = !running_optimized;
             }
             const bool test = test_deadline != std::chrono::steady_clock::time_point{};
             if (test) {
@@ -886,9 +1233,11 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             // log line of zortos293/Lichii #995: first-time compute programs waited 0.6-1 s each).
             const auto waited = std::chrono::steady_clock::now() - begin;
             if (waited > std::chrono::milliseconds{50}) {
-                LOG_INFO(Render_Vulkan, "Compute dispatch waited {:.1f} ms for pipeline {:016x}{}",
+                LOG_INFO(Render_Vulkan, "Compute dispatch waited {:.1f} ms for pipeline {:016x}{}{}",
                          std::chrono::duration<double, std::milli>(waited).count(), shader_hash,
-                         test ? " (FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS)" : "");
+                         test ? " (FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS)" : "",
+                         unoptimized ? " (an unoptimized build, FRITCHII_COMPUTE_FAST_FIRST)"
+                                     : "");
             }
         });
     }
@@ -936,6 +1285,11 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     auto bind = [this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
+        // FRITCHII_COMPUTE_FAST_FIRST: the optimized pipeline replaces the unoptimized one here,
+        // on the scheduler worker (the only thread that binds it). Off: two loads.
+        if (optimized_ready.load(std::memory_order::acquire) || retired_fast) [[unlikely]] {
+            SwapInOptimized();
+        }
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};

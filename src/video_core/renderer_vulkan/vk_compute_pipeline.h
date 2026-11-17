@@ -47,6 +47,7 @@ public:
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
                              vk::ShaderModule spv_module, u64 shader_hash,
                              std::function<vk::ShaderModule()> make_module = {});
+    ~ComputePipeline();
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -170,7 +171,10 @@ public:
     }
     /// Whether the build ended without a pipeline (its module could not be made).
     [[nodiscard]] bool BuildFailed() const noexcept {
-        return is_built.load(std::memory_order::acquire) && !pipeline;
+        // has_pipeline, not `pipeline`: the scheduler worker swaps that one
+        // (FRITCHII_COMPUTE_FAST_FIRST).
+        return is_built.load(std::memory_order::acquire) &&
+               !has_pipeline.load(std::memory_order::acquire);
     }
     /// Whether the build ended, with a pipeline or not.
     [[nodiscard]] bool IsBuilt() const noexcept {
@@ -213,11 +217,42 @@ public:
         test_wait_until = deadline;
     }
 
+    // --- FRITCHII_COMPUTE_FAST_FIRST ---
+
+    /// 0 off, 1 a dispatch that would wait for a first build gets an unoptimized build at once
+    /// (the optimized one follows on its worker and is swapped in), 2 (test) every program built
+    /// at run time takes that path, waited for or not. Live, any thread.
+    [[nodiscard]] static int FastFirstMode();
+    /// The 10 s line and the "unoptimized over 30 s" check. GPU thread, each frame.
+    static void ReportFastFirst();
+
 private:
-    /// Builds the pipeline once, on whichever thread gets here first.
+    /// Builds the optimized pipeline once, on whichever thread gets here first.
     void RunBuild();
+    /// A dispatch needs the pipeline now (Configure's wait, FRITCHII_ASYNC_COMPUTE_SKIP's kick):
+    /// with FRITCHII_COMPUTE_FAST_FIRST the unoptimized build, else RunBuild.
+    void RunNeededBuild();
+    /// The unoptimized build (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT, same SPIR-V and
+    /// layout), published when it ends before the optimized one. False when it made nothing.
+    bool RunFastBuild();
+    [[nodiscard]] bool UsesFastFirst() const;
+    /// The pipeline from the module; the caller holds the module (AcquireModule).
+    [[nodiscard]] vk::Pipeline CreateHandle(bool unoptimized);
+    /// Makes the module when it is made late (precompiled), and holds it until ReleaseModule.
+    /// False when there is none (it failed, or the optimized build released it).
+    [[nodiscard]] bool AcquireModule();
+    /// `optimized_done`: nothing builds from the module any more once its users let go.
+    void ReleaseModule(bool optimized_done);
+    /// The first build to end becomes the pipeline; a later optimized one waits for the swap.
+    /// True when `made` became the pipeline.
+    bool Publish(vk::Pipeline made, bool optimized, double compile_ms);
+    /// Scheduler worker, before a bind: frees the swapped-out unoptimized pipeline once the GPU
+    /// passed it, and swaps in a finished optimized one.
+    void SwapInOptimized();
 
     const Device& device;
+    Scheduler& owner_scheduler;
+    VideoCore::ShaderNotify* const build_notify;
     vk::PipelineCache& pipeline_cache;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
@@ -252,6 +287,32 @@ private:
     std::atomic_bool kick_pending{false};
     bool pointers_prebound{};
     std::chrono::steady_clock::time_point test_wait_until{};
+
+    /// Whether `pipeline` is set (BuildFailed reads this, not the handle the worker swaps).
+    std::atomic_bool has_pipeline{false};
+    /// FRITCHII_COMPUTE_FAST_FIRST. The module, shared by both builds: made late for a
+    /// precompiled pipeline, released when the optimized build and every fast one let go.
+    std::function<vk::ShaderModule()> make_module_fn;
+    std::mutex module_mutex;
+    u32 module_users{};
+    bool module_release_due{};
+    /// Built at run time on a worker (not the boot, warm-up or preparation builds), and not one
+    /// of the programs always built unoptimized.
+    bool fast_first_allowed{};
+    std::atomic_bool fast_claimed{false};
+    /// Under build_mutex: `pipeline` is the optimized one (false while the fast one serves), and
+    /// the fast build's compile time.
+    bool running_optimized{true};
+    double fast_ms{};
+    /// The optimized pipeline waiting for SwapInOptimized (set under build_mutex).
+    std::atomic_bool optimized_ready{false};
+    vk::Pipeline optimized_pipeline;
+    /// Scheduler worker only: the swapped-out unoptimized pipeline, freed once the GPU passed
+    /// retired_tick.
+    vk::Pipeline retired_fast;
+    u64 retired_tick{};
+    /// In the fast-first registry (its lock): no swap yet.
+    bool fast_open{};
 };
 
 } // namespace Vulkan

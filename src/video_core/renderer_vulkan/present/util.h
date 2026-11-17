@@ -57,6 +57,11 @@ vk::Pipeline CreateWrappedPremultipliedBlendingPipeline(
 vk::Pipeline CreateWrappedCoverageBlendingPipeline(
     const Device& device, vk::RenderPass& renderpass, vk::PipelineLayout& layout,
     std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders);
+/// Straight alpha "over": colour and alpha both src * a + dst * (1 - a). At a = 1 the source is
+/// written as is (alpha 1), at a = 0 the target keeps its colour and alpha.
+vk::Pipeline CreateWrappedOverBlendingPipeline(
+    const Device& device, vk::RenderPass& renderpass, vk::PipelineLayout& layout,
+    std::tuple<vk::ShaderModule&, vk::ShaderModule&> shaders);
 VkWriteDescriptorSet CreateWriteDescriptorSet(std::vector<VkDescriptorImageInfo>& images,
                                               VkSampler sampler, VkImageView view,
                                               VkDescriptorSet set, u32 binding);

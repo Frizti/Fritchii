@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 
 #include "common/build_stamp.h"
+#include "common/logging.h"
 #include "video_core/test_watermark.h"
 
 namespace VideoCore::TestWatermark {
@@ -85,6 +88,22 @@ constexpr std::array<std::array<float, 2>, 6> Spots{{
 
 } // namespace
 
+int Mode() {
+    static const int mode = [] {
+        const char* value = std::getenv("FRITCHII_TEST_MARK");
+        const int v = value != nullptr ? std::atoi(value) : 1;
+        return v == 0 || v == 3 ? v : 1;
+    }();
+    return mode;
+}
+
+void LogMode(const char* how) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        LOG_INFO(Render, "Test mark: {} (FRITCHII_TEST_MARK={})", how, Mode());
+    }
+}
+
 const Blocks& Build(const Common::Rectangle<u32>& screen, u32 frame_width, u32 frame_height) {
     static const std::string id = StampId();
     static const Blocks none{};
@@ -116,6 +135,8 @@ const Blocks& Build(const Common::Rectangle<u32>& screen, u32 frame_width, u32 f
         return blocks;
     }
     key = now_key;
+    static std::atomic<u64> next_version{0};
+    blocks.version = next_version.fetch_add(1, std::memory_order_relaxed) + 1;
     blocks.shadow.clear();
     blocks.text.clear();
     if (sw < 64 || sh < 64) {

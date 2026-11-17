@@ -121,8 +121,19 @@ void WindowAdaptPass::DrawToFramebuffer(ProgramManager& program_manager, std::li
 
     // Stamped test copies: their mark, inside the game picture (video_core/test_watermark.cpp).
     // Scissor 0 is marked dirty by BlitScreen::DrawScreen, so the next draw sets it again.
+    // FRITCHII_TEST_MARK=0: not drawn; any other value: these clears.
+    static bool mark_off_logged = false;
+    if (mark_off_logged) {
+        return;
+    }
     const auto& mark = VideoCore::TestWatermark::Build(layout.screen, layout.width, layout.height);
+    if (!mark.text.empty() && VideoCore::TestWatermark::Mode() == 0) {
+        VideoCore::TestWatermark::LogMode("off");
+        mark_off_logged = true;
+        return;
+    }
     if (!mark.text.empty()) {
+        VideoCore::TestWatermark::LogMode("clears (OpenGL)");
         glEnablei(GL_SCISSOR_TEST, 0);
         const auto clear_blocks = [&](const std::vector<VideoCore::TestWatermark::Block>& blocks,
                                       const float (&c)[4]) {

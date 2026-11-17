@@ -1768,6 +1768,18 @@ int PrepOrderMode(const Device& device) {
     return mode;
 }
 
+// FRITCHII_COMPUTE_PREBUILD_FIRST (boot, default 1; 0 = graphics first as before): the boot build
+// of the disk cache queues its compute records before its graphics ones. Same builds on the same
+// workers, so it is safe on; the boot waits for all of them before the game runs, so it changes
+// when they end within the boot, not what a dispatch finds built.
+bool ComputePrebuildFirst() {
+    static const bool value = [] {
+        const char* const env = std::getenv("FRITCHII_COMPUTE_PREBUILD_FIRST");
+        return env == nullptr || *env == '\0' || std::atoi(env) != 0;
+    }();
+    return value;
+}
+
 // FRITCHII_PREP_THROTTLE (boot, default 0): beside the game (not at full speed, not paused),
 // 1 = the preparation parks for 3 s after a frame over 50 ms or a draw held for an unbuilt
 // pipeline, so the runtime builds get the driver's compiler; 2 = as 1, and half the threads
@@ -4262,23 +4274,37 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         boot_stream = std::make_shared<RecordStream>(record_file, 2 * num_pipeline_workers + 8,
                                                      false);
     }
-    for (auto& [key, records] : graphics_records) {
-        std::ranges::reverse(records.envs);
-        std::ranges::reverse(records.refs);
-        queue_graphics(key, std::move(records));
+    const auto queue_all_graphics = [&] {
+        for (auto& [key, records] : graphics_records) {
+            std::ranges::reverse(records.envs);
+            std::ranges::reverse(records.refs);
+            queue_graphics(key, std::move(records));
+        }
+        graphics_records.clear();
+        graphics_record_index.clear();
+    };
+    const auto queue_all_compute = [&] {
+        for (auto& [key, candidates] : compute_envs) {
+            OrderComputeTranslations(candidates.envs, [](const FileEnvironment& env) {
+                return env.MappedStoragePointerKeys();
+            });
+            OrderComputeTranslations(candidates.refs, [](const StreamedTranslation& candidate) {
+                return candidate.pointer_keys;
+            });
+            queue_compute(key, std::move(candidates));
+        }
+        compute_envs.clear();
+    };
+    // FRITCHII_COMPUTE_PREBUILD_FIRST (boot, default 1): the compute records are queued before
+    // the graphics ones. Only the order changes: the boot waits for every queued build either
+    // way (WaitForRequests below).
+    if (ComputePrebuildFirst()) {
+        queue_all_compute();
+        queue_all_graphics();
+    } else {
+        queue_all_graphics();
+        queue_all_compute();
     }
-    graphics_records.clear();
-    graphics_record_index.clear();
-    for (auto& [key, candidates] : compute_envs) {
-        OrderComputeTranslations(candidates.envs, [](const FileEnvironment& env) {
-            return env.MappedStoragePointerKeys();
-        });
-        OrderComputeTranslations(candidates.refs, [](const StreamedTranslation& candidate) {
-            return candidate.pointer_keys;
-        });
-        queue_compute(key, std::move(candidates));
-    }
-    compute_envs.clear();
     if (boot_stream) {
         boot_stream->Seal();
     }
@@ -7264,6 +7290,7 @@ void PipelineCache::TickFrame() {
     ReportWorstFrame();
     ReportAsyncDiscard();
     ReportTranslateProfile();
+    ComputePipeline::ReportFastFirst();
     if (PrecompiledFastMode() != 0) {
         CheckPrecompiledBuilds();
         ReportPrecompiled();

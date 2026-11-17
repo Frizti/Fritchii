@@ -336,6 +336,9 @@ inline std::atomic<int> g_async_redrawn{-1};
 /// FRITCHII_ASYNC_COMPUTE_SKIP (live, default 0; 2 = dry): docs/fritchii/switches.md
 /// (renderer_vulkan/vk_async_compute_skip.h).
 inline std::atomic<int> g_async_compute_skip{-1};
+/// FRITCHII_COMPUTE_FAST_FIRST (live, default 0; 2 = test): docs/fritchii/switches.md
+/// (renderer_vulkan/vk_compute_pipeline.cpp).
+inline std::atomic<int> g_compute_fast_first{-1};
 /// FRITCHII_OCCLUSION_VISIBLE (live, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_occlusion_visible{-1};
 /// FRITCHII_UNSWIZZLE_IN_PLACE (live, default 0): docs/fritchii/switches.md.

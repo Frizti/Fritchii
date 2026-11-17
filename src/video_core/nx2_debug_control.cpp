@@ -598,6 +598,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ASYNC_COMPUTE_SKIP") {
         return &g_async_compute_skip;
     }
+    if (name == "FRITCHII_COMPUTE_FAST_FIRST") {
+        return &g_compute_fast_first;
+    }
     if (name == "FRITCHII_OCCLUSION_VISIBLE") {
         return &g_occlusion_visible;
     }

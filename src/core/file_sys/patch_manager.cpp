@@ -199,80 +199,146 @@ constexpr size_t HIGH_REFRESH_ROUTINE_OFFSET = 0x3C46E00;
 constexpr std::array<u8, 4> HIGH_REFRESH_CALL{0x4F, 0x80, 0xD5, 0x94}; // bl 0x3c46e00
 constexpr size_t HIGH_REFRESH_SCALE = 0x88; // the speed scale word, in the routine
 
-// Water ripples above 60 fps (a ported community patch): the water renderer
-// (main+0x472E0) runs its ripple simulation trunc(step) * substeps times a frame (fcvtzs w9, s0 at
-// main+0x475F8), so below a step of 1 the rings Link makes in water freeze. That fcvtzs branches
-// to an accumulator that keeps the fractional step per water object (x21) in 8 slots in BSS
-// after Dark's timer state (main+0x4E9FE00, 16 bytes): a u32 round-robin index at +0x10, then
-// (u64 owner, f32 rest) slots with a 16-byte stride at +0x20, replaced round-robin when full.
-// It returns w9 = trunc(step + rest) and keeps the rest. The original patch puts it at main+0x3C46280; it
-// sits at +0x90 of our routine here (main+0x3C46E90): the same page, so its adrp is the original's
-// word; only the two branches between the hook and it are re-encoded.
+// Water ripples at any frame rate: a port of Blitchii PR #1180 (480e01394 and its review
+// follow-up), found and verified live by a tester. The water renderer (main+0x472E0) runs
+// iterations * trunc(step) ripple passes a frame (w8 = 6 from ldr w8, [x19, #0x4c]; fcvtzs w9, s0
+// at main+0x475F8; mul w8, w8, w9 at main+0x4760C). Below a step of 1 some or all frames run no
+// pass: the ripples freeze, and the grid that follows Link moves without a pass to apply the
+// shift, so the surface jumps (on camera turns above 60 fps). Our earlier accumulator returned
+// trunc(step + rest), which kept the average rate but still ran 0 and 6 passes in turn at a step
+// of 0.5. Now the fcvtzs calls a routine (bl 0x3c46f20) and the mul is a nop: the routine adds
+// iterations * step to a rest kept per water object (x21), runs the rounded whole passes, at least
+// one while time moves (none while the step is 0: paused), and keeps total - passes, never below
+// -0.5. At a step of 0.5: 3 passes every frame.
+// In: w8 iterations, s0 step, x21 the water object. Out: w8 passes. Clobbers x9-x12, s0-s2, the
+// flags and x30 (the bl). Checked on the game's code (2026-11-17): the function saves x30 in its
+// prologue (stp x29, x30, [sp, #-0x60]! at main+0x472E4) and reloads it before its retab, makes
+// calls of its own, and on no path from the call to its return is x9-x12, x30 or a flag read
+// before it is written; s0-s2 are only ever passed into calls that every loop around them already
+// clobbers (our earlier accumulator changed s0 and s1 too).
+//   +0x00 s0 = w8 * s0 ; s0 <= 0: +0x8C (w8 = 0 ; ret)
+//   +0x10 x9 = 0x4e9fe20 (8 slots of {u64 object, f32 rest}), x10 = 0x4e9fea0 (next slot to take)
+//   +0x20 find x21's slot; none (+0x38): take slot [next], object = x21, rest = 0,
+//         next = (next + 1) & 7
+//   +0x54 s0 += rest ; w8 = max(fcvtzs(s0 + 0.5), 1) ; rest = max(s0 - w8, -0.5) ; ret
+// The routine is the port's byte for byte, but for the slot base (add x9, x9, #0xe20 at +0x14;
+// there #0xe10): the slots stay where our accumulator had them, after Dark's timer state.
 constexpr size_t WATER_HOOK_OFFSET = 0x475F8;
-constexpr u32 WATER_FCVTZS = 0x1E380009;                        // fcvtzs w9, s0
-constexpr std::array<u8, 4> WATER_HOOK{0x26, 0xFE, 0xEF, 0x14}; // b 0x3c46e90
-constexpr size_t WATER_ACCUMULATOR_OFFSET = HIGH_REFRESH_ROUTINE_OFFSET + 0x90;
-constexpr std::array<u8, 128> WATER_ACCUMULATOR{
-    0xC9, 0x92, 0x00, 0xB0, 0x29, 0x81, 0x38, 0x91, 0x0B, 0x01, 0x80, 0x52, 0x2A, 0x01,
-    0x40, 0xF9, 0x5F, 0x01, 0x15, 0xEB, 0x80, 0x02, 0x00, 0x54, 0x29, 0x41, 0x00, 0x91,
-    0x6B, 0x05, 0x00, 0x71, 0x61, 0xFF, 0xFF, 0x54, 0x29, 0x01, 0x02, 0xD1, 0x0B, 0x01,
-    0x80, 0x52, 0x2A, 0x01, 0x40, 0xF9, 0x6A, 0x01, 0x00, 0xB4, 0x29, 0x41, 0x00, 0x91,
-    0x6B, 0x05, 0x00, 0x71, 0x81, 0xFF, 0xFF, 0x54, 0x29, 0x41, 0x02, 0xD1, 0x2A, 0x01,
-    0x40, 0xB9, 0x4B, 0x05, 0x00, 0x11, 0x6B, 0x09, 0x00, 0x12, 0x2B, 0x01, 0x00, 0xB9,
-    0x29, 0x41, 0x00, 0x91, 0x29, 0x11, 0x0A, 0x8B, 0x35, 0x01, 0x00, 0xF9, 0x3F, 0x09,
-    0x00, 0xB9, 0x21, 0x09, 0x40, 0xBD, 0x00, 0x28, 0x21, 0x1E, 0x01, 0xC0, 0x25, 0x1E,
-    0x00, 0x38, 0x21, 0x1E, 0x20, 0x09, 0x00, 0xBD, 0x29, 0x00, 0x38, 0x1E, 0xBC, 0x01,
-    0x10, 0x17, // +0x7C b 0x475fc (from 0x3c46f0c; the original, from 0x3c46280: 0x171004c0)
+constexpr u32 WATER_FCVTZS = 0x1E380009;                            // fcvtzs w9, s0
+constexpr std::array<u8, 4> WATER_ORIGINAL{0x09, 0x00, 0x38, 0x1E}; // fcvtzs w9, s0
+constexpr std::array<u8, 4> WATER_HOOK{0x4A, 0xFE, 0xEF, 0x94};     // bl 0x3c46f20
+constexpr size_t WATER_MUL_OFFSET = 0x4760C;
+constexpr u32 WATER_MUL = 0x1B097D08;                                   // mul w8, w8, w9
+constexpr std::array<u8, 4> WATER_MUL_ORIGINAL{0x08, 0x7D, 0x09, 0x1B}; // mul w8, w8, w9
+constexpr std::array<u8, 4> WATER_MUL_NOP{0x1F, 0x20, 0x03, 0xD5};      // nop
+constexpr size_t WATER_ROUTINE_OFFSET = 0x3C46F20;
+constexpr std::array<u8, 148> WATER_ROUTINE{
+    0x01, 0x01, 0x22, 0x1E, 0x00, 0x08, 0x21, 0x1E, 0x08, 0x20, 0x20, 0x1E, 0x0D, 0x04, 0x00, 0x54,
+    0xC9, 0x92, 0x00, 0xB0, 0x29, 0x81, 0x38, 0x91, 0x2A, 0x01, 0x02, 0x91, 0xEB, 0x03, 0x09, 0xAA,
+    0x6C, 0x01, 0x40, 0xF9, 0x9F, 0x01, 0x15, 0xEB, 0x60, 0x01, 0x00, 0x54, 0x6B, 0x41, 0x00, 0x91,
+    0x7F, 0x01, 0x0A, 0xEB, 0x61, 0xFF, 0xFF, 0x54, 0x4C, 0x01, 0x40, 0xB9, 0x2B, 0x51, 0x2C, 0x8B,
+    0x75, 0x01, 0x00, 0xF9, 0x7F, 0x09, 0x00, 0xB9, 0x8C, 0x05, 0x00, 0x11, 0x8C, 0x09, 0x00, 0x12,
+    0x4C, 0x01, 0x00, 0xB9, 0x61, 0x09, 0x40, 0xBD, 0x00, 0x28, 0x21, 0x1E, 0x01, 0x10, 0x2C, 0x1E,
+    0x02, 0x28, 0x21, 0x1E, 0x48, 0x00, 0x38, 0x1E, 0x1F, 0x05, 0x00, 0x71, 0x4A, 0x00, 0x00, 0x54,
+    0x28, 0x00, 0x80, 0x52, 0x01, 0x01, 0x22, 0x1E, 0x00, 0x38, 0x21, 0x1E, 0x01, 0x10, 0x3C, 0x1E,
+    0x00, 0x48, 0x21, 0x1E, 0x60, 0x09, 0x00, 0xBD, 0xC0, 0x03, 0x5F, 0xD6, 0xE8, 0x03, 0x1F, 0x2A,
+    0xC0, 0x03, 0x5F, 0xD6,
 };
-// Dark's timer state and the ripple slots (ldr/str through adrp 0x4e9f000 + 0xe00 / + 0xe20).
+// The routine's place with the ripples off: free.
+constexpr std::array<u8, WATER_ROUTINE.size()> FREE_WATER_ROUTINE{};
+constexpr size_t WATER_SLOTS_OFFSET = 0x4E9FE20;
+constexpr size_t WATER_NEXT_OFFSET = 0x4E9FEA0; // u32, the next slot to take
+// Dark's timer state (+0x00..+0x10), then the ripple slots (+0x20..+0xA0) and the next-slot word
+// (+0xA0; +0x10 held our earlier accumulator's, unused now).
 constexpr size_t HIGH_REFRESH_STATE_OFFSET = 0x4E9FE00;
-constexpr size_t HIGH_REFRESH_STATE_SIZE = 0xA0;
+constexpr size_t HIGH_REFRESH_STATE_SIZE = 0xB0;
+
+// What the encodings say, checked against the offsets they are meant for.
+constexpr u32 InstructionAt(std::span<const u8> bytes, size_t offset) {
+    return u32{bytes[offset]} | u32{bytes[offset + 1]} << 8 | u32{bytes[offset + 2]} << 16 |
+           u32{bytes[offset + 3]} << 24;
+}
+constexpr u32 EncodeBl(size_t from, size_t to) {
+    return 0x94000000U |
+           (static_cast<u32>((static_cast<s64>(to) - static_cast<s64>(from)) / 4) & 0x03FFFFFFU);
+}
+constexpr size_t AdrpTarget(size_t pc, u32 word) {
+    const s64 pages = static_cast<s64>((((word >> 5) & 0x7FFFF) << 2) | ((word >> 29) & 3));
+    const s64 signed_pages = pages >= (s64{1} << 20) ? pages - (s64{1} << 21) : pages;
+    return static_cast<size_t>(static_cast<s64>(pc & ~size_t{0xFFF}) + signed_pages * 0x1000);
+}
+constexpr size_t AddImmediate(u32 word) { // add xd, xn, #imm (shift 0)
+    return (word >> 10) & 0xFFF;
+}
+static_assert(InstructionAt(WATER_HOOK, 0) == EncodeBl(WATER_HOOK_OFFSET, WATER_ROUTINE_OFFSET));
+static_assert(InstructionAt(WATER_ORIGINAL, 0) == WATER_FCVTZS);
+static_assert(InstructionAt(WATER_MUL_ORIGINAL, 0) == WATER_MUL);
+// The routine's only position-dependent word is its adrp (x9 = page 0x4e9f000 from any spot on
+// the page 0x3c46000); its branches are relative and stay inside it.
+static_assert(InstructionAt(WATER_ROUTINE, 0x10) == 0xB00092C9 && // adrp x9, ...
+              InstructionAt(WATER_ROUTINE, 0x14) == 0x91388129 && // add x9, x9, #0xe20
+              InstructionAt(WATER_ROUTINE, 0x18) == 0x9102012A);  // add x10, x9, #0x80
+static_assert(AdrpTarget(WATER_ROUTINE_OFFSET + 0x10, InstructionAt(WATER_ROUTINE, 0x10)) +
+                  AddImmediate(InstructionAt(WATER_ROUTINE, 0x14)) ==
+              WATER_SLOTS_OFFSET);
+static_assert(WATER_SLOTS_OFFSET + AddImmediate(InstructionAt(WATER_ROUTINE, 0x18)) ==
+              WATER_NEXT_OFFSET);
+static_assert(WATER_NEXT_OFFSET == WATER_SLOTS_OFFSET + 8 * 16);
+// The slots after Dark's 16 bytes, the next-slot word inside the state.
+static_assert(WATER_SLOTS_OFFSET >= HIGH_REFRESH_STATE_OFFSET + 0x10 &&
+              WATER_NEXT_OFFSET + 4 <= HIGH_REFRESH_STATE_OFFSET + HIGH_REFRESH_STATE_SIZE);
 
 // Our cave (main+0x3C46E00, executable padding after the end of the code: the text page runs on to
-// main+0x3C47000) as the high refresh rate mode leaves it: its routine, a zero word, the water
-// ripple accumulator. Every word must be free (zero) in the module.
-constexpr size_t OOT_CAVE_SIZE = 0x110;
-static_assert(HIGH_REFRESH_ROUTINE_OFFSET + OOT_CAVE_SIZE <= 0x3C47000);
-// The texture pool routine follows our cave on the same page.
+// main+0x3C47000): the high refresh routine. Then, on the same page, the texture pool routine
+// (main+0x3C46F10..0x3C46F1C) and the water ripple routine (main+0x3C46F20..0x3C46FB4). Every word
+// of ours must be free (zero) in the module.
+constexpr size_t OOT_CAVE_SIZE = HIGH_REFRESH_ROUTINE.size();
 static_assert(HIGH_REFRESH_ROUTINE_OFFSET + OOT_CAVE_SIZE <= TEXTURE_POOL_ROUTINE_OFFSET);
-static_assert(TEXTURE_POOL_ROUTINE_OFFSET + TEXTURE_POOL_ROUTINE.size() <= 0x3C47000);
-constexpr std::array<u8, OOT_CAVE_SIZE> HIGH_REFRESH_CAVE = [] {
-    std::array<u8, OOT_CAVE_SIZE> cave{};
-    std::ranges::copy(HIGH_REFRESH_ROUTINE, cave.begin());
-    std::ranges::copy(WATER_ACCUMULATOR,
-                      cave.begin() + (WATER_ACCUMULATOR_OFFSET - HIGH_REFRESH_ROUTINE_OFFSET));
-    return cave;
-}();
-static_assert(WATER_ACCUMULATOR_OFFSET - HIGH_REFRESH_ROUTINE_OFFSET + WATER_ACCUMULATOR.size() ==
-              OOT_CAVE_SIZE);
+static_assert(TEXTURE_POOL_ROUTINE_OFFSET + TEXTURE_POOL_ROUTINE.size() <= WATER_ROUTINE_OFFSET);
+static_assert(WATER_ROUTINE_OFFSET + WATER_ROUTINE.size() <= 0x3C47000);
+static_assert(OOT_CAVE_SIZE % 4 == 0 && WATER_ROUTINE.size() % 4 == 0);
 // Our cave with the high refresh mode off: free.
 constexpr std::array<u8, OOT_CAVE_SIZE> FREE_CAVE{};
-constexpr std::array<u8, 4> WATER_ORIGINAL{0x09, 0x00, 0x38, 0x1E}; // fcvtzs w9, s0
 static_assert(OotHighRefreshCode::CallOffset == 0x6E6CC4 &&
               OotHighRefreshCode::WaterOffset == WATER_HOOK_OFFSET &&
+              OotHighRefreshCode::WaterMulOffset == WATER_MUL_OFFSET &&
               OotHighRefreshCode::DarkOffset == 0x3C46200 &&
               OotHighRefreshCode::DarkSize == DYNAMIC_FPS_ROUTINE.size() &&
               OotHighRefreshCode::CaveOffset == HIGH_REFRESH_ROUTINE_OFFSET &&
               OotHighRefreshCode::CaveSize == OOT_CAVE_SIZE &&
+              OotHighRefreshCode::RippleOffset == WATER_ROUTINE_OFFSET &&
+              OotHighRefreshCode::RippleSize == WATER_ROUTINE.size() &&
               OotHighRefreshCode::ScaleOffset == HIGH_REFRESH_ROUTINE_OFFSET + HIGH_REFRESH_SCALE);
 
 // The call (to our routine or to Dark's), Dark's routine (so the mode can switch live), the water
-// hook (over its fcvtzs), then our cave one word at a time, each checked to be zero in the module.
-// Since v5.8 (a ported finding, 2026-11-10) Dark's mode gets the same hook and
-// cave too, through the separate ripple built-in: with his Dynamic FPS alone the ripples ran
+// hook (over its fcvtzs) and nop (over its mul), then our cave and the ripple routine one word at
+// a time, each checked to be zero in the module.
+// Since v5.8 (a ported finding, 2026-11-10) Dark's mode gets the same hook, nop, cave and ripple
+// routine too, through the separate ripple built-in: with his Dynamic FPS alone the ripples ran
 // trunc(step) passes, so at a 60 fps cap (step 0.998-1.003) some frames ran none and below 60
 // they ran slow (1.33 -> 1). With both, the call word is the only difference between the modes.
 constexpr auto MakeOotRecords(std::span<const u8> call) {
-    std::array<BuiltinPatchRecord, 3 + OOT_CAVE_SIZE / 4> records{};
+    std::array<BuiltinPatchRecord, 4 + OOT_CAVE_SIZE / 4 + WATER_ROUTINE.size() / 4> records{};
     records[0] = BuiltinPatchRecord{.module_offset = 0x6E6CC4, .bytes = call};
     records[1] = BuiltinPatchRecord{.module_offset = 0x3C46200, .bytes = DYNAMIC_FPS_ROUTINE};
     records[2] = BuiltinPatchRecord{.module_offset = WATER_HOOK_OFFSET,
                                     .bytes = WATER_HOOK,
                                     .checked = true,
                                     .original = WATER_FCVTZS};
-    for (size_t i = 3, offset = 0; offset < OOT_CAVE_SIZE; ++i, offset += 4) {
+    records[3] = BuiltinPatchRecord{.module_offset = WATER_MUL_OFFSET,
+                                    .bytes = WATER_MUL_NOP,
+                                    .checked = true,
+                                    .original = WATER_MUL};
+    size_t i = 4;
+    for (size_t offset = 0; offset < OOT_CAVE_SIZE; ++i, offset += 4) {
         records[i] = BuiltinPatchRecord{.module_offset = HIGH_REFRESH_ROUTINE_OFFSET + offset,
-                                        .bytes = std::span<const u8>{HIGH_REFRESH_CAVE}.subspan(offset, 4),
+                                        .bytes = std::span<const u8>{HIGH_REFRESH_ROUTINE}.subspan(offset, 4),
+                                        .checked = true,
+                                        .original = 0};
+    }
+    for (size_t offset = 0; offset < WATER_ROUTINE.size(); ++i, offset += 4) {
+        records[i] = BuiltinPatchRecord{.module_offset = WATER_ROUTINE_OFFSET + offset,
+                                        .bytes = std::span<const u8>{WATER_ROUTINE}.subspan(offset, 4),
                                         .checked = true,
                                         .original = 0};
     }
@@ -286,10 +352,11 @@ constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x3C46200, .bytes = DYNAMIC_FPS_ROUTINE},
 };
 // The water ripples with Dark's Dynamic FPS (its own built-in, applied after his): the water hook
-// and our cave, the same words the high refresh mode has, without its call. Skipped when the
-// high refresh mode already wrote them, or when another mod holds any of those spots.
+// and nop, our cave and the ripple routine, the same words the high refresh mode has, without its
+// call. Skipped when the high refresh mode already wrote them, or when another mod holds any of
+// those spots.
 constexpr auto WATER_RIPPLE_RECORDS = [] {
-    std::array<BuiltinPatchRecord, 1 + OOT_CAVE_SIZE / 4> records{};
+    std::array<BuiltinPatchRecord, 2 + OOT_CAVE_SIZE / 4 + WATER_ROUTINE.size() / 4> records{};
     const auto all = MakeOotRecords(DYNAMIC_FPS_CALL);
     std::ranges::copy(std::span{all}.subspan(2), records.begin());
     return records;
@@ -338,8 +405,8 @@ constexpr std::array<u8, 176> PICKUP_STUB{
     0xF0, 0x09, 0x00, 0xBD, 0xF0, 0x47, 0x42, 0x6D, 0xEF, 0x43, 0x41, 0xA9,
     0xED, 0x3B, 0xC3, 0xA8, 0xD6, 0x85, 0x38, 0x17, // +0xAC b 0xa68304
 };
-// Its slots: after Dark's timer state and the ripple slots (+0x00..+0xA0), with +0xA0..+0xB0 left
-// free. The BSS of this main runs to main+0x4EA0000.
+// Its slots: right after Dark's timer state, the ripple slots and their next-slot word
+// (+0x00..+0xB0). The BSS of this main runs to main+0x4EA0000.
 constexpr size_t PICKUP_STATE_OFFSET = 0x4E9FEB0;
 constexpr size_t PICKUP_STATE_SIZE = 0x50;
 static_assert(PICKUP_STATE_OFFSET >= HIGH_REFRESH_STATE_OFFSET + HIGH_REFRESH_STATE_SIZE);
@@ -2280,15 +2347,20 @@ std::optional<size_t> OotHighRefreshScaleOffset(std::span<const u8> code) {
 
 std::optional<OotHighRefreshCode> ReadOotHighRefreshCode(std::span<const u8> code) {
     using Code = OotHighRefreshCode;
-    static_assert(Code::WaterOffset < Code::CallOffset && Code::CallOffset < Code::CaveOffset);
-    if (code.size() < Code::CaveOffset + Code::CaveSize) {
+    static_assert(Code::WaterOffset < Code::WaterMulOffset && Code::WaterMulOffset < Code::CallOffset &&
+                  Code::CallOffset < Code::DarkOffset && Code::DarkOffset < Code::CaveOffset &&
+                  Code::CaveOffset + Code::CaveSize <= Code::RippleOffset);
+    if (code.size() < Code::RippleOffset + Code::RippleSize) {
         return std::nullopt;
     }
     Code parts;
     std::ranges::copy(code.subspan(Code::CallOffset, parts.call.size()), parts.call.begin());
     std::ranges::copy(code.subspan(Code::WaterOffset, parts.water.size()), parts.water.begin());
+    std::ranges::copy(code.subspan(Code::WaterMulOffset, parts.water_mul.size()),
+                      parts.water_mul.begin());
     std::ranges::copy(code.subspan(Code::DarkOffset, parts.dark.size()), parts.dark.begin());
     std::ranges::copy(code.subspan(Code::CaveOffset, parts.cave.size()), parts.cave.begin());
+    std::ranges::copy(code.subspan(Code::RippleOffset, parts.ripples.size()), parts.ripples.begin());
     return parts;
 }
 
@@ -2297,16 +2369,20 @@ OotHighRefreshLayout GetOotHighRefreshLayout(const OotHighRefreshCode& code) {
     if (code.dark != DYNAMIC_FPS_ROUTINE) {
         return OotHighRefreshLayout::Unknown;
     }
-    // Before v5.8 Dark's mode had no water hook and a free cave; still switchable.
-    if (code.call == DYNAMIC_FPS_CALL && code.water == WATER_ORIGINAL && code.cave == FREE_CAVE) {
+    // Before v5.8 (and with the ripple built-in off) Dark's mode has the water renderer's own
+    // fcvtzs and mul and leaves our cave and the ripple routine's place free; still switchable.
+    if (code.call == DYNAMIC_FPS_CALL && code.water == WATER_ORIGINAL &&
+        code.water_mul == WATER_MUL_ORIGINAL && code.cave == FREE_CAVE &&
+        code.ripples == FREE_WATER_ROUTINE) {
         return OotHighRefreshLayout::Off;
     }
     // The cave but the speed scale word, which the present pacing sets (Turbo, Slow).
     const auto cave = std::span<const u8>{code.cave};
-    const auto ours = std::span<const u8>{HIGH_REFRESH_CAVE};
+    const auto ours = std::span<const u8>{HIGH_REFRESH_ROUTINE};
     constexpr size_t after_scale = HIGH_REFRESH_SCALE + 4;
     const bool our_cave =
-        code.water == WATER_HOOK &&
+        code.water == WATER_HOOK && code.water_mul == WATER_MUL_NOP &&
+        code.ripples == WATER_ROUTINE &&
         std::ranges::equal(cave.first(HIGH_REFRESH_SCALE), ours.first(HIGH_REFRESH_SCALE)) &&
         std::ranges::equal(cave.subspan(after_scale), ours.subspan(after_scale));
     if (our_cave && code.call == HIGH_REFRESH_CALL) {
@@ -2329,12 +2405,15 @@ std::optional<OotHighRefreshCode> SwitchOotHighRefreshCode(const OotHighRefreshC
     }
     OotHighRefreshCode switched = code;
     switched.call = on ? HIGH_REFRESH_CALL : DYNAMIC_FPS_CALL;
-    // Both modes keep the water hook and the cave (v5.8): only the call and the speed scale word
-    // change, so no code a thread may be running changes under it. Unless the player turned the
-    // ripple built-in off: then Dark's mode has neither, as before.
+    // Both modes keep the water hook and nop, the cave and the ripple routine (v5.8): only the
+    // call and the speed scale word change, so no code a thread may be running changes under it.
+    // Unless the player turned the ripple built-in off: then Dark's mode has none of them, as
+    // before (the fcvtzs and the mul both back, both routines' places free).
     const bool keep = on || ripples;
     switched.water = keep ? WATER_HOOK : WATER_ORIGINAL;
-    switched.cave = keep ? HIGH_REFRESH_CAVE : FREE_CAVE;
+    switched.water_mul = keep ? WATER_MUL_NOP : WATER_MUL_ORIGINAL;
+    switched.cave = keep ? HIGH_REFRESH_ROUTINE : FREE_CAVE;
+    switched.ripples = keep ? WATER_ROUTINE : FREE_WATER_ROUTINE;
     return switched;
 }
 
@@ -2351,14 +2430,24 @@ OotHighRefreshSwitch SwitchOotHighRefreshStalled(Kernel::KProcess& process, u64 
                                                  bool on) {
     using Code = OotHighRefreshCode;
     const u64 cave_address = code_address + Code::CaveOffset;
-    // No thread may stand inside our cave, where the bytes under it change (it could have been
-    // stopped at a block boundary in it). The call and the water hook are single words: either
-    // word leads into complete code, and Dark's routine never changes.
+    const u64 ripple_address = code_address + Code::RippleOffset;
+    // No thread may stand inside our cave or the ripple routine, where the bytes under it change
+    // (it could have been stopped at a block boundary in it), nor between the water hook and its
+    // nop (main+0x475FC..0x4760C: the routine's return lands at 0x475FC, a block start): it ran
+    // one form of the hook and would run the other form of the mul (passes * w9, where w9 now
+    // holds a slot address, would run the ripples for ever). The call is a single word that
+    // leads into complete code either way, and Dark's routine never changes.
     {
+        const auto inside = [](u64 pc, u64 start, u64 size) {
+            return pc >= start && pc < start + size;
+        };
+        const u64 between_water_words = code_address + Code::WaterOffset + 4;
         Kernel::KScopedLightLock lk{process.GetListLock()};
         for (auto& thread : process.GetThreadList()) {
             const u64 pc = thread.GetContext().pc;
-            if (pc >= cave_address && pc < cave_address + Code::CaveSize) {
+            if (inside(pc, cave_address, Code::CaveSize) ||
+                inside(pc, ripple_address, Code::RippleSize) ||
+                inside(pc, between_water_words, Code::WaterMulOffset + 4 - (Code::WaterOffset + 4))) {
                 return OotHighRefreshSwitch::Busy;
             }
         }
@@ -2372,9 +2461,12 @@ OotHighRefreshSwitch SwitchOotHighRefreshStalled(Kernel::KProcess& process, u64 
     if (!memory.ReadBlock(code_address + Code::CallOffset, current.call.data(), current.call.size()) ||
         !memory.ReadBlock(code_address + Code::WaterOffset, current.water.data(),
                           current.water.size()) ||
+        !memory.ReadBlock(code_address + Code::WaterMulOffset, current.water_mul.data(),
+                          current.water_mul.size()) ||
         !memory.ReadBlock(code_address + Code::DarkOffset, current.dark.data(),
                           current.dark.size()) ||
-        !memory.ReadBlock(cave_address, current.cave.data(), current.cave.size())) {
+        !memory.ReadBlock(cave_address, current.cave.data(), current.cave.size()) ||
+        !memory.ReadBlock(ripple_address, current.ripples.data(), current.ripples.size())) {
         return OotHighRefreshSwitch::UnknownCode;
     }
     const auto disabled = Settings::values.disabled_addons.find(0x0400486024DEC000ULL);
@@ -2392,11 +2484,16 @@ OotHighRefreshSwitch SwitchOotHighRefreshStalled(Kernel::KProcess& process, u64 
     // On: our code first, then the words leading into it; off: the words first, then the code
     // cleared (the guest is stalled either way; this order never leaves a word pointing at a
     // cave that isn't complete).
-    const auto write_cave = [&] {
-        if (target->cave != current.cave) {
-            memory.WriteBlock(cave_address, target->cave.data(), target->cave.size());
-            Core::InvalidateInstructionCacheRange(&process, cave_address, target->cave.size());
+    const auto write_block = [&](u64 address, std::span<const u8> bytes,
+                                 std::span<const u8> was) {
+        if (!std::ranges::equal(bytes, was)) {
+            memory.WriteBlock(address, bytes.data(), bytes.size());
+            Core::InvalidateInstructionCacheRange(&process, address, bytes.size());
         }
+    };
+    const auto write_cave = [&] {
+        write_block(cave_address, target->cave, current.cave);
+        write_block(ripple_address, target->ripples, current.ripples);
     };
     const auto write_word = [&](size_t offset, const std::array<u8, 4>& word,
                                 const std::array<u8, 4>& was) {
@@ -2408,6 +2505,7 @@ OotHighRefreshSwitch SwitchOotHighRefreshStalled(Kernel::KProcess& process, u64 
     if (on) {
         write_cave();
     }
+    write_word(Code::WaterMulOffset, target->water_mul, current.water_mul);
     write_word(Code::WaterOffset, target->water, current.water);
     write_word(Code::CallOffset, target->call, current.call);
     if (!on) {
