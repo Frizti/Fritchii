@@ -4196,6 +4196,8 @@ void GpuSplit::ExecuteCbJoined(const u64* words, u32 count) {
             // FRITCHII_CB_MERGE=2: where the next run's first word goes on the back (the sink
             // first, as that word does) against the front's address for it.
             back_engine->ConsumeSink(*system);
+#if defined(_CPPRTTI) || defined(__GXX_RTTI)
+            // Diagnostic only; builds without RTTI (Linux) don't compare.
             if (auto* const maxwell3d = dynamic_cast<Maxwell3D*>(back_engine)) {
                 const auto& regs = maxwell3d->regs;
                 const GPUVAddr back_address =
@@ -4212,6 +4214,7 @@ void GpuSplit::ExecuteCbJoined(const u64* words, u32 count) {
                     }
                 }
             }
+#endif
             i += 2;
             continue;
         }

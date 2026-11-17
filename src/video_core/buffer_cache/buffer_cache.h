@@ -29,6 +29,7 @@
 #include "shader_recompiler/frontend/ir/opcodes.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/mem_read_log.h"
+#include "video_core/compute_skip_hook.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/nx2_bytes_equal.h"
 #include "video_core/nx2_debug_control.h"
@@ -7614,6 +7615,9 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync,
                                        bool capped) {
+    // FRITCHII_ASYNC_COMPUTE_SKIP: these bytes are no longer last written by a skipped dispatch
+    // (in stream order, wherever the mark is made).
+    VideoCommon::ComputeSkipHook::NoteWrite(device_addr, size);
     // FRITCHII_MEMSTAGE_MARKS_AHEAD: GPUMem's own fill puts the mark on the list ("Marks ahead of
     // the back", below). Anywhere else the whole of it runs here, after the due promotions.
     if (marks_ahead.load(std::memory_order_relaxed)) [[unlikely]] {

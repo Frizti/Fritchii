@@ -508,18 +508,35 @@ pass draws is missing; the frame after the build ends is right again.
 
 Log, every 10 s while anything happened: "Async compute skip (FRITCHII_ASYNC_COMPUTE_SKIP=n) in the
 last 10 s: x dispatches/s skipped, y/s would skip (dry), p new programs, t ms of waits avoided;
-unbuilt dispatches that waited: a shape, b unknown extent, c read back, d no GPU data, e not every
-frame; must be 0: s programs still skipping 10 s after their first skip, r guest reads of skipped
-output". Once per program (first 64): "pipeline X is still building, its dispatches are skipped" and
-"pipeline X skipped N dispatches over T ms (frames f-g), ran at frame h; W ms of wait avoided" (the
-wait avoided runs from the first skip to the build's end).
+unbuilt dispatches that waited: a shape, b unknown extent, c read back (c2 of them only by a guest
+read seen here), d no GPU data, e not every frame; must be 0: s programs still skipping 10 s after
+their first skip (since boot), guest reads of skipped output r in these 10 s (r2 since boot; h
+ranges held now)". Then one line per list with the top 8 programs by dispatches: "Async compute skip
+programs, waited, read back (n programs): hash xN, ..." for each refusal, for skipped, would skip
+(dry) and guest reads of skipped output. Once per program (first 64): "pipeline X is still
+building, its dispatches are skipped" and "pipeline X skipped N dispatches over T ms (frames f-g),
+ran at frame h; W ms of wait avoided" (the wait avoided runs from the first skip to the build's end).
+
+The skipped-output read count (round 2, helper DU) counts only reads of bytes whose last writer was
+a skipped dispatch: each skip holds its written ranges, and any later write over them ends that (a
+buffer write mark of any dispatch, draw or copy, an image modification, which counts for the whole
+image, or a guest CPU write: VideoCommon::ComputeSkipHook). Ranges held 60 s without a write are
+dropped. Before, it counted every read of a range a skipped pipeline had written until that pipeline
+ran again, also when other passes had rewritten the range since. Dry runs hold nothing.
+
+The OoT upscaler passes (the game's 1440p, scaled 1440p and 3/4 passes, the full-size pass and the
+depth reader) never skip: skipping them keeps the whole picture still.
 
 FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS (boot, ms, default 0; test only): every compute program counts as
 unbuilt for that long after its first dispatch, to test the skip on a PC with warm caches (2000 =
-a cold compile for each). Its pipelines are built, so there is no budget wait; the log says it is on.
-Test: one session at a pinned save, mode 2 first (no visual change, read the refusal split), then
-mode 1 with the delay; screenshot at 1 s and 10 s, compare the 10 s shot with mode 0; both must-be-0
-counts 0.
+a cold compile for each). A dispatch that runs meanwhile (mode 0, a refusal, mode 2) waits as a
+building pipeline's does, since round 2: Configure records the build wait on the scheduler worker,
+held until the delay ends, and logs "Compute dispatch waited N ms for pipeline X
+(FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS)". With the one follower such dispatches are lent ("lent:
+unbuilt pipeline") in every mode while the delay is set. The pipelines are built, so there is no
+budget wait. Test: one session at a pinned save, mode 2 first (no visual change, read the refusal
+split), then mode 1 with the delay; screenshot at 1 s and 10 s, compare the 10 s shot with mode 0;
+both must-be-0 counts 0.
 
 ### FRITCHII_OCCLUSION_VISIBLE
 

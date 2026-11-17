@@ -29,6 +29,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/buffer_cache/mem_read_log.h"
+#include "video_core/compute_skip_hook.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/early_compute.h"
@@ -8202,6 +8203,11 @@ auto TextureCache<P>::ComputeSkipImageState(DAddr addr, u64 size) -> SkipImageSt
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    // FRITCHII_ASYNC_COMPUTE_SKIP: a GPU write over the image (the whole of it counts).
+    if (image.cpu_addr_end > image.cpu_addr) {
+        VideoCommon::ComputeSkipHook::NoteWrite(image.cpu_addr,
+                                                image.cpu_addr_end - image.cpu_addr);
+    }
     image.flags |= ImageFlagBits::GpuModified;
     CountGpuModified(image); // EXP100
     // EXP76: GPU-written texels no longer match a hash of guest bytes.

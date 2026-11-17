@@ -206,6 +206,12 @@ public:
     void UsePreboundPointers() noexcept {
         pointers_prebound = true;
     }
+    /// FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS (test): the next Configure records the build wait a
+    /// pipeline still building records (on the scheduler worker, every channel behind it, the
+    /// "Compute dispatch waited" line), held until `deadline`.
+    void SetTestWaitUntil(std::chrono::steady_clock::time_point deadline) noexcept {
+        test_wait_until = deadline;
+    }
 
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
@@ -245,6 +251,7 @@ private:
     std::atomic<std::chrono::steady_clock::rep> built_at{};
     std::atomic_bool kick_pending{false};
     bool pointers_prebound{};
+    std::chrono::steady_clock::time_point test_wait_until{};
 };
 
 } // namespace Vulkan

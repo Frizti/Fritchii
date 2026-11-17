@@ -4465,8 +4465,9 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         return false;
     };
     // FRITCHII_ASYNC_COMPUTE_SKIP: an unbuilt pipeline's dispatch is decided in the lent call
-    // (DispatchCompute's SkipUnbuiltDispatch), before anything is filled or marked here.
-    if (AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+    // (DispatchCompute's SkipUnbuiltDispatch), before anything is filled or marked here. With
+    // the test delay (any mode), the lent call also makes it wait as a building one would.
+    if (AsyncComputeSkip::Mode() != 0 || AsyncComputeSkip::DelayMs() > 0) [[unlikely]] {
         if (async_compute_skip.CountsUnbuilt(*pipeline)) {
             return lend_with(Count::Unbuilt);
         }
@@ -5342,8 +5343,8 @@ bool RasterizerVulkan::SkipUnbuiltDispatch(ComputePipeline& pipeline, bool indir
     // dispatch is filled yet. The guards in order: G4 (shape, then extents), G3, G1, G2.
     using Skip = AsyncComputeSkip;
     const int mode = Skip::Mode();
-    const auto run = [&](Skip::Refusal why) {
-        async_compute_skip.NoteRefusal(why);
+    const auto run = [&](Skip::Refusal why, bool sticky_only = false) {
+        async_compute_skip.NoteRefusal(why, pipeline.ShaderHash(), sticky_only);
         return false;
     };
     const MemStage::DispatchFacts facts = pipeline.MemFacts();
@@ -5358,9 +5359,9 @@ bool RasterizerVulkan::SkipUnbuiltDispatch(ComputePipeline& pipeline, bool indir
     // Configure's pointer binds, ahead (they resolve the written ranges and mark nothing). From
     // here a dispatch that runs keeps them: Configure does not bind again.
     pipeline.BindStoragePointers(buffer_cache);
-    const auto run_bound = [&](Skip::Refusal why) {
+    const auto run_bound = [&](Skip::Refusal why, bool sticky_only = false) {
         pipeline.UsePreboundPointers();
-        return run(why);
+        return run(why, sticky_only);
     };
     boost::container::small_vector<Skip::Range, 8> ranges;
     bool bounded = CollectComputeWrites(ranges);
@@ -5391,8 +5392,11 @@ bool RasterizerVulkan::SkipUnbuiltDispatch(ComputePipeline& pipeline, bool indir
         // G3: never a page the guest reads back (this file's sticky reads, and the buffer
         // cache's Preflushable marks, CPU-read ranges and read downloads).
         const auto buffer_facts = buffer_cache.ComputeSkipRangeFacts(range.addr, range.size);
-        if (buffer_facts.read_back || async_compute_skip.GuestReadSeen(range)) {
+        if (buffer_facts.read_back) {
             return run_bound(Skip::Refusal::ReadBack);
+        }
+        if (async_compute_skip.GuestReadSeen(range)) {
+            return run_bound(Skip::Refusal::ReadBack, true);
         }
         if (range.kind == Skip::Kind::Buffer) {
             // G1: every byte GPU-written, no CPU write to upload. G2: every frame.
@@ -5646,6 +5650,15 @@ void RasterizerVulkan::DispatchCompute() {
     // and still happen. Run, it takes Configure's own path (no fill: the decision bound its
     // storage pointers already, or Configure binds them) and waits for the build as before.
     bool unbuilt_decided = false;
+    if (onef_play == nullptr &&
+        (AsyncComputeSkip::Mode() != 0 || AsyncComputeSkip::DelayMs() > 0)) [[unlikely]] {
+        // FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS (any mode): a dispatch that runs while its
+        // program counts as unbuilt waits in Configure as a building pipeline's does (the
+        // scheduler worker held until the delay ends, "Compute dispatch waited" logged).
+        if (const auto deadline = async_compute_skip.DelayDeadline(*pipeline)) {
+            pipeline->SetTestWaitUntil(*deadline);
+        }
+    }
     if (onef_play == nullptr && AsyncComputeSkip::Mode() != 0) [[unlikely]] {
         if (async_compute_skip.CountsUnbuilt(*pipeline)) {
             unbuilt_decided = true;
@@ -5655,8 +5668,12 @@ void RasterizerVulkan::DispatchCompute() {
                 can_replace || pipeline->CanReplaceOcarinaUpscale() ||
                 hash == ComputePipeline::OcarinaFullSizeShader ||
                 hash == ComputePipeline::Ocarina1440pShader || hash == ThreeQuarterShader ||
-                hash == DepthReaderShader || (marking_effects && pipeline->WritesImages());
+                hash == ComputePipeline::Ocarina1440pScaledShader ||
+                hash == ComputePipeline::Ocarina1440pScaledFieldShader ||
+                hash == ComputePipeline::OcarinaThreeQuarterShader || hash == DepthReaderShader ||
+                (marking_effects && pipeline->WritesImages());
             if (SkipUnbuiltDispatch(*pipeline, indirect_address.has_value(), special_pass)) {
+                pipeline->SetTestWaitUntil({}); // no Configure: nothing waits
                 // EXP10: the dispatch writes nothing.
                 if (VideoCommon::GpuSplit::RecordingDispatch()) {
                     VideoCommon::GpuSplit::Get().ConfirmDispatch();
@@ -7161,6 +7178,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     if (addr == 0 || size == 0) {
         return;
     }
+    VideoCommon::ComputeSkipHook::NoteWrite(addr, size); // FRITCHII_ASYNC_COMPUTE_SKIP
     ONEF_LEND(Invalidation, InvalidateRegion(addr, size, which))
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
@@ -7372,6 +7390,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 }
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+    VideoCommon::ComputeSkipHook::NoteWrite(addr, size); // FRITCHII_ASYNC_COMPUTE_SKIP
     ONEF_LEND_RESULT(Invalidation, OnCPUWrite(addr, size))
     DEBUG_ASSERT(addr != 0 || size != 0);
     CountGuestAccess(g_guest_access.write_locked);
@@ -7450,6 +7469,9 @@ bool RasterizerVulkan::OneFollowerGatherOnEngine(
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    for (const auto& [range_addr, range_size] : ranges) {
+        VideoCommon::ComputeSkipHook::NoteWrite(range_addr, range_size); // ASYNC_COMPUTE_SKIP
+    }
     if (VideoCommon::OneFollower::ShouldLend() && OneFollowerGatherOnEngine(ranges)) {
         return;
     }
@@ -7767,6 +7789,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
+    VideoCommon::ComputeSkipHook::NoteWrite(addr, size); // FRITCHII_ASYNC_COMPUTE_SKIP
     ONEF_LEND(Invalidation, OnCacheInvalidation(addr, size))
     if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackCacheInvalidation(false, 1);

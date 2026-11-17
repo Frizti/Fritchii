@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <limits>
 #include <optional>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -862,9 +864,13 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         return false;
     }
 
-    if (!is_built.load(std::memory_order::relaxed)) {
+    // FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS: a pipeline that counts as unbuilt by the test delay
+    // waits here as a building one does, until the delay ends.
+    const auto test_deadline = std::exchange(test_wait_until, {});
+    if (!is_built.load(std::memory_order::relaxed) ||
+        test_deadline != std::chrono::steady_clock::time_point{}) {
         // Wait for the pipeline to be built
-        scheduler.Record([this](vk::CommandBuffer) {
+        scheduler.Record([this, test_deadline](vk::CommandBuffer) {
             const auto begin = std::chrono::steady_clock::now();
             RunBuild();
             {
@@ -872,12 +878,17 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 build_condvar.wait(lock,
                                    [this] { return is_built.load(std::memory_order::relaxed); });
             }
+            const bool test = test_deadline != std::chrono::steady_clock::time_point{};
+            if (test) {
+                std::this_thread::sleep_until(test_deadline);
+            }
             // Every GPU channel waits with the dispatch, so a long wait is a freeze (port of the
             // log line of zortos293/Lichii #995: first-time compute programs waited 0.6-1 s each).
             const auto waited = std::chrono::steady_clock::now() - begin;
             if (waited > std::chrono::milliseconds{50}) {
-                LOG_INFO(Render_Vulkan, "Compute dispatch waited {:.1f} ms for pipeline {:016x}",
-                         std::chrono::duration<double, std::milli>(waited).count(), shader_hash);
+                LOG_INFO(Render_Vulkan, "Compute dispatch waited {:.1f} ms for pipeline {:016x}{}",
+                         std::chrono::duration<double, std::milli>(waited).count(), shader_hash,
+                         test ? " (FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS)" : "");
             }
         });
     }

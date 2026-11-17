@@ -35,6 +35,7 @@ add_library(video_core STATIC
     churn_counters.h
     compatible_formats.cpp
     compatible_formats.h
+    compute_skip_hook.h
     control/channel_state.cpp
     control/channel_state.h
     control/channel_state_cache.cpp

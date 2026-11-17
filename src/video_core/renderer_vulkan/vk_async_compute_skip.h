@@ -31,17 +31,21 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
+#include <fmt/format.h>
 
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/range_sets.h"
 #include "common/thread_worker.h"
+#include "video_core/compute_skip_hook.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 
@@ -96,10 +100,24 @@ public:
         return value;
     }
 
+    AsyncComputeSkip() {
+        s_instance.store(this, std::memory_order_release);
+        VideoCommon::ComputeSkipHook::g_slow.store(
+            [](u64 addr, u64 size) {
+                if (AsyncComputeSkip* const self = s_instance.load(std::memory_order_acquire)) {
+                    self->NoteWritten(addr, size);
+                }
+            },
+            std::memory_order_release);
+    }
     ~AsyncComputeSkip() {
+        VideoCommon::ComputeSkipHook::g_slow.store(nullptr, std::memory_order_release);
+        s_instance.store(nullptr, std::memory_order_release);
         // Joined first (a build in progress ends): the pipelines outlive this object.
         kick_workers.reset();
     }
+    AsyncComputeSkip(const AsyncComputeSkip&) = delete;
+    AsyncComputeSkip& operator=(const AsyncComputeSkip&) = delete;
 
     // --- The frame clock: the render thread's frames (TickFrame) ---
 
@@ -130,10 +148,20 @@ public:
         if (delay <= 0) {
             return false;
         }
+        return DelayDeadline(pipeline).has_value();
+    }
+    /// FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS: while the program counts as unbuilt by the test
+    /// delay, when that ends (its first dispatch plus the delay). Registers the first dispatch.
+    [[nodiscard]] std::optional<Clock::time_point> DelayDeadline(const ComputePipeline& pipeline) {
+        const int delay = DelayMs();
+        if (delay <= 0) {
+            return std::nullopt;
+        }
         std::scoped_lock lock{mutex};
         const auto now = Clock::now();
         const auto it = first_dispatch.try_emplace(pipeline.ShaderHash(), now).first;
-        return now - it->second < std::chrono::milliseconds{delay};
+        const auto deadline = it->second + std::chrono::milliseconds{delay};
+        return now < deadline ? std::optional{deadline} : std::nullopt;
     }
 
     // --- Write streaks (G2), the buffer cache's lock held by the caller ---
@@ -199,9 +227,15 @@ public:
         const DAddr end = (range.addr + range.size + PageSize - 1) & ~(PageSize - 1);
         return read_pages.Intersects(begin, end - begin);
     }
-    void NoteRefusal(Refusal why) {
+    /// An unbuilt dispatch of program `hash` that waits, and why. `sticky_only`: refused by G3
+    /// only for a guest read this file saw (none of the buffer cache's read-back marks).
+    void NoteRefusal(Refusal why, u64 hash, bool sticky_only = false) {
         std::scoped_lock lock{mutex};
         ++window.refused[static_cast<size_t>(why)];
+        ++window.programs_by[static_cast<size_t>(why)][hash];
+        if (sticky_only) {
+            ++window.read_back_sticky_only;
+        }
     }
 
     /// A dispatch skipped (mode 1) or that would be (mode 2) with these written ranges.
@@ -239,8 +273,14 @@ public:
             if (std::ranges::find(session.ranges, range) == session.ranges.end()) {
                 session.ranges.push_back(range);
             }
+            if (!dry) {
+                // Last written by a skipped dispatch now, until any write covers it
+                // (NoteWritten).
+                AddSkippedOutLocked(range, session.hash, now);
+            }
         }
         ++(dry ? window.would_skip : window.skipped);
+        ++window.programs_by[dry ? WouldSkipIndex : SkippedIndex][session.hash];
         if (!session.stuck && now - session.first > std::chrono::seconds{10}) {
             // Must be 0: the build should have ended long before.
             session.stuck = true;
@@ -300,7 +340,8 @@ public:
     }
 
     /// Any thread (GetFlushArea): a guest read of [addr, addr + size) on GPU-written or image
-    /// pages. Sticky for G3; must be 0: a read of output whose last writer was skipped.
+    /// pages. Sticky for G3; must be 0: a read of bytes whose last writer was a skipped
+    /// dispatch (no GPU mark, image modification or guest write over them since the skip).
     void NoteGuestRead(DAddr addr, u64 size) {
         if (size == 0) {
             return;
@@ -309,22 +350,49 @@ public:
         const DAddr end = (addr + size + PageSize - 1) & ~(PageSize - 1);
         std::scoped_lock lock{mutex};
         read_pages.Add(begin, end - begin);
-        for (const auto& [pipeline, session] : sessions) {
-            if (session.dry) {
-                continue; // it ran (waited): its output is there
-            }
-            for (const Range& range : session.ranges) {
-                if (range.addr < addr + size && addr < range.addr + range.size) {
-                    ++total.skipped_reads;
-                    if (total.skipped_reads <= 8) {
-                        LOG_WARNING(Render_Vulkan,
-                                    "Async compute skip: the guest read {:#x}+{:#x}, written by "
-                                    "the skipped pipeline {:016x} (must be 0)",
-                                    addr, size, session.hash);
-                    }
-                    return;
+        for (const SkippedOut& out : skipped_out) {
+            if (out.addr < addr + size && addr < out.addr + out.size) {
+                ++window.skipped_reads;
+                ++total.skipped_reads;
+                ++window.programs_by[SkippedReadIndex][out.hash];
+                if (total.skipped_reads <= 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Async compute skip: the guest read {:#x}+{:#x}, last written by "
+                                "a skipped dispatch of {:016x} {:.0f} ms ago (must be 0)",
+                                addr, size, out.hash,
+                                std::chrono::duration<double, std::milli>(Clock::now() - out.at)
+                                    .count());
                 }
+                return;
             }
+        }
+    }
+
+    /// Any thread (VideoCommon::ComputeSkipHook): a write over [addr, addr + size), by the GPU
+    /// (a buffer write mark, an image modification) or the guest CPU. Its bytes are no longer
+    /// "last written by a skipped dispatch".
+    void NoteWritten(u64 addr, u64 size) {
+        std::scoped_lock lock{mutex};
+        const u64 end = addr + size;
+        boost::container::small_vector<SkippedOut, 4> kept;
+        bool changed = false;
+        std::erase_if(skipped_out, [&](const SkippedOut& out) {
+            const u64 out_end = out.addr + out.size;
+            if (out_end <= addr || end <= out.addr) {
+                return false;
+            }
+            changed = true;
+            if (out.addr < addr) {
+                kept.push_back({out.addr, addr - out.addr, out.hash, out.at});
+            }
+            if (end < out_end) {
+                kept.push_back({end, out_end - end, out.hash, out.at});
+            }
+            return true;
+        });
+        if (changed) {
+            skipped_out.insert(skipped_out.end(), kept.begin(), kept.end());
+            UpdateBoundsLocked();
         }
     }
 
@@ -373,6 +441,44 @@ private:
         u64 number{};
         boost::container::small_vector<Range, 4> ranges;
     };
+    /// Bytes whose last writer was a skipped dispatch (of program `hash`, at `at`).
+    struct SkippedOut {
+        DAddr addr{};
+        u64 size{};
+        u64 hash{};
+        Clock::time_point at{};
+    };
+
+    /// programs_by's slots after the refusals
+    static constexpr size_t SkippedIndex = static_cast<size_t>(Refusal::Count);
+    static constexpr size_t WouldSkipIndex = SkippedIndex + 1;
+    static constexpr size_t SkippedReadIndex = SkippedIndex + 2;
+    static constexpr size_t ProgramLists = SkippedIndex + 3;
+
+    void AddSkippedOutLocked(const Range& range, u64 hash, Clock::time_point now) {
+        // Bytes already held stay with their first skip; a range is added once.
+        for (SkippedOut& out : skipped_out) {
+            if (out.addr == range.addr && out.size == range.size) {
+                out.hash = hash;
+                out.at = now;
+                return;
+            }
+        }
+        skipped_out.push_back({range.addr, range.size, hash, now});
+        UpdateBoundsLocked();
+    }
+    void UpdateBoundsLocked() {
+        u64 lo = ~u64{0};
+        u64 hi = 0;
+        for (const SkippedOut& out : skipped_out) {
+            lo = (std::min)(lo, out.addr);
+            hi = (std::max)(hi, out.addr + out.size);
+        }
+        // Set under the lock. Writes in stream order after a skip see the new bounds; only a
+        // write unordered with the skip (another thread at the same moment) can miss them.
+        VideoCommon::ComputeSkipHook::g_lo.store(lo, std::memory_order_release);
+        VideoCommon::ComputeSkipHook::g_hi.store(hi, std::memory_order_release);
+    }
 
     void StampLocked(std::span<const Range> ranges, u64 now_frame) {
         for (const Range& range : ranges) {
@@ -415,6 +521,13 @@ private:
             return now - entry.second.last > std::chrono::seconds{30};
         });
         any_sessions.store(!sessions.empty(), std::memory_order_relaxed);
+        // Bytes last written by a skip 60 s ago and never since: dropped (keeps the write
+        // hook's bounds tight; a read of them after that is no longer counted).
+        if (std::erase_if(skipped_out, [&](const SkippedOut& out) {
+                return now - out.at > std::chrono::seconds{60};
+            }) != 0) {
+            UpdateBoundsLocked();
+        }
         Window& w = window;
         u64 refused = 0;
         for (const u64 count : w.refused) {
@@ -425,13 +538,38 @@ private:
                      "Async compute skip (FRITCHII_ASYNC_COMPUTE_SKIP={}) in the last {:.0f} s: "
                      "{:.1f} dispatches/s skipped, {:.1f}/s would skip (dry), {} new programs, "
                      "{:.0f} ms of waits avoided; unbuilt dispatches that waited: {} shape, {} "
-                     "unknown extent, {} read back, {} no GPU data, {} not every frame; must be "
-                     "0: {} programs still skipping 10 s after their first skip, {} guest reads "
-                     "of skipped output",
+                     "unknown extent, {} read back ({} of them only by a guest read seen here), "
+                     "{} no GPU data, {} not every frame; must be 0: {} programs still skipping "
+                     "10 s after their first skip (since boot), guest reads of skipped output "
+                     "{} in these 10 s ({} since boot; {} ranges held now)",
                      Mode(), seconds, static_cast<double>(w.skipped) / seconds,
                      static_cast<double>(w.would_skip) / seconds, w.programs, w.avoided_ms,
-                     w.refused[0], w.refused[1], w.refused[2], w.refused[3], w.refused[4],
-                     total.stuck, total.skipped_reads);
+                     w.refused[0], w.refused[1], w.refused[2], w.read_back_sticky_only,
+                     w.refused[3], w.refused[4], total.stuck, w.skipped_reads,
+                     total.skipped_reads, skipped_out.size());
+            // Which programs: the top 8 of each list by dispatches.
+            static constexpr std::array<const char*, ProgramLists> list_names{
+                "waited, shape",         "waited, unknown extent", "waited, read back",
+                "waited, no GPU data",   "waited, not every frame", "skipped",
+                "would skip (dry)",      "guest reads of skipped output",
+            };
+            for (size_t list = 0; list < ProgramLists; ++list) {
+                const auto& counts = w.programs_by[list];
+                if (counts.empty()) {
+                    continue;
+                }
+                std::vector<std::pair<u64, u64>> sorted(counts.begin(), counts.end());
+                std::ranges::sort(sorted, [](const auto& a, const auto& b) {
+                    return a.second > b.second;
+                });
+                std::string top;
+                for (size_t i = 0; i < (std::min)(sorted.size(), size_t{8}); ++i) {
+                    top += fmt::format("{}{:016x} x{}", i == 0 ? "" : ", ", sorted[i].first,
+                                       sorted[i].second);
+                }
+                LOG_INFO(Render_Vulkan, "Async compute skip programs, {} ({} programs): {}",
+                         list_names[list], sorted.size(), top);
+            }
         }
         w = Window{};
     }
@@ -441,7 +579,11 @@ private:
         u64 would_skip{};
         u64 programs{};
         double avoided_ms{};
+        u64 read_back_sticky_only{};
+        u64 skipped_reads{};
         std::array<u64, static_cast<size_t>(Refusal::Count)> refused{};
+        /// Dispatches by program: the refusals, then skipped, would skip, skipped-output reads
+        std::array<std::unordered_map<u64, u64>, ProgramLists> programs_by{};
     };
     struct Totals {
         u64 stuck{};
@@ -457,11 +599,14 @@ private:
     std::unordered_map<const ComputePipeline*, Session> sessions;
     std::unordered_map<u64, Clock::time_point> first_dispatch; ///< DELAY_MS only, by program
     Common::RangeSet<DAddr> read_pages;
+    std::vector<SkippedOut> skipped_out;
     Window window;
     Totals total;
     u32 logged_programs{};
     u32 logged_ends{};
     Clock::time_point report_at{}; ///< TickFrame's thread only
+    /// The live object, for VideoCommon::ComputeSkipHook (one rasterizer)
+    static inline std::atomic<AsyncComputeSkip*> s_instance{nullptr};
     /// Last: joined first.
     std::unique_ptr<Common::ThreadWorker> kick_workers;
 };
