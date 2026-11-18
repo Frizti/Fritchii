@@ -373,7 +373,29 @@ int main(int argc, char* argv[]) {
         }
 #ifdef __linux__
         // Mesa's drivers (RADV, ANV, NVK) keep them in Mesa's disk cache, 1 GiB by default.
-        if (!qEnvironmentVariableIsSet("MESA_SHADER_CACHE_MAX_SIZE")) {
+        // Steam sets its own value for the games it launches (Steam Deck game mode); one below
+        // 10 GiB is raised there (a Deck kept 71 of 222 prepared pipelines, 2026-11-18). Outside
+        // Steam a value already set is the player's and wins.
+        const auto mesa_cache_bytes = [](const QByteArray& value) -> double {
+            // Mesa's format: a number with an optional K, M or G suffix (no suffix: G).
+            bool ok = false;
+            QByteArray number = value.trimmed();
+            double unit = 1024.0 * 1024.0 * 1024.0;
+            if (!number.isEmpty()) {
+                const char suffix = static_cast<char>(number.back() & ~0x20);
+                if (suffix == 'K' || suffix == 'M' || suffix == 'G') {
+                    unit = suffix == 'K' ? 1024.0 : suffix == 'M' ? 1024.0 * 1024.0 : unit;
+                    number.chop(1);
+                }
+            }
+            const double size = number.toDouble(&ok);
+            return ok ? size * unit : 0.0;
+        };
+        const bool from_steam =
+            qEnvironmentVariableIsSet("SteamAppId") || qEnvironmentVariableIsSet("SteamGameId");
+        if (!qEnvironmentVariableIsSet("MESA_SHADER_CACHE_MAX_SIZE") ||
+            (from_steam && mesa_cache_bytes(qgetenv("MESA_SHADER_CACHE_MAX_SIZE")) <
+                               10.0 * 1024.0 * 1024.0 * 1024.0)) {
             qputenv("MESA_SHADER_CACHE_MAX_SIZE", "10G");
         }
 #endif

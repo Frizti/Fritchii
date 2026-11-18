@@ -808,9 +808,31 @@ void LogDriverCacheFolder(const Device& device, std::string_view when) {
     // The size and cleanup variables main() sets for Fritchii are logged with it: a Linux NVIDIA
     // tester's driver compiled ~650 of 1,128 prepared pipelines again (log t0419).
     if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
-        return;
-    }
-    if (const char* const path = std::getenv("__GL_SHADER_DISK_CACHE_PATH")) {
+        // Mesa (RADV, ANV, NVK): <MESA_SHADER_CACHE_DIR, else $XDG_CACHE_HOME, else ~/.cache>/
+        // mesa_shader_cache_db (current Mesa's default) or mesa_shader_cache. Steam sets its own
+        // MESA_* values for the games it launches (Steam Deck game mode): a Deck kept 71 of 222
+        // prepared pipelines (2026-11-18), so the values are logged with the folder.
+        std::filesystem::path base;
+        if (const char* const dir = std::getenv("MESA_SHADER_CACHE_DIR"); dir && *dir == '/') {
+            base = dir;
+        } else if (const char* const xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg == '/') {
+            base = xdg;
+        } else if (const char* const home = std::getenv("HOME")) {
+            base = std::filesystem::path{home} / ".cache";
+        } else {
+            return;
+        }
+        std::error_code db_ec;
+        folder = std::filesystem::is_directory(base / "mesa_shader_cache_db", db_ec)
+                     ? base / "mesa_shader_cache_db"
+                     : base / "mesa_shader_cache";
+        for (const char* const name :
+             {"MESA_SHADER_CACHE_MAX_SIZE", "MESA_SHADER_CACHE_DIR", "MESA_DISK_CACHE_SINGLE_FILE",
+              "MESA_DISK_CACHE_MULTI_FILE", "MESA_DISK_CACHE_DATABASE", "SteamAppId"}) {
+            const char* const value = std::getenv(name);
+            settings += fmt::format("; {}={}", name, value != nullptr ? value : "(unset)");
+        }
+    } else if (const char* const path = std::getenv("__GL_SHADER_DISK_CACHE_PATH")) {
         folder = path;
     } else if (const char* const xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg == '/') {
         folder = std::filesystem::path{xdg} / "nvidia/GLCache";
@@ -821,6 +843,9 @@ void LogDriverCacheFolder(const Device& device, std::string_view when) {
     }
     for (const char* const name : {"__GL_SHADER_DISK_CACHE", "__GL_SHADER_DISK_CACHE_SIZE",
                                    "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"}) {
+        if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+            break;
+        }
         const char* const value = std::getenv(name);
         settings += fmt::format("; {}={}", name, value != nullptr ? value : "(unset)");
     }

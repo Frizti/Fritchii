@@ -74,6 +74,12 @@ if [ -n "${TEST_SWITCHES:-}" ]; then
     cp "$TEST_SWITCHES" "$appdir/usr/bin/nx2_switches.txt"
     echo "Test switches: $(grep -c = "$TEST_SWITCHES") from $TEST_SWITCHES"
 fi
+# Test packages only: BUILD_TAG ("test 8") goes next to the exe as fritchii_build.txt, which the
+# window title, About, the log and the corner mark show. Releases leave it unset.
+if [ -n "${BUILD_TAG:-}" ]; then
+    printf '%s\n' "$BUILD_TAG" > "$appdir/usr/bin/fritchii_build.txt"
+    echo "Build tag: $BUILD_TAG"
+fi
 
 if [ -z "${RECIPES_ZIP:-}" ]; then
     RECIPES_ZIP="$TOOLS_DIR/Fritchii-v$RECIPES_VERSION-Windows-x64.zip"
