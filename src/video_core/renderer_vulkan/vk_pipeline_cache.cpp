@@ -1549,7 +1549,7 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                                    const std::filesystem::path& own_used) {
     constexpr std::array<char, 8> PipelineCacheMagic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
     // 55: same records, keys masked as ours already are.
-    constexpr std::array<u32, 3> CompatibleVersions{55, 54, 53};
+    constexpr auto CompatibleVersions = VideoCommon::VulkanCompatibleSharedVersions;
     struct Candidate {
         std::filesystem::path cache;
         std::filesystem::path used;
@@ -5321,10 +5321,18 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
 #else
     const std::string mesa_identity = MesaCacheIdentity(device);
 #endif
-    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}{}\n", file_size, modified,
+    // The resolution scale changes the pipelines (rescaled shaders: built at another scale they
+    // all miss the driver cache), so a scale other than 1x is part of the stamp and a change
+    // prepares again (2026-11-18: 0.75x for low-end PCs). The scale in effect, after OoT's
+    // upscalers set it to 1x (ApplyOcarinaResolution); at 1x the stamp is what it always was.
+    const auto& scale = Settings::values.resolution_info;
+    const std::string scale_part =
+        scale.active ? fmt::format(" scale {}/{}", scale.up_scale, 1U << scale.down_shift)
+                     : std::string{};
+    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}{}{}\n", file_size, modified,
                                           device.GetDriverVersion(), NX2_SHADER_STAMP,
                                           device.GetModelName(), mesa_identity,
-                                          PipelineBinary::StampSuffix());
+                                          PipelineBinary::StampSuffix(), scale_part);
     // EDEN_NX2_PRECOMPILED_FAST: the preparation keeps each pipeline's infos and SPIR-V too
     // (vk_precompiled_kept.h), for this release, its settings and GPU. Whether this build
     // translates them the same is checked on a sample at boot (CheckKeptSample), not stamped.

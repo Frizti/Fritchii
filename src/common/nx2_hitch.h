@@ -212,6 +212,19 @@ size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max);
 /// From Common::SetCurrentThreadName: the thread's CPU time goes in the hitch line under `name`.
 void RegisterThread(const char* name);
 
+/// The calling thread's name as RegisterThread saw it (cut to 15 characters; empty before), for
+/// diagnostics that say which thread did something (FRITCHII_SLOW_GPU's "from").
+inline thread_local std::array<char, 16> t_thread_name{};
+
+/// FRITCHII_SLOW_GPU's breadcrumbs (vk_submit_times.h SlowGpu): the newest main-queue
+/// submissions, what they held and whether the GPU finished or started them. The hang report
+/// logs them after its stall snapshot, Vulkan::Device::ReportLoss on a device loss. The renderer
+/// installs `log` (called under a lock; it must not block for long) and removes it before it goes.
+void SetGpuBreadcrumbs(void (*log)(const void* owner, const char* prefix), const void* owner);
+void ClearGpuBreadcrumbs(const void* owner);
+/// Logs them at Critical, each line starting with `prefix`; one line saying none without a renderer.
+void LogGpuBreadcrumbs(const char* prefix);
+
 /// From the game's present, one thread: `gap_us` since its previous present.
 void OnPresent(long long gap_us);
 

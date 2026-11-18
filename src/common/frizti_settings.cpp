@@ -10,6 +10,7 @@ constexpr std::string_view RevisionKey = "revision";
 constexpr std::string_view GlobalPrefix = "global.";
 constexpr std::string_view PerGamePrefix = "game.";
 constexpr std::string_view UseGlobal = "global";
+constexpr std::string_view FoldedKey = "oot_folded";
 
 std::string_view Trim(std::string_view text) {
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
@@ -52,6 +53,9 @@ std::string SerializeRecord(const Record& record) {
     std::string text = "# Written by the Frizti builds: the tuned settings as they last saved "
                        "them. Other builds share qt-config.ini but not this file.\n";
     text += fmt::format("{}={}\n", RevisionKey, record.revision);
+    if (record.oot_folded) {
+        text += fmt::format("{}=1\n", FoldedKey);
+    }
     for (const auto& [label, value] : record.global) {
         text += fmt::format("{}{}={}\n", GlobalPrefix, label, value);
     }
@@ -79,6 +83,8 @@ Record ParseRecord(std::string_view text) {
             } catch (...) {
                 record.revision = 0;
             }
+        } else if (key == FoldedKey) {
+            record.oot_folded = value == "1";
         } else if (key.starts_with(GlobalPrefix)) {
             record.global.insert_or_assign(std::string{key.substr(GlobalPrefix.size())}, value);
         } else if (key.starts_with(PerGamePrefix)) {
@@ -130,6 +136,47 @@ std::vector<Change> ReconcilePerGame(std::span<BasicSetting* const> settings, co
         changes.push_back({fmt::format("{:016X} {}", OcarinaOfTimeProgramId, setting->GetLabel()),
                            from, std::string{UseGlobal}});
     }
+    return changes;
+}
+
+std::vector<Moved> FoldPerGame(std::span<BasicSetting* const> settings) {
+    std::vector<Moved> moved;
+    for (BasicSetting* const setting : settings) {
+        if (!setting->Switchable() || !setting->Save() || setting->UsingGlobal()) {
+            continue;
+        }
+        const std::string value = setting->ToString();
+        setting->SetGlobal(true);
+        if (setting->ToString() == value) {
+            continue; // the override matched the main value
+        }
+        const std::string from = setting->Canonicalize();
+        setting->LoadString(value);
+        moved.push_back({setting, from, setting->Canonicalize()});
+    }
+    return moved;
+}
+
+std::vector<Change> FoldPerGamePlayers(Values& values) {
+    std::vector<Change> changes;
+    const bool was_global = values.players.UsingGlobal();
+    values.players.SetGlobal(false);
+    auto& custom = values.players.GetValue();
+    auto& global = values.players.GetValue(true);
+    for (size_t index = 0; index < custom.size(); ++index) {
+        if (custom[index].profile_name.empty()) {
+            continue; // this player already uses the main controls
+        }
+        const std::string from = global[index].profile_name;
+        global[index] = custom[index];
+        custom[index].profile_name.clear();
+        if (from != global[index].profile_name) {
+            changes.push_back({fmt::format("player_{}_profile", index),
+                               from.empty() ? std::string{"own"} : from,
+                               global[index].profile_name});
+        }
+    }
+    values.players.SetGlobal(was_global);
     return changes;
 }
 

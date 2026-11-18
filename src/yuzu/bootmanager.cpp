@@ -48,6 +48,7 @@
 #include <QOpenGLContext>
 #endif
 
+#include "common/build_stamp.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/settings_input.h"
@@ -123,7 +124,8 @@ GRenderWindow::GRenderWindow(MainWindow* parent,
                              std::shared_ptr<InputCommon::InputSubsystem> input_subsystem_)
     : QWidget(parent), input_subsystem{std::move(input_subsystem_)} {
     if (std::string_view{Common::g_build_name} == "Fritchii") {
-        setWindowTitle(QStringLiteral("Fritchii %1").arg(QString::fromUtf8(Common::g_build_label)));
+        setWindowTitle(
+            QStringLiteral("Fritchii %1").arg(QString::fromStdString(Common::BuildLabelWithTag())));
     } else {
         setWindowTitle(QStringLiteral("Fritchii %1 | %2-%3")
                            .arg(QString::fromUtf8(Common::g_build_name),

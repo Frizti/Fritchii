@@ -321,6 +321,10 @@ inline std::atomic<int> g_bank_flagged_slots{-1};
 inline std::atomic<int> g_vertex_input_compact{-1};
 /// FRITCHII_WORKER_SPIN: docs/fritchii/switches.md.
 inline std::atomic<int> g_worker_spin{-1};
+/// FRITCHII_SLOW_GPU: docs/fritchii/switches.md (vk_submit_times.h SlowGpu).
+inline std::atomic<int> g_slow_gpu{-1};
+/// FRITCHII_SLOW_GPU_MS: docs/fritchii/switches.md.
+inline std::atomic<int> g_slow_gpu_ms{-1};
 /// FRITCHII_BIND_ADDR_MEMO: docs/fritchii/switches.md.
 inline std::atomic<int> g_bind_addr_memo{-1};
 /// FRITCHII_STORE_MEMO: docs/fritchii/switches.md.

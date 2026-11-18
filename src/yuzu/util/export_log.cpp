@@ -188,6 +188,9 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
     if (const auto stamp = Common::BuildStamp(); !stamp.empty()) {
         text += Line(QStringLiteral("Build hash"), QString::fromStdString(stamp));
     }
+    if (const auto& tag = Common::BuildTag(); !tag.empty()) {
+        text += Line(QStringLiteral("Build tag"), QString::fromStdString(tag));
+    }
     text += Line(QStringLiteral("Tuned settings revision"),
                  QStringLiteral("%1 (applied: %2)")
                      .arg(Settings::Frizti::Revision)

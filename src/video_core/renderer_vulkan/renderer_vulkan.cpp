@@ -41,6 +41,7 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/one_follower.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/streamline.h"
@@ -251,6 +252,14 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         render_window.OnFrameDisplayed();
     };
 
+    // One follower: the frame fence's syncpoint can run this on E while R still plays the frame.
+    // The scheduler is R's: wait for R before the first record (before 2026-11-18 a lend inside
+    // AccelerateDisplay did that by accident; FRITCHII_SLOW_GPU's present-pass records ran before
+    // it and raced R's DispatchWork, a null chunk on GPUBack; helper EC).
+    if (VideoCommon::OneFollower::OnEngineThread()) {
+        VideoCommon::OneFollower::Drain();
+    }
+
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {
@@ -424,6 +433,11 @@ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> 
 
 std::vector<u8> RendererVulkan::GetAppletCaptureBuffer() {
     using namespace VideoCore::Capture;
+
+    // Same as Composite: the scheduler is R's (this Finish ran on E too).
+    if (VideoCommon::OneFollower::OnEngineThread()) {
+        VideoCommon::OneFollower::Drain();
+    }
 
     std::vector<u8> out(VideoCore::Capture::TiledSize);
 

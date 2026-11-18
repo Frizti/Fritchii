@@ -312,6 +312,11 @@ std::mutex g_stall_reporter_mutex;
 std::string (*g_stall_reporter)(const void*){};
 const void* g_stall_reporter_owner{};
 
+// FRITCHII_SLOW_GPU's breadcrumbs (SetGpuBreadcrumbs).
+std::mutex g_breadcrumb_mutex;
+void (*g_breadcrumb_log)(const void*, const char*){};
+const void* g_breadcrumb_owner{};
+
 // The snapshot's times, all on one clock: the slots', the acquire's and the line's "now".
 u64 StallNow() {
     return StallTickNs();
@@ -529,6 +534,8 @@ void HangTick() {
     LOG_CRITICAL(Render, "Hang report: {}",
                  StallOn() ? StallSnapshotLine(gap_us)
                            : std::string{"no stall snapshot (EDEN_NX2_STALL_SNAPSHOT=0)"});
+    // FRITCHII_SLOW_GPU: what the GPU was last given, and how far it got.
+    LogGpuBreadcrumbs("Hang report");
     if (g_hang_hooks.report != nullptr) {
         try { // read only diagnostics: never let them end the process
             g_hang_hooks.report(g_hang_hooks.context);
@@ -983,7 +990,39 @@ bool StartHangWatch() {
 
 } // Anonymous namespace
 
+void SetGpuBreadcrumbs(void (*log)(const void* owner, const char* prefix), const void* owner) {
+    std::scoped_lock lock{g_breadcrumb_mutex};
+    g_breadcrumb_log = log;
+    g_breadcrumb_owner = owner;
+}
+
+void ClearGpuBreadcrumbs(const void* owner) {
+    std::scoped_lock lock{g_breadcrumb_mutex};
+    if (g_breadcrumb_owner == owner) {
+        g_breadcrumb_log = nullptr;
+        g_breadcrumb_owner = nullptr;
+    }
+}
+
+void LogGpuBreadcrumbs(const char* prefix) {
+    std::scoped_lock lock{g_breadcrumb_mutex};
+    if (g_breadcrumb_log == nullptr) {
+        LOG_CRITICAL(Render, "{}: GPU breadcrumbs: no renderer", prefix);
+        return;
+    }
+    // A diagnostic never takes the game down (it reads the card's semaphore and queries).
+    try {
+        g_breadcrumb_log(g_breadcrumb_owner, prefix);
+    } catch (const std::exception& e) {
+        LOG_CRITICAL(Render, "{}: GPU breadcrumbs failed ({})", prefix, e.what());
+    } catch (...) {
+        LOG_CRITICAL(Render, "{}: GPU breadcrumbs failed", prefix);
+    }
+}
+
 void RegisterThread(const char* name) {
+    std::strncpy(t_thread_name.data(), name, t_thread_name.size() - 1);
+    t_thread_name.back() = '\0';
     const std::string_view view{name};
     t_role = view.starts_with("CPUCore") ? Role::GuestCore
              : view == "GPUBack"         ? Role::GpuBack

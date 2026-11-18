@@ -21,6 +21,7 @@
 
 #include "common/common_types.h"
 #include "video_core/vulkan_common/vulkan.h"
+#include "video_core/vulkan_common/vulkan_cmd_stats.h"
 
 #ifdef _MSC_VER
 #pragma warning(disable : 26812) // Disable prefer enum class over enum
@@ -1322,6 +1323,10 @@ public:
 
     void BeginRenderPass(const VkRenderPassBeginInfo& renderpass_bi,
                          VkSubpassContents contents) const noexcept {
+        // FRITCHII_SLOW_GPU's counts (vulkan_cmd_stats.h): a thread_local load while off.
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->render_passes;
+        }
         dld->vkCmdBeginRenderPass(handle, &renderpass_bi, contents);
     }
 
@@ -1330,19 +1335,31 @@ public:
     }
 
     void BeginQuery(VkQueryPool query_pool, u32 query, VkQueryControlFlags flags) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->query_ops;
+        }
         dld->vkCmdBeginQuery(handle, query_pool, query, flags);
     }
 
     void EndQuery(VkQueryPool query_pool, u32 query) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->query_ops;
+        }
         dld->vkCmdEndQuery(handle, query_pool, query);
     }
 
     void ResetQueryPool(VkQueryPool query_pool, u32 first, u32 count) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->query_ops;
+        }
         dld->vkCmdResetQueryPool(handle, query_pool, first, count);
     }
 
     void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
                         u32 query) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->query_ops;
+        }
         dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
     }
 
@@ -1359,6 +1376,9 @@ public:
     }
 
     void BindPipeline(VkPipelineBindPoint bind_point, VkPipeline pipeline) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Bind(bind_point, pipeline);
+        }
         dld->vkCmdBindPipeline(handle, bind_point, pipeline);
     }
 
@@ -1378,11 +1398,17 @@ public:
 
     void Draw(u32 vertex_count, u32 instance_count, u32 first_vertex,
               u32 first_instance) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(false);
+        }
         dld->vkCmdDraw(handle, vertex_count, instance_count, first_vertex, first_instance);
     }
 
     void DrawIndexed(u32 index_count, u32 instance_count, u32 first_index, u32 vertex_offset,
                      u32 first_instance) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(false);
+        }
         dld->vkCmdDrawIndexed(handle, index_count, instance_count, first_index, vertex_offset,
                               first_instance);
     }
@@ -1393,6 +1419,9 @@ public:
         if (src_buffer == VK_NULL_HANDLE) [[unlikely]] {
             NoteNullTarget("vkCmdDrawIndirect on a null buffer, skipped", site);
             return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
         }
         dld->vkCmdDrawIndirect(handle, src_buffer, src_offset, draw_count, stride);
     }
@@ -1405,15 +1434,24 @@ public:
             NoteNullTarget("vkCmdDrawIndexedIndirect on a null buffer, skipped", site);
             return;
         }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
+        }
         dld->vkCmdDrawIndexedIndirect(handle, src_buffer, src_offset, draw_count, stride);
     }
 
     void DrawMeshTasksEXT(u32 group_count_x, u32 group_count_y, u32 group_count_z) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(false);
+        }
         dld->vkCmdDrawMeshTasksEXT(handle, group_count_x, group_count_y, group_count_z);
     }
 
     void DrawMeshTasksIndirectEXT(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
                                   u32 stride) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
+        }
         dld->vkCmdDrawMeshTasksIndirectEXT(handle, src_buffer, src_offset, draw_count, stride);
     }
 
@@ -1424,6 +1462,9 @@ public:
         if (src_buffer == VK_NULL_HANDLE || count_buffer == VK_NULL_HANDLE) [[unlikely]] {
             NoteNullTarget("vkCmdDrawIndirectCount on a null buffer, skipped", site);
             return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
         }
         dld->vkCmdDrawIndirectCount(handle, src_buffer, src_offset, count_buffer, count_offset,
                                     draw_count, stride);
@@ -1438,6 +1479,9 @@ public:
             NoteNullTarget("vkCmdDrawIndexedIndirectCount on a null buffer, skipped", site);
             return;
         }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
+        }
         dld->vkCmdDrawIndexedIndirectCount(handle, src_buffer, src_offset, count_buffer,
                                            count_offset, draw_count, stride);
     }
@@ -1445,24 +1489,36 @@ public:
     void DrawIndirectByteCountEXT(u32 instance_count, u32 first_instance, VkBuffer counter_buffer,
                                   VkDeviceSize counter_buffer_offset, u32 counter_offset,
                                   u32 stride) {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Draw(true);
+        }
         dld->vkCmdDrawIndirectByteCountEXT(handle, instance_count, first_instance, counter_buffer,
                                            counter_buffer_offset, counter_offset, stride);
     }
 
     void ClearAttachments(Span<VkClearAttachment> attachments,
                           Span<VkClearRect> rects) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->clears;
+        }
         dld->vkCmdClearAttachments(handle, attachments.size(), attachments.data(), rects.size(),
                                    rects.data());
     }
 
     void ClearColorImage(VkImage image, VkImageLayout layout, VkClearColorValue color,
                          Span<VkImageSubresourceRange> ranges) {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->clears;
+        }
         dld->vkCmdClearColorImage(handle, image, layout, &color, ranges.size(), ranges.data());
     }
 
     void ClearDepthStencilImage(VkImage image, VkImageLayout layout,
                                 VkClearDepthStencilValue value,
                                 Span<VkImageSubresourceRange> ranges) {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->clears;
+        }
         dld->vkCmdClearDepthStencilImage(handle, image, layout, &value, ranges.size(),
                                          ranges.data());
     }
@@ -1470,17 +1526,26 @@ public:
     void BlitImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
                    VkImageLayout dst_layout, Span<VkImageBlit> regions,
                    VkFilter filter) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->image_copies;
+        }
         dld->vkCmdBlitImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                             regions.data(), filter);
     }
 
     void ResolveImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
                       VkImageLayout dst_layout, Span<VkImageResolve> regions) {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->image_copies;
+        }
         dld->vkCmdResolveImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                                regions.data());
     }
 
     void Dispatch(u32 x, u32 y, u32 z) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Dispatch(false);
+        }
         dld->vkCmdDispatch(handle, x, y, z);
     }
 
@@ -1491,6 +1556,9 @@ public:
             NoteNullTarget("vkCmdDispatchIndirect on a null buffer, skipped", site);
             return;
         }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            stats->Dispatch(true);
+        }
         dld->vkCmdDispatchIndirect(handle, indirect_buffer, offset);
     }
 
@@ -1498,6 +1566,11 @@ public:
                          VkDependencyFlags dependency_flags, Span<VkMemoryBarrier> memory_barriers,
                          Span<VkBufferMemoryBarrier> buffer_barriers,
                          Span<VkImageMemoryBarrier> image_barriers) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->barriers;
+            stats->barrier_items += static_cast<u32>(
+                memory_barriers.size() + buffer_barriers.size() + image_barriers.size());
+        }
         static constexpr u32 MaxBarriers = 16;
         if (dld->vkCmdPipelineBarrier2 && memory_barriers.size() <= MaxBarriers &&
             buffer_barriers.size() <= MaxBarriers && image_barriers.size() <= MaxBarriers) {
@@ -1613,6 +1686,9 @@ public:
             NoteNullTarget("vkCmdCopyBufferToImage on a null buffer, skipped", site);
             return;
         }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->image_uploads;
+        }
         dld->vkCmdCopyBufferToImage(handle, src_buffer, dst_image, dst_image_layout, regions.size(),
                                     regions.data());
     }
@@ -1627,11 +1703,20 @@ public:
                            site);
             return;
         }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->buffer_copies;
+            for (const VkBufferCopy& region : regions) {
+                stats->buffer_copy_bytes += region.size;
+            }
+        }
         dld->vkCmdCopyBuffer(handle, src_buffer, dst_buffer, regions.size(), regions.data());
     }
 
     void CopyImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
                    VkImageLayout dst_layout, Span<VkImageCopy> regions) const noexcept {
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->image_copies;
+        }
         dld->vkCmdCopyImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                             regions.data());
     }
@@ -1643,6 +1728,9 @@ public:
         if (dst_buffer == VK_NULL_HANDLE) [[unlikely]] {
             NoteNullTarget("vkCmdCopyImageToBuffer on a null buffer, skipped", site);
             return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->image_downloads;
         }
         dld->vkCmdCopyImageToBuffer(handle, src_image, src_layout, dst_buffer, regions.size(),
                                     regions.data());
@@ -1657,6 +1745,9 @@ public:
             NoteNullTarget("vkCmdCopyQueryPoolResults on a null buffer, skipped", site);
             return;
         }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->query_ops;
+        }
         dld->vkCmdCopyQueryPoolResults(handle, query_pool, first_query, query_count, dst_buffer,
                                        dst_offset, stride, flags);
     }
@@ -1667,6 +1758,11 @@ public:
         if (dst_buffer == VK_NULL_HANDLE) [[unlikely]] {
             NoteNullTarget("vkCmdFillBuffer on a null buffer, skipped", site);
             return;
+        }
+        if (CmdStats* const stats = t_cmd_stats) [[unlikely]] {
+            ++stats->fills;
+            // VK_WHOLE_SIZE counts as 0 bytes (the buffer's size is not known here).
+            stats->fill_bytes += size == VK_WHOLE_SIZE ? 0 : size;
         }
         dld->vkCmdFillBuffer(handle, dst_buffer, dst_offset, size, data);
     }

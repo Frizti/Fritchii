@@ -508,7 +508,12 @@ std::optional<ProfileImportChoice> UserDataMigrator::AskImport(QWidget* parent, 
     auto* layout = new QVBoxLayout(&dialog);
     layout->setSpacing(12);
     QFont big = dialog.font();
-    big.setPointSizeF(big.pointSizeF() * 1.15);
+    // A font sized in pixels (some Linux desktops) has no point size: scale its pixels.
+    if (big.pointSizeF() > 0) {
+        big.setPointSizeF(big.pointSizeF() * 1.15);
+    } else if (big.pixelSize() > 0) {
+        big.setPixelSize(static_cast<int>(big.pixelSize() * 1.15 + 0.5));
+    }
     auto* text = new QLabel(
         from_menu ? QObject::tr("Copy your data from another folder?\nFritchii restarts and "
                                 "copies it over its own. What it has now is kept as a backup.")

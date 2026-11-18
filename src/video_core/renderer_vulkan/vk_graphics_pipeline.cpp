@@ -3019,6 +3019,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 return;
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+            // FRITCHII_SLOW_GPU: the programs a slow submission's draws ran (one TLS load off).
+            vk::NoteBoundProgram(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                 key.unique_hashes[1] != 0 ? key.unique_hashes[1]
+                                                           : key.unique_hashes[0],
+                                 key.unique_hashes[5]);
         }
         const VkShaderStageFlags push_stages =
             mesh_emulation ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT

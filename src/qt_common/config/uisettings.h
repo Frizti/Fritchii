@@ -148,6 +148,10 @@ struct Values {
     // The Fritchii version whose "What's new" window was shown (yuzu/fritchii/whats_new.cpp).
     Setting<std::string> fritchii_whats_new_seen{linkage, {}, "fritchii_whats_new_seen",
                                                  Category::Ui};
+    // The major version ("v6") that asked to clear the old shader caches (yuzu/fritchii/
+    // cache_cleanup.cpp), whatever the answer.
+    Setting<std::string> fritchii_cache_cleanup_asked{linkage, {}, "fritchii_cache_cleanup_asked",
+                                                      Category::Ui};
 
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,

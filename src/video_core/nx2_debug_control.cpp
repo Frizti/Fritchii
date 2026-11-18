@@ -580,6 +580,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_WORKER_SPIN") {
         return &g_worker_spin;
     }
+    if (name == "FRITCHII_SLOW_GPU") {
+        return &g_slow_gpu;
+    }
+    if (name == "FRITCHII_SLOW_GPU_MS") {
+        return &g_slow_gpu_ms;
+    }
     if (name == "FRITCHII_BIND_ADDR_MEMO") {
         return &g_bind_addr_memo;
     }

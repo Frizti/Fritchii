@@ -27,6 +27,10 @@ inline constexpr u32 VulkanPipelineCacheVersion = 54;
 /// This fork's earlier versions of the same record format, newest first: their files are copied
 /// once to the current version's names (header version rewritten; records unchanged).
 inline constexpr std::array<u32, 1> VulkanOwnPreviousVersions{52};
+/// Versions of the shared cache names (vulkan.fork-v<N>.bin, and the legacy vulkan.bin by its
+/// header) whose records MergeCompatiblePipelineCaches merges into this fork's cache. Shared
+/// caches of other versions are never read.
+inline constexpr std::array<u32, 3> VulkanCompatibleSharedVersions{55, 54, 53};
 
 // An earlier build (cache version 18) and this fork (a different version) both
 // used <shader dir>/<title>/vulkan.bin and vulkan_pipelines.bin. Each build deletes a file

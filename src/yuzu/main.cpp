@@ -41,6 +41,7 @@
 
 #include "main_window.h"
 #include "fritchii/fritchii_ui.h"
+#include "fritchii/switches_window.h"
 #include "util/profiling_mode.h"
 #ifdef ENABLE_UPDATE_CHECKER
 #include "updater/update_dialog.h"
@@ -234,14 +235,40 @@ extern char** environ;
 // ("Test switches:", main_window.cpp) so a stale one left in a file or a launcher's environment
 // can't skew a test unseen.
 static std::string g_switch_summary;
+// The same, one entry per source: source name, "A=1, B=2" (Tools > Switches).
+static std::vector<std::pair<std::string, std::string>> g_switch_groups;
 
 std::string Nx2SwitchSummary() {
     return g_switch_summary;
 }
 
+std::vector<std::pair<std::string, std::string>> Nx2SwitchGroups() {
+    return g_switch_groups;
+}
+
 static bool IsTestSwitch(std::string_view name) {
     return name.starts_with("FRITCHII_") || name.starts_with("EDEN_NX2_") ||
            name.starts_with("LICHII_");
+}
+
+bool Nx2IsTestSwitch(std::string_view name) {
+    return IsTestSwitch(name);
+}
+
+// The player's switch file, in Fritchii's data folder: the one Tools > Switches writes.
+std::filesystem::path Nx2UserSwitchFile() {
+#ifdef _WIN32
+    const auto app_data = Common::FS::GetAppDataRoamingDirectory();
+#else
+    const auto app_data = Common::FS::GetDataDirectory("XDG_CONFIG_HOME");
+#endif
+    return app_data / EDEN_DIR / "nx2_switches.txt";
+}
+
+// Before the first launch's import has copied it, the player's file is still in the old folder
+// (Fritchii v5.8 moved from eden to fritchii): read, never written.
+std::filesystem::path Nx2LegacyUserSwitchFile() {
+    return Nx2UserSwitchFile().parent_path().parent_path() / EDEN_LEGACY_DIR / "nx2_switches.txt";
 }
 
 static void LoadNx2Switches(const char* argv0) {
@@ -288,16 +315,9 @@ static void LoadNx2Switches(const char* argv0) {
         take(std::move(file), 5);
     }
 #endif
-#ifdef _WIN32
-    const auto app_data = Common::FS::GetAppDataRoamingDirectory();
-#else
-    const auto app_data = Common::FS::GetDataDirectory("XDG_CONFIG_HOME");
-#endif
-    // Before the first launch's import has copied it, the player's file is still in the old
-    // folder (Fritchii v5.8 moved from eden to fritchii).
-    auto user_file = app_data / EDEN_DIR / "nx2_switches.txt";
+    auto user_file = Nx2UserSwitchFile();
     if (!std::filesystem::exists(user_file)) {
-        user_file = app_data / EDEN_LEGACY_DIR / "nx2_switches.txt";
+        user_file = Nx2LegacyUserSwitchFile();
     }
     {
         std::map<std::string, std::string> file;
@@ -340,10 +360,12 @@ static void LoadNx2Switches(const char* argv0) {
         }
     }
     g_switch_summary.clear();
+    g_switch_groups.clear();
     for (size_t i = 0; i < groups.size(); ++i) {
         if (!groups[i].empty()) {
             g_switch_summary += fmt::format("{}{}: {}", g_switch_summary.empty() ? "" : "; ",
                                             SourceNames[i], groups[i]);
+            g_switch_groups.emplace_back(SourceNames[i], groups[i]);
         }
     }
 

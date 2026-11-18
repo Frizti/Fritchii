@@ -15,6 +15,9 @@
 #include "common/logging.h"
 #ifdef _WIN32
 #include "common/windows/crash_handler.h"
+#ifdef __linux__
+#include "common/linux/crash_handler.h"
+#endif
 #endif
 #include "common/scm_rev.h"
 #include "common/build_stamp.h"
@@ -250,6 +253,8 @@ void Init(QWidget* root) {
     Common::Log::Start();
 #ifdef _WIN32
     Common::Windows::InstallCrashHandler(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir));
+#elif defined(__linux__)
+    Common::Linux::InstallCrashHandler();
 #endif
 
     Network::Init();
@@ -262,6 +267,9 @@ void Init(QWidget* root) {
     LOG_INFO(Frontend, "Fritchii Version: {}", BuildVersionString());
     if (const auto stamp = Common::BuildStamp(); !stamp.empty()) {
         LOG_INFO(Frontend, "Build hash: {}", stamp);
+    }
+    if (const auto& tag = Common::BuildTag(); !tag.empty()) {
+        LOG_INFO(Frontend, "Build tag: {}", tag);
     }
     LogRuntimes();
 #ifdef ARCHITECTURE_x86_64

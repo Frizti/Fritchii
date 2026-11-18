@@ -5,6 +5,7 @@
 
 #include <QIcon>
 #include <fmt/ranges.h>
+#include "common/build_stamp.h"
 #include "common/scm_rev.h"
 #include "ui_aboutdialog.h"
 #include "yuzu/about_dialog.h"
@@ -15,7 +16,7 @@ AboutDialog::AboutDialog(QWidget* parent)
     static const std::string build_id = std::string{Common::g_build_id};
     static const std::string yuzu_build =
         fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_label}, std::string{Common::g_compiler_id});
+                    Common::BuildLabelWithTag(), std::string{Common::g_compiler_id});
 
     const auto override_build =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);

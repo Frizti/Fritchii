@@ -86,6 +86,8 @@ held for 200 ms" rather than wait). Lines, in order:
 2. The stall snapshot (EDEN_NX2_STALL_SNAPSHOT) as a 100 ms present gap would log it: the span
    each GPU thread is in now and for how long, the longest span in the gap, the present thread,
    the master semaphore's ticks.
+   Then, with FRITCHII_SLOW_GPU on (the default), "GPU breadcrumbs": the last 8 main-queue
+   submissions, what they held and whether the GPU finished or started each.
 3. "channels suspended on an acquire: yes/no; acquires waiting (N): device ADDR OP VALUE, word
    now W, for T s" for every semaphore acquire a channel (or the memory stage) is suspended on.
 4. "syncpoint waits": each syncpoint something waits on, its guest and host values, the values its
@@ -6507,6 +6509,72 @@ which must be unset for this), not only the bytes the shader stored. So "page on
 as the cache's own tracking (no written binding covers the read's bytes), while "overlap" means
 a written binding covers them, not that the shader changed them. Reads after the first one in an area are answered from it (memory.cpp's per-core area)
 and are not seen. Off: one test of a constant at each site.
+
+### FRITCHII_SLOW_GPU
+
+FRITCHII_SLOW_GPU (live, default 1; 0 = off, 2 = also the 10 s summary when nothing was slow;
+helper EB, 2026-11-18, vk_submit_times.h SlowGpu) and FRITCHII_SLOW_GPU_MS (live, default 50,
+0 = no lines). Why: an owner playtest had the guest wait 298 and 205 ms on two GPU read-backs
+with the CPU idle, no pipeline builds and VRAM fine, so the GPU itself took 0.3 s, and nothing
+said on what; and the rare GPU hangs/TDRs (about 1 in 200 launches) end in a device loss whose
+NVIDIA fault info is empty.
+- Every main-queue submission gets a GPU timestamp at its start (top of the upload command
+  buffer) and end (bottom of the command buffer), in a 256-slot pool reset from the host
+  (hostQueryReset; a reset command per submission without it). The Vulkan worker reads them back
+  when it begins the next command buffers, batched (once 8 are pending or 50 ms passed), only
+  for ticks the master semaphore already reported, so it never waits for the GPU. When the GPU
+  is 256 stamped submissions behind, new ones go untimed (counted in the summary).
+- What a submission holds is counted by the vk::CommandBuffer wrappers on the worker
+  (vulkan_cmd_stats.h, a thread_local pointer the worker sets per chunk; null on every other
+  thread): draws, dispatches, render passes, clears, fills, buffer copies and bytes, image
+  uploads/downloads/copies, query ops, barriers, pipeline binds, the draws or dispatches per bound
+  pipeline (8 per bind point; graphics and compute pipelines name their program hashes at the
+  bind, ASTC decode and BC encode passes name themselves), and BlitScreen's presentation passes
+  (window adapt, upscalers, anti-aliasing) bracketed apart.
+- "Slow GPU submission: tick T ran G ms on the GPU (over N ms; queue wait ~Q ms, started X ms
+  after the previous one ended / started X ms before the previous one ended / previous submission
+  not timed, vkQueueSubmit U us); from THREAD at FILE:LINE[, a Finish (the thread waits for it)]
+  [, signals a semaphore][, waits on a semaphore]; draws D (I indirect), dispatches ..., top
+  graphics: vs HASH fs HASH xN, ...; top compute: cs HASH xN / astc xN / unnamed xN" (Info), at
+  most 20 a minute.
+  - G is end stamp minus start stamp: GPU time, including any wait on a semaphore inside the
+    submission (", waits on a semaphore") and the tail of the previous submission it overlapped
+    ("started before the previous one ended").
+  - Queue wait is an estimate: GPU start minus the CPU time just before vkQueueSubmit, less the
+    smallest such difference seen in the last 10 to 20 s (a submission the GPU took at once), so
+    it is the time the submission sat behind earlier work (or the OS scheduler) before starting.
+    Good to a fraction of a millisecond; without calibrated timestamps that is the best there is.
+  - THREAD is the recording thread's name: GPUBack (E, or the whole back without one follower),
+    GPURender (R), VulkanPresent, ...; FILE:LINE is the Flush or Finish call site.
+  - Reading it: a big G with a small queue wait and a short gap is the GPU working on that
+    submission: look at its draw count and its top programs (a single program with a huge count
+    or a texture decode pass). A small G with a big queue wait means earlier submissions or
+    another process held the GPU: look at the lines before it. "unnamed" programs are helper
+    passes (blits, conversions, mesh emulation) that do not name themselves.
+- "Slow GPU 10 s: S submissions timed, U not (the GPU 256 or more behind), K over
+  FRITCHII_SLOW_GPU_MS=N ms (H lines held back, 20 a minute), longest M ms (tick T), submission
+  times sum B ms/s" (Info) after a window with a slow submission, a held line or an untimed one
+  (every window with FRITCHII_SLOW_GPU=2). B counts overlaps twice: a GPU busyness hint only.
+- Breadcrumbs: the last 8 submissions' contents are kept. The hang report (FRITCHII_HANG_REPORT_S)
+  logs them after its stall snapshot, and a device loss (Device::ReportLoss, after the fault info):
+  "PREFIX: GPU breadcrumbs: the main queue's last 8 submissions, oldest first; the GPU reported
+  tick R done; newest submitted S", then per submission "PREFIX: GPU breadcrumb tick T: done /
+  NOT done, started on the GPU / NOT done, not started on the GPU / NOT done; submitted X ms ago
+  (vkQueueSubmit U us) / not through vkQueueSubmit yet; from ...; <contents>" (Critical). The
+  first "NOT done, started on the GPU" is the one the GPU was running when it stopped. Only
+  submissions recorded while the switch is on are kept ("none" otherwise).
+- Not covered: the present thread's swapchain copy (it waits on the acquire semaphore, so its GPU
+  time would be the present engine's), the side copy queue (FRITCHII_READ_SIDE_COPY >= 2, copies
+  only, off by default), VK_NV_device_diagnostic_checkpoints / VK_AMD_buffer_marker (not
+  enabled: they need device extensions and per-checkpoint driver work, and the breadcrumbs' start
+  stamp already says which submission was running).
+- Cost on: per submission two timestamps on the GPU (well under a microsecond), on the worker
+  about 1 us (a clock read, two ~0.8 KiB copies, a lock, a share of one query read and host
+  reset per 8 submissions); per counted command a thread_local load and an add. At the market's
+  300 to 1,100 submissions a second that is about 1 ms/s on the Vulkan worker, which is not the
+  bottleneck. Off: one relaxed load per submission, one compare after vkQueueSubmit, and the
+  wrappers' thread_local load (always there, the pointer is null). Check: profile_toggle on
+  FRITCHII_SLOW_GPU, judged on the worker's busy time.
 
 ### EXP113
 

@@ -315,7 +315,15 @@ struct System::Impl {
 
         kernel.SuspendEmulation(false);
         core_timing.SyncPause(false);
-        is_paused.store(false, std::memory_order_relaxed);
+        // A pause shows in the log with its length: a long one looks exactly like a freeze to
+        // players (2026-11-18: 18-35 s "freezes" were pauses; the frontend logs who asked).
+        if (is_paused.exchange(false, std::memory_order_relaxed) &&
+            pause_begin != std::chrono::steady_clock::time_point{}) {
+            LOG_INFO(Core, "Emulation resumed after {:.1f} s paused",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - pause_begin)
+                         .count());
+            pause_begin = {};
+        }
     }
 
     void Pause() {
@@ -323,7 +331,10 @@ struct System::Impl {
 
         core_timing.SyncPause(true);
         kernel.SuspendEmulation(true);
-        is_paused.store(true, std::memory_order_relaxed);
+        if (!is_paused.exchange(true, std::memory_order_relaxed) && is_powered_on) {
+            pause_begin = std::chrono::steady_clock::now();
+            LOG_INFO(Core, "Emulation paused");
+        }
     }
 
     bool IsPaused() const {
@@ -756,6 +767,7 @@ struct System::Impl {
     mutable std::mutex suspend_guard;
     std::mutex general_channel_mutex;
     std::atomic_bool is_paused{};
+    std::chrono::steady_clock::time_point pause_begin{}; ///< Under suspend_guard: the log's length
     std::atomic_bool is_stalled{}; ///< StallApplication until UnstallApplication (hang report)
     std::atomic_bool is_shutting_down{};
     std::atomic_bool is_powered_on{};

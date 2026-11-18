@@ -111,7 +111,15 @@ const Blocks& Build(const Common::Rectangle<u32>& screen, u32 frame_width, u32 f
         return none;
     }
     static const std::string text = [] {
+        // A test package's tag ("test 8") puts its number in: "FRITCHII V6 TEST 8 <id>".
         std::string t = "FRITCHII V6 TEST ";
+        if (const auto& tag = Common::BuildTag(); tag.rfind("test ", 0) == 0) {
+            for (std::size_t i = 5; i < tag.size() && i < 9; ++i) {
+                const char c = tag[i];
+                t += (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c;
+            }
+            t += ' ';
+        }
         for (std::size_t i = 0; i < 8; ++i) {
             const char c = id[i];
             t += (c >= 'a' && c <= 'f') ? static_cast<char>(c - 'a' + 'A') : c;

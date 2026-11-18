@@ -422,6 +422,8 @@ private slots:
     /// Help > Profiling Mode and, while it is on, its banner and status bar label
     /// (util/profiling_mode).
     void SetUpProfilingMode();
+    /// Tools > Switches (fritchii/switches_window): the player's nx2_switches.txt.
+    void SetUpSwitchesWindow();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();

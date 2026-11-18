@@ -27,6 +27,7 @@
 #include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "common/memory_detect.h"
+#include "common/nx2_hitch.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -1637,6 +1638,8 @@ void Device::ReportLoss() const {
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
     PipelineBinary::NoteDeviceLoss();
     ReportDeviceFault();
+    // FRITCHII_SLOW_GPU: what the GPU was last given (NVIDIA's fault info has no addresses).
+    Common::Nx2Hitch::LogGpuBreadcrumbs("Device loss");
 
     // Wait for the log to flush and for Nsight Aftermath to dump the results
     std::this_thread::sleep_for(std::chrono::seconds{15});

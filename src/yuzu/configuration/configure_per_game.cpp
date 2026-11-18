@@ -7,6 +7,7 @@
 #include <cctype>
 #include <chrono>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <set>
@@ -39,10 +40,12 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QString>
+#include <QTabBar>
 #include <QTimer>
 #include <QUrl>
 #include <QtConcurrent/QtConcurrentRun>
 
+#include "common/frizti_settings.h"
 #include "common/fs/fs_util.h"
 #include "common/settings_enums.h"
 #include "common/settings_input.h"
@@ -360,6 +363,12 @@ int ScoreCandidateTitle(const std::string& candidate, const std::string& query) 
     return score;
 }
 
+// Fritchii keeps one place for OoT's settings (Emulation > Configure): its game settings show
+// only the add-ons (mods) and never write a per-game override. Other games keep every tab.
+bool SettingsInOnePlace(u64 title_id) {
+    return title_id == Settings::Frizti::OcarinaOfTimeProgramId;
+}
+
 } // namespace
 
 ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::string& file_name,
@@ -403,15 +412,30 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
     ui->tabWidget->addTab(FritchiiUi::SettingsPage(network_tab.get()), tr("Network"));
     ui->tabWidget->addTab(FritchiiUi::SettingsPage(applets_tab.get()), tr("Applets"));
 
+    // A tab's page is its scroll area in the Fritchii look.
+    const auto tab_index = [this](QWidget* tab) {
+        return ui->tabWidget->indexOf(FritchiiUi::SettingsPage(tab));
+    };
+
     setFocusPolicy(Qt::ClickFocus);
     setWindowTitle(tr("Properties"));
     if (FritchiiUi::Enabled()) {
         setWindowTitle(tr("Game Settings"));
-        ui->tabWidget->setTabText(ui->tabWidget->indexOf(graphics_advanced_tab.get()),
-                                  tr("Advanced Graphics"));
-        ui->tabWidget->setTabText(ui->tabWidget->indexOf(graphics_extensions_tab.get()),
-                                  tr("Graphics Extras"));
-        ui->tabWidget->setTabText(ui->tabWidget->indexOf(input_tab.get()), tr("Controls"));
+        ui->tabWidget->setTabText(tab_index(graphics_advanced_tab.get()), tr("Advanced Graphics"));
+        ui->tabWidget->setTabText(tab_index(graphics_extensions_tab.get()), tr("Graphics Extras"));
+        ui->tabWidget->setTabText(tab_index(input_tab.get()), tr("Controls"));
+    }
+
+    if (SettingsInOnePlace(title_id)) {
+        for (QWidget* const tab : std::initializer_list<QWidget*>{
+                 system_tab.get(), cpu_tab.get(), graphics_tab.get(), graphics_advanced_tab.get(),
+                 graphics_extensions_tab.get(), audio_tab.get(), input_tab.get(),
+                 network_tab.get(), applets_tab.get()}) {
+            ui->tabWidget->setTabVisible(tab_index(tab), false);
+        }
+        // Only the add-ons are left: no tab bar.
+        ui->tabWidget->setCurrentIndex(tab_index(addons_tab.get()));
+        ui->tabWidget->tabBar()->hide();
     }
 
     addons_tab->SetTitleId(title_id);
@@ -482,6 +506,14 @@ void ConfigurePerGame::done(int result) {
 }
 
 void ConfigurePerGame::ApplyConfiguration() {
+    if (SettingsInOnePlace(title_id)) {
+        // The add-ons are kept in the main config; OoT's own config is not written, so no hidden
+        // tab can leave an override in it.
+        addons_tab->ApplyConfiguration();
+        system.ApplySettings();
+        Settings::LogSettings();
+        return;
+    }
     for (const auto tab : *tab_group) {
         tab->ApplyConfiguration();
     }

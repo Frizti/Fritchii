@@ -155,8 +155,12 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
         }
     }
 
+    // FRITCHII_SLOW_GPU: the frame's presentation passes (window adapt, upscalers, anti-aliasing)
+    // count apart, bracketed in recording order on the worker (one TLS load each while off).
+    scheduler.Record([](vk::CommandBuffer) { vk::NotePresentPass(true); });
     window_adapt->Draw(device, memory_allocator, rasterizer, scheduler, image_index, layers,
                        framebuffers, layout, frame);
+    scheduler.Record([](vk::CommandBuffer) { vk::NotePresentPass(false); });
 
     if (++image_index >= image_count) {
         image_index = 0;

@@ -738,6 +738,8 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                               : VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, image_barrier);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
+        // FRITCHII_SLOW_GPU: one texture decode pass (one TLS load off).
+        vk::NoteBoundPass(VK_PIPELINE_BIND_POINT_COMPUTE, "astc", true);
     });
     // With trimmed host levels the input holds each layer's mip chain from host_level_offset on
     // (see TextureCache::UploadImageContents), so its layer stride is that tail's size.
@@ -904,6 +906,8 @@ void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers
         const VkDescriptorSet set = descriptor_allocator.Commit();
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
+        // FRITCHII_SLOW_GPU: one texture encode pass (one TLS load off).
+        vk::NoteBoundPass(VK_PIPELINE_BIND_POINT_COMPUTE, "bc-encode", true);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
         cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
         cmdbuf.Dispatch(Common::DivCeil(uniforms.blocks_x, 8U), Common::DivCeil(uniforms.blocks_y, 8U),

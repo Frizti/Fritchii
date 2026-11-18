@@ -194,6 +194,11 @@ set_source_files_properties(zbic_compression.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${ZBIC_INCLUDE_DIR}"
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>")
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(common PRIVATE linux/crash_handler.cpp
+        linux/crash_handler.h)
+endif()
+
 if(WIN32)
     target_sources(common PRIVATE windows/crash_handler.cpp
         windows/crash_handler.h

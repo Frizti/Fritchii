@@ -26,6 +26,7 @@ struct Record {
     u32 revision = 0;
     std::map<std::string, std::string> global;   ///< label -> value written to qt-config.ini
     std::map<std::string, std::string> per_game; ///< label -> "global" or Ocarina's override
+    bool oot_folded = false; ///< Ocarina's per-game settings were moved to the main ones once
 };
 
 std::string SerializeRecord(const Record& record);
@@ -46,6 +47,20 @@ std::vector<Change> ReconcileGlobal(std::span<BasicSetting* const> settings, con
 // (all of them with `full`).
 std::vector<Change> ReconcilePerGame(std::span<BasicSetting* const> settings, const Record& record,
                                      bool full);
+
+// `settings` hold Ocarina's per-game config. Fritchii keeps one place for Ocarina's settings:
+// each per-game override becomes the global value (what the player saw in game) and the per-game
+// setting uses the global one again. Returns those whose global value changed.
+struct Moved {
+    const BasicSetting* setting;
+    std::string from;
+    std::string to;
+};
+std::vector<Moved> FoldPerGame(std::span<BasicSetting* const> settings);
+
+// The same for the controls: a per-game input profile becomes that player's main controls.
+// Returns "player_N_profile" changes for the players whose main profile changed.
+std::vector<Change> FoldPerGamePlayers(Values& values);
 
 // Docked mode can't use the handheld controller: player 1 becomes a Pro Controller, as the
 // docked toggle does.

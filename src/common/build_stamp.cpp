@@ -2,8 +2,15 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <system_error>
 
 #include "common/build_stamp.h"
+#include "common/scm_rev.h"
+#ifdef _WIN32
+#include "common/fs/path_util.h"
+#endif
 
 namespace Common {
 
@@ -34,6 +41,57 @@ std::string BuildStamp() {
         std::snprintf(hex + i * 2, 3, "%02x", id[i]);
     }
     return std::string(hex, 32);
+}
+
+namespace {
+
+std::filesystem::path ExeDirectory() {
+#ifdef _WIN32
+    return FS::GetExeDirectory();
+#elif defined(__linux__)
+    // The real binary: inside a mounted AppImage that is usr/bin, where the package puts the file.
+    std::error_code ec;
+    const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    return ec ? std::filesystem::path{} : exe.parent_path();
+#else
+    return {};
+#endif
+}
+
+} // namespace
+
+const std::string& BuildTag() {
+    static const std::string tag = [] {
+        const auto dir = ExeDirectory();
+        if (dir.empty()) {
+            return std::string{};
+        }
+        std::ifstream file(dir / "fritchii_build.txt");
+        std::string line;
+        if (!file || !std::getline(file, line)) {
+            return std::string{};
+        }
+        // Printable ASCII only, at most 40 characters, no edge spaces: it lands in titles and logs.
+        std::string out;
+        for (const char c : line) {
+            if (c >= 0x20 && c <= 0x7e && out.size() < 40) {
+                out += c;
+            }
+        }
+        const auto first = out.find_first_not_of(' ');
+        if (first == std::string::npos) {
+            return std::string{};
+        }
+        return out.substr(first, out.find_last_not_of(' ') - first + 1);
+    }();
+    return tag;
+}
+
+const std::string& BuildLabelWithTag() {
+    static const std::string label =
+        BuildTag().empty() ? std::string{g_build_label}
+                           : std::string{g_build_label} + " " + BuildTag();
+    return label;
 }
 
 } // namespace Common

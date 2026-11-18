@@ -1299,6 +1299,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             return;
         }
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+        // FRITCHII_SLOW_GPU: the program a slow submission's dispatches ran (one TLS load off).
+        vk::NoteBoundProgram(VK_PIPELINE_BIND_POINT_COMPUTE, ShaderHash(), 0);
         if (!descriptor_set_layout) {
             return;
         }

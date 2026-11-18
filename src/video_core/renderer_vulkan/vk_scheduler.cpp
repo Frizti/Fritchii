@@ -198,9 +198,15 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
+    // FRITCHII_SLOW_GPU: the hang report and a device loss print the newest submissions.
+    Common::Nx2Hitch::SetGpuBreadcrumbs(&Scheduler::LogGpuBreadcrumbs, this);
 }
 
 Scheduler::~Scheduler() {
+    // No breadcrumb read after this returns (the hang watch and a device loss read slow_gpu).
+    // FRITCHII_SLOW_GPU's stamp pool waits in ~SlowGpu, after worker_thread (declared after it)
+    // has joined.
+    Common::Nx2Hitch::ClearGpuBreadcrumbs(this);
     if (trace_query_pool || budget_pool) {
         WaitWorker();
         worker_thread.request_stop();
@@ -214,6 +220,11 @@ Scheduler::~Scheduler() {
     }
 }
 
+void Scheduler::LogGpuBreadcrumbs(const void* self_, const char* prefix) {
+    const auto* const self = static_cast<const Scheduler*>(self_);
+    self->slow_gpu.LogBreadcrumbs(prefix, *self->master_semaphore);
+}
+
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
     SeamHook::Watch(SeamHook::Use::Flush, location);
@@ -225,6 +236,8 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
     // When flushing, we only send data to the worker thread; no waiting is necessary.
+    submit_site = location;
+    submit_is_finish = false;
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
     AllocateNewContext();
     submitted_serial = record_serial; // what AllocateNewContext recorded counts as submitted
@@ -326,6 +339,8 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     const u64 presubmit_tick = CurrentTick();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
     const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
+    submit_site = location;
+    submit_is_finish = true;
     SubmitExecution(signal_semaphore, wait_semaphore);
     Wait(presubmit_tick);
     AllocateNewContext();
@@ -796,6 +811,9 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // recording (and submit) and the command buffer reallocation ("Price Vulkan worker").
             namespace Price = VideoCommon::FritchiiPrice;
             const u64 price_start = Price::On() ? Price::Ticks() : 0;
+            // FRITCHII_SLOW_GPU: the command buffer wrappers count this submission's commands
+            // (null while off; the submission's SlowGpu::End clears it).
+            vk::t_cmd_stats = slow_gpu.Counting();
             work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
 
             // If the chunk was a submission, reallocate the command buffer.
@@ -853,6 +871,9 @@ void Scheduler::AllocateWorkerCommandBuffer() {
     if ((budget_pending != 0 || Common::FrameBudget::Wanted()) && !budget_failed) [[unlikely]] {
         BudgetGpuSubmission();
     }
+    // FRITCHII_SLOW_GPU (live, default 1): reads finished submissions back, stamps this one's
+    // start, counts its commands from the next chunk on. Last, so the stamps above go uncounted.
+    slow_gpu.Begin(device, current_upload_cmdbuf, *master_semaphore);
 }
 
 void Scheduler::BudgetGpuSubmission() {
@@ -1186,7 +1207,18 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     if (Common::Nx2Timeline::Active()) {
         Common::Nx2Timeline::Instant("submit", {"tick", signal_value});
     }
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+    // FRITCHII_SLOW_GPU: who submits, from where (a slow line's and a breadcrumb's "from").
+    const SlowGpu::Origin origin{
+        .thread = Common::Nx2Hitch::t_thread_name,
+        .file = submit_site.file_name(),
+        .line = submit_site.line(),
+        .finish = submit_is_finish,
+        .signals = signal_semaphore != VK_NULL_HANDLE,
+        .waits = wait_semaphore != VK_NULL_HANDLE,
+    };
+    submit_site = {};
+    submit_is_finish = false;
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, origin,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1196,6 +1228,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         };
         upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
         upload_cmdbuf.End();
+        // FRITCHII_SLOW_GPU: the diagnostic stamps below are not the submission's work.
+        vk::t_cmd_stats = nullptr;
         if (trace_gpu_recording) {
             cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_query_pool,
                                  trace_gpu_count * 2 + 1);
@@ -1221,6 +1255,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             trace_work = {};
         }
         submit_times.End(cmdbuf, signal_value); // FRITCHII_SUBMIT_TIMES; nothing when off
+        // FRITCHII_SLOW_GPU: the end stamp, the contents kept; stops the counting.
+        slow_gpu.End(cmdbuf, signal_value, origin);
         const auto end_start = std::chrono::steady_clock::now();
         cmdbuf.End();
         const auto end_done = std::chrono::steady_clock::now();
@@ -1268,9 +1304,12 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             Common::Nx2Timeline::Instant("vkQueueSubmit", {"tick", signal_value});
         }
         const Common::Nx2Hitch::StallScope submit_stall{"worker: vkQueueSubmit"};
+        const u64 slow_call_ns = SlowGpu::NowNs();
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:
+            // FRITCHII_SLOW_GPU: the CPU side of the queue wait estimate; one compare when off.
+            slow_gpu.Submitted(signal_value, slow_call_ns);
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
                 Settings::values.gpu_log_vulkan_calls.GetValue()) {

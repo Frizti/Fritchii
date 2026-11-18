@@ -564,6 +564,13 @@ private:
     void ReadBudgetResults();
     /// FRITCHII_SUBMIT_TIMES: the worker's per-submission GPU timestamps (GetSubmitTimes).
     SubmitTimes submit_times;
+    /// FRITCHII_SLOW_GPU: slow submission lines and the hang breadcrumbs (worker side).
+    SlowGpu slow_gpu;
+    /// The Flush or Finish that calls SubmitExecution (recording thread), for SlowGpu::Origin.
+    std::source_location submit_site{};
+    bool submit_is_finish{};
+    /// Common::Nx2Hitch::LogGpuBreadcrumbs's hook (any thread).
+    static void LogGpuBreadcrumbs(const void* self, const char* prefix);
     static constexpr u32 BudgetSlots = 256;
     vk::QueryPool budget_pool;
     std::array<u64, BudgetSlots> budget_ticks{}; ///< each pending slot's tick

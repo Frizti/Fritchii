@@ -1358,17 +1358,25 @@ void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
     ui->bg_widget->setToolTip(tr("The color around the picture when it doesn't fill the "
                                  "window."));
 
-    // The scales as the heights they make: docked, then handheld.
+    // The scales as the heights OoT draws at them: docked, then handheld. At 1x OoT draws 1440p
+    // docked with the Max Resolution add-on (its dynamic resolution, at most 1080p, without it)
+    // and 1080p handheld, not the Switch 1 heights (1080p/720p) these rows showed before
+    // (2026-11-18: no "1440p" anywhere, and the 0.75x row for weak PCs read "810p").
     if (resolution_combobox != nullptr) {
         using Res = Settings::ResolutionSetup;
+        const bool max_resolution = MaxResolutionSaved();
+        const u32 docked_base = max_resolution ? 1440 : 1080;
         for (int row = 0; row < resolution_combobox->count(); ++row) {
             const auto setup = static_cast<Res>(resolution_combobox->itemData(row).toUInt());
             Settings::ResolutionScalingInfo info{};
             Settings::TranslateResolutionInfo(setup, info);
-            const u32 docked = 1080 * info.up_scale >> info.down_shift;
-            const u32 handheld = 720 * info.up_scale >> info.down_shift;
+            const u32 docked = docked_base * info.up_scale >> info.down_shift;
+            const u32 handheld = 1080 * info.up_scale >> info.down_shift;
+            const QString docked_text = max_resolution
+                                            ? HeightName(docked)
+                                            : tr("up to %1").arg(HeightName(docked));
             resolution_combobox->setItemText(
-                row, tr("%1  (%2 handheld)").arg(HeightName(docked), HeightName(handheld)));
+                row, tr("%1  (%2 handheld)").arg(docked_text, HeightName(handheld)));
         }
     }
     UpdateOcarinaUpscalerLabels();

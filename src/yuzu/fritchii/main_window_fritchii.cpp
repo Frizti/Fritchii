@@ -165,7 +165,11 @@ void MainWindow::SetUpPrecompileGate() {
     constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
     auto* gate = new FritchiiUi::PrecompileGate(
         this, statusBar(),
-        {.pause = [this] { OnPauseGame(); },
+        {.pause =
+             [this] {
+                 LOG_INFO(Frontend, "Pausing: shader preparation");
+                 OnPauseGame();
+             },
          .resume = [this] { OnStartGame(); },
          .game_name = [] {
              return QtCommon::system &&
