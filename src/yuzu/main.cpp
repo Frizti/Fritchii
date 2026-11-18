@@ -279,6 +279,15 @@ static void LoadNx2Switches(const char* argv0) {
         ParseSwitchFile(exe_dir / "nx2_switches.txt", file);
         take(std::move(file), 2);
     }
+#ifdef __linux__
+    // An AppImage's own folder is read-only (editing its file meant unpacking and repacking it,
+    // 2026-11-18): a nx2_switches.txt next to the .AppImage file wins over the one inside.
+    if (const char* const appimage = std::getenv("APPIMAGE"); appimage && *appimage == '/') {
+        std::map<std::string, std::string> file;
+        ParseSwitchFile(std::filesystem::path{appimage}.parent_path() / "nx2_switches.txt", file);
+        take(std::move(file), 5);
+    }
+#endif
 #ifdef _WIN32
     const auto app_data = Common::FS::GetAppDataRoamingDirectory();
 #else
@@ -317,7 +326,7 @@ static void LoadNx2Switches(const char* argv0) {
     // retired name) shows too, so it can be spotted.
     constexpr const char* SourceNames[] = {"environment", "user nx2_switches.txt",
                                            "nx2_switches.txt next to the exe", "built in",
-                                           "profiling mode"};
+                                           "profiling mode", "nx2_switches.txt next to the AppImage"};
     std::vector<std::string> groups(std::size(SourceNames));
     const auto add = [&groups](int source, const std::string& name, const std::string& value) {
         groups[source] += fmt::format("{}{}={}", groups[source].empty() ? "" : ", ", name, value);
