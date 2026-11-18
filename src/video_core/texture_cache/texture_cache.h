@@ -45,6 +45,7 @@
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
+#include "video_core/texture_cache/relocation_memory.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
 #include "video_core/churn_counters.h"
@@ -84,6 +85,13 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
     // EXP100 (fable52_answer_imagereads 2): the mutex's release closes the counter a hold opened
     // for gpu_image_filter. Before any other thread sees the cache.
     mutex.SetReleaseHook(&VideoCommon::MirrorSeq::ReleaseHook, &image_seq);
+    // FRITCHII_RELOCATION_MEMORY: shapes guarded in earlier sessions (and the seed) never
+    // relocate, so their first read this session isn't lost (relocation_memory.h).
+    if (RelocationMemory::Enabled()) {
+        for (const auto& [shape_key, guard] : RelocationMemory::Load()) {
+            relocation_shapes[shape_key].guard |= guard;
+        }
+    }
     // Configure null sampler
     TSCEntry sampler_descriptor{};
     sampler_descriptor.min_filter.Assign(Tegra::Texture::TextureFilter::Linear);
@@ -927,6 +935,9 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
         relocation_guarded_addresses[drop->gpu_addr] |= GuardSampled;
         relocation_shapes[drop->shape_key].guard |= GuardSampled;
         ++s.relocation_guards;
+        if (RelocationMemory::Enabled()) {
+            RelocationMemory::Note(drop->shape_key, GuardSampled);
+        }
     }
     const u8 why = drop != nullptr
                        ? (std::min)(drop->why, static_cast<u8>(LostWhyCount - 1))

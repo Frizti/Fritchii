@@ -591,7 +591,7 @@ public:
     }
 
     /// A new emulation session (nvdrv's Module): the previous session's waiters are gone. Left
-    /// in, a hang report listed acquires waiting longer than the session ran (Damage's log
+    /// in, a hang report listed acquires waiting longer than the session ran (a tester's log
     /// 2026-11-17: 6 waiters of 2,500-6,300 s) and read their words through stale pointers.
     void Clear() {
         std::scoped_lock lk{mutex};

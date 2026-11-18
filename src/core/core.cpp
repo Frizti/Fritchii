@@ -385,7 +385,7 @@ struct System::Impl {
                      Kernel::DescribeGuestWaits());
         // The cores that run game code now (a spin on a word, a loop): each core's thread logs
         // its guest backtrace when its JIT next returns ("Guest backtrace (hang report)" lines
-        // right after this; Damage's second Jabu-Jabu freeze had one core in JIT code).
+        // right after this; a tester's second Jabu-Jabu freeze had one core in JIT code).
         std::string cores;
         for (std::size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
             const u64 thread_id = impl.kernel.PhysicalCore(core).RequestBacktrace("hang report");

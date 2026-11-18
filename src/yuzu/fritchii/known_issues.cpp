@@ -46,6 +46,9 @@ std::vector<Item> Items(const std::vector<VkDeviceInfo::Record>& records) {
     std::vector<Item> items{
         {QObject::tr("Killing enemies"),
          QObject::tr("Short hitches can still happen (fewer than before).")},
+        {QObject::tr("Unlimited fps with VSync off"),
+         QObject::tr("The game can crash right after a loading screen. Keep an fps cap, or "
+                     "VSync on.")},
         {QObject::tr("Cutting lots of flowers"),
          QObject::tr("The game can slow down for about half a minute, then recovers.")},
         {QObject::tr("New areas"),
@@ -63,6 +66,17 @@ std::vector<Item> Items(const std::vector<VkDeviceInfo::Record>& records) {
     items.push_back({QObject::tr("Weaker PCs and Steam Deck"),
                      QObject::tr("Keep Max Resolution off and pick a lower Resolution in "
                                  "Graphics, like 810p.")});
+    // A tester's 16 GB PC (test 10): free RAM fell to 0.5 GB and Windows paging froze the game
+    // for up to 12 s (OoT's own memory is ~10 GB, Fritchii's ~2.7 GB more).
+    items.push_back({QObject::tr("16 GB of RAM"),
+                     QObject::tr("Close your browser and other programs while playing. When memory "
+                                 "runs out, the game freezes for seconds.")});
+    // Compute-written images go back to the game's size at every dispatch, so a lower scale only
+    // shrinks the plain draws (2026-11-18; the game's own render scale fixes it, 6.1 waitlist).
+    items.push_back({QObject::tr("Lower resolutions"),
+                     QObject::tr("Going below 1080p gives less fps than you'd expect, because part "
+                                 "of OoT's drawing stays at full size. A v6.x update will fix "
+                                 "it.")});
     if (IntelCpu()) {
         items.push_back({QObject::tr("Intel 12th-14th gen and Core Ultra"),
                          QObject::tr("If fps is about half what it should be, add "
@@ -99,7 +113,7 @@ QLabel* Label(const QString& text, const char* object_name) {
 
 void ShowImpl(QWidget* parent, const std::vector<VkDeviceInfo::Record>& records, bool first) {
     const auto items = Items(records);
-    const QString title = QObject::tr("Good to know");
+    const QString title = QObject::tr("Good to know: very important, please read");
     const QString footer = QObject::tr("Anything else: Help > Export Log, then send it to us.");
 
     if (!FritchiiUi::Enabled()) {
@@ -122,7 +136,7 @@ void ShowImpl(QWidget* parent, const std::vector<VkDeviceInfo::Record>& records,
 
     ReadFirstDialog dialog(parent);
     dialog.setObjectName(QStringLiteral("FritchiiKnownIssues"));
-    dialog.setWindowTitle(QStringLiteral("Fritchii"));
+    dialog.setWindowTitle(QObject::tr("Fritchii: very important, please read"));
     dialog.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
     dialog.setMinimumWidth(640);
     auto* layout = new QVBoxLayout(&dialog);

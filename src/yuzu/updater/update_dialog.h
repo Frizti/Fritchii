@@ -54,7 +54,7 @@ namespace Updater {
 // environment that a restart uses.
 void PrepareLaunch();
 
-// Whether this build can replace its own files: a Fritchii build on Windows run as lichii.exe.
+// Whether this build can replace its own files: a Fritchii build on Windows run as fritchii.exe.
 bool CanInstallInPlace();
 
 // Whether this build can replace the AppImage it was started from (FRITCHII_APPIMAGE builds).
@@ -69,7 +69,7 @@ std::optional<QString> RollbackVersion();
 
 void RollBack(QWidget* window);
 
-// Start lichii.exe in the install folder again, with the current arguments minus any game, and
+// Start fritchii.exe in the install folder again, with the current arguments minus any game, and
 // close `window`. The new process shows `note` once it is up.
 bool Restart(QWidget* window, const QString& note = {});
 

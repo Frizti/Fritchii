@@ -7,7 +7,10 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <string>
 #include <string_view>
+
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -565,9 +568,35 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                         range.max.height, selection.requested_range ? "supported" : "unavailable");
                 }
                 if (!selection.mode) {
-                    LOG_WARNING(Render_Vulkan, "No NVIDIA DLSS mode accepts {}x{} -> {}x{}",
+                    // What each mode takes for this output (a tester's 1440p -> 8K found none,
+                    // 2026-11-18; Ultra Performance should take exactly 3x).
+                    std::string ranges;
+                    for (const auto mode :
+                         {Settings::NvidiaDlssQuality::Quality, Settings::NvidiaDlssQuality::Balanced,
+                          Settings::NvidiaDlssQuality::Performance,
+                          Settings::NvidiaDlssQuality::UltraPerformance}) {
+                        auto probe = options;
+                        probe.mode = ModeFor(mode);
+                        sl::DLSSOptimalSettings optimal{};
+                        const auto query =
+                            reinterpret_cast<PFun_slDLSSGetOptimalSettings*>(get_optimal_settings);
+                        const sl::Result probe_result = query(probe, optimal);
+                        ranges += fmt::format(
+                            "{}{}: {}", ranges.empty() ? "" : "; ",
+                            Settings::CanonicalizeEnum(mode),
+                            probe_result == sl::Result::eOk
+                                ? fmt::format("optimal {}x{}, {}x{} to {}x{}",
+                                              optimal.optimalRenderWidth,
+                                              optimal.optimalRenderHeight, optimal.renderWidthMin,
+                                              optimal.renderHeightMin, optimal.renderWidthMax,
+                                              optimal.renderHeightMax)
+                                : fmt::format("query result {}", static_cast<int>(probe_result)));
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "No NVIDIA DLSS mode accepts {}x{} -> {}x{} (output asked {}x{}): {}",
                                 in.render_size.width, in.render_size.height, in.upscale_size.width,
-                                in.upscale_size.height);
+                                in.upscale_size.height, options.outputWidth, options.outputHeight,
+                                ranges);
                     return false;
                 }
                 validated.mode = ModeFor(*selection.mode);

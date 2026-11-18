@@ -81,7 +81,7 @@ u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
         unmapped = 0;
         // 32 lines a burst (reads a second or more after the previous one start a new burst),
         // and the first 32 bursts each get a guest backtrace from the core's thread once the JIT
-        // returns (the pc here is the block's, the backtrace the real call chain). Damage's
+        // returns (the pc here is the block's, the backtrace the real call chain). A tester's
         // Jabu-Jabu log (2026-11-17) spent the old 32-a-process budget on the first of three
         // null-object bursts, at area loads; the third ended in the game's crash.
         static std::atomic<u32> logged{};

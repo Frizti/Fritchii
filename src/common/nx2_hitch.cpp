@@ -434,7 +434,7 @@ std::atomic<u64> g_hang_last_present_ns{};
 std::mutex g_hang_mutex;
 HangHooks g_hang_hooks{}; ///< Under g_hang_mutex
 /// Bumped by SetHangHooks and ClearHangHooks (a boot, a shutdown): HangTick starts over, so the
-/// frameless time never counts from the previous session's last present (Damage's log
+/// frameless time never counts from the previous session's last present (a tester's log
 /// 2026-11-17: five false reports 4-5 s into boots, "27.8 s / 150.2 s since the last present").
 std::atomic<u64> g_hang_session{};
 /// NowNs at the newest SetHangHooks: presents before it belong to an earlier session.

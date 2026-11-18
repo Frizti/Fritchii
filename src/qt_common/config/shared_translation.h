@@ -55,6 +55,7 @@ static const std::map<Settings::DlssPreset, QString> nvidia_dlss_preset_texts_ma
 };
 
 static const std::map<Settings::ScalingFilter, QString> scaling_filter_texts_map = {
+    {Settings::ScalingFilter::Auto, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Auto"))},
     {Settings::ScalingFilter::NearestNeighbor,
      QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "Nearest"))},
     {Settings::ScalingFilter::Bilinear,

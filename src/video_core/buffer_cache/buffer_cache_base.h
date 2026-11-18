@@ -1853,7 +1853,7 @@ private:
     /// FRITCHII_LANDING_CHECK (boot; 0 off, 1 count and log, 2 also keep the guest's bytes):
     /// at each fence download's commit the guest bytes under its copies; at its landing, the bytes
     /// the guest changed since then (a write no tracking saw) that the landing would overwrite.
-    /// Damage's Jabu-Jabu freezes (2026-11-17): game objects read as null or float bits
+    /// A tester's Jabu-Jabu freezes (2026-11-17): game objects read as null or float bits
     /// (0xbf7fffff..., 0x80000000...) right after area loads, the game's assert, then a stopped
     /// thread; with FRITCHII_ONEF_SEM_E the game's sync point wait ends before the fence's
     /// downloads land, so memory it frees and reuses after the wait can take an old landing.

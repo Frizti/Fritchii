@@ -49,7 +49,8 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr wchar_t ExeName[] = L"lichii.exe";
+// fritchii.exe since v6 (lichii.exe is the small forwarder that starts it: src/lichii_forwarder).
+constexpr wchar_t ExeName[] = L"fritchii.exe";
 // Set for a restarted process to a note it shows once it is up, such as "v5 is installed".
 constexpr char RestartNoteVariable[] = "LICHII_UPDATE_NOTE";
 
@@ -333,21 +334,21 @@ void UpdateDialog::InstallInPlace() {
 
     const auto package = UpdateInstaller::FindPackageRoot(unpacked, ExeName);
     if (!package) {
-        // 2026-11-11, v5.8.4: a player got this with a good zip: lichii.exe was in it but gone
+        // 2026-11-11, v5.8.4: a player got this with a good zip: the exe was in it but gone
         // from disk right after unpacking, as an antivirus quarantining a new unsigned exe does.
         const bool in_archive = std::ranges::any_of(extracted, [](const QString& file) {
-            return file.endsWith(QStringLiteral("/lichii.exe"), Qt::CaseInsensitive) ||
-                   file.endsWith(QStringLiteral("\\lichii.exe"), Qt::CaseInsensitive);
+            return file.endsWith(QStringLiteral("/fritchii.exe"), Qt::CaseInsensitive) ||
+                   file.endsWith(QStringLiteral("\\fritchii.exe"), Qt::CaseInsensitive);
         });
         LOG_ERROR(Frontend, "Update package without {}: {} files unpacked, the exe {} in the list",
                   PathText(ExeName), extracted.size(), in_archive ? "was" : "was not");
         fail(in_archive
-                 ? tr("Your antivirus probably removed lichii.exe from the update right after it "
+                 ? tr("Your antivirus probably removed fritchii.exe from the update right after it "
                       "was unpacked.\n\nAllow it in your antivirus and try again, or download %1 "
                       "from the release page and unzip it over your Fritchii folder. Your saves "
                       "and settings are kept either way.")
                        .arg(QString::fromStdString(m_asset.filename.empty() ? m_asset.name : m_asset.filename))
-                 : tr("The downloaded update does not contain lichii.exe."));
+                 : tr("The downloaded update does not contain fritchii.exe."));
         return;
     }
 

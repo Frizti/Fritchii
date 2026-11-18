@@ -600,6 +600,13 @@ private:
     mutable bool oot_dlss_jitter{}; ///< DLSS gets the camera jitter (set with oot_backend)
     /// oot_upscale_output for this session (set with oot_backend): 0 = Auto (as before).
     mutable u32 oot_output_height{};
+    /// The status bar's picture as published at the start (set with oot_backend), so a DLSS
+    /// quality switched to or from DLAA in game shows the size that really runs.
+    mutable u32 oot_picture_backend{};
+    mutable u32 oot_picture_input{};
+    mutable u32 oot_picture_output{};
+    mutable bool oot_picture_up_to{};
+    int oot_picture_native{-1}; ///< DLAA last published: -1 not yet, 0 no, 1 yes
     bool oot_resolution_checked{};
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};

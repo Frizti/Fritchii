@@ -1558,7 +1558,7 @@ namespace Kernel {
         std::ranges::sort(waits, [](const Wait& a, const Wait& b) { return a.since < b.since; });
         const u64 now = Common::Nx2Hitch::StallTickNs();
         // The longest 8, then the newest 24 (newest first): the long ones are the game's idle
-        // workers (Damage's Jabu-Jabu freeze 2026-11-17: 137 waits, the first 32 all workers
+        // workers (a tester's Jabu-Jabu freeze 2026-11-17: 137 waits, the first 32 all workers
         // parked since the boot); what the game's main loop waits on began just before the freeze.
         std::vector<size_t> shown;
         for (size_t i = 0; i < (std::min)(waits.size(), size_t{8}); ++i) {

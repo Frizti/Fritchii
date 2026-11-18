@@ -225,6 +225,62 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     // toggle 61.3 -> 62.5 fps, 1% low 43.5 -> 45.5, 0.1% low 32.8 -> 37.4; FLAGGED=2 verify: never
     // flagged, recheck and CPU-modified 0 in all 29 windows (the other counts are timed races).
     {"FRITCHII_BANK_FLAGGED", "1"},
+    // v6.0 (owner's release order 2026-11-18: bake the switch set into the defaults): the set
+    // every v6 test, PGO training and tester build 1-9 ran with, so a player with no
+    // nx2_switches.txt gets exactly the tested build. Values as tested; each stays live or
+    // overridable in nx2_switches.txt (=0 turns one off). Linux gets the set its test builds ran.
+    {"EDEN_NX2_SPLIT", "2"},              {"EDEN_NX2_FENCE_BATCH", "1"},
+    // Recompiler
+    {"FRITCHII_JIT_INDIRECT_CACHE", "2"}, {"FRITCHII_JIT_RSQRT_ZERO", "2"},
+    {"FRITCHII_JIT_NO_FRAME_POINTER", "1"}, {"FRITCHII_JIT_FLAG_BRANCH", "2"},
+    {"FRITCHII_JIT_FAR_CODE", "1"},       {"FRITCHII_JIT_CHAIN", "6"},
+    {"FRITCHII_JIT_BLOCK_LIST", "1"},     {"FRITCHII_JIT_INLINE_CNTPCT", "1"},
+    {"FRITCHII_JIT_STATE_REFS", "1"},     {"FRITCHII_JIT_SHARED", "1"},
+    {"FRITCHII_STORE_MEMO", "2"},
+    // GPU front and back
+    {"EDEN_NX2_EXP37", "1"},              {"EDEN_NX2_EXP103", "64"},
+    {"EDEN_NX2_EXP123", "3"},             {"EDEN_NX2_LIGHT_TABLE_ARRAYS", "1"},
+    {"FRITCHII_MEMSTAGE_TICKS", "1"},     {"FRITCHII_STAMP_READ_PAGES", "2"},
+    {"FRITCHII_LIST_COPY_SKIP", "1"},     {"FRITCHII_DISPATCH_WALK_SUMMARY", "1"},
+    {"FRITCHII_FRONT_CALL_LEAN", "1"},    {"FRITCHII_FRONT_LIST_LANE", "3"},
+    {"FRITCHII_NOTED_FAST", "1"},         {"FRITCHII_FRONT_TRIM_RANGE", "1"},
+    {"FRITCHII_FRONT_TRIM_QMD", "1"},     {"FRITCHII_FRONT_ASYNC_TABLE", "1"},
+    {"FRITCHII_DEPTH_POOL_BIG", "1"},     {"FRITCHII_RAM_GPU_ENTRIES", "1"},
+    {"FRITCHII_SMALL_CARD", "2"},         {"FRITCHII_READ_SIDE_COPY", "3"},
+    {"FRITCHII_GPU_SIBLINGS_FREE", "1"},  {"FRITCHII_PACE_FIX", "3"},
+    // One follower (E/R GPU threads)
+    {"FRITCHII_ONEF_LEAN", "1"},          {"FRITCHII_ONEF_AHEAD", "0"},
+    {"FRITCHII_ONEF_POSTED", "1"},        {"FRITCHII_ONEF_COPY_E", "1"},
+    {"FRITCHII_ONEF_UNLEND", "55"},       {"FRITCHII_ONEF_GATHER_E", "1"},
+    {"FRITCHII_ONEF_OP_CLEAR", "1"},      {"FRITCHII_ONEF_OP_INVAL", "1"},
+    {"FRITCHII_ONEF_POST_FENCE", "1"},    {"FRITCHII_ONEF_FLUSH_E", "1"},
+    {"FRITCHII_ONEF_OP_DMA", "1"},        {"FRITCHII_ONEF_OP_LISTKEEP", "1"},
+    {"FRITCHII_ONEF_SEM_E", "1"},         {"FRITCHII_ONEF_UNLENT_RESET", "1"},
+    {"FRITCHII_ONEF_UNLENT_VALUES", "1"}, {"FRITCHII_ONEF_BIND_SEED", "1"},
+    {"FRITCHII_ONEF_OP_DISPATCH", "7"},   {"FRITCHII_ONEF_UNION_FILTER", "1"},
+    {"FRITCHII_ONEF_SOFT_RELEASE_E", "1"}, {"FRITCHII_ONEF_POST_FENCE_REPORT", "1"},
+    {"FRITCHII_ONEF_CARRY_OPS", "1"},     {"FRITCHII_ONEF_KEY_KEEP", "2"},
+    {"FRITCHII_ONEF_CB_LEAN", "3"},       {"FRITCHII_ONEF_DISPATCH_RANGES", "1"},
+    {"FRITCHII_ONEF_POST_IDLE", "2"},     {"FRITCHII_ONEF_RAISE_AFTER_LEND", "1"},
+    // zortos293/Lichii #2104 (owner 2026-11-18: keep zortos's proven stutter fixes even where
+    // our tests show no difference): a native dispatch whose compute pipeline isn't built yet is
+    // skipped for that frame when its guards prove nothing reads the output. Works only while a
+    // pipeline builds (no cost with warm caches); cold A/B 11-18: 0 skipped, must-be-0 counts 0.
+    {"FRITCHII_ASYNC_COMPUTE_SKIP", "1"},
+    // Pot room (guard house): moving makes per-object shadow depth images every frame. A
+    // GPU-written target whose memory newer GPU writes fully cover, untouched for 4 frames, is
+    // retired; queued collector downloads still land under a GPU-only overlap. 11-14 owner run:
+    // peak VRAM 12.45 -> 9.1 GB. It was only in the play build, so v6.0 shipped without it.
+    {"FRITCHII_COVERED_RETIRE", "4"},
+    {"FRITCHII_COLLECT_LAND_UNDER", "1"},
+#ifdef _WIN32
+    // Tested on Windows only (the Linux test builds ran without them).
+    {"FRITCHII_JIT_PIN", "1"},            {"FRITCHII_JIT_PIN_REGS", "x8,x0"},
+    {"FRITCHII_ONEF_PIN", "2"},           {"FRITCHII_GPU_PRIORITY", "2"},
+    {"FRITCHII_ZERO_TRIM_BATCH", "1"},    {"FRITCHII_ZERO_TRIM_CHUNK", "1"},
+    {"FRITCHII_ZERO_UPLOAD", "1"},        {"FRITCHII_REPORT_WAIT", "1"},
+    {"FRITCHII_FENCE_COPY_UNLOCKED", "1"},
+#endif
 };
 
 #ifndef _WIN32

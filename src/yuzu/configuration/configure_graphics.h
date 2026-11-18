@@ -98,6 +98,9 @@ private:
     void SetupPictureMenu(const std::map<u32, QWidget*>& rows);
     void UpdatePictureMenu();
     void ApplyPictureChoice(int choice);
+    /// Fritchii builds: the window filter's pros and cons, and which one suits the picture size
+    /// on this screen (bigger: Area, smaller: ScaleForce), under the "Window filter" row.
+    void UpdateWindowFilterNote();
     /// The picture choices for the upscaler now picked (none while it's off).
     [[nodiscard]] std::vector<int> PictureChoicesNow() const;
     [[nodiscard]] int CurrentPictureChoice() const;
@@ -168,6 +171,9 @@ private:
     QWidget* quality_row{};                ///< "Quality": input -> output
     QComboBox* quality_combobox{};
     QLabel* quality_fixed_label{};         ///< In place of the choice when there is one
+    QLabel* upscale_note{};                ///< Where an upscaler starts from, and how to go lower
+    QComboBox* scaling_filter_combobox{};  ///< The "Window filter" choice
+    QLabel* filter_note{};                 ///< Fritchii: under it, pros, cons and the advice
     QWidget* texture_sharpness_widget{};
     QComboBox* texture_sharpness_combobox{};
     QWidget* lod_custom_widget{};

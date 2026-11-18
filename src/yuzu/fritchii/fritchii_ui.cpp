@@ -565,7 +565,7 @@ void CopyDataFromOldFolder(QMainWindow& window) {
     if (IsPortableMode()) {
         QMessageBox::information(&window, QStringLiteral("Fritchii"),
                                  QObject::tr("This Fritchii keeps its data in the user folder next to "
-                                    "lichii.exe."));
+                                    "fritchii.exe."));
         return;
     }
     const bool any = std::ranges::any_of(
