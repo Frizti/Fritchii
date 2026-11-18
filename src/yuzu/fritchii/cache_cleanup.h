@@ -36,6 +36,10 @@ struct Plan {
 /// Reads names, sizes and a few small headers; changes nothing.
 [[nodiscard]] Plan PlanCleanup(const std::filesystem::path& shader_dir);
 
+/// "v6" of Common::g_build_version "v6", "v6.1" or "v6.0 Beta" (empty for a build without a
+/// version): the once-per-major-version questions key their saved answers to it.
+[[nodiscard]] std::string MajorVersion();
+
 /// Main window, before a game boots (not when one was started from the command line: that launch
 /// leaves the question to the next one). Asks when this major version has not asked yet and there
 /// is enough to clear, and clears on "Clear". Returns true when it recorded an answer in

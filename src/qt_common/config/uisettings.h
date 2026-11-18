@@ -152,6 +152,10 @@ struct Values {
     // cache_cleanup.cpp), whatever the answer.
     Setting<std::string> fritchii_cache_cleanup_asked{linkage, {}, "fritchii_cache_cleanup_asked",
                                                       Category::Ui};
+    // The major version that turned OoT's Max Resolution add-on off once, and the one that asked
+    // whether to turn it on (yuzu/fritchii/max_resolution.cpp), whatever the answer.
+    Setting<std::string> fritchii_maxres_off{linkage, {}, "fritchii_maxres_off", Category::Ui};
+    Setting<std::string> fritchii_maxres_asked{linkage, {}, "fritchii_maxres_asked", Category::Ui};
 
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,

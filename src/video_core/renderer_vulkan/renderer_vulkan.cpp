@@ -57,23 +57,6 @@ constexpr VkExtent2D CaptureImageSize{
     .height = VideoCore::Capture::LinearHeight,
 };
 
-#ifdef HAS_LSFG
-[[nodiscard]] VkExtent2D GuestExtent(std::span<const Tegra::FramebufferConfig> framebuffers) {
-    if (framebuffers.empty()) {
-        return VkExtent2D{};
-    }
-
-    const auto& framebuffer = framebuffers.front();
-    if (framebuffer.crop_rect.IsEmpty()) {
-        return VkExtent2D{.width = framebuffer.width, .height = framebuffer.height};
-    }
-    return VkExtent2D{
-        .width = static_cast<u32>(framebuffer.crop_rect.GetWidth()),
-        .height = static_cast<u32>(framebuffer.crop_rect.GetHeight()),
-    };
-}
-#endif
-
 constexpr VkExtent3D CaptureImageExtent{
     .width = VideoCore::Capture::LinearWidth,
     .height = VideoCore::Capture::LinearHeight,
@@ -203,9 +186,6 @@ try
                   scheduler,
                   PresentFiltersForAppletCapture)
     , rasterizer(render_window, gpu, device_memory, device, memory_allocator, state_tracker, scheduler)
-#ifdef HAS_LSFG
-    , frame_gen(memory_allocator, scheduler)
-#endif
 {
 
     // Force maximum clocks (off by default): a second device keeps the GPU busy. Its device
@@ -279,22 +259,6 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                                present_manager.SwapchainImageCount(),
                                swapchain.GetImageViewFormat());
 
-#ifdef HAS_LSFG
-    void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
-
-    frame_gen.Process(device, frame, present_manager.SwapchainImageFormat(),
-                      GuestExtent(framebuffers));
-
-    const size_t generated_frames = frame_gen.GeneratedFrameCount();
-    for (size_t generation = 0; generation < generated_frames; ++generation) {
-        Frame* generated = present_manager.GetRenderFrame();
-        blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
-        frame_gen.GenerateInto(device, generated, generation);
-        generated->render_tick = scheduler.Flush(*generated->render_ready);
-        present_manager.Present(generated);
-    }
-#endif
-
     if (trace) {
         scheduler.MarkFrameEnd(++trace_frame);
     }
@@ -305,9 +269,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     present_manager.Present(frame);
     const auto presented = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
-#ifdef HAS_LSFG
+    // Hand the work recorded so far to the worker right after the present.
     scheduler.DispatchWork();
-#endif
 
     gpu.RendererFrameEndNotify();
     rasterizer.TickFrame();

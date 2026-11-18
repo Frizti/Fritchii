@@ -72,6 +72,7 @@
 #include "util/export_log.h"
 #include "util/profiling_mode.h"
 #include "fritchii/cache_cleanup.h"
+#include "fritchii/max_resolution.h"
 #include "fritchii/fritchii_ui.h"
 #include "fritchii/perf_overlay.h"
 #include "fritchii/switches_window.h"
@@ -481,6 +482,17 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     Common::FS::CreateEdenPaths();
     this->config = std::make_unique<QtConfig>();
     MigrateFriztiSettings();
+    // New mods start disabled: saved at once (from the GUI thread), so a crash keeps it.
+    FileSys::PatchManager::SetNewModsCallback([this](u64 title_id) {
+        QMetaObject::invokeMethod(
+            this,
+            [this, title_id] {
+                Common::FS::RemoveFile(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
+                                       "game_list" / fmt::format("{:016X}.pv.txt", title_id));
+                config->SaveAddOnValues();
+            },
+            Qt::QueuedConnection);
+    });
 
     Common::Log::Filter filter;
     filter.ParseFilterString(Settings::values.log_filter.GetValue());
@@ -628,6 +640,12 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // to prevent the UI from blowing up.
     UpdateUITheme();
 
+    // v6 turns OoT's Max Resolution add-on off once for everyone, before a game from the command
+    // line boots with it; the question whether to turn it back on comes on a plain launch.
+    if (FritchiiMaxResolution::SwitchOffOnce()) {
+        OnSaveConfig();
+    }
+
     if (QStringList args = QApplication::arguments(); args.size() >= 2) {
         QList<QByteArray> qba{};
         for (auto const& e : args)
@@ -663,6 +681,11 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // Once per major version, before a game boots: clear the old shader caches? (Not when started
     // with a game: the next plain launch asks.)
     if (!launched_with_game && FritchiiCacheCleanup::OfferOnce(this)) {
+        OnSaveConfig();
+    }
+
+    // Then, once per major version: Max Resolution on or off, with this PC's card in the question.
+    if (!launched_with_game && FritchiiMaxResolution::OfferOnce(this, vk_device_records)) {
         OnSaveConfig();
     }
 
@@ -929,6 +952,7 @@ void MainWindow::AskOotFrameRate() {
 }
 
 MainWindow::~MainWindow() {
+    FileSys::PatchManager::SetNewModsCallback(nullptr);
     Common::ShutdownWatch::Exiting("main window destructor: waiting for the NUP task");
     if (nup_cancel) {
         nup_cancel->store(true);
@@ -5820,6 +5844,15 @@ void MainWindow::SetOotHighRefresh(bool on) {
         text = tr("High refresh: busy, try again");
         break;
     case FileSys::OotHighRefreshSwitch::UnknownCode:
+        // A mod that writes over the same game code wins over the built-in: name it.
+        if (const auto mod = FileSys::OotHighRefreshBlockedBy(); !mod.empty()) {
+            text = tr("High refresh can't turn on: the mod \"%1\" changes the same game code. "
+                      "Turn the mod off in Add-Ons to use it.")
+                       .arg(QString::fromStdString(mod));
+            statusBar()->showMessage(text, 10000);
+            SetFPSSuffix();
+            return;
+        }
         text = tr("High refresh: can't switch, a mod or Add-Ons changed that code");
         break;
     case FileSys::OotHighRefreshSwitch::NotRunning:

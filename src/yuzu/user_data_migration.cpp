@@ -409,7 +409,7 @@ ImportPlan PlanImport(const OldProfile& old, const ProfileImportChoice& choice) 
     if (choice.settings) {
         add(old.config, GetEdenPath(EdenPath::ConfigDir));
         folders.insert(folders.end(), {TAS_DIR, ICONS_DIR, POST_SHADER_DIR, POST_PRESET_DIR,
-                                       LOSSLESS_DIR, STREAMLINE_DIR, FIDELITYFX_DIR});
+                                       STREAMLINE_DIR, FIDELITYFX_DIR});
     }
     if (choice.saves) {
         folders.insert(folders.end(), {KEYS_DIR, AMIIBO_DIR, PLAY_TIME_DIR});

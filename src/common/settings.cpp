@@ -69,7 +69,6 @@ SWITCHABLE(NvdecEmulation, false);
 SWITCHABLE(Region, true);
 SWITCHABLE(RendererBackend, true);
 SWITCHABLE(ScalingFilter, false);
-SWITCHABLE(FrameGenType, false);
 SWITCHABLE(SpirvOptimizeMode, true);
 SWITCHABLE(TimeZone, true);
 SETTING(VSyncMode, true);
@@ -515,16 +514,6 @@ void UpdateRescalingInfo() {
     TranslateResolutionInfo(setup, info);
 }
 
-u32 FrameGenMultiplier() {
-    return std::clamp(values.frame_gen_multiplier.GetValue(), MIN_FRAME_GEN_MULTIPLIER,
-                      MAX_FRAME_GEN_MULTIPLIER);
-}
-
-bool FrameGenActive() {
-    static const bool fritchii = std::string_view{Common::g_build_name} == "Fritchii";
-    return values.frame_gen.GetValue() && !fritchii;
-}
-
 namespace {
 std::atomic<bool> oot_high_refresh_patched{false};
 } // Anonymous namespace
@@ -553,23 +542,6 @@ bool SpeedLimitEnabled() {
     // "Unlocked" presents as fast as the PC can without speeding the game up. The 30 FPS mode
     // keeps its cap.
     return !OotHighRefreshPatched() || values.oot_30fps.GetValue();
-}
-
-size_t FrameGenGenerations() {
-    if (!FrameGenActive()) {
-        return 0;
-    }
-    return FrameGenMultiplier() - 1;
-}
-
-size_t FrameGenMaxGenerations() {
-    if (!FrameGenActive()) {
-        return 0;
-    }
-    if (values.frame_gen_target_rate.GetValue() != 0) {
-        return MAX_FRAME_GEN_MULTIPLIER - 1;
-    }
-    return FrameGenMultiplier() - 1;
 }
 
 void RestoreGlobalState(bool is_powered_on) {

@@ -177,6 +177,19 @@ QDialog#FritchiiCachePrompt QPushButton {
     font-weight: 500;
 }
 
+/* Max Resolution on or off (fritchii/max_resolution.cpp) */
+QDialog#FritchiiMaxResPrompt { background: #111113; }
+QDialog#FritchiiMaxResPrompt QPushButton {
+    min-height: 40px;
+    padding: 0 28px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 500;
+}
+QFrame#FritchiiMaxResCard { background: #18181b; border: 1px solid #2a2a30; border-radius: 12px; }
+QLabel#FritchiiMaxResSide { font-size: 19px; font-weight: 600; color: #ececf1; }
+QLabel#FritchiiMaxResYours { font-size: 17px; font-weight: 500; color: #a78bfa; }
+
 /* Switches window (fritchii/switches_window.cpp) */
 QLabel#FritchiiSwitchesSection { font-size: 16px; font-weight: 600; color: #ececf1; }
 QTextEdit#FritchiiSwitchesInUse { background: #141417; color: #c9c9d3; }

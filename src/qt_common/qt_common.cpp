@@ -15,9 +15,9 @@
 #include "common/logging.h"
 #ifdef _WIN32
 #include "common/windows/crash_handler.h"
+#endif
 #ifdef __linux__
 #include "common/linux/crash_handler.h"
-#endif
 #endif
 #include "common/scm_rev.h"
 #include "common/build_stamp.h"

@@ -95,8 +95,8 @@ start.
   after showing AMD's licence, only when the user presses its download button. Each file must match its pinned size and SHA-256
   (`vulkan_common/ffx_files.h`) and carry AMD's Authenticode signature, checked after the
   download and again before loading. AMD's runtime picks the model (FP8 on RDNA 4, INT8 on RDNA 3
-  and RDNA 2); the choice is only offered for those GPUs. Only an upscale context is created:
-  no frame generation. `VK_EXT_shader_float8` and the
+  and RDNA 2); the choice is only offered for those GPUs. Only an upscale context is created.
+  `VK_EXT_shader_float8` and the
   `shaderFloat16` device feature are enabled for it only while it's picked. FSR 3.1
   stays created and takes over if the files are missing or don't check out, AMD's runtime offers
   no FSR 4 for the GPU, the context can't be created or a dispatch fails. The log says which, and

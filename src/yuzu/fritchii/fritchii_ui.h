@@ -35,9 +35,6 @@ namespace FritchiiUi {
 /// when the Fritchii UI is off.
 bool ApplyTheme();
 
-/// Settings the Fritchii settings pages leave out (frame generation and its dev options).
-[[nodiscard]] bool HidesSetting(const std::string& label);
-
 /// A bundled line icon (fritchii/icons/<name>.svg): grey, and violet when checked.
 [[nodiscard]] QIcon Icon(const QString& name, int px = 22);
 /// One colour for every state (a filled button whose own colour is not the palette's).

@@ -44,15 +44,6 @@ constexpr std::uintmax_t MinBytesToAsk = 64ULL << 20;
 
 constexpr std::array<char, 8> RecordsMagic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
 
-/// "v6" of "v6", "v6.1" or "v6.0 Beta": the question comes once per major version.
-std::string MajorVersion() {
-    std::string version{Common::g_build_version};
-    if (const auto end = version.find_first_of(". "); end != std::string::npos) {
-        version.resize(end);
-    }
-    return version;
-}
-
 bool EndsWith(std::string_view text, std::string_view end) {
     return text.size() >= end.size() && text.substr(text.size() - end.size()) == end;
 }
@@ -381,6 +372,14 @@ void LogPlan(const Plan& plan, std::string_view verb) {
 }
 
 } // Anonymous namespace
+
+std::string MajorVersion() {
+    std::string version{Common::g_build_version};
+    if (const auto end = version.find_first_of(". "); end != std::string::npos) {
+        version.resize(end);
+    }
+    return version;
+}
 
 Plan PlanCleanup(const fs::path& shader_dir) {
     Plan plan;
