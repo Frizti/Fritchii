@@ -38,6 +38,7 @@
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/small_card.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
@@ -526,8 +527,8 @@ public:
                       OCARINA_DLSS_4K_COMPOSITE_COMP_SPV) {}
 
     void Record(Scheduler& scheduler, const void* descriptors, VkImage image,
-                const OcarinaUpscaler& upscaler, u64 frame) {
-        scheduler.Record([this, descriptors, image, &upscaler, frame](vk::CommandBuffer cmd) {
+                const OcarinaUpscaler& upscaler, u64 frame, VkExtent2D extent) {
+        scheduler.Record([this, descriptors, image, &upscaler, frame, extent](vk::CommandBuffer cmd) {
             const auto output = ProbeBarrier(image, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                              VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                                              VK_IMAGE_LAYOUT_GENERAL);
@@ -544,7 +545,7 @@ public:
             cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
             const u32 enabled = !upscaler.EvaluationFailed();
             cmd.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, enabled);
-            cmd.Dispatch(3840 / 8, 2160 / 8, 1);
+            cmd.Dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
             const VkMemoryBarrier complete{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -553,7 +554,8 @@ public:
             cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 0, complete);
             if (enabled && (!logged || frame % 120 == 0)) {
-                LOG_INFO(Render_Vulkan, "Ocarina temporal presented 3840x2160 frame={}", frame);
+                LOG_INFO(Render_Vulkan, "Ocarina temporal presented {}x{} frame={}", extent.width,
+                         extent.height, frame);
                 logged = true;
             }
         });
@@ -792,6 +794,9 @@ struct OcarinaUpscaler::Impl {
     vk::ImageView native_scene_view;
     vk::Image composite;
     vk::ImageView composite_view;
+    VkExtent2D composite_extent{};
+    /// The last recorded frame's output size (the composite's size).
+    VkExtent2D last_output{3840, 2160};
     std::unique_ptr<OcarinaColorPass> reference_pass;
     std::unique_ptr<OcarinaCompositePass> composite_pass;
     vk::Sampler linear_sampler;
@@ -853,13 +858,23 @@ void OcarinaUpscaler::Composite4k(VkImageView native_composite, u64 frame) {
     if (state.composited_frame == frame) {
         return;
     }
+    const VkExtent2D extent = state.last_output;
     if (!state.composite_pass) {
-        constexpr VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
-        state.composite = CreateOcarinaImage(state.allocator, {3840, 2160}, format,
-                                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        state.composite_view = CreateOcarinaView(state.device, *state.composite, format);
         state.composite_pass = std::make_unique<OcarinaCompositePass>(
             state.device, state.scheduler, state.pool);
+    }
+    // The composite reads the upscaler's output pixel for pixel: it has the output's size
+    // (oot_upscale_output; 4K before).
+    if (!state.composite || state.composite_extent.width != extent.width ||
+        state.composite_extent.height != extent.height) {
+        if (state.composite) {
+            state.scheduler.Finish(); // the old image may still be read by a present
+        }
+        constexpr VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+        state.composite = CreateOcarinaImage(state.allocator, extent, format,
+                                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        state.composite_view = CreateOcarinaView(state.device, *state.composite, format);
+        state.composite_extent = extent;
     }
     state.scheduler.RequestOutsideRenderPassOperationContext();
     state.queue.Acquire(state.scheduler, 4);
@@ -869,7 +884,7 @@ void OcarinaUpscaler::Composite4k(VkImageView native_composite, u64 frame) {
     state.queue.AddSampledImage(native_composite, sampler);
     state.queue.AddImage(*state.composite_view);
     state.composite_pass->Record(state.scheduler, state.queue.UpdateData(), *state.composite,
-                                 *this, frame);
+                                 *this, frame, extent);
     state.scheduler.InvalidateState();
     state.composited_frame = frame;
 }
@@ -927,6 +942,10 @@ VkImage OcarinaUpscaler::CompositedImage() const {
 
 VkImageView OcarinaUpscaler::CompositedView() const {
     return *impl->composite_view;
+}
+
+VkExtent2D OcarinaUpscaler::CompositedExtent() const {
+    return impl->composite_extent;
 }
 
 bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView target, VkExtent2D extent,
@@ -1113,6 +1132,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     state.scheduler.InvalidateState();
     state.last_frame = frame;
     state.last_view_projection = current;
+    state.last_output = output_extent;
     return true;
 }
 VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) {
@@ -1135,6 +1155,22 @@ VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) 
         return VideoCommon::OcarinaUpscaleBackend::Native;
     }
     return backend;
+}
+
+VideoCommon::OcarinaOutputSetting OcarinaUpscaleOutput(const Device& device, u64* vram) {
+    // The main heap's size, as the driver reports it (EDEN_NX2_VRAM_LIMIT_MIB lowers it for
+    // small card tests). GetDeviceLocalMemory is the texture cache's capped share, not the card.
+    u64 size = 0;
+    u64 usage = 0;
+    u64 budget = 0;
+    if (!device.MainHeapNumbers(size, usage, budget)) {
+        size = 0;
+    }
+    if (vram != nullptr) {
+        *vram = size;
+    }
+    return VideoCommon::ResolveOcarinaUpscaleOutput(Settings::values.oot_upscale_output.GetValue(),
+                                                    size, VideoCore::SmallCard::Active());
 }
 
 bool OcarinaFsrOutputsGameSize(VideoCommon::OcarinaUpscaleBackend backend) {

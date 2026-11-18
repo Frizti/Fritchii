@@ -885,6 +885,9 @@ void ResyncFrontQmd(VideoCommon::GpuSplit& split, VideoCommon::QmdPrediction::Mi
     mirror.synced = true;
     if (why == VideoCommon::QmdPrediction::Mirror::SessionStart) {
         mirror.ResetWindow();
+        // A new split session's positions start at 0: what the predictor keeps by position
+        // starts over (its horizon above all), before its records do.
+        VideoCommon::QmdPrediction::StartSplitSession(split.Session());
         // Records from before (another split session's ring positions, or EXP13=1's) go.
         VideoCommon::QmdPrediction::SetRecordsValid(false, 0);
     }

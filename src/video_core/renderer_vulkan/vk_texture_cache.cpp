@@ -5601,10 +5601,16 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
             const bool dlaa = backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
                               Settings::GetNvidiaDlssRuntimeSettings().quality ==
                                   Settings::NvidiaDlssQuality::Native;
-            // FRITCHII_FSR_OUTPUT: FSR draws the game's own 1440p picture, not a 4K one.
-            const bool output_4k = max_resolution && !OcarinaFsrOutputsGameSize(backend);
+            // The output: oot_upscale_output (Auto: 4K, or the game's own 1440p picture with
+            // FRITCHII_FSR_OUTPUT; 1440p without Max Resolution), the scene's size for 1x AA.
+            const auto plan = VideoCommon::PlanOcarinaPassOutput(
+                OcarinaUpscaleOutput(device).height, max_resolution,
+                Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale()), dlaa,
+                OcarinaFsrOutputsGameSize(backend));
             const u32 output_height =
-                dlaa ? render_height : std::max(render_height, output_4k ? 2160U : 1440U);
+                plan.native_aa
+                    ? render_height
+                    : std::max(render_height, plan.big_height != 0 ? plan.big_height : 1440U);
             const bool dlss_jitter =
                 VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());
             const int mode = VideoCommon::OcarinaLodRatioMode();

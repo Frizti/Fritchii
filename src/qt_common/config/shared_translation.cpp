@@ -176,6 +176,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, oot_texture_sharpness, tr("Texture sharpness:"),
            tr("Auto matches OoT's render and output sizes. Sharper goes half a step further. "
               "Custom uses the LOD bias you set.\nTakes effect when the game starts."));
+    // Set by the picture menu's "Resolution" row (ConfigureGraphics::UpdatePictureMenu).
+    INSERT(Settings, oot_upscale_output, QString(), QString());
     INSERT(Settings, oot_lod_bias_custom, tr("LOD bias:"),
            tr("Lower is sharper. Too low makes textures shimmer.\nTakes effect when the game "
               "starts."));

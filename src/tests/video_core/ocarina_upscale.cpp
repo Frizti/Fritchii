@@ -158,3 +158,62 @@ TEST_CASE("OoT FSR output size switch keeps 4K unless asked", "[video_core][ocar
     STATIC_REQUIRE_FALSE(OcarinaFsrOutputsGameSize(1, Dlss, 1440));
     STATIC_REQUIRE_FALSE(OcarinaFsrOutputsGameSize(1, Native, 1440));
 }
+
+TEST_CASE("OoT upscaler output setting keeps Auto as before", "[video_core][ocarina]") {
+    using VideoCommon::OcarinaPassOutput;
+    using VideoCommon::PlanOcarinaPassOutput;
+    // Auto: 4K from the 1440p pass, the game's 1440p with FRITCHII_FSR_OUTPUT, the target from
+    // the 3/4 pass, the scene's size with DLSS Native.
+    STATIC_REQUIRE(PlanOcarinaPassOutput(0, true, 1440, false, false) == OcarinaPassOutput{false, 2160});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(0, true, 1440, false, true) == OcarinaPassOutput{false, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(0, false, 1440, false, false) == OcarinaPassOutput{false, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(0, true, 1440, true, false) == OcarinaPassOutput{true, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(0, true, 720, false, false) == OcarinaPassOutput{false, 2160});
+}
+
+TEST_CASE("OoT upscaler output setting picks the new sizes", "[video_core][ocarina]") {
+    using VideoCommon::OcarinaPassOutput;
+    using VideoCommon::PlanOcarinaPassOutput;
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1800, true, 1440, false, false) == OcarinaPassOutput{false, 1800});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(2880, true, 1440, false, false) == OcarinaPassOutput{false, 2880});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(4320, true, 1440, false, false) == OcarinaPassOutput{false, 4320});
+    // The picked size wins over FRITCHII_FSR_OUTPUT; DLSS Native over the picked size.
+    STATIC_REQUIRE(PlanOcarinaPassOutput(2880, true, 1440, false, true) == OcarinaPassOutput{false, 2880});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(4320, true, 1440, true, false) == OcarinaPassOutput{true, 0});
+    // At or below the scene: 1x at the target's size (1440p pass) or the scene's (3/4 pass).
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1440, true, 1440, false, false) == OcarinaPassOutput{false, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1080, true, 1440, false, false) == OcarinaPassOutput{false, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1080, false, 1440, false, false) == OcarinaPassOutput{true, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1440, false, 1440, false, false) == OcarinaPassOutput{false, 0});
+    // Bigger outputs need the 1440p pass; at most 3x the scene a side.
+    STATIC_REQUIRE(PlanOcarinaPassOutput(4320, false, 1440, false, false) == OcarinaPassOutput{false, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(4320, true, 1080, false, false) == OcarinaPassOutput{false, 2880});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(4320, true, 720, false, false) == OcarinaPassOutput{false, 2160});
+}
+
+TEST_CASE("OoT upscaler output setting checks the card", "[video_core][ocarina]") {
+    using VideoCommon::ResolveOcarinaUpscaleOutput;
+    constexpr unsigned long long GiB = 1ULL << 30;
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(0, 16 * GiB, false).height == 0);
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(1234, 16 * GiB, false).height == 0);
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(1800, 4 * GiB, true).height == 1800);
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(2160, 4 * GiB, true).height == 2160);
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(4320, 16 * GiB, false).height == 4320);
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(4320, 12 * GiB, false).height == 4320);
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(4320, 8 * GiB, false).height == 2160);
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(2880, 8 * GiB, false).height == 2880);
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(2880, 4 * GiB, false).height == 2160);
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(2880, 16 * GiB, true).height == 2160);
+    STATIC_REQUIRE(ResolveOcarinaUpscaleOutput(4320, 0, false).height == 4320);
+}
+
+TEST_CASE("OoT scaled upscale takes the picked big output", "[video_core][ocarina]") {
+    using VideoCommon::OcarinaExtent;
+    using VideoCommon::SelectOcarinaScaledOutput;
+    auto choice = SelectOcarinaScaledOutput({2560, 1440}, {2560, 1440}, false, true, {5120, 2880});
+    CHECK(choice.output == OcarinaExtent{5120, 2880});
+    CHECK(choice.upscale_4k);
+    choice = SelectOcarinaScaledOutput({3840, 2160}, {2560, 1440}, false, true, {3200, 1800});
+    CHECK(choice.output == OcarinaExtent{3840, 2160});
+    CHECK_FALSE(choice.upscale_4k);
+}

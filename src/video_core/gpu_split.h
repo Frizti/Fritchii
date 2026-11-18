@@ -2495,6 +2495,8 @@ private:
     /// own, which EXP126 = 1 leaves out.
     u64 ranged_overflow_position{};
     u64 session{};
+    /// FRITCHII_TEST_SPLIT_RESTART: when this session started.
+    std::chrono::steady_clock::time_point session_started{};
     /// EnableWriteStamps' tables: a slot keeps its newest stamp, the tag that made it, and the
     /// newest stamp of any other tag before it.
     struct StampSlot {

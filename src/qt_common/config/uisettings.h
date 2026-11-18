@@ -156,6 +156,9 @@ struct Values {
     // whether to turn it on (yuzu/fritchii/max_resolution.cpp), whatever the answer.
     Setting<std::string> fritchii_maxres_off{linkage, {}, "fritchii_maxres_off", Category::Ui};
     Setting<std::string> fritchii_maxres_asked{linkage, {}, "fritchii_maxres_asked", Category::Ui};
+    // The major version ("v6") that showed "Good to know" (yuzu/fritchii/known_issues.cpp).
+    Setting<std::string> fritchii_known_issues_shown{linkage, {}, "fritchii_known_issues_shown",
+                                                     Category::Ui};
 
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,

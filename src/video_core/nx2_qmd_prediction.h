@@ -25,9 +25,9 @@
 /// 3: as 2, and the predictions meet acquires (fable_answer_6 6b slice B, 6c/6e): a queued (or
 ///    run but not landed) plain or max release whose value meets the acquire with nothing queued
 ///    after it that may write the word, or a reduction lower bound (GEQ only). The feed turns
-///    itself off for the rest of the session (until EXP13 leaves 3) at the first bound
-///    violation, payload mismatch, unpredicted back release or reduction, phantom record or
-///    lost event, with an ERROR line saying why.
+///    itself off at the first bound violation, payload mismatch, unpredicted back release or
+///    reduction, phantom record or lost event, with an ERROR line saying why: for the rest of the
+///    session (until EXP13 leaves 3) with FRITCHII_FEED_REARM=0, else as FeedRearm says.
 /// The tables are the front's own (no lock): the back's releases and the landings reach them
 /// through rings the front drains.
 /// One log line every 5 s (HW_GPU, Info), three with 2, four with 3.
@@ -65,6 +65,25 @@ namespace VideoCommon::QmdPrediction {
 [[nodiscard]] inline bool FeedMemoryOverlays() {
     return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_feed_memory_overlay,
                                             "EDEN_NX2_FEED_MEMORY_OVERLAY", 1) != 0;
+}
+
+/// FRITCHII_FEED_REARM (live, default 1): the feed that turned itself off comes back on after
+/// 10 s with no new divergence, when the audit says nothing it met was wrong: no acquire judged
+/// wrongly met since, none named by the turn-off's own scan, no violation still being re-read.
+/// The words named by a turn-off stay out of the feed for the split session. Off for good (the
+/// session) at the third turn-off, at lost events, or at any acquire wrongly met (the process).
+/// A new split session (the game booted again) starts with the feed on. 0: off for the rest of
+/// the run, as before.
+[[nodiscard]] inline bool FeedRearm() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_feed_rearm,
+                                            "FRITCHII_FEED_REARM", 1) != 0;
+}
+
+/// FRITCHII_TEST_FEED_OFF (live, default 0, test only): every N seconds of feed on, the feed
+/// turns itself off as for an unpredicted back release of no word (FeedRearm's path, tested).
+[[nodiscard]] inline int TestFeedOffSeconds() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_test_feed_off,
+                                            "FRITCHII_TEST_FEED_OFF", 0);
 }
 
 /// EXP127 (live, fable_fence_writers_brief piece 2): the feed's QMD sources. 0: as before. 1
@@ -188,6 +207,12 @@ void NoteLanded(u64 device, u32 value, Tegra::Nx2Landing site);
 /// Front, EXP13=2: the records are complete for the work sent from `position` on (the copy just
 /// started over), or not any more (`valid` false: it stopped).
 void SetRecordsValid(bool valid, u64 position);
+/// Front, at the copy's start in a split session (GpuSplit::Session): a new session's ring
+/// positions start again at 0, so what is kept by position goes (Settle's horizon: kept, it
+/// stopped every back release from waiting for its record until the new ring passed the old
+/// one, and the first one that ran before its record turned the feed off). With FeedRearm the
+/// feed starts the new session on, as a fresh run would.
+void StartSplitSession(u64 session);
 /// Front, EXP13=2-4: the copy recorded every release of the work sent up to `position` (the end
 /// of the signal it just ran). Record first, compare after (6g (a)): the back's releases of
 /// entries after the previous one that found no record wait for this, and the phantom sweep

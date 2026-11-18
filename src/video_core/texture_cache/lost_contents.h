@@ -16,5 +16,7 @@ inline std::atomic<int> g_stale_zero{-1};
 /// FRITCHII_LOST_WRITEBACK (live, default 1; N > 1 = only images up to N KiB):
 /// docs/fritchii/switches.md.
 inline std::atomic<int> g_lost_writeback{-1};
+/// FRITCHII_LOST_KEEP (live, default 1; N > 1 = a budget of N MiB/s, 1 = 32): docs/fritchii/switches.md.
+inline std::atomic<int> g_lost_keep{-1};
 
 } // namespace VideoCore::Nx2Debug

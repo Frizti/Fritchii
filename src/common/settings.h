@@ -455,6 +455,11 @@ struct Values {
         linkage, OotTextureSharpness::Auto, "oot_texture_sharpness", Category::Renderer};
     SwitchableSetting<float, true> oot_lod_bias_custom{linkage, -1.58f, -3.0f, 1.0f,
                                                        "oot_lod_bias_custom", Category::Renderer};
+    // OoT's DLSS or FSR output height (docked), set by the picture menu: 0 = Auto (4K with Max
+    // Resolution, 1440p without, as before), else 1080, 1440, 1800, 2160, 2880 or 4320
+    // (VideoCommon::OcarinaUpscaleOutputs; above 4K only where the card's memory allows it).
+    // Global only; takes effect when the game starts.
+    Setting<u32> oot_upscale_output{linkage, 0, "oot_upscale_output", Category::Renderer};
     // The title screen's and cutscenes' videos (AV1 1080p60): the game's own upscaler (removes
     // banding, 1080p -> 1440p; tensor operations) or a bilinear copy. Automatic: the game's where
     // the GPU runs tensor operations natively (RTX), the copy elsewhere (its emulated matrices

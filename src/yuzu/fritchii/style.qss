@@ -275,3 +275,9 @@ QToolButton#FritchiiTile:hover { background: #1b1b1f; color: #ececf1; }
 QWidget#ConfigureInputPlayer QPushButton { padding: 3px 8px; border-radius: 6px; }
 QWidget#ConfigureInputPlayer QGroupBox { margin-top: 18px; padding: 8px 6px 6px 6px; border-radius: 8px; }
 QWidget#ConfigureInputPlayer QComboBox { padding: 3px 8px; border-radius: 6px; }
+
+/* Good to know (fritchii/known_issues.cpp) */
+QDialog#FritchiiKnownIssues { background: #111113; }
+QDialog#FritchiiKnownIssues QPushButton { min-width: 120px; padding: 9px 22px; border-radius: 8px; }
+QLabel#FritchiiKnownIssuesLead { font-size: 17px; font-weight: 600; color: #ececf1; }
+QLabel#FritchiiKnownIssuesFooter { font-size: 15px; color: #a78bfa; }

@@ -267,7 +267,8 @@ std::string GbText(std::uintmax_t bytes) {
 bool AskToClear(QWidget* parent, std::uintmax_t bytes) {
     const QString title = QObject::tr("Clear old shader caches?");
     const QString lead =
-        QObject::tr("Frees %1. Shaders are prepared again once.").arg(SizeText(bytes));
+        QObject::tr("Frees %1 and can help performance a lot. Shaders are prepared again once.")
+            .arg(SizeText(bytes));
     if (!FritchiiUi::Enabled()) {
         QMessageBox box(QMessageBox::Question, QStringLiteral("Fritchii"), title,
                         QMessageBox::NoButton, parent);

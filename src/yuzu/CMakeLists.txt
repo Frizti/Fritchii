@@ -210,6 +210,8 @@ add_executable(yuzu
     util/controller_navigation.h
     fritchii/cache_cleanup.cpp
     fritchii/cache_cleanup.h
+    fritchii/known_issues.cpp
+    fritchii/known_issues.h
     fritchii/max_resolution.cpp
     fritchii/max_resolution.h
     fritchii/fritchii.qrc

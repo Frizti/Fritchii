@@ -4,13 +4,52 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <optional>
 #include <cstdlib>
 #include <string_view>
 
 #include "common/settings_enums.h"
 
 namespace VideoCommon {
+
+/// OoT's picture this session, for the status bar: the upscaler that really runs and its sizes.
+/// The rasterizer publishes it once when it picks OoT's upscaler (the "Ocarina temporal: output"
+/// log line); empty before that and outside OoT. Backend: 1 the game's own, 2 FSR 3.1, 3 FSR 4,
+/// 4 DLSS. A 0 output means no upscaler (the resolution setting applies).
+struct OcarinaPicture {
+    std::uint32_t backend;
+    std::uint32_t input_height;
+    bool input_up_to; ///< The game's dynamic resolution (Max Resolution off): at most input_height
+    std::uint32_t output_height;
+};
+
+inline std::atomic<std::uint64_t> g_ocarina_picture{0};
+
+inline void PublishOcarinaPicture(std::uint32_t backend, std::uint32_t input_height, bool up_to,
+                                  std::uint32_t output_height) {
+    g_ocarina_picture.store((std::uint64_t{1} << 63) | (std::uint64_t{backend & 0xff} << 48) |
+                                (std::uint64_t{up_to} << 47) |
+                                (std::uint64_t{input_height & 0xffff} << 16) |
+                                std::uint64_t{output_height & 0xffff},
+                            std::memory_order_relaxed);
+}
+
+inline void ClearOcarinaPicture() {
+    g_ocarina_picture.store(0, std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline std::optional<OcarinaPicture> ReadOcarinaPicture() {
+    const std::uint64_t value = g_ocarina_picture.load(std::memory_order_relaxed);
+    if ((value >> 63) == 0) {
+        return std::nullopt;
+    }
+    return OcarinaPicture{static_cast<std::uint32_t>((value >> 48) & 0xff),
+                          static_cast<std::uint32_t>((value >> 16) & 0xffff),
+                          ((value >> 47) & 1) != 0, static_cast<std::uint32_t>(value & 0xffff)};
+}
 
 enum class OcarinaUpscaleBackend { Native, Fsr, Dlss };
 
@@ -80,6 +119,107 @@ constexpr bool OcarinaFsrOutputsGameSize(int mode, OcarinaUpscaleBackend backend
         return false;
     }
     return mode == 1 || (mode == 2 && display_height != 0 && display_height <= 1440);
+}
+
+/// oot_upscale_output: the output heights the player may pick for OoT's DLSS or FSR (docked,
+/// 16:9). 0 = Auto, as before: 4K from Max Resolution's 1440p pass (the game's 1440p picture
+/// with FRITCHII_FSR_OUTPUT), the game's 1440p from its 3/4 pass without Max Resolution.
+inline constexpr std::array<unsigned, 6> OcarinaUpscaleOutputs{1080, 1440, 1800, 2160, 2880, 4320};
+
+constexpr bool OcarinaUpscaleOutputKnown(unsigned height) {
+    for (const unsigned known : OcarinaUpscaleOutputs) {
+        if (known == height) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The 16:9 width of an output height (1800 -> 3200, 4320 -> 7680).
+constexpr unsigned OcarinaOutputWidth(unsigned height) {
+    return height * 16 / 9;
+}
+
+/// Video memory an output above the game's 1440p picture takes, estimated: the upscaler's
+/// output-sized images (FSR 3.1: two RGBA16F histories, the RGBA16F output and a lock mask, 25
+/// bytes a pixel; DLSS and FSR 4 keep similar ones) and the RGBA8 composite with the game's
+/// interface, rounded up to 40 bytes a pixel. 4K ~316 MiB, 2880p ~563 MiB, 8K ~1.24 GiB.
+constexpr unsigned long long OcarinaOutputBytes(unsigned height) {
+    return 40ULL * OcarinaOutputWidth(height) * height;
+}
+
+/// Whether a card whose main video memory heap has `vram` bytes (0 = unknown) takes an output:
+/// up to 4K always (as before); above it when the estimate is at most an eighth of the card
+/// (2880p from 6 GB, 8K from 12 GB), so 8 GB cards keep their room for the game.
+constexpr bool OcarinaUpscaleOutputFits(unsigned height, unsigned long long vram) {
+    return height <= 2160 || vram == 0 || OcarinaOutputBytes(height) * 8 <= vram;
+}
+
+/// oot_upscale_output as the game starts with it, and why (the boot log line).
+struct OcarinaOutputSetting {
+    unsigned height{};   ///< 0 = Auto, else one of OcarinaUpscaleOutputs
+    const char* reason{};
+};
+
+constexpr OcarinaOutputSetting ResolveOcarinaUpscaleOutput(unsigned requested,
+                                                           unsigned long long vram,
+                                                           bool small_card) {
+    if (requested == 0) {
+        return {0, "Auto, as before"};
+    }
+    if (!OcarinaUpscaleOutputKnown(requested)) {
+        return {0, "not one of the offered heights, Auto instead"};
+    }
+    if (requested > 2160 && small_card) {
+        return {2160, "the small card profile is on, 4K instead"};
+    }
+    if (!OcarinaUpscaleOutputFits(requested, vram)) {
+        return {2160, "more than an eighth of this card's video memory, 4K instead"};
+    }
+    return {requested, "picked in the picture menu"};
+}
+
+/// What one replaced pass makes. `native_aa`: the output keeps the scene's size (DLAA, or FSR
+/// at 1x). `big_height`: an output above the game's 1440p picture (4K before), composited with
+/// the game's interface when presented; 0 = none, the upscaler writes into the game's target
+/// at the target's size.
+struct OcarinaPassOutput {
+    bool native_aa{};
+    unsigned big_height{};
+    constexpr bool operator==(const OcarinaPassOutput&) const = default;
+};
+
+/// `output`: oot_upscale_output resolved (0 = Auto). `pass_1440p`: Max Resolution's 1440p pass,
+/// whose target is the game's 1440p picture. `scene_height`: the height the game drew (1440, or
+/// what the DLSS render scale made it). `dlss_native`: the DLSS quality Native (DLAA), which
+/// keeps the scene's size whatever the output. `fsr_game_size`: FRITCHII_FSR_OUTPUT (Auto
+/// only). DLSS and FSR only enlarge, by up to 3x a side (FSR 3.1's range, DLSS Ultra
+/// Performance), so an output at or below the scene is native AA at the scene's size (the
+/// window's scaling takes it down), and one more than 3x the scene drops to the largest offered
+/// height within 3x.
+constexpr OcarinaPassOutput PlanOcarinaPassOutput(unsigned output, bool pass_1440p,
+                                                  unsigned scene_height, bool dlss_native,
+                                                  bool fsr_game_size) {
+    if (dlss_native) {
+        return {true, 0};
+    }
+    if (output == 0) {
+        return {false, pass_1440p && !fsr_game_size ? 2160U : 0U};
+    }
+    if (!pass_1440p) {
+        // The 3/4 pass: its target is 4/3 of the scene (1440p at most).
+        return {output <= 1080, 0};
+    }
+    if (output <= 1440) {
+        return {false, 0};
+    }
+    unsigned big = 0;
+    for (const unsigned height : OcarinaUpscaleOutputs) {
+        if (height > 1440 && height <= output && height <= 3 * scene_height) {
+            big = height;
+        }
+    }
+    return {false, big};
 }
 
 /// FRITCHII_OOT_CAMERA_GUEST (boot, 0 = off): the camera tracker reads vertex uniform slot 3 as
@@ -209,25 +349,26 @@ struct OcarinaExtent {
 /// What the temporal upscaler writes for one frame with the scene at the resolution scale.
 /// `render`: the scene's real size (the scaled size when the scaler scaled it). `target`: the real
 /// size of the game's upscale target. `native_aa`: the DLSS quality "Native" (the output keeps the
-/// render size). `want_4k`: the 1440p pass with the 4K output. DLSS and FSR only enlarge, so a
-/// scene larger than the target is upscaled to its own size (native AA) and the output pass
-/// shrinks the result into the target: supersampling.
+/// render size). `want_4k`: the 1440p pass with the big output (`big`: 4K unless the player
+/// picked another, PlanOcarinaPassOutput). DLSS and FSR only enlarge, so a scene larger than the
+/// target is upscaled to its own size (native AA) and the output pass shrinks the result into
+/// the target: supersampling.
 struct OcarinaScaledOutput {
     OcarinaExtent output;
     bool upscale_4k{};
 };
 
 constexpr OcarinaScaledOutput SelectOcarinaScaledOutput(OcarinaExtent render, OcarinaExtent target,
-                                                        bool native_aa, bool want_4k) {
+                                                        bool native_aa, bool want_4k,
+                                                        OcarinaExtent big = {3840, 2160}) {
     const auto fits = [render](OcarinaExtent output) {
         return render.width <= output.width && render.height <= output.height;
     };
     if (native_aa) {
         return {render, false};
     }
-    constexpr OcarinaExtent uhd{3840, 2160};
-    if (want_4k && fits(uhd)) {
-        return {uhd, true};
+    if (want_4k && fits(big)) {
+        return {big, true};
     }
     return {fits(target) ? target : render, false};
 }

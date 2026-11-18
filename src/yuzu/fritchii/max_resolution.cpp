@@ -66,11 +66,14 @@ QString ShortName(const std::string& device_name) {
     return name.isEmpty() ? QString::fromStdString(device_name) : name;
 }
 
-/// Cards slower than about an RTX 3060 Ti that can still have 8 GB or more.
+/// Cards slower than about an RTX 3070 / RX 6800 that can still have 8 GB or more (owner
+/// 2026-11-18: the bar a notch above the RTX 3060 Ti / RX 6700 XT first used).
 bool EntryLevel(const QString& name) {
     static const QRegularExpression pattern(
-        QStringLiteral(R"(\b(GTX|MX)\s*\d|\bRTX\s*([2-5]050|2060)\b|\bRX\s*[45]\d\d\b|)"
-                       R"(\bRX\s*(5500|5600|6400|6500)\b|\bVega\b|\bR[579]\s|\bArc\s*A3\d\d)"),
+        QStringLiteral(R"(\b(GTX|MX)\s*\d|\bRTX\s*([2-5]050|2060|3060)\b|)"
+                       R"(\bRTX\s*20[78]0\b(?!\s*Ti)|\bRTX\s*4060\b(?!\s*Ti)|\bRX\s*[45]\d\d\b|)"
+                       R"(\bRX\s*(5500|5600|5700|6400|6500|6600|6650|6700|6750|7600)\b|)"
+                       R"(\bVega\b|\bR[579]\s|\bArc\s*(A[357]\d\d|B5\d\d))"),
         QRegularExpression::CaseInsensitiveOption);
     return pattern.match(name).hasMatch();
 }
@@ -148,8 +151,8 @@ bool AskToTurnOn(QWidget* parent, const QString& card_line) {
     const QString title = QObject::tr("Max Resolution");
     const QStringList on_lines{
         QObject::tr("Sharper (1440p)"),
-        QObject::tr("Needed for 4K with DLSS"),
-        QObject::tr("Needs about an RTX 3060 Ti / RX 6700 XT or better (8 GB+)"),
+        QObject::tr("Needed for 4K and higher with DLSS or FSR"),
+        QObject::tr("Needs about an RTX 3070 / RX 6800 or better (8 GB+)"),
     };
     const QStringList off_lines{
         QObject::tr("Like the Switch 2 (up to 1080p)"),
@@ -160,8 +163,8 @@ bool AskToTurnOn(QWidget* parent, const QString& card_line) {
 
     if (!FritchiiUi::Enabled()) {
         // The same words as the two sides of the Fritchii window, as two sentences.
-        QString text = QObject::tr("On: sharper (1440p), needed for 4K with DLSS. Needs about an "
-                                   "RTX 3060 Ti / RX 6700 XT or better (8 GB+).") +
+        QString text = QObject::tr("On: sharper (1440p), needed for 4K and higher with DLSS or FSR. Needs about an "
+                                   "RTX 3070 / RX 6800 or better (8 GB+).") +
                        QStringLiteral("\n") +
                        QObject::tr("Off: like the Switch 2 (up to 1080p), more fps on weaker PCs.");
         if (!card_line.isEmpty()) {

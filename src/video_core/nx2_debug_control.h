@@ -146,6 +146,12 @@ inline std::atomic<int> g_report_wait{-1};
 inline std::atomic<int> g_occl_lean{-1};
 /// EDEN_NX2_FEED_MEMORY_OVERLAY: docs/fritchii/switches.md.
 inline std::atomic<int> g_feed_memory_overlay{-1};
+/// FRITCHII_FEED_REARM: docs/fritchii/switches.md.
+inline std::atomic<int> g_feed_rearm{-1};
+/// FRITCHII_TEST_FEED_OFF (test only): docs/fritchii/switches.md.
+inline std::atomic<int> g_test_feed_off{-1};
+/// FRITCHII_TEST_SPLIT_RESTART (test only): docs/fritchii/switches.md.
+inline std::atomic<int> g_test_split_restart{-1};
 /// EDEN_NX2_QMD_3D_PATCH: docs/fritchii/switches.md.
 inline std::atomic<int> g_qmd_3d_patch{-1};
 /// FRITCHII_MEMSTAGE_THREAD: docs/fritchii/switches.md.

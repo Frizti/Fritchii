@@ -426,7 +426,22 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         LOG_INFO(HW_GPU, "GPU thread split: stopped, the accuracy settings need the caches on the front");
         return;
     }
-    if (active || !allowed) {
+    if (active) {
+        // FRITCHII_TEST_SPLIT_RESTART (test only): the accuracy change's stop above, every N
+        // seconds of a session; the next loop starts a new session (ring positions from 0).
+        if (const int every = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_test_split_restart, "FRITCHII_TEST_SPLIT_RESTART", 0);
+            every > 0 && std::chrono::steady_clock::now() - session_started >=
+                             std::chrono::seconds{every}) [[unlikely]] {
+            Drain();
+            Stop();
+            LOG_WARNING(HW_GPU, "GPU thread split: stopped for FRITCHII_TEST_SPLIT_RESTART={} "
+                                "(test), a new session starts now",
+                        every);
+        }
+        return;
+    }
+    if (!allowed) {
         return;
     }
     system = &system_;
@@ -452,6 +467,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     two_positions = OneFollower::On();
     ring = std::make_unique<u64[]>(RingWords);
     ++session;
+    session_started = std::chrono::steady_clock::now();
     // EDEN_NX2_RUNAHEAD: Ocarina of Time only.
     Runahead::Reset();
     Runahead::SetProgramId(system_.GetApplicationProcessProgramID());

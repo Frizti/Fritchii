@@ -79,6 +79,11 @@ private:
     void UpdateDeviceSelection(int device);
     void UpdateAmdFsr4Visibility();
     void UpdateDlssVisibility();
+    /// The selected GPU can run NVIDIA DLSS (Vulkan on an NVIDIA card).
+    [[nodiscard]] bool DlssDevice() const;
+    /// DLSS would upscale: its checkbox on (per game: the global value) on a DLSS device. A saved
+    /// "on" from another PC or build does nothing on AMD or Intel, so it shows nothing there.
+    [[nodiscard]] bool DlssOn() const;
     /// Fritchii builds: OoT's real sizes in the DLSS quality names, and the resolution's tooltip
     /// while DLSS or FSR sets OoT's resolution.
     void SetupOcarinaUpscalerLabels();
@@ -169,4 +174,6 @@ private:
     bool max_resolution_choice{true};      ///< OoT's Max Resolution add-on, saved on Apply
     bool max_resolution_saved{true};       ///< ...as it was when the page opened
     bool max_resolution_when_off{true};    ///< Its value when the upscaler goes back to off
+    u32 upscale_output_choice{};           ///< oot_upscale_output, saved on Apply (0 = Auto)
+    u32 upscale_output_saved{};            ///< ...as it was when the page opened
 };

@@ -1489,6 +1489,8 @@ private:
     /// guest memory stale (the GPU's data is gone). Its whole pages are marked here and kept
     /// tracked, so CPU writes, unmaps and write-backs clear them. An image made entirely on marked
     /// pages starts without an upload: the upload would only copy stale bytes the GPU overwrites.
+    /// FRITCHII_LOST_KEEP: not an image the CPU wrote whole since (its GPU data was void already,
+    /// the guest bytes are newer), nor pages a newer write-back holds.
     void MarkStale(const ImageBase& image);
     void ClearStale(DAddr addr, size_t size);
     void ClearStaleImage(const ImageBase& image);
@@ -1547,6 +1549,7 @@ private:
         u32 height;
         u8 reason;   ///< DeleteReason, or LostReasonRelocate
         u8 guard;    ///< The image's relocation_guard_noted
+        u8 why;      ///< LostWhy: why no write-back saved it
         u64 shape_key; ///< RelocationShapeKey (a relocation's loss guards the shape)
     };
     static constexpr u8 LostReasonRelocate = 0x40;
@@ -1555,6 +1558,17 @@ private:
     size_t stale_drop_next{};
     size_t stale_drop_count{};
     bool marking_relocation{};
+    /// FRITCHII_LOST_KEEP (live, default 1): why a GPU-written image went without a write-back.
+    enum LostWhy : u8 {
+        LostWhyNone = 0,     ///< The drop path has no write-back (join, unmap, relocation, ...)
+        LostWhyOverCap = 1,  ///< Over FRITCHII_LOST_WRITEBACK's size cap
+        LostWhyRefused = 2,  ///< A newer write-back holds some of its bytes
+        LostWhyNoCopy = 3,   ///< Not downloadable (MSAA, trimmed levels, unsafe copy)
+        LostWhyOff = 4,      ///< FRITCHII_LOST_WRITEBACK=0, or no queue (OpenGL)
+        LostWhyBudget = 5,   ///< Learned or guarded, but past FRITCHII_LOST_KEEP's byte budget
+        LostWhyLanding = 6,  ///< Refused at the landing (newer bytes landed over it since)
+    };
+    static constexpr size_t LostWhyCount = 7;
     struct LostContentStats {
         u64 made_skipped{};      ///< Images whose upload the stale skip dropped
         u64 made_zeroed{};       ///< Of them, cleared to zero (FRITCHII_STALE_ZERO)
@@ -1575,9 +1589,41 @@ private:
         std::array<u64, LostPathCount> wb_refused{};
         std::array<u64, LostPathCount> wb_kept{};
         std::array<u64, LostPathCount> wb_over_cap{};
+        /// FRITCHII_LOST_KEEP: over the size cap but written back all the same, as the memory
+        /// was read after an earlier loss (learned) or the image was read in a later frame
+        /// (guarded); over the cap with such a reason but past the byte budget (dropped).
+        std::array<u64, LostPathCount> wb_learned{};
+        std::array<u64, LostPathCount> wb_guarded{};
+        std::array<u64, LostPathCount> wb_over_budget{};
+        u64 wb_cpu_written{};    ///< Not written back: the CPU wrote it since (guest bytes newer)
+        /// Of the sampled, by LostWhy of the drop (0 = no write-back tried on that path).
+        std::array<u64, LostWhyCount> sampled_by_why{};
+        u64 learned_new{};       ///< Ranges learned (a sampled loss)
+        u64 stale_cpu_skipped{}; ///< Drops not marked stale: the CPU wrote the image since
+        u64 stale_pages_kept{};  ///< Pages not marked stale: a newer write-back holds them
         u64 logged{};
+        u64 window_logged{};     ///< "Lost contents sampled" lines in this 10 s window
         u64 last_log_ns{};
     } lost_stats;
+    /// FRITCHII_LOST_KEEP: memory ranges sampled with lost contents (the reader's range). The
+    /// game reads that memory again after the image there went cold (OoT's exposure and HUD
+    /// buffers; a one-frame black flash when it read zeros), so a later drop over one is written
+    /// back whatever its size, under a byte budget. Ring of LostReadRing, oldest replaced.
+    struct LostReadRange {
+        DAddr begin;
+        DAddr end;
+    };
+    static constexpr size_t LostReadRing = 128;
+    std::array<LostReadRange, LostReadRing> lost_read_ranges{};
+    size_t lost_read_next{};
+    size_t lost_read_count{};
+    /// FRITCHII_LOST_KEEP's byte budget for write-backs over the size cap (token bucket, MiB/s).
+    u64 lost_keep_tokens{};
+    u64 lost_keep_refill_ns{};
+    [[nodiscard]] bool OverlapsLostRead(DAddr addr, u64 size) const;
+    void LearnLostRead(DAddr addr, u64 size);
+    /// Takes `bytes` of the budget; guarded (not learned) images leave half of it to learned ones.
+    bool TakeLostKeepBudget(u64 bytes, bool learned, int keep);
     /// The drop that left [addr, addr + size) stale, newest first (nullptr: none recorded).
     [[nodiscard]] const StaleDrop* FindStaleDrop(DAddr addr, size_t size) const;
     void RecordStaleDrop(const ImageBase& image);
@@ -1606,6 +1652,7 @@ private:
     static constexpr size_t RecentWritebackRing = 256;
     std::array<RecentWriteback, RecentWritebackRing> recent_writebacks{};
     size_t recent_writeback_next{};
+    u64 recent_writeback_newest{}; ///< The newest modification in the ring (MarkStale's early out)
     void NoteWriteback(const ImageBase& image);
     [[nodiscard]] bool NewerWritebackOver(const ImageBase& image) const;
 

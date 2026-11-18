@@ -623,6 +623,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
     // FRITCHII_LOCK_CENSUS: the two cache locks by name (before any other thread uses them).
+    // A new session: OoT's picture is published again when its upscaler is picked.
+    VideoCommon::ClearOcarinaPicture();
     buffer_cache.mutex.SetCensusName("buffer cache");
     texture_cache.mutex.SetCensusName("texture cache");
     scheduler.SetQueryCache(query_cache);
@@ -8583,6 +8585,45 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
         !Fsr3Upscaler::IsSupported(device)) {
         LOG_WARNING(Render_Vulkan, "Ocarina FSR 3.1 unsupported on this device; using native upscale");
     }
+    if (*oot_backend == VideoCommon::OcarinaUpscaleBackend::Native) {
+        // No upscaler: the status bar names the resolution setting's size.
+        VideoCommon::PublishOcarinaPicture(1, 0, false, 0);
+    }
+    if (*oot_backend != VideoCommon::OcarinaUpscaleBackend::Native) {
+        // The output size for the session (oot_upscale_output), and why.
+        u64 vram = 0;
+        const auto output = OcarinaUpscaleOutput(device, &vram);
+        oot_output_height = output.height;
+        const bool max_resolution = Settings::OcarinaMaxResolutionOn();
+        const bool fsr_game_size = OcarinaFsrOutputsGameSize(*oot_backend);
+        const auto plan = VideoCommon::PlanOcarinaPassOutput(
+            output.height, max_resolution,
+            Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale()), false,
+            fsr_game_size);
+        const u32 shown = plan.big_height != 0 ? plan.big_height
+                          : plan.native_aa     ? 1080U
+                                               : 1440U;
+        // The status bar: what runs, from what to what (DLSS Native keeps the game's size).
+        const bool dlss_backend = *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss;
+        const u32 picture_backend =
+            dlss_backend ? 4U
+            : Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::Fsr4
+                ? 3U
+                : 2U;
+        const u32 input_height = max_resolution ? 1440U : 1080U;
+        VideoCommon::PublishOcarinaPicture(picture_backend, input_height, !max_resolution,
+                                           plan.native_aa ? input_height : shown);
+        LOG_INFO(Render_Vulkan,
+                 "Ocarina temporal: output {}x{} with Max Resolution {} (oot_upscale_output={}: "
+                 "{}; {} MiB video memory{}{}){}",
+                 VideoCommon::OcarinaOutputWidth(shown), shown, max_resolution ? "on" : "off",
+                 Settings::values.oot_upscale_output.GetValue(), output.reason, vram >> 20,
+                 plan.native_aa ? ", 1x anti-aliasing at the game's size, at most 1080p" : "",
+                 output.height == 0 && fsr_game_size ? ", FRITCHII_FSR_OUTPUT" : "",
+                 *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss
+                     ? "; DLSS Native keeps the scene's size"
+                     : "");
+    }
     return *oot_backend != VideoCommon::OcarinaUpscaleBackend::Native;
 }
 
@@ -8996,9 +9037,15 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     const bool native_resolution =
         oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
         Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
-    // FRITCHII_FSR_OUTPUT: FSR may draw the game's own 1440p picture instead of a 4K one.
-    const bool upscale_4k =
-        pass_1440p && !native_resolution && !OcarinaFsrOutputsGameSize(*oot_backend);
+    // The output size: oot_upscale_output (Auto: 4K from the 1440p pass, the target's size from
+    // the 3/4 pass; FRITCHII_FSR_OUTPUT may make FSR draw the game's own 1440p picture). Above
+    // 1440p the output is composited with the game's interface when presented ("4K" below).
+    const auto output_plan = VideoCommon::PlanOcarinaPassOutput(
+        oot_output_height, pass_1440p, Settings::OcarinaRenderHeightFor(render_scale),
+        native_resolution, OcarinaFsrOutputsGameSize(*oot_backend));
+    const bool upscale_4k = output_plan.big_height != 0;
+    const VkExtent2D big_extent{VideoCommon::OcarinaOutputWidth(output_plan.big_height),
+                                output_plan.big_height};
     const auto read_tic = [this](u32 index) -> std::optional<Tegra::Texture::TICEntry> {
         const auto& table = kepler_compute->regs.tic;
         using Entry = Tegra::Texture::TICEntry;
@@ -9127,9 +9174,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     // game's sizes.
     VkExtent2D render_extent = extent;
     VkExtent2D target_extent{target.size.width, target.size.height};
-    VkExtent2D output_extent = native_resolution ? extent
-                               : upscale_4k      ? VkExtent2D{3840, 2160}
-                                                 : target_extent;
+    VkExtent2D output_extent = output_plan.native_aa ? extent
+                               : upscale_4k          ? big_extent
+                                                     : target_extent;
     bool use_4k = upscale_4k;
     if (scaled_mode) {
         // The scene's colour, depth and the motion made from that depth must share one size;
@@ -9154,7 +9201,8 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         // The 4K output reads the target back at 2560x1440 (SaveSceneReference).
         const auto choice = VideoCommon::SelectOcarinaScaledOutput(
             {color_real.width, color_real.height}, {target_extent.width, target_extent.height},
-            native_resolution, upscale_4k && !target.IsRescaled());
+            output_plan.native_aa, upscale_4k && !target.IsRescaled(),
+            {big_extent.width, big_extent.height});
         render_extent = color_real;
         output_extent = {choice.output.width, choice.output.height};
         use_4k = choice.upscale_4k;
@@ -10147,8 +10195,8 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
         oot_live_dlss->Composite4k(info.image_view, render_trace_frame);
         info.image = oot_live_dlss->CompositedImage();
         info.image_view = oot_live_dlss->CompositedView();
-        info.scaled_width = 3840;
-        info.scaled_height = 2160;
+        info.scaled_width = oot_live_dlss->CompositedExtent().width;
+        info.scaled_height = oot_live_dlss->CompositedExtent().height;
         info.already_upscaled = true;
     } catch (const vk::Exception& error) {
         LOG_WARNING(Render_Vulkan, "Ocarina temporal 4K presentation unavailable: {}", error.what());

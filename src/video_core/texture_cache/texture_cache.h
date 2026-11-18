@@ -582,6 +582,7 @@ void TextureCache<P>::LandCollectDownloads() {
                     ++lost_stats.wb_refused[entry.lost_path];
                     DropCollectDownload(i);
                     ++collect_stats.dropped_written;
+                    image.lost_drop_why = LostWhyLanding;
                     MarkStale(image); // before UntrackImage (see MarkStale)
                     if (True(image.flags & ImageFlagBits::Tracked)) {
                         UntrackImage(image, image_id);
@@ -654,11 +655,21 @@ void TextureCache<P>::UpdateStaleTracking(u64 run_begin, u64 run_pages, s32 delt
 
 template <class P>
 void TextureCache<P>::MarkStale(const ImageBase& image) {
-    if (True(image.flags & ImageFlagBits::GpuModified)) {
-        RecordStaleDrop(image); // the lost contents counter's attribution
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        return;
     }
-    if (!TcSkipStale() || False(image.flags & ImageFlagBits::GpuModified) ||
-        True(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::Unbacked)) ||
+    const bool keep = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
+                                                       "FRITCHII_LOST_KEEP", 1) > 0;
+    // FRITCHII_LOST_KEEP: the CPU wrote it since the GPU did (all of it dirty: its next use would
+    // upload the guest bytes over the GPU's). Nothing GPU-only is lost; marked, the CPU's bytes
+    // were skipped as stale and the next image there showed zeros.
+    if (keep && True(image.flags & ImageFlagBits::CpuModified) && image.dirty_layers.empty() &&
+        image.dirty_ranges.empty()) {
+        ++lost_stats.stale_cpu_skipped;
+        return;
+    }
+    RecordStaleDrop(image); // the lost contents counter's attribution
+    if (!TcSkipStale() || True(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::Unbacked)) ||
         image.guest_size_bytes == 0) {
         return;
     }
@@ -672,6 +683,26 @@ void TextureCache<P>::MarkStale(const ImageBase& image) {
     if (stale_bits.size() * 64 < end) {
         stale_bits.resize((end + 63) / 64);
     }
+    // FRITCHII_LOST_KEEP: pages a newer image's write-back landed on hold bytes newer than this
+    // image's (the refused write-backs: OoT draws HUD masks of several sizes at one address, the
+    // newest landed first, the older one's drop marked it all stale and the next one there was
+    // zero). Left unmarked, as pages shared with other data are.
+    boost::container::small_vector<std::pair<u64, u64>, 8> newer_pages;
+    if (keep && recent_writeback_newest > image.modification_tick) {
+        for (const RecentWriteback& w : recent_writebacks) {
+            if (w.size != 0 && w.modification > image.modification_tick &&
+                w.cpu_addr < image.cpu_addr + image.guest_size_bytes &&
+                image.cpu_addr < w.cpu_addr + w.size) {
+                newer_pages.emplace_back(w.cpu_addr >> STALE_PAGE_BITS,
+                                         (w.cpu_addr + w.size + page_size - 1) >> STALE_PAGE_BITS);
+            }
+        }
+    }
+    const auto newer = [&newer_pages](u64 page) {
+        return std::ranges::any_of(newer_pages, [page](const std::pair<u64, u64>& range) {
+            return range.first <= page && page < range.second;
+        });
+    };
     // Tracked from here on so CPU writes reach WriteMemory. Marking before the image's own
     // tracking goes keeps the pages' write protection from switching off and on again.
     u64 run_begin = 0;
@@ -679,6 +710,12 @@ void TextureCache<P>::MarkStale(const ImageBase& image) {
     for (u64 page = first; page < end; ++page) {
         u64& word = stale_bits[page / 64];
         const u64 bit = u64{1} << (page % 64);
+        if (!newer_pages.empty() && (word & bit) == 0 && newer(page)) {
+            ++lost_stats.stale_pages_kept;
+            UpdateStaleTracking(run_begin, run_pages, 1);
+            run_pages = 0;
+            continue;
+        }
         if ((word & bit) != 0) {
             UpdateStaleTracking(run_begin, run_pages, 1);
             run_pages = 0;
@@ -832,6 +869,7 @@ void TextureCache<P>::RecordStaleDrop(const ImageBase& image) {
         .height = image.info.size.height,
         .reason = marking_relocation ? LostReasonRelocate : static_cast<u8>(delete_reason),
         .guard = image.relocation_guard_noted,
+        .why = image.lost_drop_why,
         .shape_key = RelocationShapeKey(image.info),
     };
     stale_drop_next = (stale_drop_next + 1) % StaleDropRing;
@@ -890,15 +928,31 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
         relocation_shapes[drop->shape_key].guard |= GuardSampled;
         ++s.relocation_guards;
     }
-    if (s.logged < 40) {
+    const u8 why = drop != nullptr
+                       ? (std::min)(drop->why, static_cast<u8>(LostWhyCount - 1))
+                       : static_cast<u8>(LostWhyNone);
+    ++s.sampled_by_why[why];
+    // FRITCHII_LOST_KEEP: this memory is read after going cold; the next drop over it is written
+    // back whatever its size (relocation has its guards instead).
+    if (reason != 8 && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
+                                                        "FRITCHII_LOST_KEEP", 1) > 0) {
+        LearnLostRead(image.cpu_addr, image.guest_size_bytes);
+    }
+    // The first 40 of the session, then 2 per 10 s window (the flashes a tester reports come
+    // late in long sessions).
+    if (s.logged < 40 || s.window_logged < 2) {
         ++s.logged;
+        ++s.window_logged;
         static constexpr std::array<const char*, 10> names{
             "other",       "garbage collect", "cold sweep",       "unmap",      "join",
             "slot retire", "unmap sweep",     "superseded sweep", "relocation", "not recorded"};
+        static constexpr std::array<const char*, LostWhyCount> whys{
+            "no write-back on that path", "over the size cap", "refused (newer write-back)",
+            "not downloadable", "write-back off", "over the keep budget", "refused at landing"};
         LOG_WARNING(HW_GPU,
                     "Lost contents sampled: format {} {}x{} levels {} at {:#x} ({} KiB), {}{}{}; "
                     "the memory's GPU data was dropped by: {} (format {} {}x{} at {:#x}, {} "
-                    "frames ago, guard {:#x})",
+                    "frames ago, guard {:#x}, {})",
                     static_cast<u32>(image.info.format), image.info.size.width,
                     image.info.size.height, image.info.resources.levels, image.gpu_addr,
                     image.guest_size_bytes >> 10,
@@ -907,8 +961,64 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
                     (bits & LostDrawn) != 0 ? ", drawn into without a full clear" : ", not drawn into",
                     names[reason], drop ? drop->format : 0u, drop ? drop->width : 0u,
                     drop ? drop->height : 0u, drop ? drop->gpu_addr : GPUVAddr{0},
-                    drop ? frame_tick - drop->frame : 0, drop ? drop->guard : u8{0});
+                    drop ? frame_tick - drop->frame : 0, drop ? drop->guard : u8{0}, whys[why]);
     }
+}
+
+template <class P>
+bool TextureCache<P>::OverlapsLostRead(DAddr addr, u64 size) const {
+    for (size_t i = 0; i < lost_read_count; ++i) {
+        const LostReadRange& range = lost_read_ranges[i];
+        if (range.begin < addr + size && addr < range.end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
+void TextureCache<P>::LearnLostRead(DAddr addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    for (size_t i = 0; i < lost_read_count; ++i) {
+        const LostReadRange& range = lost_read_ranges[i];
+        if (range.begin <= addr && addr + size <= range.end) {
+            return; // known
+        }
+    }
+    lost_read_ranges[lost_read_next] = LostReadRange{addr, addr + size};
+    lost_read_next = (lost_read_next + 1) % LostReadRing;
+    lost_read_count = (std::min)(lost_read_count + 1, LostReadRing);
+    ++lost_stats.learned_new;
+}
+
+template <class P>
+bool TextureCache<P>::TakeLostKeepBudget(u64 bytes, bool learned, int keep) {
+    // N MiB a second (1 = 32), up to a second's worth saved. 32 MiB/s is ~1/20 of what
+    // FRITCHII_LOST_WRITEBACK=1 wrote back in the market (-3 fps there), and only memory with a
+    // reason is in it.
+    const u64 rate = u64{keep > 1 ? (std::min)(static_cast<u32>(keep), 4096U) : 32U} << 20;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (lost_keep_refill_ns == 0) {
+        lost_keep_tokens = rate;
+        lost_keep_refill_ns = now;
+    } else if (now > lost_keep_refill_ns) {
+        // At most 2^32 * 10^9 < 2^62.
+        const u64 elapsed = (std::min<u64>)(now - lost_keep_refill_ns, 1'000'000'000);
+        const u64 refill = rate * elapsed / 1'000'000'000;
+        if (refill != 0) {
+            lost_keep_tokens = (std::min)(rate, lost_keep_tokens + refill);
+            lost_keep_refill_ns = now; // else the remainder keeps adding up
+        }
+    }
+    // Guarded images (read in a later frame, not yet seen lost) leave half to learned memory.
+    const u64 floor = learned ? 0 : rate / 2;
+    if (lost_keep_tokens < floor + bytes) {
+        return false;
+    }
+    lost_keep_tokens -= bytes;
+    return true;
 }
 
 template <class P>
@@ -929,18 +1039,36 @@ void TextureCache<P>::LogLostContents() {
         wb_any += s.wb_queued[i] + s.wb_landed[i] + s.wb_refused[i] + s.wb_kept[i] +
                   s.wb_over_cap[i];
     }
-    if (s.made_skipped + s.made_uploaded + sampled + wb_any != 0) {
+    if (s.made_skipped + s.made_uploaded + sampled + wb_any + s.stale_cpu_skipped +
+            s.stale_pages_kept + s.wb_cpu_written !=
+        0) {
         const auto& r = s.sampled_by_reason;
         // queued/landed (MiB) refused R kept K over cap C, per path.
         std::string wb;
         static constexpr std::array<const char*, LostPathCount> paths{
             "", "collector", "cold sweep", "superseded sweep", "slot retire"};
         for (size_t i = 1; i < LostPathCount; ++i) {
-            wb += fmt::format("{}{} {}/{} ({:.1f} MiB) refused {} kept {} over cap {}",
+            wb += fmt::format("{}{} {}/{} ({:.1f} MiB) refused {} kept {} over cap {} (written "
+                              "back all the same: learned {}, guarded {}; over budget {})",
                               i == 1 ? "" : "; ", paths[i], s.wb_queued[i], s.wb_landed[i],
                               static_cast<double>(s.wb_landed_bytes[i]) / (1024.0 * 1024.0),
-                              s.wb_refused[i], s.wb_kept[i], s.wb_over_cap[i]);
+                              s.wb_refused[i], s.wb_kept[i], s.wb_over_cap[i], s.wb_learned[i],
+                              s.wb_guarded[i], s.wb_over_budget[i]);
         }
+        // FRITCHII_LOST_KEEP: why the sampled ones' drops had no write-back (over cap, refused
+        // and over budget are the ones it works on: they must stay near 0 with it on).
+        const auto& y = s.sampled_by_why;
+        wb += fmt::format(
+            "; FRITCHII_LOST_KEEP={}: sampled ones' drops without a write-back because: no "
+            "write-back on that path {}, over cap {}, refused {}, not downloadable {}, off {}, "
+            "over budget {}, refused at landing {}; learned ranges {} (+{}), pages kept from "
+            "stale under newer write-backs {}, CPU-written images not marked stale {} (not "
+            "written back {})",
+            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
+                                             "FRITCHII_LOST_KEEP", 1),
+            y[LostWhyNone], y[LostWhyOverCap], y[LostWhyRefused], y[LostWhyNoCopy], y[LostWhyOff],
+            y[LostWhyBudget], y[LostWhyLanding], lost_read_count, s.learned_new,
+            s.stale_pages_kept, s.stale_cpu_skipped, s.wb_cpu_written);
         LOG_INFO(HW_GPU,
                  "Lost contents in 10 s (FRITCHII_STALE_ZERO={}, FRITCHII_LOST_WRITEBACK={}): "
                  "images made over memory whose GPU data was dropped: {} upload skipped ({} "
@@ -971,24 +1099,69 @@ auto TextureCache<P>::QueueLostWriteback(ImageId image_id, Image& image, u8 path
     // 1 (default): every image; N > 1: only images up to N KiB (larger ones dropped as before).
     const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
                                                       "FRITCHII_LOST_WRITEBACK", 1024);
-    if (mode <= 0 || False(image.flags & ImageFlagBits::GpuModified) ||
-        True(image.flags & ImageFlagBits::CollectPending) || !IsDownloadable(image)) {
+    const int keep = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
+                                                      "FRITCHII_LOST_KEEP", 1);
+    if (False(image.flags & ImageFlagBits::GpuModified) ||
+        True(image.flags & ImageFlagBits::CollectPending)) {
+        return LostWriteback::Drop;
+    }
+    LostContentStats& s = lost_stats;
+    // FRITCHII_LOST_KEEP: the CPU wrote all of it since the GPU did: the guest bytes are the
+    // newer ones (MarkStale leaves them unmarked), and a write-back would land the GPU's older
+    // bytes over them.
+    if (keep > 0 && True(image.flags & ImageFlagBits::CpuModified) &&
+        image.dirty_layers.empty() && image.dirty_ranges.empty()) {
+        ++s.wb_cpu_written;
+        return LostWriteback::Drop;
+    }
+    if (mode <= 0) {
+        image.lost_drop_why = LostWhyOff;
+        return LostWriteback::Drop;
+    }
+    if (!IsDownloadable(image)) {
+        image.lost_drop_why = LostWhyNoCopy;
         return LostWriteback::Drop;
     }
     if constexpr (!requires { runtime.CurrentTick(); }) {
+        image.lost_drop_why = LostWhyOff;
         return LostWriteback::Drop; // no queue (OpenGL)
     } else {
-        LostContentStats& s = lost_stats;
-        if (mode > 1 && image.guest_size_bytes > u64{static_cast<u32>(mode)} * 1024) {
-            ++s.wb_over_cap[path];
-            return LostWriteback::Drop;
-        }
         // Bytes a newer image already wrote back: landing this one would put older bytes there.
-        if (NewerWritebackOver(image)) {
-            ++s.wb_refused[path];
-            return LostWriteback::Drop;
+        // (Before the size cap: a refused image costs no budget.)
+        const bool over_cap =
+            mode > 1 && image.guest_size_bytes > u64{static_cast<u32>(mode)} * 1024;
+        if (!over_cap || keep > 0) {
+            if (NewerWritebackOver(image)) {
+                ++s.wb_refused[path];
+                image.lost_drop_why = LostWhyRefused;
+                return LostWriteback::Drop;
+            }
+        }
+        // FRITCHII_LOST_KEEP: over the cap, but memory read after an earlier loss there
+        // (learned) or an image read in a later frame than its write (guarded) is written back
+        // all the same, within the byte budget.
+        u64 budget_taken = 0;
+        if (over_cap) {
+            ++s.wb_over_cap[path];
+            const bool learned =
+                keep > 0 && OverlapsLostRead(image.cpu_addr, image.guest_size_bytes);
+            const bool guarded =
+                keep > 0 && (image.relocation_guard_noted &
+                             (GuardSampled | GuardLoaded | GuardCpuRead)) != 0;
+            if (!learned && !guarded) {
+                image.lost_drop_why = LostWhyOverCap;
+                return LostWriteback::Drop;
+            }
+            if (!TakeLostKeepBudget(image.guest_size_bytes, learned, keep)) {
+                ++s.wb_over_budget[path];
+                image.lost_drop_why = LostWhyBudget;
+                return LostWriteback::Drop;
+            }
+            budget_taken = image.guest_size_bytes;
+            ++(learned ? s.wb_learned[path] : s.wb_guarded[path]);
         }
         if (!QueueCollectDownload(image_id)) {
+            lost_keep_tokens += budget_taken; // not spent
             ++s.wb_kept[path];
             return LostWriteback::Keep;
         }
@@ -1006,6 +1179,8 @@ void TextureCache<P>::NoteWriteback(const ImageBase& image) {
         .modification = image.modification_tick,
     };
     recent_writeback_next = (recent_writeback_next + 1) % RecentWritebackRing;
+    // Only grows: an entry the ring dropped leaves it high, which costs MarkStale a scan.
+    recent_writeback_newest = (std::max)(recent_writeback_newest, image.modification_tick);
 }
 
 template <class P>

@@ -220,7 +220,7 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     {"FRITCHII_GATHER_ONE_LOCK", "1"},    {"FRITCHII_GATHER_EMPTY_TEST", "1"},
     {"FRITCHII_FENCE_COMMIT_FAST", "1"},  {"FRITCHII_FRONT_RAN_READS", "1"},
     {"FRITCHII_VERTEX_INPUT_COMPACT", "1"}, {"FRITCHII_BIND_ADDR_MEMO", "1"},
-    {"FRITCHII_WORKER_SPIN", "80"},       {"FRITCHII_CB_WORDS_BLOCK", "1"},
+    {"FRITCHII_WORKER_SPIN", "20"},       {"FRITCHII_CB_WORDS_BLOCK", "1"},
     // 2026-11-14: uniform bank pages nobody flagged as written are not compared again. Market
     // toggle 61.3 -> 62.5 fps, 1% low 43.5 -> 45.5, 0.1% low 32.8 -> 37.4; FLAGGED=2 verify: never
     // flagged, recheck and CPU-modified 0 in all 29 windows (the other counts are timed races).

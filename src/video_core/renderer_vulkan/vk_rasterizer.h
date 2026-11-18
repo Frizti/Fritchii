@@ -598,6 +598,8 @@ private:
     /// AMD FSR 4 takes OoT's scene without camera jitter (Fsr4Upscaler::RunsUnjittered).
     mutable bool oot_fsr4_unjittered{};
     mutable bool oot_dlss_jitter{}; ///< DLSS gets the camera jitter (set with oot_backend)
+    /// oot_upscale_output for this session (set with oot_backend): 0 = Auto (as before).
+    mutable u32 oot_output_height{};
     bool oot_resolution_checked{};
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};

@@ -172,6 +172,9 @@ struct ImageBase {
     /// Made where a GPU-written image was dropped without a write-back (TextureCache's lost
     /// contents counter): bits of TextureCache::LostBits, 0 once counted or overwritten whole.
     u8 lost_contents = 0;
+    /// Why a drop path deleted it without a write-back (TextureCache::LostWhy), for the lost
+    /// contents counter's attribution; 0 = no write-back was tried.
+    u8 lost_drop_why = 0;
 
     /// Unmapped images (TextureCache::UnmapGPUMemory): the frame + 1 at which an unmap of its GPU
     /// memory flagged it Remapped (0 = none did, or it was found again since) and its device
