@@ -848,8 +848,15 @@ bool OneFollowerDraw::AsyncTailFits(const Maxwell3D& engine,
     if (!VideoCommon::ESplit::g_async || pipeline == nullptr) {
         return false; // S1, or no rule 3 pipeline (the facts table's lookup reads the engine)
     }
-    if (pipeline->IsEmulatedMesh()) {
-        return false; // FRITCHII_ONEF_MESH_EMU: its fill raises E1's vertex buffer flags (lockstep)
+    // FRITCHII_ONEF_MESH_EMU: an emulated mesh draw fits too. Its fill raises VertexBuffer0..31
+    // on the cache's inputs (E2's view flags when async: E2 owns the buffer flags in the split).
+    // FRITCHII_ONEF_MESH_EMU_ASYNC=0: lockstep tails for them.
+    static const bool mesh_async = [] {
+        const char* const value = std::getenv("FRITCHII_ONEF_MESH_EMU_ASYNC");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!mesh_async && pipeline->IsEmulatedMesh()) {
+        return false;
     }
     const MemStage::DrawFacts pipeline_facts = pipeline->MemFacts();
     if (pipeline_facts.has_texel_buffers || pipeline_facts.stage_infos == nullptr) {
