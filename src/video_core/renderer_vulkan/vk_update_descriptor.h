@@ -6,6 +6,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <variant>
 #include <vector>
@@ -95,7 +96,12 @@ public:
         };
     }
 
-    void TickFrame();
+    /// Starts the next frame's payload. FRITCHII_DESC_FRAME_GUARD (default 1): the frame it
+    /// reuses (FRAMES_IN_FLIGHT frames ago) must be recorded by the scheduler's worker first:
+    /// its Record lambdas read these entries when the worker runs them, and a worker that fell
+    /// that far behind (a GPU-bound load blocks its submits while the recording thread goes on)
+    /// recorded overwritten descriptors (garbage view and buffer handles).
+    void TickFrame(Scheduler& scheduler);
     void Acquire(Scheduler& scheduler, size_t required_entries = 0,
                  bool use_descriptor_buffer_ = false);
 
@@ -167,6 +173,7 @@ private:
     const bool supports_descriptor_buffer;
     bool use_descriptor_buffer{false};
     size_t frame_index{0};
+    std::array<u64, FRAMES_IN_FLIGHT> frame_end_tick{};
     DescriptorUpdateEntry* payload_cursor = nullptr;
     DescriptorUpdateEntry* payload_start = nullptr;
     const DescriptorUpdateEntry* upload_start = nullptr;

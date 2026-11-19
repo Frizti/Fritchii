@@ -10215,8 +10215,8 @@ void RasterizerVulkan::TickFrame() {
     part_done(FrameEndTimes::Head);
     pipeline_cache.TickFrame();
     part_done(FrameEndTimes::Pipeline);
-    guest_descriptor_queue.TickFrame();
-    compute_pass_descriptor_queue.TickFrame();
+    guest_descriptor_queue.TickFrame(scheduler);
+    compute_pass_descriptor_queue.TickFrame(scheduler);
     descriptor_buffer_ring.TickFrame();
     part_done(FrameEndTimes::Queues);
     fence_manager.TickFrame();
