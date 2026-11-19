@@ -40,6 +40,7 @@ class ShaderNotify;
 }
 
 namespace Vulkan {
+void NoteDrawReuseProbeFrame();
 
 struct GraphicsPipelineCacheKey {
     std::array<u64, 6> unique_hashes;
