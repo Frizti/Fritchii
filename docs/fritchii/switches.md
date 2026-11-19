@@ -6501,7 +6501,7 @@ guest range made in the current command buffer, when the bytes still match
 EXP18 (buffer binding memos), bits: 1 = a constant buffer bind of the slot's current
 GPU range keeps its translation and resolved buffer (UBO_REBIND), 2 = storage bindings reuse
 their last FindBuffer result (STORAGE_MEMO), 4 = buffers touch the LRU once per frame
-(default 4: exact, see LoadExperiments). All while the mappings and the set of buffers are
+(default 6 since 2026-11-19, bits 4 and 2: exact, see LoadExperiments; 4 = the old default). All while the mappings and the set of buffers are
 unchanged (BufferCache::binding_epoch).
 
 ### EXP19

@@ -34,10 +34,14 @@ void LoadExperiments() {
         // EXP14: unchanged macro register writes dropped before FrontWrite's other checks.
         // Castle Town, profile toggle: front macro 250 -> 236 ms/s, push 77 -> 70 ms/s.
         g_experiments[14].store(1, std::memory_order_relaxed);
-        // EXP18 = 4 (exact): a buffer touches its LRU node once
+        // EXP18 = 6 (exact): a buffer touches its LRU node once
         // per frame; a second touch in the same frame was already a no-op in LruCache::Touch
-        // (its tick is not older), so only the node's cache miss goes. Bits 1 and 2 stay off.
-        g_experiments[18].store(4, std::memory_order_relaxed);
+        // (its tick is not older), so only the node's cache miss goes. Bit 2: storage bindings
+        // reuse their last FindBuffer and range result while binding_epoch and the map serial
+        // are unchanged (2026-11-19, AMD one follower with ESPLIT at the fountain: queued entries
+        // 2.4 -> 2.05 us, draw tails 3.42 -> 3.37 us, picture unchanged). Bit 1 stays off.
+        // EDEN_NX2_EXP18=4 is the old default.
+        g_experiments[18].store(6, std::memory_order_relaxed);
         // EXP21 = 1: a texture whose handle word is a storage buffer's address gets no texture
         // (VideoCommon::HandleIsStoragePointer). Ocarina of Time's Zora's River waterfall
         // flickered every other frame in bursts without it.

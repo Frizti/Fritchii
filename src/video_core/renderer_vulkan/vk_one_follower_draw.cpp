@@ -581,6 +581,16 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     const bool filled =
         r.mem_stage.FillRingDraw(r.buffer_cache, draw_facts, is_indexed, position, seq, 0, nullptr,
                                  nullptr, &handle_values, null_pointer_handles, list_args);
+    // FRITCHII_ONEF_MESH_EMU: a lent emulated mesh draw leaves VertexBuffer0..31 raised on E's
+    // engine (InvalidateInputState after its compute passes: the next draw binds its vertex
+    // buffers again). Posted, R raises them on its view only, and they are E's flags: E raises
+    // them here, where the lent draw left them, before the split's view takes the flags.
+    if (filled && pipeline != nullptr && pipeline->IsEmulatedMesh()) [[unlikely]] {
+        auto& dirty = r.buffer_cache.Inputs().Dirty();
+        for (u32 index = 0; index < Maxwell3D::Regs::NumVertexArrays; ++index) {
+            dirty[VideoCommon::Dirty::VertexBuffer0 + index] = true;
+        }
+    }
     if (esplit_records) [[unlikely]] {
         if (esplit_thread) {
             VideoCommon::ESplit::FillDone(engine, esplit_view);
@@ -838,6 +848,9 @@ bool OneFollowerDraw::AsyncTailFits(const Maxwell3D& engine,
     if (!VideoCommon::ESplit::g_async || pipeline == nullptr) {
         return false; // S1, or no rule 3 pipeline (the facts table's lookup reads the engine)
     }
+    if (pipeline->IsEmulatedMesh()) {
+        return false; // FRITCHII_ONEF_MESH_EMU: its fill raises E1's vertex buffer flags (lockstep)
+    }
     const MemStage::DrawFacts pipeline_facts = pipeline->MemFacts();
     if (pipeline_facts.has_texel_buffers || pipeline_facts.stage_infos == nullptr) {
         return false; // FillRing would refuse (LateFill)
@@ -959,7 +972,13 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         }
         // UNLEND's Mesh bit covers native task/mesh pipelines only (RouteDraw tests the device;
         // this is the pipeline's own word for it).
-        if (pipeline->IsEmulatedMesh()) [[unlikely]] {
+        // FRITCHII_ONEF_MESH_EMU: emulated mesh pipelines are posted too (not list draws). A
+        // mesh pipeline whose emulation was refused (no VkPipeline: R drops the draw) stays lent,
+        // as before, so the skip counters keep their meaning.
+        if (pipeline->IsEmulatedMesh() ? (list || !OneF::EmulatedMeshPostable())
+                                       : (pipeline->IsMeshPipeline() &&
+                                          !rasterizer.device.IsExtMeshShaderSupported()))
+            [[unlikely]] {
             reason = LentReason::NoPath;
             return false;
         }
@@ -1192,7 +1211,7 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
     // Mesh: native task/mesh pipelines only (the emulation's buffers are not R's alone). Without
     // VK_EXT_mesh_shader every mesh pipeline is emulated or skipped.
     if (reason == LentReason::Count && kind == OneF::Mesh &&
-        !rasterizer.device.IsExtMeshShaderSupported()) {
+        !rasterizer.device.IsExtMeshShaderSupported() && !OneF::EmulatedMeshPostable()) {
         reason = LentReason::NoPath;
     }
     if (reason == LentReason::Count && FillAndPush(engine, is_indexed, seq, false, reason)) {

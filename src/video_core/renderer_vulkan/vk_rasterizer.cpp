@@ -2560,9 +2560,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         no_mesh = std::filesystem::exists(no_mesh_file);
     }
     const bool emulated_mesh{mesh_draw && pipeline->IsEmulatedMesh()};
-    // UNLEND's Mesh bit: E unlends native mesh draws only (the emulation takes the staging pool
-    // and the mesh arenas, which R does not own alone).
-    if (onef_play != nullptr && emulated_mesh) [[unlikely]] {
+    // UNLEND's Mesh bit: native mesh draws, and with FRITCHII_ONEF_MESH_EMU emulated ones too (the
+    // staging pool, the mesh arenas and the compute passes below run on R, played or lent; E
+    // raises the vertex buffer flags the emulation leaves). An indirect one is never posted.
+    if (onef_play != nullptr && emulated_mesh &&
+        (is_indirect || !VideoCommon::OneFollower::EmulatedMeshPostable())) [[unlikely]] {
         VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::PlayedNoPath,
                                        "a played draw on an emulated mesh pipeline");
         VideoCommon::OneFollower::DisableUnlend("a played draw needed mesh emulation");
