@@ -217,3 +217,7 @@ jobs:
           path: build/windows-ci/bin/
           if-no-files-found: error
           retention-days: 7
+
+      - name: Verify both languages in the packaged Windows frontend
+        shell: pwsh
+        run: ./tools/translations/test-windows-package.ps1 -PackageDir (Resolve-Path build/windows-ci/bin)
