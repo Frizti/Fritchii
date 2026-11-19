@@ -1304,6 +1304,13 @@ public:
 
     void AddDescriptors(const DescriptorUpdateEntry* entries, size_t count);
 
+    /// Before a draw is recorded (R, or the back): in a command buffer the remembered vertex
+    /// bindings were not bound in yet (VertexEpoch moved), they are bound again. The bindings
+    /// the fill leaves out as clean (their flags are E's under one follower, and R's new command
+    /// buffers do not raise them) are then still bound: the AMD device loss at the Market load
+    /// read the old command buffer's vertex table. Once per command buffer; nothing otherwise.
+    void EnsureVertexBindings();
+
     /// The remembered index and vertex buffers are forgotten (SEAM changed).
     void ForgetBindings() noexcept;
 
@@ -1370,11 +1377,14 @@ private:
         VkDeviceSize size = 0;
         VkDeviceSize stride = 0;
         u64 epoch = ~u64{0};
+        bool dynamic = false; ///< bound with BindVertexBuffers2EXT (its size and stride)
     };
+    u64 ensured_vertex_epoch = ~u64{0};
     static constexpr size_t NUM_BOUND_VERTEX_BUFFERS = 32;
     std::array<BoundVertexBuffer, NUM_BOUND_VERTEX_BUFFERS> bound_vertex_buffers{};
     /// BindVertices entries recorded, and dropped as still bound (FRITCHII_MEMSTAGE_FULL_BINDS).
     std::atomic<u64> vertex_runs_recorded{};
+    std::atomic<u64> vertex_runs_rebound{}; ///< EnsureVertexBindings: bindings bound again
     std::atomic<u64> vertex_runs_dropped{};
 
     static constexpr u32 LIST_DRAW_SLOTS = 1024;

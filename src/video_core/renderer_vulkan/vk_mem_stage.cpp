@@ -3115,6 +3115,33 @@ void MemStage::NoteHeldFlush(SeamHook::Use use, const std::source_location& loca
     }
 }
 
+void MemPlayer::EnsureVertexBindings() {
+    const u64 epoch = scheduler.VertexEpoch();
+    if (epoch == ensured_vertex_epoch) {
+        return;
+    }
+    ensured_vertex_epoch = epoch;
+    for (u32 index = 0; index < NUM_BOUND_VERTEX_BUFFERS; ++index) {
+        BoundVertexBuffer& bound = bound_vertex_buffers[index];
+        if (bound.buffer == VK_NULL_HANDLE || bound.epoch == epoch || bound.epoch == ~u64{0}) {
+            continue;
+        }
+        bound.epoch = epoch;
+        Bump(vertex_runs_rebound);
+        if (bound.dynamic) {
+            scheduler.Record([index, buffer = bound.buffer, offset = bound.offset,
+                              size = bound.size, stride = bound.stride](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers2EXT(index, 1, &buffer, &offset, &size, &stride);
+            });
+        } else {
+            scheduler.Record([index, buffer = bound.buffer,
+                              offset = bound.offset](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers(index, 1, &buffer, &offset);
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The read log (5.3)
 
@@ -4191,13 +4218,11 @@ void MemStage::TickThread(int seam) {
     // E's (one_follower_view.cpp): the unchanged bindings were never bound in the new command
     // buffer. AMD then reads the old command buffer's vertex table: a GPU page fault (Radeon GPU
     // Detective, 2026-11-19). The player drops the bindings still bound (VertexEpoch).
-    static const bool full_off = [] {
-        const char* value = std::getenv("FRITCHII_MEMSTAGE_FULL_BINDS");
-        return value != nullptr && value[0] == '0';
-    }();
+    // (With one follower the player now binds the remembered bindings again itself in a new
+    // command buffer, MemPlayer::EnsureVertexBindings: full binds stay opt-in.)
     const bool full =
         Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0 ||
-        link.Mode() == 2 || (!full_off && VideoCommon::OneFollower::On());
+        link.Mode() == 2;
     if (full != Link::FullVertexBinds()) {
         Link::SetFullVertexBinds(full);
         LOG_INFO(Render_Vulkan, "Memory seam full vertex bindings (FRITCHII_MEMSTAGE_FULL_BINDS={}): {}",
@@ -4427,6 +4452,17 @@ void MemStage::LogStats() {
                  "runs recorded {:.0f}/s, dropped as still bound {:.0f}/s",
                  rate(vertex_runs[0] - reported_vertex_runs[0]),
                  rate(vertex_runs[1] - reported_vertex_runs[1]));
+    }
+    {
+        static u64 reported_rebound = 0;
+        const u64 rebound = player.vertex_runs_rebound.load(std::memory_order_relaxed);
+        if (rebound != reported_rebound) {
+            LOG_INFO(Render_Vulkan,
+                     "  memory seam vertex bindings bound again in a new command buffer "
+                     "(EnsureVertexBindings): {:.0f}/s",
+                     rate(rebound - reported_rebound));
+        }
+        reported_rebound = rebound;
     }
     reported_vertex_runs = vertex_runs;
     reported = current;
@@ -5344,9 +5380,10 @@ void MemPlayer::PlayVertices(u8 flags, u32 first, u32 binding_count, const VkBuf
             Bump(vertex_runs_dropped);
             return;
         }
+        const bool dynamic = (flags & MemStage::DynamicState) != 0;
         for (u32 i = 0; i < binding_count; ++i) {
             bound_vertex_buffers[first + i] = {handles[i], offsets[i], sizes[i], strides[i],
-                                               epoch};
+                                               epoch, dynamic};
         }
     }
     Bump(vertex_runs_recorded);

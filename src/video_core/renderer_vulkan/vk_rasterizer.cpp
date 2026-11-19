@@ -3043,6 +3043,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                           maxwell3d->regs.zpass_pixel_count_enable);
             }
         }
+        // The vertex bindings the fill left out as clean, in a command buffer they are not
+        // bound in yet (one follower's R starts command buffers E cannot see).
+        mem_player.EnsureVertexBindings();
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
         if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
