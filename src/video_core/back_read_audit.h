@@ -47,6 +47,18 @@ enum class Kind : u8 {
 /// Set once at boot from FRITCHII_BACK_READ_AUDIT (Init). The only thing a read checks while off.
 extern bool enabled;
 
+/// FRITCHII_BACK_READ_AUDIT itself (set in Init): every thread's reads go through the funnel.
+inline bool g_count_all = false;
+/// The thread whose reads feed g_touch_hook (FRITCHII_ESPLIT=1's E1, set by StartE2 there). With
+/// the counting switch off, the funnel does nothing on any other thread (the hook acts only on
+/// E1, t_depth is the funnel's own), so those threads skip it.
+inline thread_local bool t_watch = false;
+
+/// Whether this thread's reads go through the funnel.
+[[nodiscard]] inline bool ActiveHere() noexcept {
+    return enabled && (t_watch || g_count_all);
+}
+
 /// FRITCHII_ESPLIT=1 (fritchii_e_split_thread.h): every audited read's caller, outside the
 /// audit's own nesting, also goes here; set (with `enabled`) before the back runs. The audit's
 /// tables still count only with its own switch.
@@ -83,7 +95,7 @@ public:
 /// Runs `body` hidden from the audit. One branch on `enabled` while off.
 template <typename F>
 inline decltype(auto) Unaudited(F&& body) {
-    if (enabled) [[unlikely]] {
+    if (ActiveHere()) [[unlikely]] {
         const HideScope hide;
         return body();
     }
@@ -95,7 +107,7 @@ inline decltype(auto) Unaudited(F&& body) {
 /// First statement of a leaf read function (one that calls no other audited read).
 #define FRITCHII_BACK_READ_NOTE(bytes, kind)                                                     \
     do {                                                                                         \
-        if (::VideoCommon::BackReadAudit::enabled) [[unlikely]] {                                \
+        if (::VideoCommon::BackReadAudit::ActiveHere()) [[unlikely]] {                           \
             ::VideoCommon::BackReadAudit::Note(FRITCHII_RETURN_ADDRESS(), (bytes), (kind));      \
         }                                                                                        \
     } while (false)
@@ -104,7 +116,7 @@ inline decltype(auto) Unaudited(F&& body) {
 /// hides the audited reads `body` makes. The return address is taken here, in the read
 /// function itself, and only while the audit is on.
 #define FRITCHII_BACK_READ_AUDITED(bytes, kind, body)                                            \
-    if (::VideoCommon::BackReadAudit::enabled) [[unlikely]] {                                    \
+    if (::VideoCommon::BackReadAudit::ActiveHere()) [[unlikely]] {                               \
         const ::VideoCommon::BackReadAudit::OuterScope fritchii_audit_scope{                     \
             FRITCHII_RETURN_ADDRESS(), (bytes), (kind)};                                         \
         return body();                                                                           \

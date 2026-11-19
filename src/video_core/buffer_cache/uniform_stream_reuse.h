@@ -14,6 +14,7 @@
 
 #include "common/common_types.h"
 #include "common/fritchii_page_flags.h"
+#include "video_core/buffer_cache/nx2_bytes_equal.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_debug_control.h"
@@ -114,7 +115,10 @@ public:
         u16 direct{}; ///< binds left that copy straight to the stream buffer (EXP115)
     };
 
-    UniformStreamReuse() : bytes{new u8[NumCopies * MaxBytes]} {}
+    /// Copies are MaxBytes plus one cache line apart: with a plain 16 KiB stride every copy's
+    /// first lines fell in the same L1 sets, so the compares of a draw's binds evicted each other.
+    static constexpr size_t Stride = MaxBytes + 64;
+    UniformStreamReuse() : bytes{new u8[NumCopies * Stride]} {}
 
     void Reset() noexcept {
         for (Copy& copy : copies) {
@@ -130,7 +134,7 @@ public:
     }
 
     [[nodiscard]] u8* Bytes(size_t copy) noexcept {
-        return bytes.get() + copy * MaxBytes;
+        return bytes.get() + copy * Stride;
     }
 
     static void NextSerial(Copy& copy) noexcept {
@@ -269,7 +273,7 @@ template <class Runtime, class DeviceMemory>
     const u64 tick = runtime.StreamEpoch();
     const auto same_bytes = [&](size_t copy_index) {
         return reuse.copies[copy_index].size == size &&
-               std::memcmp(reuse.Bytes(copy_index), guest, size) == 0;
+               Nx2BytesEqual(reuse.Bytes(copy_index), guest, size);
     };
     const auto rebind = [&](size_t copy_index) {
         const typename Reuse::Copy& copy = reuse.copies[copy_index];

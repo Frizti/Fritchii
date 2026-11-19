@@ -1247,7 +1247,7 @@ private:
 
     void UpdateVertexBuffers();
 
-    void UpdateVertexBuffer(u32 index);
+    void UpdateVertexBuffer(u32 index, const CacheInputs& inputs);
 
     /// FRITCHII_FILL_UPDATE_KEEP (fable_b 25.2 cut f): resolve() (the translation and the buffer
     /// lookup UpdateIndexBuffer or UpdateVertexBuffer make), or the binding it gave last time for

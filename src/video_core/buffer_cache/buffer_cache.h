@@ -7325,17 +7325,30 @@ void BufferCache<P>::UpdateVertexBuffers() {
     }
     flags[Dirty::VertexBuffers] = false;
 
+    // One copy of the inputs for the loop (nothing in it changes the override, the engine or the
+    // flags' view). A switched-off stream's dirty bit is never cleared (BindHostVertexBuffers
+    // clears only enabled streams), so every pass met ~30 sticky-dirty disabled streams and
+    // resolved each to NULL_BINDING: they take that binding directly now, with the same two
+    // stores, and the flags are still tested live per stream (a mark raised mid-loop is seen).
+    const CacheInputs inputs = Inputs();
     for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
-        UpdateVertexBuffer(index);
+        if (!flags[Dirty::VertexBuffer0 + index]) {
+            continue;
+        }
+        if (update_keep == 0 && inputs.VertexStream(index).enable == 0) [[likely]] {
+            if (BindAddrMemo()) {
+                ++bind_addr_disabled_skips;
+            }
+            channel_state->vertex_buffers[index] = NULL_BINDING;
+            UpdateVertexBufferSlot(index, NULL_BINDING);
+            continue;
+        }
+        UpdateVertexBuffer(index, inputs);
     }
 }
 
 template <class P>
-void BufferCache<P>::UpdateVertexBuffer(u32 index) {
-    const CacheInputs inputs = Inputs();
-    if (!inputs.Dirty()[Dirty::VertexBuffer0 + index]) {
-        return;
-    }
+void BufferCache<P>::UpdateVertexBuffer(u32 index, const CacheInputs& inputs) {
     const auto& array = inputs.VertexStream(index);
     const auto& limit = inputs.VertexStreamLimit(index);
     const GPUVAddr gpu_addr_begin = array.Address();

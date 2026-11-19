@@ -251,6 +251,7 @@ void Init() {
     // Not at static initialization: main() applies nx2_switches.txt to the environment later.
     [[maybe_unused]] static const bool once = [] {
         g_counting = ReadSwitch();
+        g_count_all = g_counting;
         enabled = enabled || g_counting;
         if (g_counting) {
             LOG_INFO(HW_GPU, "Back read audit: FRITCHII_BACK_READ_AUDIT=1, counting the GPU "

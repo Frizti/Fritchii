@@ -76,6 +76,7 @@
 //     1 write in 64 is read back after E2 wrote it (ESplitCbBytes).
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -472,6 +473,9 @@ u64 WaitFor(Ready&& ready, std::atomic<u32>& wake, std::atomic<bool>& sleeping,
             while (!ready()) {
                 const u32 seen = wake.load(std::memory_order_seq_cst);
                 sleeping.store(true, std::memory_order_seq_cst);
+                // The other side's done store may be a release store followed by a fence: the
+                // fence here pairs with it (sleeping set before ready() reads).
+                std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (!ready()) {
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
@@ -485,6 +489,20 @@ u64 WaitFor(Ready&& ready, std::atomic<u32>& wake, std::atomic<bool>& sleeping,
                                   limit);
     return Profile::Ticks() - start_ticks;
 }
+
+inline void PrefetchLine(const void* address) noexcept {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)) && !defined(__clang__)
+    _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+#elif defined(__clang__) || defined(__GNUC__)
+    __builtin_prefetch(address, 0, 3);
+#else
+    static_cast<void>(address);
+#endif
+}
+
+/// FRITCHII_ESPLIT_WAKE_EACH=1 (boot): E2's fenced wake check after every job, as before. Read
+/// on E2's start (after main() applied nx2_switches.txt).
+bool g_wake_each = false;
 
 void WakeE1() noexcept {
     if (g.e1_sleeping.load(std::memory_order_seq_cst)) {
@@ -780,13 +798,22 @@ void E2Main(std::stop_token) {
     }
     OneF::MarkEngineHelperThread();
     ThreadMark();
+    {
+        const char* const value = std::getenv("FRITCHII_ESPLIT_WAKE_EACH");
+        g_wake_each = value != nullptr && value[0] == '1';
+    }
     t_role = 2;
     g.e2_id = std::this_thread::get_id();
     g.e2_ready.store(true, std::memory_order_release);
     g.e2_ready.notify_all();
     u64 next = 1;
+    // E2's copy of `posted` (only grows): reloaded when E2 has run every job it saw.
+    u64 avail = 0;
     while (true) {
-        if (g.posted.load(std::memory_order_acquire) < next) {
+        if (avail < next) {
+            avail = g.posted.load(std::memory_order_acquire);
+        }
+        if (avail < next) {
             if (g.stop.load(std::memory_order_acquire)) {
                 break;
             }
@@ -801,11 +828,51 @@ void E2Main(std::stop_token) {
                      g_async ? AsyncPollLimit : E2PollLimit));
             continue;
         }
+        Job& job = g.jobs[next % Slots];
+        const bool draw_tail = job.info.hand == Hand::DrawTail;
+        // E1 wrote the next jobs' slots on its own core: their first lines are fetched while
+        // this job runs (two stages: slot next + 2's header lines, then slot next + 1's buffers,
+        // read from its header fetched one job earlier). Hints only.
+        if (next + 2 <= avail) {
+            const u8* const ahead = reinterpret_cast<const u8*>(&g.jobs[(next + 2) % Slots]);
+            PrefetchLine(ahead);
+            PrefetchLine(ahead + 64);
+        }
+        if (next + 1 <= avail) {
+            const Job& upcoming = g.jobs[(next + 1) % Slots];
+            const SlotBuffers& buffers = g.buffers[(next + 1) % Slots];
+            PrefetchLine(upcoming.payload.data());
+            if (upcoming.info.hand == Hand::DrawTail) {
+                PrefetchLine(reinterpret_cast<const u8*>(&upcoming.tls));
+                PrefetchLine(upcoming.fill_state.data());
+                PrefetchLine(upcoming.fill_state.data() + 64);
+                PrefetchLine(buffers.packet.get());
+                PrefetchLine(buffers.packet.get() + 64);
+            }
+            if (upcoming.record_kind == RecordKind::Record) {
+                const u32 bytes = (std::min)(upcoming.record_bytes, 256U);
+                for (u32 offset = 0; offset < bytes; offset += 64) {
+                    PrefetchLine(buffers.record.get() + offset);
+                }
+            }
+            if (upcoming.info.hand == Hand::CbWords) {
+                for (u32 offset = 0; offset < 256; offset += 64) {
+                    PrefetchLine(buffers.cb.get() + offset);
+                }
+            }
+        }
         Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Back);
-        RunJob(g.jobs[next % Slots]);
+        RunJob(job);
         Common::LowEndSim::CpuWorkEnd();
-        g.done.store(next, std::memory_order_seq_cst);
-        WakeE1();
+        // `done` is a release store; E1's wake check (a fence, then its sleeping flag) runs after
+        // every draw tail (E1's depth waits count them), every 8th job (its room waits) and the
+        // last job E2 saw (its drains and idle waits wait for exactly that one), instead of a
+        // full fence after every job. FRITCHII_ESPLIT_WAKE_EACH=1: a fenced check after each.
+        g.done.store(next, std::memory_order_release);
+        if (draw_tail || (next & 7) == 0 || next == avail || g_wake_each) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            WakeE1();
+        }
         if ((next & 1023) == 0) {
             g.e2_cpu_ns.store(Common::CurrentThreadCpuTimeNs().value_or(0),
                               std::memory_order_relaxed);
@@ -1280,6 +1347,7 @@ void StartE2(Core::System& system, void (*adopt)(void*), void* adopt_argument) {
     // E1's reads of game memory, through the back read audit's funnel (its own tables count only
     // with its switch).
     BackReadAudit::g_touch_hook = &ReadTouch;
+    BackReadAudit::t_watch = true; // this thread (E1) only: the hook acts nowhere else
     BackReadAudit::enabled = true;
     u64 e1_mask = 0;
     bool e1_unpin = false;
@@ -1317,6 +1385,7 @@ void StopE2() {
     g.e2_wake.notify_all();
     g.thread = {};
     BackReadAudit::g_touch_hook = nullptr;
+    BackReadAudit::t_watch = false;
 }
 
 void ThreadBatch() noexcept {
@@ -1627,7 +1696,8 @@ bool WaitE2IdleOrImpl(bool (*more)(void*), void* argument) noexcept {
     {
         const CauseScope cause{static_cast<size_t>(Join::Idle)};
         PostCbWrites();
-        // E2 bumps E1's wake word after each job while E1 sleeps: `more` is asked again then.
+        // E2 bumps E1's wake word (after every 8th job, each draw tail and when it ran out of
+        // jobs) while E1 sleeps: `more` is asked again then.
         E1Wait([&] {
             if (E2Idle()) {
                 return true;
