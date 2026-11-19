@@ -138,7 +138,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_TESTING=OFF `
             -DYUZU_TESTS=OFF `
-            -DYUZU_CMD=ON `
             -DYUZU_ROOM=OFF `
             -DYUZU_ROOM_STANDALONE=OFF `
             -DYUZU_USE_BUNDLED_QT=OFF `
@@ -193,16 +192,16 @@ jobs:
           if ($identity -notmatch '#define BUILD_NAME "Fritchii"') { throw "Fritchii UI would be disabled by build identity" }
           if ($identity -notmatch '#define BUILD_VERSION "v6.2"') { throw "Incorrect Fritchii build version" }
 
-      - name: Build localized frontend and CLI
+      - name: Build localized frontend
         shell: pwsh
         run: |
-          cmake --build build/windows-ci --target yuzu yuzu-cmd --parallel 4
+          cmake --build build/windows-ci --target yuzu --parallel 4
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify executables and deploy Qt
         shell: pwsh
         run: |
-          foreach ($exe in @("fritchii.exe", "lichii.exe", "eden-cli.exe")) {
+          foreach ($exe in @("fritchii.exe", "lichii.exe")) {
             if (-not (Test-Path "build/windows-ci/bin/$exe")) {
               throw "Missing expected Windows executable: $exe"
             }
