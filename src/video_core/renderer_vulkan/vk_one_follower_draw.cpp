@@ -992,12 +992,14 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         // FRITCHII_ONEF_OCCL (OneFollower::OcclWanted: unset = AMD's proprietary driver on a
         // discrete GPU) with FRITCHII_OCCL_FLAG: E picks the draw's flag variant at its lookup
         // (the pipeline cache and the registers are E's); R records it as the lent path does
-        // (the slot, the address push). Only variants drawn in place: a pre-pass (colour or
-        // discard) records the draw twice, decided by R's thread state.
+        // (the slot, the address push). Variants drawn in place, and with
+        // FRITCHII_ONEF_OCCL_PREPASS the pre-pass ones (colour or discard: R records the draw
+        // twice, as R's query state decides).
         // FillAndPush's callers are RouteDraw (direct draws) and RouteListDraw (list draws) only:
         // a non-list indirect draw is always lent, so it reaches the lent path's own choice,
         // where the pre-pass refuses indirect draws (review C8). Only list draws need excluding
         // here (their arguments are consumed once).
+        push_occl = 0;
         if (VideoCommon::OneFollower::OcclWanted() &&
             VideoCommon::OcclFlag::Mode() != VideoCommon::OcclFlag::Off &&
             rasterizer.query_cache_runtime.OcclFlagAreaExists()) {
@@ -1006,15 +1008,40 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
             VideoCommon::OcclFlag::t_colour_discard_prepass = false;
             GraphicsPipeline* const flag =
                 rasterizer.pipeline_cache.OcclFlagPipeline(pipeline, engine.regs, true);
-            const bool in_place = flag != nullptr && flag != pipeline &&
-                                  !VideoCommon::OcclFlag::t_colour_prepass &&
-                                  !VideoCommon::OcclFlag::t_colour_discard_prepass &&
-                                  !flag->IsOcclDiscardPrepass();
+            const bool colour_prepass = VideoCommon::OcclFlag::t_colour_prepass;
+            const bool discard_direct = VideoCommon::OcclFlag::t_discard_direct;
+            const bool colour_discard_prepass = VideoCommon::OcclFlag::t_colour_discard_prepass;
+            const bool prepass_kind = colour_prepass || colour_discard_prepass ||
+                                      (flag != nullptr && flag->IsOcclDiscardPrepass());
             VideoCommon::OcclFlag::t_colour_prepass = false;
             VideoCommon::OcclFlag::t_discard_direct = false;
             VideoCommon::OcclFlag::t_colour_discard_prepass = false;
-            if (in_place) {
-                pipeline = flag;
+            // FRITCHII_ONEF_OCCL_PREPASS (default 1, so it follows FRITCHII_ONEF_OCCL; 0 keeps
+            // played draws to in-place variants): a pre-pass variant too (the colour or
+            // discard pre-pass records the draw twice on R, decided there by R's query state as
+            // the lent and off paths decide it); its pre-pass state goes in the packet. Without
+            // it every such draw counted with a host query (~16k more a second at the fountain,
+            // ~1.2 ms of GPU a frame on the eGPU). Not for list draws (recording them twice
+            // consumes their arguments).
+            static const bool onef_prepass = [] {
+                const char* value = std::getenv("FRITCHII_ONEF_OCCL_PREPASS");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (flag != nullptr && flag != pipeline) {
+                if (!prepass_kind) {
+                    pipeline = flag;
+                } else if (onef_prepass && !list) {
+                    pipeline = flag;
+                    if (flag->occl_flag_parent == nullptr) [[unlikely]] {
+                        LOG_ERROR(Render_Vulkan, "One follower: E's pre-pass variant has no "
+                                                 "flag parent (kind {})",
+                                  flag->occl_flag_kind);
+                    }
+                    push_occl = static_cast<u8>(
+                        (colour_prepass ? OneF::OcclColourPrepass : 0) |
+                        (discard_direct ? OneF::OcclDiscardDirect : 0) |
+                        (colour_discard_prepass ? OneF::OcclColourDiscardPrepass : 0));
+                }
             }
         }
     }
@@ -1053,6 +1080,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
             static_assert(std::is_trivially_copyable_v<AsyncTail>);
             tail.packet_bytes =
                 OneF::PackDraw(engine, seq, push_flags, pipeline, tail.header, slot.packet);
+            tail.header.reserved[1] = push_occl;
             std::memcpy(slot.payload, &tail, sizeof(tail));
             ESplit::PostAsync([](void* raw) {
                 AsyncTail t;
@@ -1113,7 +1141,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
             if (!FillRing(engine, pipeline, is_indexed, position, seq, number, reason, list)) {
                 return;
             }
-            OneF::PushDraw(engine, seq, number, push_flags, pipeline);
+            OneF::PushDraw(engine, seq, number, push_flags, pipeline, push_occl);
             counts.pushed.store(counts.pushed.load(std::memory_order_relaxed) + 1,
                                 std::memory_order_relaxed);
             rasterizer.gpu.TickWork();
@@ -1161,7 +1189,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     }
     {
         const Profile::FineScope push_zone{Profile::Zone::DrawPush}; // helper CP
-        OneF::PushDraw(engine, seq, buffer_number, push_flags, pipeline);
+        OneF::PushDraw(engine, seq, buffer_number, push_flags, pipeline, push_occl);
     }
     if (occl_note.timed) [[unlikely]] {
         VideoCommon::OcclLean::NoteFill(occl_note, VideoCommon::OcclLean::NowNs() - occl_start);

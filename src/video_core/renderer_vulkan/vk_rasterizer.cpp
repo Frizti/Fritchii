@@ -2475,15 +2475,47 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
         if (onef_play != nullptr && onef_play->pipeline != nullptr) {
             // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looked this draw's pipeline up at its own
-            // position; R binds it and looks nothing up. With FRITCHII_ONEF_OCCL on it may be the
-            // in-place flag variant E picked (FillAndPush); off, never a flag variant (v6.2: the
-            // parent).
+            // position; R binds it and looks nothing up. With FRITCHII_ONEF_OCCL off it is never a
+            // flag variant (v6.2: the parent). On, it may be the flag variant E picked
+            // (FillAndPush): an in-place one, or a pre-pass variant bringing E's pre-pass state
+            // (FRITCHII_ONEF_OCCL_PREPASS); R records the pre-pass as the off path does, or, where
+            // that path falls back (draw counting, a frame dump's probe), the parent with the same
+            // descriptors.
             auto* const played = const_cast<GraphicsPipeline*>(
                 static_cast<const GraphicsPipeline*>(onef_play->pipeline));
-            if (VideoCommon::OneFollower::OcclWanted()) {
-                return played;
+            if (!VideoCommon::OneFollower::OcclWanted()) {
+                return played->occl_flag_parent != nullptr ? played->occl_flag_parent : played;
             }
-            return played->occl_flag_parent != nullptr ? played->occl_flag_parent : played;
+            const u8 occl = played->occl_flag_parent != nullptr ? onef_play->reserved[1] : u8{0};
+            namespace OcclFlag = VideoCommon::OcclFlag;
+            OcclFlag::t_colour_prepass = (occl & VideoCommon::OneFollower::OcclColourPrepass) != 0;
+            OcclFlag::t_discard_direct = (occl & VideoCommon::OneFollower::OcclDiscardDirect) != 0;
+            OcclFlag::t_colour_discard_prepass =
+                (occl & VideoCommon::OneFollower::OcclColourDiscardPrepass) != 0;
+            const bool prepass = OcclFlag::t_colour_prepass ||
+                                 (played->IsOcclDiscardPrepass() && !OcclFlag::t_discard_direct);
+            if (prepass && played->occl_flag_parent == nullptr) [[unlikely]] {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_ERROR(Render_Vulkan,
+                              "One follower: a played draw's occlusion pre-pass bits {:#x} on a "
+                              "pipeline without a flag parent (kind {}, draw seq {}, flags {:#x})",
+                              occl, played->occl_flag_kind, onef_play->draw_seq,
+                              onef_play->flags);
+                }
+                OcclFlag::t_colour_prepass = false;
+                OcclFlag::t_discard_direct = false;
+                OcclFlag::t_colour_discard_prepass = false;
+            }
+            if (prepass && played->occl_flag_parent != nullptr &&
+                (draw_tracking || frame_dump.CapturingSampled())) [[unlikely]] {
+                OcclFlag::Add(OcclFlag::g_stats.prepass_fallback);
+                OcclFlag::t_colour_prepass = false;
+                OcclFlag::t_discard_direct = false;
+                OcclFlag::t_colour_discard_prepass = false;
+                return played->occl_flag_parent;
+            }
+            return played;
         }
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return occl_flag(pipeline_cache.CurrentGraphicsPipeline(), true);

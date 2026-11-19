@@ -2966,7 +2966,7 @@ void EngineConsumed(u64 position) noexcept {
 }
 
 void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags,
-              const void* pipeline) {
+              const void* pipeline, u8 occl_prepass) {
     if (!Detail::t_engine || !g.thread.joinable()) {
         t_next_draw_set = false;
         return;
@@ -2979,6 +2979,7 @@ void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags
     header.draw_seq = draw_seq;
     header.buffer_number = buffer_number;
     header.pipeline = pipeline;
+    header.reserved[1] = occl_prepass;
     // Packed straight into the packet buffer, after the header: no copy, no allocation.
     u8* const buffer = PackBuffer();
     std::size_t bytes;

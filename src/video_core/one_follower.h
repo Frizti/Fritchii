@@ -441,6 +441,9 @@ struct PacketHeader {
     u8 flags;         ///< PacketFlag
     u8 reason;        ///< LentReason (a lent draw) or 0
     u8 op;            ///< LentOp (a lent packet)
+    /// reserved[0]: the draw's UnlendKind bit (TakeDrawKind). reserved[1], a draw packet with E's
+    /// flag variant: the occlusion flag pre-pass bits E's lookup gave (OcclPrepassBit), which R's
+    /// thread-local pre-pass state takes before the draw.
     u8 reserved[3];
     u32 delta_count;  ///< RegPair count (SpanDelta)
     u64 number;       ///< packets since R started, E's count (1 = the first)
@@ -617,7 +620,14 @@ void SetDrawPlayer(DrawPlayer* player) noexcept;
 /// index) and `flags` (PacketFlag), with the spans PackSpans gives; E goes on within
 /// FRITCHII_ONEF_AHEAD.
 void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags,
-              const void* pipeline = nullptr);
+              const void* pipeline = nullptr, u8 occl_prepass = 0);
+
+/// PacketHeader::reserved[1] of a draw packet: OcclFlag's pre-pass state for E's flag variant.
+enum OcclPrepassBit : u8 {
+    OcclColourPrepass = 1,        ///< OcclFlag::t_colour_prepass
+    OcclDiscardDirect = 2,        ///< OcclFlag::t_discard_direct
+    OcclColourDiscardPrepass = 4, ///< OcclFlag::t_colour_discard_prepass
+};
 
 /// E, at the end of Maxwell3D::ProcessQueryCondition when the host did not take the condition:
 /// from step 3, R computes the mode on its view at this place (in the lent call when one is

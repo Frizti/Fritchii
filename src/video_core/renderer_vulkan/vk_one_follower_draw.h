@@ -278,6 +278,7 @@ private:
     /// UnlentBlocker's PacketFlag bits for the draw's packet (PacketNoReset), and its reset test
     /// for a forced-lent draw (LendDraw hands it to RunLent).
     u8 push_flags{};
+    u8 push_occl{}; ///< OneF::OcclPrepassBit of the draw's flag variant (E's lookup)
     ResetCheck verify_reset{};
     MemStage::StagedFacts facts{};
     std::vector<u32> handle_values;

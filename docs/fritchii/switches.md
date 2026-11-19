@@ -1146,6 +1146,17 @@ MemPlayer::EnsureVertexBindings. The flag program only stores. Without played-dr
 16,000 draws a second at the fountain fall back to host queries (+1.2 ms eGPU a frame) and one
 follower is slower than off under PCIe load.
 
+FRITCHII_ONEF_OCCL_PREPASS (boot, default 1, so it follows FRITCHII_ONEF_OCCL; 0 keeps played
+draws to in-place variants): E also takes a played draw's pre-pass variant (colour, discard,
+colour-discard; only at Full, which allows pre-passes; never for list draws, whose arguments are
+consumed once; non-list indirect draws are always lent) and carries OcclFlag's pre-pass state in
+PacketHeader::reserved[1] (OcclPrepassBit). R restores it before the draw, only on a real flag
+variant, and records the pre-pass as the off path does (R's query state decides), or the parent
+with the same descriptors where that path falls back (draw counting, a frame dump's probe).
+Measured (RX 9070 XT eGPU, fountain, Full): host queries 19k -> 3.1k a second (off 3.0k); one
+follower 16.35-16.6 ms idle and 20.4-20.7 ms under PCIe load against off 18.2 / 21.3 ms; real
+draws lost 0, checks 0, picture unchanged.
+
 ### FRITCHII_ASTC_HELD_DEFER
 
 Boot, default 0 (helper BG's fix from 2026-11-16, ported by helper FJ). 1 = an ASTC GPU decode made
