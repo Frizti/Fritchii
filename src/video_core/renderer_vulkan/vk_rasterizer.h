@@ -178,6 +178,9 @@ public:
     void WaitForIdle() override;
     void FragmentBarrier() override;
     void TiledCacheBarrier() override;
+    [[nodiscard]] bool TiledCacheBarrierIsNoop() const noexcept override {
+        return true; // TiledCacheBarrier is empty here
+    }
     void FlushCommands() override;
     void TickFrame() override;
     bool AccelerateConditionalRendering() override;

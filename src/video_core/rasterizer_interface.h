@@ -315,6 +315,12 @@ public:
     /// Notify the host renderer to make available previous render target writes.
     virtual void TiledCacheBarrier() = 0;
 
+    /// True when TiledCacheBarrier does nothing (Vulkan): the method is then not queued or called
+    /// (FRITCHII_ESPLIT would queue a job for it on E2).
+    [[nodiscard]] virtual bool TiledCacheBarrierIsNoop() const noexcept {
+        return false;
+    }
+
     /// Notify the rasterizer to send all written commands to the host GPU.
     virtual void FlushCommands() = 0;
 
