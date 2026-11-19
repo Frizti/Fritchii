@@ -23,8 +23,8 @@ namespace FritchiiOcclusionOffer {
 /// The main window's cards, read once at launch: whether Full can act on the picked one.
 void NoteCards(const std::vector<VkDeviceInfo::Record>& records);
 
-/// Whether Full can act on this PC: the picked card runs AMD's Windows driver with one follower
-/// off (FRITCHII_ONEF_AMD not 1), or another card with one follower turned off by a switch.
+/// Whether Full can act on this PC: the picked card runs with one follower off, or with one
+/// follower on and FRITCHII_ONEF_OCCL on (by default AMD's proprietary driver on a discrete GPU).
 [[nodiscard]] bool FullCanAct();
 
 /// The setting's row (a ConfigurationShared::Widget): Full greyed out where it can't act, with

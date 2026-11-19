@@ -4020,19 +4020,38 @@ void MemStage::TickFrame() {
     int value = VideoCore::Nx2Debug::Experiment(123);
     // AMD safe default (2026-11-16): SEAM 3 lost the device on an RX 7900 XT and an RX 9070 XT at
     // the title screen (the ASTC decoder's submit inside a held fill); SEAM 1 ran clean on both.
-    // Held to 1 on AMD's proprietary driver; FRITCHII_SEAM_AMD=1 keeps the asked level (tests).
+    // Since 2026-11-19 that submit is skipped by default (FRITCHII_ASTC_HELD_DEFER=1), and with
+    // one follower on SEAM 3 is what the AMD one-follower result and soak ran at: kept on AMD's
+    // proprietary driver when one follower is on (unset FRITCHII_SEAM_AMD). Held to 1 with one
+    // follower off (there SEAM 3 is about 0.6 ms slower than 1 on AMD) or FRITCHII_SEAM_AMD=0;
+    // FRITCHII_SEAM_AMD=1 keeps the asked level either way (tests).
     if (value >= 2 && VideoCommon::OneFollower::IsAmdProprietaryDriver()) [[unlikely]] {
         static const bool keep = [] {
             const char* const v = std::getenv("FRITCHII_SEAM_AMD");
-            return v != nullptr && v[0] == '1';
-        }();
-        if (!keep) {
-            static bool logged = false;
-            if (!std::exchange(logged, true)) {
-                LOG_WARNING(Render_Vulkan, "Memory seam: EXP123={} held to 1 on AMD's proprietary "
-                                           "driver (device losses with 3); FRITCHII_SEAM_AMD=1 keeps it",
-                            value);
+            if (v != nullptr && v[0] != '\0') {
+                return v[0] != '0';
             }
+            return VideoCommon::OneFollower::On();
+        }();
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            if (keep) {
+                LOG_INFO(Render_Vulkan,
+                         "Memory seam: EXP123={} kept on AMD's proprietary driver ({}); "
+                         "FRITCHII_SEAM_AMD=0 holds it to 1",
+                         value,
+                         std::getenv("FRITCHII_SEAM_AMD") != nullptr ? "FRITCHII_SEAM_AMD=1"
+                                                                     : "one follower on");
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "Memory seam: EXP123={} held to 1 on AMD's proprietary driver ({}); "
+                            "FRITCHII_SEAM_AMD=1 keeps it",
+                            value,
+                            std::getenv("FRITCHII_SEAM_AMD") != nullptr ? "FRITCHII_SEAM_AMD=0"
+                                                                        : "one follower off");
+            }
+        }
+        if (!keep) {
             value = 1;
         }
     }

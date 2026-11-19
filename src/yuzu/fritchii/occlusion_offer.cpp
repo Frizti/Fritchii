@@ -38,12 +38,44 @@ bool StartsWithOne(const char* name) {
     return value != nullptr && value[0] == '1';
 }
 
+/// A switch's value, or null when it is not set (an empty value counts as not set).
+const char* SwitchText(const char* name) {
+    const char* const value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? value : nullptr;
+}
+
+/// The occlusion speed-up in effect at the next boot is Full (9): a FRITCHII_OCCL_FLAG switch
+/// wins over the setting (OcclFlag::ReadAtBoot).
+bool FullInEffect() {
+    if (const char* const value = SwitchText("FRITCHII_OCCL_FLAG")) {
+        return std::atoi(value) == VideoCommon::OcclFlag::Full;
+    }
+    return Settings::values.occlusion_speedup.GetValue() == Settings::OcclusionSpeedup::Full;
+}
+
 /// One follower at boot as VideoCommon::OneFollower::ReadSwitches decides it: wanted with
-/// FRITCHII_ONEF_LEAN=1 (built in) or FRITCHII_ONEF=1; on AMD's proprietary driver only with
-/// FRITCHII_ONEF_AMD=1 too. The occlusion flags act only where it is off.
-bool OneFollowerOn(bool amd_proprietary) {
+/// FRITCHII_ONEF_LEAN=1 (built in) or FRITCHII_ONEF=1. On AMD's proprietary driver: an explicit
+/// FRITCHII_ONEF_AMD wins (0 off); unset, on for a discrete GPU with the occlusion speed-up Full
+/// in effect, off otherwise.
+bool OneFollowerOn(bool amd_proprietary, bool integrated) {
     const bool wanted = StartsWithOne("FRITCHII_ONEF_LEAN") || StartsWithOne("FRITCHII_ONEF");
-    return wanted && (!amd_proprietary || StartsWithOne("FRITCHII_ONEF_AMD"));
+    if (!wanted || !amd_proprietary) {
+        return wanted;
+    }
+    if (const char* const keep = SwitchText("FRITCHII_ONEF_AMD")) {
+        return keep[0] != '0';
+    }
+    return !integrated && FullInEffect();
+}
+
+/// FRITCHII_ONEF_OCCL as VideoCommon::OneFollower::ReadSwitches decides it (OcclWanted): an
+/// explicit value wins (0 off); unset, on for AMD's proprietary driver on a discrete GPU. With
+/// it on the occlusion flags act with one follower on too.
+bool OneFollowerOcclOn(bool amd_proprietary, bool integrated) {
+    if (const char* const value = SwitchText("FRITCHII_ONEF_OCCL")) {
+        return value[0] != '0';
+    }
+    return amd_proprietary && !integrated;
 }
 
 /// A switch sets FRITCHII_OCCL_FLAG (it wins over the setting: a test runs).
@@ -116,7 +148,11 @@ void NoteCards(const std::vector<VkDeviceInfo::Record>& records) {
         records, Settings::values.vulkan_device.GetValue(true),
         Settings::values.vulkan_device_name.GetValue(true));
     const bool amd = index < records.size() && records[index].amd_proprietary;
-    g_full_can_act = !OneFollowerOn(amd);
+    const bool integrated = index < records.size() &&
+                            records[index].device_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    // Full acts with one follower off, and with it on where FRITCHII_ONEF_OCCL is on (by default
+    // AMD's proprietary driver on a discrete GPU, where one follower now runs at Full).
+    g_full_can_act = !OneFollowerOn(amd, integrated) || OneFollowerOcclOn(amd, integrated);
 }
 
 bool FullCanAct() {

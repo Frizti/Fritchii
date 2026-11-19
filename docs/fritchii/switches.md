@@ -1121,10 +1121,34 @@ for fps runs. Must be 0 bad; any line names the shader to clamp on the GPU next.
 
 ### FRITCHII_ONEF_AMD
 
-Boot, off by default (helper BJ, 2026-11-16). On AMD's proprietary Vulkan driver the one follower
-(FRITCHII_ONEF / FRITCHII_ONEF_LEAN) stays off: the desktop RX 7900 XT lost the device in game with
-it on and ran clean with every FRITCHII_ONEF_* line out. Log once: "One follower: off on AMD's
-proprietary driver ...". 1 = keep it on there (tests). RADV, NVIDIA and Intel unchanged.
+Boot (helper BJ, 2026-11-16; default inverted 2026-11-19). On AMD's proprietary Vulkan driver the
+one follower (FRITCHII_ONEF / FRITCHII_ONEF_LEAN) is on by default where it was measured: a
+discrete GPU with the occlusion speed-up at Full (9) in effect. Elsewhere on that driver it stays
+off as in 6.2: an integrated GPU (APUs, handhelds: never measured), or Full not in effect (the win
+over off comes from FRITCHII_ONEF_OCCL's pre-pass variants, which act only at Full; at Standard one
+follower on against off was never measured on AMD). 0 = off; 1 = on anyway (tests). Logs once:
+"One follower on AMD's proprietary driver (discrete GPU, occlusion speed-up Full |
+FRITCHII_ONEF_AMD=1); FRITCHII_ONEF_AMD=0 turns it off" or "One follower: off on AMD's proprietary
+driver (FRITCHII_ONEF_AMD=0 | an integrated GPU ... | the occlusion speed-up is not Full ...)".
+History: the desktop RX 7900 XT lost the device in game with it on (2026-11-16). Radeon GPU
+Detective traced the RX 9070 XT's loss at 0xbef011af0000 to AMD's vertex-buffer table in
+command-buffer embedded memory, read through a stale pointer after a draw without vertex buffers;
+fixed by MemPlayer::EnsureVertexBindings. Since then (with FRITCHII_ONEF_OCCL, FRITCHII_SEAM_AMD
+and FRITCHII_ASTC_HELD_DEFER on) about 30 launches and a 4-window soak had 0 losses, and one
+follower beat off at the fountain: 16.35-16.6 against 18.2 ms idle, 20.4-20.7 against 21.3 ms under
+PCIe load (RX 9070 XT over OCuLink x4, Core Ultra 7 255H). Only RDNA 4 tested: confirm on an RDNA 3
+desktop card. RADV, NVIDIA and Intel unchanged. The settings' Full row follows the same rule
+(fritchii/occlusion_offer.cpp).
+
+### FRITCHII_SEAM_AMD
+
+Boot (helper BJ, 2026-11-16; changed 2026-11-19). On AMD's proprietary driver EDEN_NX2_EXP123 (the
+memory seam, 3 built in) is kept at its value when one follower is on, and held to 1 when it is
+off (there SEAM 3 is about 0.6 ms slower than 1 on AMD). The original SEAM 3 loss at the title was
+the ASTC decoder's submit inside a held packet, skipped by FRITCHII_ASTC_HELD_DEFER (default 1). 0 =
+held to 1; 1 = kept either way (tests). Log once: "Memory seam: EXP123=N kept on AMD's proprietary
+driver (one follower on | FRITCHII_SEAM_AMD=1)" or "... held to 1 ... (one follower off |
+FRITCHII_SEAM_AMD=0)".
 
 ### FRITCHII_ONEF_OCCL
 
@@ -2963,7 +2987,7 @@ mode for AMD / Can give more fps on AMD cards. / Change it any time in Graphics 
 [Not now] [Turn it on]". The answer is kept and logged ("Occlusion speed-up offer: ..."); it is
 never asked again. FRITCHII_OCCL_OFFER=0 never asks; =ask asks at every plain launch on any PC
 (screenshots). In the settings, Full is greyed out where it can't act (the picked card runs one
-follower: every card but AMD's Windows driver by default), with one tooltip line.
+follower without FRITCHII_ONEF_OCCL: by default NVIDIA, Intel and RADV), with one tooltip line.
 
 Preparing shaders: the extensions change files the stamp hashes, but no prepared pipeline (every
 new SPIR-V path runs only for a variant made during play, never stored on disk; any other module
