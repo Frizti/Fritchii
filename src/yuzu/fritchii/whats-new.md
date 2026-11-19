@@ -8,6 +8,11 @@ On Fritchii v4 to v6.1 you don't need to download anything: it offers this updat
 
 Fritchii v6.2: smaller graphics cards, slower PCs and above 60 fps.
 
+### Good to know
+- **Intel 12th to 14th gen (P-cores and E-cores): you shouldn't need `EDEN_HYBRID_CORES=0` any more.** v6.1 tied the GPU threads tightly to the P-cores, which halved fps on some of these CPUs. v6.2 lets Windows place them by default. If you added the switch, remove it in Tools > Switches: while it's there, the new default and the CPU settings' Intel P-cores choice don't apply. If fps is still about half of what you expect, put it back and tell us on the Discord.
+- **First start asks once: "Use the recommended settings?"** Use recommended applies the settings tuned for OoT and saves your old ones first. Keep my settings changes nothing. You can switch later in Settings > General.
+- No new shader preparation: v6.2 keeps v6.1's prepared shaders.
+
 ### Graphics cards with 4 to 6 GB
 - **No more texture churn when video memory runs short.** On small cards Fritchii kept deleting textures the game was about to use again and making them over, dozens of times a frame. Now it keeps the ones the game keeps coming back to. On a simulated 4 GB card in Castle Town: **43 → 75 fps**, 1% lows **20 → 57**. A real 4 GB card also has to swap memory over PCIe, so expect less than that, but a big step either way.
 - Less video memory lost to half-empty buffer blocks on small cards.
@@ -39,7 +44,7 @@ Fritchii v6.2: smaller graphics cards, slower PCs and above 60 fps.
 - When Windows runs out of memory for a moment, Fritchii waits and tries again instead of closing.
 - A crash report now names the GPU work that hung, and a few rare GPU limits no longer end the game.
 
-No new shader preparation is needed: v6.2 keeps v6.1's prepared shaders. Some fixes in this release are ports from the Longshot and HeyListen projects, with thanks.
+Some fixes in this release are ports from the Longshot and HeyListen projects, with thanks.
 
 ---
 
