@@ -310,7 +310,7 @@ inline void PublishPools(const void* owner, const DeviceSpans& tic, const Device
     // Too many pieces: each pool's hull (more breaks, never fewer).
     const bool fits = tic.Spans().size() + tsc.Spans().size() <= PoolSpans::Max;
     u32 count = 0;
-    const auto add = [&](DAddr begin, DAddr end) {
+    const auto add = [&pools, &count](DAddr begin, DAddr end) {
         pools.begin[count].store(begin, std::memory_order_relaxed);
         pools.end[count].store(end, std::memory_order_relaxed);
         ++count;

@@ -185,6 +185,11 @@ else()
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-parameter>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-missing-field-initializers>)
 
+    # Clang-cl diagnoses valid explicit captures in the shared GPU code.
+    if (ENABLE_WERROR AND CXX_CLANG AND MSVC)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-error=unused-lambda-capture>)
+    endif()
+
     if (ENABLE_WERROR AND (NOT MSVC))
         add_compile_options(
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=unused>
