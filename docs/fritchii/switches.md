@@ -1159,15 +1159,18 @@ draws lost 0, checks 0, picture unchanged.
 
 ### FRITCHII_ASTC_HELD_DEFER
 
-Boot, default 0 (helper BG's fix from 2026-11-16, ported by helper FJ). 1 = an ASTC GPU decode made
-while this thread holds a filled draw or dispatch packet (EXP123 >= 2) does not submit: the decode
-and its barrier stay in the current command buffer, ahead of the draw, and the next flush takes
-them. Why: that submit splits a held packet across two command buffers ("Memory seam (5.5) ...
-ASTCDecoderPass"), and both AMD cards lost the device 10-15 ms after one at the title. That loss
-is why EXP123 is held to 1 on AMD's driver (FRITCHII_SEAM_AMD), and with EXP123=1 the one follower
-posts nothing there ("lent: no ring", every draw a transient lend). Test on AMD with
-FRITCHII_SEAM_AMD=1: the 5.5 lines from ASTCDecoderPass must be gone, "ASTC GPU decode inside a
-held draw fill" shows once. Watch RADV for BC3 flashes (the submit once hid a race there).
+Boot, default 1 since 2026-11-19 (helper BG's fix from 2026-11-16, ported by helper FJ; 6.2 had it
+at 0). An ASTC GPU decode made while this thread holds a filled draw or dispatch packet (EXP123 >= 2)
+does not submit: the decode and its barrier stay in the current command buffer, ahead of the draw,
+and the next flush takes them (Scheduler::DeferFlushUntilWanted: the back submits when it idles;
+in Finish mode, EDEN_NX2_ASTC_FLUSH=0, too, where the wait is pacing only). It acts only inside a
+held packet (SEAM 2/3), so it is inert elsewhere. Why: that submit splits a held packet across two
+command buffers ("Memory seam (5.5) ... ASTCDecoderPass"), and both AMD cards (RX 7900 XT, RX 9070
+XT) lost the device 10-15 ms after one at the title; with the skip, SEAM 3 on AMD passed the title
+and the fountain in every run since. 0, or the old FRITCHII_ASTC_HELD_FLUSH=1 of exp/onef-amd,
+submits as before. Log once: "ASTC GPU decode inside a held draw fill: submit left to the next
+flush". Watch RADV for BC3 flashes (the submit once hid a race there); NVIDIA, where SEAM 3 is the
+default, now takes this path too.
 
 ### FRITCHII_VA_REPORT
 

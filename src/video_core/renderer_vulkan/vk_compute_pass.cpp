@@ -853,16 +853,20 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     if (!target.wait) {
         return;
     }
-    // FRITCHII_ASTC_HELD_DEFER (boot, default 0; helper BG's fix, ported by helper FJ): inside a
-    // held draw fill (EXP123 >= 2: the texture work sits between the fill and its PlayRest) this
-    // submit splits the packet across two command buffers (Memory seam 5.5). An RX 7900 XT and an
-    // RX 9070 XT lost the device 10-15 ms after such submits at the title (2026-11-16), which is
-    // why EXP123 is held to 1 on AMD's driver and the one follower posts nothing there. 1 = the
-    // decode and its barrier stay in this command buffer, ahead of the draw on the same queue, and
-    // the next flush submits them.
+    // FRITCHII_ASTC_HELD_DEFER (boot, default 1 since 2026-11-19; helper BG's fix, ported by
+    // helper FJ): inside a held draw fill (EXP123 >= 2: the texture work sits between the fill and
+    // its PlayRest) this submit splits the packet across two command buffers (Memory seam 5.5). An
+    // RX 7900 XT and an RX 9070 XT lost the device 10-15 ms after such submits at the title
+    // (2026-11-16). 1 = the decode and its barrier stay in this command buffer, ahead of the draw
+    // on the same queue, and the next flush submits them (in Finish mode too: the wait is pacing
+    // only). It acts only inside a held packet. 0, or the old FRITCHII_ASTC_HELD_FLUSH=1,
+    // submits as before.
     static const bool held_defer = [] {
-        const char* value = std::getenv("FRITCHII_ASTC_HELD_DEFER");
-        return value != nullptr && value[0] == '1';
+        const char* const value = std::getenv("FRITCHII_ASTC_HELD_DEFER");
+        const char* const old_flush = std::getenv("FRITCHII_ASTC_HELD_FLUSH");
+        const bool off = (value != nullptr && value[0] == '0') ||
+                         (old_flush != nullptr && old_flush[0] == '1');
+        return !off;
     }();
     if (held_defer && SeamHook::Holding()) [[unlikely]] {
         static std::atomic<u32> held_skips{};
