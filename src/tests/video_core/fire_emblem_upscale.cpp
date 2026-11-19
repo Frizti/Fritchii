@@ -172,6 +172,7 @@ TEST_CASE("Star Fox captured passes use the validated colour and jitter slots", 
     const auto fire_emblem = FE::CapturedPasses(FE::ProgramId);
     REQUIRE(fire_emblem);
     REQUIRE_FALSE(fire_emblem->spatial_only);
+    REQUIRE(fire_emblem->prepass_alt == FE::PrepassProgramKeyV111);
     REQUIRE_FALSE(FE::CapturedPasses(0x040074A01BF12000ULL));
 }
 
