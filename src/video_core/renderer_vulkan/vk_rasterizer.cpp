@@ -2427,16 +2427,23 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
             chosen = chosen->occl_flag_parent; // a kept flag variant: decided again
         }
-        // With one follower on, only where FRITCHII_ONEF_OCCL is on (OneFollower::OcclWanted:
-        // unset = AMD's proprietary driver on a discrete GPU). v6.2 kept every draw, lent ones
-        // included, off its flag variants with one follower on, after two AMD losses read a wild
-        // address at a lent load (2026-11-18/19); RGD traced those to a stale vertex-buffer table
-        // (MemPlayer::EnsureVertexBindings), not the flag store, which only stores. OcclWanted
-        // false is exactly that v6.2 rule.
-        if (onef_play != nullptr ||
-            (VideoCommon::OneFollower::On() && !VideoCommon::OneFollower::OcclWanted()) ||
-            chosen == nullptr ||
-            VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Off ||
+        // One follower with FRITCHII_ONEF_OCCL on (OneFollower::OcclWanted: unset = AMD's
+        // proprietary driver on a discrete GPU): a played draw's flag variant is E's choice (its
+        // lookup, the packet's pipeline); R only makes sure the flag area exists (made here, on
+        // R), and lent draws take their variants as with one follower off. With it off, v6.2's
+        // rule exactly: no flag variant with one follower on, lent draws included. (v6.2 made
+        // that rule after two AMD losses read a wild address at a lent load, 2026-11-18/19;
+        // RGD traced those to a stale vertex-buffer table, MemPlayer::EnsureVertexBindings,
+        // not the flag store, which only stores.)
+        const bool onef_occl = VideoCommon::OneFollower::OcclWanted();
+        if (onef_play != nullptr && onef_occl) {
+            if (VideoCommon::OcclFlag::Mode() != VideoCommon::OcclFlag::Off) {
+                static_cast<void>(query_cache_runtime.OcclFlagReady());
+            }
+            return chosen;
+        }
+        if (onef_play != nullptr || (VideoCommon::OneFollower::On() && !onef_occl) ||
+            chosen == nullptr || VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Off ||
             !query_cache_runtime.OcclFlagReady()) {
             return chosen;
         }
@@ -2468,9 +2475,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
         if (onef_play != nullptr && onef_play->pipeline != nullptr) {
             // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looked this draw's pipeline up at its own
-            // position; R binds it and looks nothing up. Never a flag variant (one follower on).
+            // position; R binds it and looks nothing up. With FRITCHII_ONEF_OCCL on it may be the
+            // in-place flag variant E picked (FillAndPush); off, never a flag variant (v6.2: the
+            // parent).
             auto* const played = const_cast<GraphicsPipeline*>(
                 static_cast<const GraphicsPipeline*>(onef_play->pipeline));
+            if (VideoCommon::OneFollower::OcclWanted()) {
+                return played;
+            }
             return played->occl_flag_parent != nullptr ? played->occl_flag_parent : played;
         }
         Profile::Scope scope{Profile::Zone::PipelineLookup};

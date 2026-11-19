@@ -234,6 +234,9 @@ public:
     bool OcclFlagReady() {
         return EnsureFlagArea();
     }
+    bool FlagAreaExists() const {
+        return flag_map.load(std::memory_order_acquire) != nullptr;
+    }
 
     /// FRITCHII_OCCL_FLAG: a counted draw drawn without a flag pipeline (its slot's reports are
     /// "mixed" and not compared).
@@ -2286,6 +2289,10 @@ void QueryCacheRuntime::OcclPrepassResume() {
 
 void QueryCacheRuntime::NoteOtherCountedDraw(bool blocks) {
     impl->sample_streamer.NoteOtherCountedDraw(blocks);
+}
+
+bool QueryCacheRuntime::OcclFlagAreaExists() const {
+    return impl->sample_streamer.FlagAreaExists();
 }
 
 bool QueryCacheRuntime::OcclFlagReady() {

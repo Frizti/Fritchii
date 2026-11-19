@@ -40,6 +40,7 @@
 #include "common/dkb_frame_trace.h"
 #include "common/fritchii_page_flags.h"
 #include "common/scope_exit.h"
+#include "video_core/fritchii_occl_flag.h"
 #include "video_core/fritchii_delta_path.h"
 #include "video_core/fritchii_e_split.h"
 #include "video_core/fritchii_e_split_thread.h"
@@ -961,6 +962,34 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         if (pipeline->IsEmulatedMesh()) [[unlikely]] {
             reason = LentReason::NoPath;
             return false;
+        }
+        // FRITCHII_ONEF_OCCL (OneFollower::OcclWanted: unset = AMD's proprietary driver on a
+        // discrete GPU) with FRITCHII_OCCL_FLAG: E picks the draw's flag variant at its lookup
+        // (the pipeline cache and the registers are E's); R records it as the lent path does
+        // (the slot, the address push). Only variants drawn in place: a pre-pass (colour or
+        // discard) records the draw twice, decided by R's thread state.
+        // FillAndPush's callers are RouteDraw (direct draws) and RouteListDraw (list draws) only:
+        // a non-list indirect draw is always lent, so it reaches the lent path's own choice,
+        // where the pre-pass refuses indirect draws (review C8). Only list draws need excluding
+        // here (their arguments are consumed once).
+        if (VideoCommon::OneFollower::OcclWanted() &&
+            VideoCommon::OcclFlag::Mode() != VideoCommon::OcclFlag::Off &&
+            rasterizer.query_cache_runtime.OcclFlagAreaExists()) {
+            VideoCommon::OcclFlag::t_colour_prepass = false;
+            VideoCommon::OcclFlag::t_discard_direct = false;
+            VideoCommon::OcclFlag::t_colour_discard_prepass = false;
+            GraphicsPipeline* const flag =
+                rasterizer.pipeline_cache.OcclFlagPipeline(pipeline, engine.regs, true);
+            const bool in_place = flag != nullptr && flag != pipeline &&
+                                  !VideoCommon::OcclFlag::t_colour_prepass &&
+                                  !VideoCommon::OcclFlag::t_colour_discard_prepass &&
+                                  !flag->IsOcclDiscardPrepass();
+            VideoCommon::OcclFlag::t_colour_prepass = false;
+            VideoCommon::OcclFlag::t_discard_direct = false;
+            VideoCommon::OcclFlag::t_colour_discard_prepass = false;
+            if (in_place) {
+                pipeline = flag;
+            }
         }
     }
     // FRITCHII_OCCL_LEAN (helper CS, fritchii_occl_lean.h): a draw that writes no colour takes
