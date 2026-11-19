@@ -5964,7 +5964,7 @@ void RasterizerVulkan::DispatchCompute() {
     // played at the rest; R must not touch E's buffer cache): with the fix on, its bind is
     // deferred and recorded with the dispatch, and the scheduler's tracker forgets the
     // descriptor buffer afterwards (the deferred bind binds it behind the tracker's back).
-    const bool defer_split_bind = SplitBindFix() && onef_play != nullptr && !indirect_address;
+    const bool defer_split_bind = SplitBindFix() && onef_play != nullptr;
     const bool defer_bind = can_replace || marking_effects || defer_split_bind;
     {
         const MemStage::RestAtEnd rest{mem_stage};
@@ -6144,7 +6144,8 @@ void RasterizerVulkan::DispatchCompute() {
         if (!bind_again_after_split()) [[unlikely]] {
             return;
         }
-        scheduler.Record([this, pipeline, indirect_buffer = indirect_ref.buffer,
+        scheduler.Record([this, pipeline, bind = std::move(deferred_bind),
+                          indirect_buffer = indirect_ref.buffer,
                           indirect_offset = indirect_ref.offset,
                           grid_buffer = grid_copy ? grid_copy->buffer : VkBuffer{},
                           grid_offset = grid_copy ? grid_copy->offset : VkDeviceSize{}](
@@ -6174,6 +6175,10 @@ void RasterizerVulkan::DispatchCompute() {
                                        HOST_READS_COPY);
             }
             RecordDispatchBarrier(cmdbuf);
+            // The deferred bind (FRITCHII_SPLIT_BIND_FIX), in the dispatch's command buffer.
+            if (bind) {
+                bind(cmdbuf);
+            }
             if (!pipeline->IsBound()) {
                 return;
             }
@@ -6181,6 +6186,11 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
+        if (defer_split_bind) {
+            // FRITCHII_SPLIT_BIND_FIX: the played dispatch's bind, recorded with it, bound a
+            // descriptor buffer the scheduler did not track.
+            scheduler.ForgetDescriptorBuffer();
+        }
         if (grid_copy) {
             onef_grid_checks.push_back({*grid_copy, scheduler.CurrentTick(),
                                         pipeline->ShaderHash(), onef_play != nullptr,
