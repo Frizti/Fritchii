@@ -16,12 +16,14 @@ namespace Vulkan {
 
 namespace {
 
-/// Below this much owed time no dispatch is added (its barriers would cost more than it adds).
-constexpr s64 MinAddNs = 50'000;
+/// Below this much owed time no dispatch is added. Each dispatch needs two full barriers, whose
+/// flush slows the work after them, and that work is then measured and multiplied too: fewer,
+/// longer dispatches keep that out of the numbers.
+constexpr s64 MinAddNs = 1'000'000;
 /// The longest single dispatch: far from the driver's hang timeout, and about one frame.
 constexpr s64 MaxAddNs = 16'000'000;
 /// Until the loop's speed on this card is measured, dispatches stay short.
-constexpr s64 UncalibratedAddNs = 500'000;
+constexpr s64 UncalibratedAddNs = 1'000'000;
 constexpr u32 CalibrationDispatches = 8;
 /// Owed time beyond this is dropped (and counted): the game can't be delayed by a backlog of
 /// seconds after a load, which a slower card would never have built up.
@@ -167,9 +169,9 @@ bool SimGpuSlow::Create(const Device& device_) {
         logical.ResetQueryPool(*pool, 0, Slots * StampsPerSlot);
     }
     LOG_INFO(Render_Vulkan,
-             "FRITCHII_SIM_GPU_SLOW: GPU timestamps around every main-queue submission, added "
-             "load of up to {} ms a submission",
-             MaxAddNs / 1'000'000);
+             "FRITCHII_SIM_GPU_SLOW: GPU timestamps around every main-queue submission; added "
+             "load in dispatches of {} to {} ms, as many a frame as it takes",
+             MinAddNs / 1'000'000, MaxAddNs / 1'000'000);
     return true;
 }
 
@@ -225,6 +227,8 @@ void SimGpuSlow::Poll(MasterSemaphore& master) {
         }
         window_work_ns += static_cast<u64>(work_ns);
         window_added_ns += static_cast<u64>(added_ns);
+        ++window_submissions;
+        window_dispatches += entry.iterations != 0 ? 1U : 0U;
         debt_ns += static_cast<s64>(work_ns * (percent - 100) / 100.0) - static_cast<s64>(added_ns);
         if (debt_ns > MaxDebtNs) {
             window_dropped_ns += static_cast<u64>(debt_ns - MaxDebtNs);
@@ -254,11 +258,12 @@ void SimGpuSlow::Report(std::chrono::steady_clock::time_point now, int percent) 
     const double added_ms = static_cast<double>(window_added_ns) / 1e6;
     LOG_INFO(Render_Vulkan,
              "Low-end simulation, GPU x{:.2f}: work {:.0f} ms/s, added {:.0f} ms/s, x{:.2f} "
-             "reached, GPU busy {:.0f}%; {:.1f} ns an iteration, {:.0f} ms owed, {:.0f} ms dropped, "
-             "{} submissions unmeasured",
+             "reached, GPU busy {:.0f}%; {:.0f} submissions/s, {:.0f} dispatches/s; {:.1f} ns an "
+             "iteration, {:.0f} ms owed, {:.0f} ms dropped, {} submissions unmeasured",
              percent / 100.0, work_ms / seconds, added_ms / seconds,
              work_ms > 0.0 ? (work_ms + added_ms) / work_ms : 0.0,
-             (work_ms + added_ms) / seconds / 10.0, ns_per_iteration,
+             (work_ms + added_ms) / seconds / 10.0, window_submissions / seconds,
+             window_dispatches / seconds, ns_per_iteration,
              static_cast<double>(debt_ns) / 1e6, static_cast<double>(window_dropped_ns) / 1e6,
              window_unstamped);
     window_start = now;
@@ -266,6 +271,8 @@ void SimGpuSlow::Report(std::chrono::steady_clock::time_point now, int percent) 
     window_added_ns = 0;
     window_dropped_ns = 0;
     window_unstamped = 0;
+    window_submissions = 0;
+    window_dispatches = 0;
 }
 
 void SimGpuSlow::Begin(const Device& device_, vk::CommandBuffer upload_cmdbuf,

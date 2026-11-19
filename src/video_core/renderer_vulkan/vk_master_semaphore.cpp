@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <ranges>
 #include <fmt/format.h>
+#include "common/lowend_sim.h"
 #include "common/nx2_hitch.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -111,6 +112,7 @@ void MasterSemaphore::Refresh() {
 }
 
 void MasterSemaphore::Wait(u64 tick) {
+    const Common::LowEndSim::CpuWaitScope sim_wait; // waiting for the GPU is not CPU work
     if (!semaphore) {
         // Fast check: already reached the requested tick?
         if (gpu_tick.load(std::memory_order_acquire) >= tick) {

@@ -5967,15 +5967,23 @@ EDEN_NX2_VRAM_LIMIT_MIB + FRITCHII_VRAM_SIM_OTHERS=1.
   (factor - 1) ms of a one-invocation compute dispatch at the end of later submissions, between
   full barriers, so nothing runs beside it. The dispatch is measured too and the difference carried
   over. Line every 10 s: "Low-end simulation, GPU x3.50: work W ms/s, added A ms/s, xR reached, GPU
-  busy B%". R should sit at the factor; a lower R with "dropped" above 0 means the game makes too
-  few submissions to fit the load. Not slowed: the present pass and the side queue.
+  busy B%; S submissions/s, D dispatches/s". R should sit at the factor; a lower R with "dropped"
+  above 0 means the load came faster than it can be added (loading screens). Dispatches take 1 to
+  16 ms each and there can be several a frame, so 16 ms does not limit a frame. The upscaler runs
+  inside the measured submissions and is scaled. Not slowed: the present pass and the side queue.
 - FRITCHII_SIM_CPU=<cores>/<threads> (boot; 6/12, 4/8, 6/6). The process keeps that many of the
   PC's last cores (always fewer than it has), thread pools size themselves by it and thread
   pinning plans for it, so a 4-core simulation runs unpinned like a real 4-core PC.
-- FRITCHII_SIM_CPU_SLOW=<factor> (live, 1 to 4). The guest cores, GPU front, GPU back and Vulkan
-  worker spin for (factor - 1) x the CPU time they used, counted in their own cycles, after each
-  stretch of work. Waits are not charged. Not slowed: the memory stage, shader compile workers,
-  audio. Line every ~10 s: "Low-end simulation, CPU x1.70: ... x1.70 in all".
+- FRITCHII_SIM_CPU_SLOW=<factor> (live, 1 to 4). The guest cores, GPU front, GPU back (E, E2),
+  render thread R and Vulkan worker take `factor` times as long over their real work: after each
+  stretch of it they spin for (factor - 1) x its length. A stretch is timed with the clock and
+  capped by the thread's own cycle counter, so being descheduled or blocked does not count; the
+  same time can't count twice. Left out: guest cores idling or polling, spin loops (every pause),
+  waits for the other GPU threads, the worker and the host GPU. Guest code that spins on memory
+  without a kernel call can't be told from work. Not slowed: the memory stage, shader compile
+  workers, HLE service threads, audio. Line every ~10 s, ms per second summed over each class's
+  threads: "Low-end simulation, CPU x1.50, ...: game W + A (x1.50, left out L), front ...". The
+  x must match the factor; a frame can't get slower than the factor from this switch alone.
 - There is no CPU cap switch on purpose. A Windows job object's hard CPU cap limits the process's
   total only, and it stops every thread until the next interval: measured on the owner's PC
   (lowend_sim.py --measure-cap, 2026-11-19), one thread capped at half a processor ran in turns with

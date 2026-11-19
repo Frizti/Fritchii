@@ -5606,7 +5606,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // shader translator. Not the commit (2026-11-09, owner: every dev build re-ran the ~20 minute
     // preparation), and since v5.8 not the release either (every release re-ran it for every
     // player, also releases that changed no shader): NX2_SHADER_STAMP hashes the shader
-    // recompiler, pipeline creation and the precompile step (CMakeModules/Nx2ShaderStamp.cmake).
+    // recompiler, pipeline creation and the precompile step (CMakeModules/Nx2ShaderStamp.cmake,
+    // which stops the build when the stamp leaves its known values: 6.2 keeps 6.1's).
     const auto stamp_path =
         base_dir / fmt::format("precompiled_prepared.fork-v{}.txt", CACHE_VERSION);
     // With the pipeline binary store saving, its file id too: a new (or started over) store is

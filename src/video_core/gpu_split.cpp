@@ -226,6 +226,7 @@ void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
 }
 
 void Pause() {
+    Common::LowEndSim::CpuPauseNote();
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     _mm_pause();
 #elif defined(__x86_64__) || defined(__i386__)
@@ -605,6 +606,7 @@ void GpuSplit::WaitForSpace(size_t words) {
         return;
     }
     Publish();
+    const Common::LowEndSim::CpuWaitScope sim_wait;
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = PlayedNow(std::memory_order_acquire);
@@ -2007,6 +2009,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     if (consumed_cache >= target || Reached(target, on_engine, std::memory_order_acquire)) {
         return false;
     }
+    const Common::LowEndSim::CpuWaitScope sim_wait;
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
     Common::Nx2Timeline::ArgSpan timeline_span{drain_site_names[static_cast<size_t>(site)],
                                                {"behind", target - consumed_cache}};
@@ -4550,10 +4553,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     MemoryStageLink& link = MemoryStageLink::Get();
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
-        // FRITCHII_SIM_CPU_SLOW: the back pays for the entries it just ran.
-        if (Common::LowEndSim::CpuSlowOn()) [[unlikely]] {
-            Common::LowEndSim::CpuCharge();
-        }
+        // FRITCHII_SIM_CPU_SLOW: one stretch of work per batch of entries.
+        Common::LowEndSim::CpuWorkEnd();
+        Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Back);
         // The ring starts and ends here, where everything before read_position is consumed.
         const bool ring_on = link.BackRingTop(read_position);
         MemoryStageLink::BackLimits limits =
@@ -4576,11 +4578,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                     continue;
                 }
             }
-            // The wait below may spin: it is not work (FRITCHII_SIM_CPU_SLOW).
+            // FRITCHII_SIM_CPU_SLOW: the wait below is not work.
+            Common::LowEndSim::CpuWorkEnd();
             SCOPE_EXIT {
-                if (Common::LowEndSim::CpuSlowOn()) [[unlikely]] {
-                    Common::LowEndSim::CpuRestart();
-                }
+                Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Back);
             };
             // On the timeline (not through the zone) with the phase the wait reached: 0 = spin,
             // 1 = the idle hook ran, 2 = slept on `wake`, 3 = waited for the memory stage

@@ -131,6 +131,12 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
 
     interface->Initialize();
 
+    // FRITCHII_SIM_CPU_SLOW: the guest code and the kernel call it ends in.
+    Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Game);
+    SCOPE_EXIT {
+        Common::LowEndSim::CpuWorkEnd();
+    };
+
     const auto EnterContext = [&]() {
         // Lock the core context.
         ScopedGuard lk{*this};
@@ -189,11 +195,6 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         // memory here, outside the scheduler lock).
         if (Common::Nx2Timeline::Guest()) [[unlikely]] {
             NameGuestThreadForTimeline(thread);
-        }
-
-        // FRITCHII_SIM_CPU_SLOW: this core pays for the guest code and kernel calls it just ran.
-        if (Common::LowEndSim::CpuSlowOn()) [[unlikely]] {
-            Common::LowEndSim::CpuCharge();
         }
 
         // Otherwise, run the thread.
@@ -354,6 +355,8 @@ void PhysicalCore::LogBacktrace(KernelCore& kernel) {
 
 void PhysicalCore::Idle(KernelCore& kernel) {
     Common::Nx2Timeline::Span timeline_span{"guest core idle"};
+    // FRITCHII_SIM_CPU_SLOW: the idle poll below is not work.
+    Common::LowEndSim::CpuWorkCancel();
     // EDEN_NX2_JIT_WARM=1: each emulated core has its own JIT, so code one core compiled is
     // compiled again by every other core the first time it runs it there (bursts of 60-180 ms
     // frames after area loads, 2026-11-10). An idle core compiles that code now, a few blocks at

@@ -97,10 +97,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
             Profile::Report();
-            // FRITCHII_SIM_CPU_SLOW: the front pays for the command it just handled.
-            if (Common::LowEndSim::CpuSlowOn()) [[unlikely]] {
-                Common::LowEndSim::CpuCharge();
-            }
+            // FRITCHII_SIM_CPU_SLOW: the command just handled ends here.
+            Common::LowEndSim::CpuWorkEnd();
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
@@ -207,10 +205,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 break;
             }
             last_progress = std::chrono::steady_clock::now();
-            // The wait for this command is not work.
-            if (Common::LowEndSim::CpuSlowOn()) [[unlikely]] {
-                Common::LowEndSim::CpuRestart();
-            }
+            // FRITCHII_SIM_CPU_SLOW: the wait for this command was not work, handling it is.
+            Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Front);
             if (split.Active()) {
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.

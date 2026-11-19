@@ -486,6 +486,8 @@ public:
     u8 occl_class{};
     GraphicsPipeline* occl_sibling{};
 
+    // FRITCHII_STAMP_SKIP_BEGIN: left out of the Preparing shaders stamp (CMakeModules/Nx2ShaderStamp.cmake).
+    // Only what can't change a pipeline the driver compiles belongs here.
     /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): this pipeline's flag variant (the same key with
     /// the host flag pixel program), owned here and never in the cache; on a flag variant, the
     /// pipeline it was made from. occl_flag_state: 0 not tried, 1 made, 2 refused for good.
@@ -498,6 +500,7 @@ public:
         return *pipeline_layout;
     }
 
+    // FRITCHII_STAMP_SKIP_END
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
     }

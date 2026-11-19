@@ -15,6 +15,7 @@
 #include <immintrin.h>
 #endif
 #include "common/logging.h"
+#include "common/lowend_sim.h"
 #include "common/settings.h"
 #include "common/nx2_hitch.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
@@ -334,6 +335,8 @@ bool CntpctPauseOn() {
 u64 DynarmicCallbacks64::GetCNTPCT() {
     const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
     if (CntpctPauseOn() && ticks - m_last_cntpct < m_spin_ticks) {
+        // The guest is polling the clock: a wait, not work (FRITCHII_SIM_CPU_SLOW).
+        Common::LowEndSim::CpuPauseNote();
 #if defined(_M_X64) || defined(__x86_64__)
         _mm_pause();
         _mm_pause();

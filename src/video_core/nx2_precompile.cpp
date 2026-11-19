@@ -22,7 +22,6 @@
 
 #include <fmt/format.h>
 
-#include "common/lowend_sim.h"
 #include "common/cityhash.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -138,7 +137,7 @@ unsigned Threads() {
         if (const char* value = std::getenv("EDEN_NX2_PRECOMPILE_THREADS")) {
             return static_cast<unsigned>(std::clamp(std::atoi(value), 1, 16));
         }
-        return std::clamp(Common::LowEndSim::LogicalProcessors() / 4, 1U, 6U);
+        return std::clamp(std::thread::hardware_concurrency() / 4, 1U, 6U);
     }();
     return threads;
 }

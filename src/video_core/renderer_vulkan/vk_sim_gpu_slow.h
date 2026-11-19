@@ -85,6 +85,8 @@ private:
     u64 window_added_ns{};
     u64 window_dropped_ns{};
     u32 window_unstamped{};
+    u32 window_submissions{};
+    u32 window_dispatches{};
 };
 
 } // namespace Vulkan

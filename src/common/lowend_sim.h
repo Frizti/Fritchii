@@ -33,7 +33,7 @@ void LogProcessLimits();
 /// At most `max_percent`.
 [[nodiscard]] int FactorPercent(std::atomic<int>& value, const char* name, int max_percent);
 
-/// FRITCHII_SIM_CPU_SLOW (live): each hooked thread spins for (factor - 1) x the CPU time it used.
+/// FRITCHII_SIM_CPU_SLOW (live): each hooked thread's work takes `factor` times as long.
 inline std::atomic<int> g_cpu_slow{-1};
 /// FRITCHII_SIM_GPU_SLOW (live): the GPU is kept busy for (factor - 1) x its measured work.
 inline std::atomic<int> g_gpu_slow{-1};
@@ -66,13 +66,56 @@ namespace Detail {
     return Detail::FactorOn(g_gpu_slow, "FRITCHII_SIM_GPU_SLOW", MaxGpuSlowPercent);
 }
 
-/// The calling thread pays for the CPU time it used since its last CpuCharge or CpuRestart: it
-/// spins for (factor - 1) x that time, counted in its own CPU cycles, so being descheduled does
-/// not count. Small amounts add up until they are worth a spin. Call only with CpuSlowOn().
-void CpuCharge();
+/// The threads FRITCHII_SIM_CPU_SLOW slows, for its log line.
+enum class CpuClass : u8 { Game, Front, Back, Render, Worker, Count };
 
-/// The calling thread's CPU time counts from here (after a wait that may have spun: waiting is
-/// not work a slower CPU would take longer over).
-void CpuRestart();
+void CpuWorkBeginSlow(CpuClass work_class);
+void CpuWorkEndSlow();
+void CpuWorkCancelSlow();
+void CpuPauseNoteSlow();
+[[nodiscard]] bool CpuWaitBeginSlow();
+void CpuWaitEndSlow();
+
+/// A stretch of real work on this thread starts. Only the time between Begin and End counts, once:
+/// a Begin inside an open stretch does nothing. At End the thread spins for (factor - 1) x the work.
+inline void CpuWorkBegin(CpuClass work_class) {
+    if (CpuSlowOn()) [[unlikely]] {
+        CpuWorkBeginSlow(work_class);
+    }
+}
+inline void CpuWorkEnd() {
+    if (CpuSlowOn()) [[unlikely]] {
+        CpuWorkEndSlow();
+    }
+}
+/// The open stretch is dropped: the thread went idle (a guest core with nothing to run).
+inline void CpuWorkCancel() {
+    if (CpuSlowOn()) [[unlikely]] {
+        CpuWorkCancelSlow();
+    }
+}
+/// From a spin loop's pause. The gaps between pauses of a loop are not work, so waiting for another
+/// thread is not charged, which would make every wait longer than the work it waited for.
+inline void CpuPauseNote() {
+    if (CpuSlowOn()) [[unlikely]] {
+        CpuPauseNoteSlow();
+    }
+}
+
+/// A wait for another thread or the GPU inside a stretch of work: left out of it.
+class CpuWaitScope {
+public:
+    CpuWaitScope() : active{CpuSlowOn() && CpuWaitBeginSlow()} {}
+    ~CpuWaitScope() {
+        if (active) [[unlikely]] {
+            CpuWaitEndSlow();
+        }
+    }
+    CpuWaitScope(const CpuWaitScope&) = delete;
+    CpuWaitScope& operator=(const CpuWaitScope&) = delete;
+
+private:
+    bool active;
+};
 
 } // namespace Common::LowEndSim

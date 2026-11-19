@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -100,6 +103,12 @@ void ApplyCpuSet() {
         return;
     }
     g_cpu_mask = mask;
+    // The preparation's threads follow the simulated CPU, by its switch: nx2_precompile.cpp is one
+    // of the files the Preparing shaders stamp hashes.
+    if (std::getenv("EDEN_NX2_PRECOMPILE_THREADS") == nullptr) {
+        const int count = std::clamp(std::popcount(mask) / 4, 1, 6);
+        _putenv_s("EDEN_NX2_PRECOMPILE_THREADS", std::to_string(count).c_str());
+    }
     g_boot_notes.push_back(fmt::format("FRITCHII_SIM_CPU={}: {} cores, {} threads, processors "
                                        "{:#x} of this PC's {} cores",
                                        text, cores, threads, mask, all.size()));
@@ -141,26 +150,43 @@ void ApplyJob() {
 }
 
 struct ThreadState {
-    u64 cycles{}; ///< the thread's own cycle counter at the last charge
-    u64 tsc{};    ///< the clock at the last charge
-    u64 debt{};   ///< cycles still to spin
-    bool started{};
+    u64 begin{};       ///< the clock at the start of the stretch, or at its last pause
+    u64 sum{};         ///< ticks of work not settled yet
+    u64 left_out{};    ///< ticks of waits and spins not reported yet
+    u64 base_cycles{}; ///< the thread's own cycle counter at the last settling
+    u64 debt{};        ///< ticks still to spin
+    u64 wait_begin{};
+    CpuClass work_class{CpuClass::Game};
+    bool open{};
+    bool after_pause{};
+    bool has_base{};
 };
 thread_local ThreadState t_state;
 
-/// The charge's cheap gate, in clock ticks (about 10 us): reading a thread's cycle counter is a
-/// system call, and the guest cores come through here at every return from the JIT.
-constexpr u64 ChargeEveryTicks = 40'000;
-/// Smaller debts wait for the next charge (about 20 us).
-constexpr u64 MinSpinCycles = 80'000;
-/// The longest single spin (about 5 ms); what is above it is forgotten, not paid later in a lump.
-constexpr u64 MaxSpinCycles = 20'000'000;
+constexpr size_t ClassCount = static_cast<size_t>(CpuClass::Count);
+constexpr std::array<const char*, ClassCount> ClassNames{"game", "front", "back", "render",
+                                                         "worker"};
+
+/// Work is settled once this much has added up (about 20 us): settling reads the thread's cycle
+/// counter, a system call, and the guest cores end a stretch at every kernel call.
+constexpr u64 SettleTicks = 80'000;
+/// Smaller debts wait for the next settling (about 20 us).
+constexpr u64 MinSpinTicks = 80'000;
+/// The longest single spin, and the most a thread may owe (about 20 ms).
+constexpr u64 MaxSpinTicks = 80'000'000;
+/// Two pauses closer than this (about 2 us) belong to one spin loop.
+constexpr u64 SpinGapTicks = 8'000;
+/// An open stretch this old (about 50 ms) was left by a switch turned off and on again.
+constexpr u64 StaleTicks = 200'000'000;
 /// A log line about this often (about 10 s).
 constexpr u64 ReportEveryTicks = 40'000'000'000;
 
-std::atomic<u64> g_worked_cycles{0};
-std::atomic<u64> g_spun_cycles{0};
+std::array<std::atomic<u64>, ClassCount> g_work_ticks{};
+std::array<std::atomic<u64>, ClassCount> g_added_ticks{};
+std::array<std::atomic<u64>, ClassCount> g_left_ticks{};
 std::atomic<u64> g_next_report{0};
+std::atomic<u64> g_report_ticks{0};
+std::atomic<s64> g_report_ns{0};
 
 [[nodiscard]] u64 ThreadCycles() {
     ULONG64 cycles = 0;
@@ -175,15 +201,84 @@ void ReportCpuSlow(u64 now_ticks, int percent) {
                                                std::memory_order_relaxed)) {
         return;
     }
-    const u64 worked = g_worked_cycles.exchange(0, std::memory_order_relaxed);
-    const u64 spun = g_spun_cycles.exchange(0, std::memory_order_relaxed);
-    if (next != 0 && worked != 0) {
+    const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    const u64 last_ticks = g_report_ticks.exchange(now_ticks, std::memory_order_relaxed);
+    const s64 last_ns = g_report_ns.exchange(now_ns, std::memory_order_relaxed);
+    std::string classes;
+    u64 all_work = 0;
+    u64 all_added = 0;
+    const double seconds = static_cast<double>(now_ns - last_ns) / 1e9;
+    // ms of thread time per second of wall time, from the clock's ticks in this window.
+    const double to_ms_per_s = next != 0 && now_ticks > last_ticks
+                                   ? 1000.0 / static_cast<double>(now_ticks - last_ticks)
+                                   : 0.0;
+    for (size_t index = 0; index < ClassCount; ++index) {
+        const u64 work = g_work_ticks[index].exchange(0, std::memory_order_relaxed);
+        const u64 added = g_added_ticks[index].exchange(0, std::memory_order_relaxed);
+        const u64 left = g_left_ticks[index].exchange(0, std::memory_order_relaxed);
+        all_work += work;
+        all_added += added;
+        classes += fmt::format(
+            "{}{} {:.0f} + {:.0f} (x{:.2f}, left out {:.0f})", classes.empty() ? "" : ", ",
+            ClassNames[index], static_cast<double>(work) * to_ms_per_s,
+            static_cast<double>(added) * to_ms_per_s,
+            work != 0 ? static_cast<double>(work + added) / static_cast<double>(work) : 0.0,
+            static_cast<double>(left) * to_ms_per_s);
+    }
+    if (next != 0 && all_work != 0 && seconds > 0.0) {
         LOG_INFO(Common,
-                 "Low-end simulation, CPU x{:.2f}: the slowed threads worked {:.1f} G cycles and "
-                 "spun {:.1f} G more, x{:.2f} in all",
-                 percent / 100.0, static_cast<double>(worked) / 1e9,
-                 static_cast<double>(spun) / 1e9,
-                 static_cast<double>(worked + spun) / static_cast<double>(worked));
+                 "Low-end simulation, CPU x{:.2f}, ms/s summed over each class's threads, work + "
+                 "added (reached, waits and spins left out): {}; all x{:.2f}",
+                 percent / 100.0, classes,
+                 static_cast<double>(all_work + all_added) / static_cast<double>(all_work));
+    }
+}
+
+/// Turns the work added up into a spin. The work is the clock's time inside the stretches, at most
+/// what the thread's own cycle counter says it ran: time it was descheduled or blocked inside a
+/// stretch costs no cycles. The spin only watches the clock and pauses: no system calls, nothing
+/// that disturbs the caches or an SMT sibling.
+void Settle(ThreadState& state) {
+    const u64 cycles = ThreadCycles();
+    const u64 used = (std::min)(state.sum, cycles - state.base_cycles);
+    const size_t index = static_cast<size_t>(state.work_class);
+    state.base_cycles = cycles;
+    state.left_out += state.sum - used;
+    state.sum = 0;
+    g_work_ticks[index].fetch_add(used, std::memory_order_relaxed);
+    g_left_ticks[index].fetch_add(std::exchange(state.left_out, 0), std::memory_order_relaxed);
+    const int percent = CpuSlowPercent();
+    if (percent <= 100) {
+        state.debt = 0;
+        return;
+    }
+    state.debt = (std::min)(state.debt + used / 100 * static_cast<u64>(percent - 100),
+                            MaxSpinTicks);
+    u64 now = __rdtsc();
+    if (state.debt >= MinSpinTicks) {
+        const u64 spin = state.debt;
+        state.debt = 0;
+        const u64 start = now;
+        while (now - start < spin) {
+            _mm_pause();
+            now = __rdtsc();
+        }
+        g_added_ticks[index].fetch_add(spin, std::memory_order_relaxed);
+        state.base_cycles = ThreadCycles(); // the spin is not work to count again
+    }
+    ReportCpuSlow(now, percent);
+}
+
+/// Ends the current piece of the stretch at `now`. The piece between two pauses of a spin loop is
+/// the loop's own check, not work.
+void ClosePiece(ThreadState& state, u64 now) {
+    const u64 piece = now - state.begin;
+    if (state.after_pause && piece < SpinGapTicks) {
+        state.left_out += piece;
+    } else {
+        state.sum += piece;
     }
 }
 
@@ -235,49 +330,86 @@ int FactorPercent(std::atomic<int>& value, const char* name, int max_percent) {
     return (std::min)(raw < 100 ? raw * 100 : raw, max_percent);
 }
 
-void CpuCharge() {
+void CpuWorkBeginSlow(CpuClass work_class) {
 #ifdef _WIN32
     ThreadState& state = t_state;
-    const u64 ticks = __rdtsc();
-    if (state.started && ticks - state.tsc < ChargeEveryTicks) {
-        return; // the time since the last charge stays on the bill
+    const u64 now = __rdtsc();
+    if (state.open && now - state.begin < StaleTicks) {
+        return; // inside a stretch: its time is counted once
     }
-    state.tsc = ticks;
-    const u64 now = ThreadCycles();
-    if (!state.started) {
-        state.started = true;
-        state.cycles = now;
-        return;
+    if (!state.has_base) {
+        state.has_base = true;
+        state.base_cycles = ThreadCycles();
     }
-    const u64 used = now - state.cycles;
-    state.cycles = now;
-    const int percent = CpuSlowPercent();
-    if (percent <= 100) {
-        state.debt = 0;
-        return;
-    }
-    g_worked_cycles.fetch_add(used, std::memory_order_relaxed);
-    state.debt += used / 100 * static_cast<u64>(percent - 100);
-    if (state.debt >= MinSpinCycles) {
-        const u64 spin = (std::min)(state.debt, MaxSpinCycles);
-        state.debt = (std::min)(state.debt - spin, MaxSpinCycles);
-        while (ThreadCycles() - now < spin) {
-            _mm_pause();
-        }
-        g_spun_cycles.fetch_add(spin, std::memory_order_relaxed);
-        state.cycles = ThreadCycles(); // the spin is not work to charge again
-        state.tsc = __rdtsc();
-    }
-    ReportCpuSlow(state.tsc, percent);
+    state.work_class = work_class;
+    state.begin = now;
+    state.open = true;
+    state.after_pause = false;
+#else
+    static_cast<void>(work_class);
 #endif
 }
 
-void CpuRestart() {
+void CpuWorkEndSlow() {
 #ifdef _WIN32
     ThreadState& state = t_state;
-    state.cycles = ThreadCycles();
-    state.tsc = __rdtsc();
-    state.started = true;
+    if (!state.open) {
+        return;
+    }
+    ClosePiece(state, __rdtsc());
+    state.open = false;
+    if (state.sum >= SettleTicks) {
+        Settle(state);
+    }
+#endif
+}
+
+void CpuWorkCancelSlow() {
+#ifdef _WIN32
+    t_state.open = false;
+#endif
+}
+
+void CpuPauseNoteSlow() {
+#ifdef _WIN32
+    ThreadState& state = t_state;
+    if (!state.open) {
+        return;
+    }
+    const u64 now = __rdtsc();
+    ClosePiece(state, now);
+    state.begin = now;
+    state.after_pause = true;
+#endif
+}
+
+bool CpuWaitBeginSlow() {
+#ifdef _WIN32
+    ThreadState& state = t_state;
+    if (!state.open) {
+        return false;
+    }
+    ClosePiece(state, __rdtsc());
+    state.open = false;
+    // Before the wait: a slower thread would reach it later.
+    if (state.sum >= SettleTicks) {
+        Settle(state);
+    }
+    state.wait_begin = __rdtsc();
+    return true;
+#else
+    return false;
+#endif
+}
+
+void CpuWaitEndSlow() {
+#ifdef _WIN32
+    ThreadState& state = t_state;
+    const u64 now = __rdtsc();
+    state.left_out += now - state.wait_begin;
+    state.begin = now;
+    state.open = true;
+    state.after_pause = false;
 #endif
 }
 

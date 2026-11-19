@@ -1073,6 +1073,11 @@ void SetOcarinaCardRunsDlss(bool runs);
 /// The render height whose patch the running game's main module got (none: unpatched).
 void SetAppliedOcarinaRenderHeight(std::optional<u32> height);
 [[nodiscard]] std::optional<u32> AppliedOcarinaRenderHeight();
+/// The same under its 6.1 name: vk_compute_pipeline.cpp calls it, and that file's bytes are part of
+/// the Preparing shaders stamp (CMakeModules/Nx2ShaderStamp.cmake), so it can't be renamed there.
+[[nodiscard]] inline std::optional<u32> AppliedOcarinaRenderScale() {
+    return AppliedOcarinaRenderHeight();
+}
 /// OoT's render height under Max Resolution with that patch (1440 without one).
 [[nodiscard]] u32 OcarinaRenderHeightFor(std::optional<u32> height);
 /// Whether OoT's built-in Max Resolution patch will apply at the next start (as PatchNSO decides

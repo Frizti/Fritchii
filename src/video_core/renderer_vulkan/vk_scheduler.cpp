@@ -355,6 +355,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
 }
 
 void Scheduler::WaitWorker() {
+    const Common::LowEndSim::CpuWaitScope sim_wait;
     DispatchWork();
 
     // Waits for the Vulkan worker (tools/nx2/critical_path.py's table): the queue, then the
@@ -814,20 +815,15 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // FRITCHII_SLOW_GPU: the command buffer wrappers count this submission's commands
             // (null while off; the submission's SlowGpu::End clears it).
             vk::t_cmd_stats = slow_gpu.Counting();
-            // FRITCHII_SIM_CPU_SLOW: from here to the charge below is this thread's work.
-            const bool sim_cpu_slow = Common::LowEndSim::CpuSlowOn();
-            if (sim_cpu_slow) [[unlikely]] {
-                Common::LowEndSim::CpuRestart();
-            }
+            // FRITCHII_SIM_CPU_SLOW: recording and submitting this chunk.
+            Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Worker);
             work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {
                 AllocateWorkerCommandBuffer();
             }
-            if (sim_cpu_slow) [[unlikely]] {
-                Common::LowEndSim::CpuCharge();
-            }
+            Common::LowEndSim::CpuWorkEnd();
             if (price_start != 0) [[unlikely]] {
                 const u64 executed = Price::Ticks();
                 const size_t kind = has_submit ? 1 : 0;
