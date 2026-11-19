@@ -161,6 +161,9 @@ inline thread_local bool t_colour_prepass{};
 /// Set by PipelineCache::OcclFlagPipeline when the discard variant it returns is drawn in place
 /// of the draw (a colour draw that discards and writes no depth or stencil): no pre-pass.
 inline thread_local bool t_discard_direct{};
+/// Set by PipelineCache::OcclFlagPipeline when the discard pre-pass it returns is for a draw that
+/// writes colour (the pre-pass draws with colour writes off).
+inline thread_local bool t_colour_discard_prepass{};
 /// The census class of that draw (restored when the draw cannot take the pre-pass).
 inline thread_local Census t_colour_prepass_class{};
 

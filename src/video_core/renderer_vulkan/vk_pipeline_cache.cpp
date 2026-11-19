@@ -3717,6 +3717,7 @@ constexpr u8 OCCL_FLAG_BUILD_HOST = 1;   ///< the host flag pixel program (colou
 constexpr u8 OCCL_FLAG_BUILD_COLOUR = 2; ///< the guest pixel program with the flag store
 constexpr u8 OCCL_FLAG_BUILD_PREPASS = 3; ///< the guest pixel program, the store at its end
 constexpr u8 OCCL_FLAG_BUILD_NOCOLOUR = 4; ///< the host flag program, colour writes off (key)
+constexpr u8 OCCL_FLAG_BUILD_PREPASS_NOCOLOUR = 5; ///< the pre-pass, colour writes off (key)
 
 /// FRITCHII_OCCL_FLAG: why `pipeline`'s guest pixel program (Lean class: no discard, depth or
 /// sample mask writes, stores) cannot take the flag store with early fragment tests for a
@@ -4049,6 +4050,42 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
                 return pipeline;
             }
         }
+        // A colour draw whose program discards and writes depth: the discard pre-pass with colour
+        // writes off (the dynamic masks cleared, or a key with every attachment's writes off),
+        // then the draw itself.
+        if (pipeline_class == PipelineClass::Discards && OcclFlag::PrepassAllowed() &&
+            pipeline->IsBuilt() && device.IsShaderInt64Supported() &&
+            !OcclFlagDiscardsNoWrites(*pipeline, regs) &&
+            OcclFlagPrepassEligible(*pipeline, regs)) {
+            const bool dynamic_masks = pipeline->Key().state.extended_dynamic_state_3_blend != 0;
+            u8& state = dynamic_masks ? pipeline->occl_flag_prepass_state
+                                      : pipeline->occl_flag_prepass_nocolour_state;
+            GraphicsPipeline* variant = dynamic_masks ? pipeline->occl_flag_prepass.get()
+                                                      : pipeline->occl_flag_prepass_nocolour.get();
+            if (state != 2) {
+                if (variant == nullptr && allow_make) {
+                    variant = FindOrMakeOcclFlag(*pipeline, dynamic_masks
+                                                                ? OCCL_FLAG_BUILD_PREPASS
+                                                                : OCCL_FLAG_BUILD_PREPASS_NOCOLOUR);
+                }
+                if (variant != nullptr && variant->Failed()) [[unlikely]] {
+                    state = 2;
+                    OcclFlag::Add(stats.failed);
+                    variant = nullptr;
+                }
+                if (variant != nullptr && variant->IsBuilt()) {
+                    OcclFlag::t_census = Census::Flag;
+                    OcclFlag::t_colour_discard_prepass = true;
+                    variant->MarkUsed(frame_count);
+                    return variant;
+                }
+                if (state != 2) {
+                    OcclFlag::t_census = Census::NotReady;
+                    OcclFlag::Add(stats.not_ready);
+                    return pipeline;
+                }
+            }
+        }
         // A colour draw whose program discards and that writes no depth or stencil: the discard
         // variant (early tests, the store after the discards) drawn in its place. Without depth
         // or stencil writes early tests change nothing, and the colour output is the program's.
@@ -4138,8 +4175,12 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
             return pipeline;
         }
     }
-    if (pipeline_class != PipelineClass::Lean || pipeline->IsMeshPipeline() ||
-        pipeline->occl_flag_state == 2) {
+    // A draw without a pixel program takes the host flag variant only at Full (or verify / 8):
+    // Standard (3) stays v6.2's reviewed core.
+    const bool no_pixel_flag =
+        pipeline_class == PipelineClass::NoPixel && OcclFlag::ColourAllowed();
+    if ((pipeline_class != PipelineClass::Lean && !no_pixel_flag) ||
+        pipeline->IsMeshPipeline() || pipeline->occl_flag_state == 2) {
         switch (pipeline->occl_flag_state == 2 ? PipelineClass::Failed
                 : pipeline->IsMeshPipeline()     ? PipelineClass::Mesh
                                                  : pipeline_class) {
@@ -4207,7 +4248,7 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
     std::unique_ptr<GraphicsPipeline> made;
     {
         graphics_key = full.Key();
-        if (kind == OCCL_FLAG_BUILD_NOCOLOUR) {
+        if (kind == OCCL_FLAG_BUILD_NOCOLOUR || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
             for (auto& attachment : graphics_key.state.attachments) {
                 attachment.raw = 0; // no colour writes, no blending
             }
@@ -4228,6 +4269,7 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
     u8& state = kind == OCCL_FLAG_BUILD_COLOUR     ? full.occl_flag_colour_state
                 : kind == OCCL_FLAG_BUILD_PREPASS  ? full.occl_flag_prepass_state
                 : kind == OCCL_FLAG_BUILD_NOCOLOUR ? full.occl_flag_nocolour_state
+                : kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR ? full.occl_flag_prepass_nocolour_state
                                                    : full.occl_flag_state;
     if (!made) {
         OcclFlag::Add(OcclFlag::g_stats.failed);
@@ -4242,7 +4284,7 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
         full.occl_flag_colour = std::move(made);
         return full.occl_flag_colour.get();
     }
-    if (kind == OCCL_FLAG_BUILD_PREPASS) {
+    if (kind == OCCL_FLAG_BUILD_PREPASS || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
         if (!OcclFlagSameDescriptors(*made, full)) {
             state = 2; // the parent could not bind this variant's descriptors
             OcclFlag::Add(OcclFlag::g_stats.prepass_refused);
@@ -4253,6 +4295,10 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
             return nullptr;
         }
         OcclFlag::Add(OcclFlag::g_stats.prepass_made);
+        if (kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
+            full.occl_flag_prepass_nocolour = std::move(made);
+            return full.occl_flag_prepass_nocolour.get();
+        }
         full.occl_flag_prepass = std::move(made);
         return full.occl_flag_prepass.get();
     }
@@ -9525,7 +9571,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             program.stage == Shader::Stage::Fragment) {
             runtime_info.occl_flag_store = true; // FRITCHII_OCCL_FLAG: the colour flag variant
         }
-        if (t_occl_flag_build == OCCL_FLAG_BUILD_PREPASS &&
+        if ((t_occl_flag_build == OCCL_FLAG_BUILD_PREPASS ||
+             t_occl_flag_build == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) &&
             program.stage == Shader::Stage::Fragment) {
             runtime_info.occl_flag_store_at_end = true; // FRITCHII_OCCL_FLAG: the pre-pass
         }
@@ -9632,10 +9679,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     // FRITCHII_OCCL_FLAG: the flag variant's pixel stage is the host flag program (the guest
     // pixel program was translated for its infos, which the variant keeps).
-    const bool occl_flag_variant =
-        (t_occl_flag_build == OCCL_FLAG_BUILD_HOST ||
-         t_occl_flag_build == OCCL_FLAG_BUILD_NOCOLOUR) &&
-        key.unique_hashes[5] != 0;
+    // A pipeline without a pixel program gets the host flag program as its pixel stage (no
+    // discard: the flag is exactly "some sample passed").
+    const bool occl_flag_variant = t_occl_flag_build == OCCL_FLAG_BUILD_HOST ||
+                                   t_occl_flag_build == OCCL_FLAG_BUILD_NOCOLOUR;
     if (occl_flag_variant && !emit_pools && !(record && record->translate_only)) {
         modules[4] = BuildShader(device, VULKAN_OCCL_FLAG_FRAG_SPV);
     }

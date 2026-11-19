@@ -509,9 +509,18 @@ public:
     /// variant built from this key with every attachment's write mask and blend cleared.
     std::unique_ptr<GraphicsPipeline> occl_flag_nocolour;
     u8 occl_flag_nocolour_state{};
+    /// FRITCHII_OCCL_FLAG: the discard pre-pass for colour draws without dynamic colour write
+    /// masks: the pre-pass variant built from this key with every attachment's writes off.
+    std::unique_ptr<GraphicsPipeline> occl_flag_prepass_nocolour;
+    u8 occl_flag_prepass_nocolour_state{};
     /// On a flag variant, its kind: 1 host flag program, 2 colour, 3 pre-pass, 4 host flag
-    /// program with colour writes off in its key.
+    /// program with colour writes off in its key, 5 pre-pass with colour writes off in its key.
     static constexpr u8 OCCL_KIND_PREPASS = 3;
+    static constexpr u8 OCCL_KIND_PREPASS_NOCOLOUR = 5;
+    /// A discard pre-pass variant (drawn first, then the draw itself with its pipeline).
+    [[nodiscard]] bool IsOcclDiscardPrepass() const noexcept {
+        return occl_flag_kind == OCCL_KIND_PREPASS || occl_flag_kind == OCCL_KIND_PREPASS_NOCOLOUR;
+    }
     u8 occl_flag_kind{};
     /// On a flag variant: 1 its translation's descriptors equal its parent's (the parent can
     /// bind them for a real draw after a pre-pass), 2 they differ.
