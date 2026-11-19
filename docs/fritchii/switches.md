@@ -2930,11 +2930,14 @@ pass" (census: all calls p0 = 0, one count of every pair 0), and writing sample 
 with the sun in view.
 
 What it does: a counted draw that writes no colour and whose pixel program can change nothing
-(FRITCHII_OCCL_LEAN's Lean class; not mesh) is drawn with its pipeline's flag variant: the same
+(FRITCHII_OCCL_LEAN's Lean class; at Full (9, and 2/8) also a mesh pipeline whose pixel program
+alone is Lean, whose variant replaces the draw, never a pre-pass, so the mesh emulation runs
+once, and a draw without a pixel program) is drawn with its pipeline's flag variant: the same
 key, a whole pipeline (no libraries) whose pixel stage is the host program
 vulkan_occl_flag.frag. With early fragment tests it runs only for fragments that passed depth
 and stencil and stores 4096 into the 64-bit slot of the open query window, at a buffer device
-address pushed at push constant offset 40 (bytes 40 to 47 are otherwise unused). The variant is
+address pushed at push constant offset 40 (bytes 40 to 47 are otherwise unused; pushed with
+the stages the pipeline's push range covers, the mesh and task stages too). The variant is
 owned by its pipeline (never in the cache or on disk), made one a frame (shared with the lean
 siblings' budget), and used once built; until then the draw keeps its pipeline and a real query.
 The flag area is device-local memory (not host visible when the device has such a type, so the
@@ -3020,17 +3023,35 @@ package called this value 1):
 - Both pre-passes only where the draw can be recorded twice and nothing in it can differ: not for
   indirect or list draws, the delta path or draw counting, frame dump probes; not with stencil
   writes, depth bounds, transform feedback, stores in any stage, mandated early Z (discard
-  pre-pass), EQUAL, or NOTEQUAL with depth writes; dynamic depth writes needed. A variant whose
+  pre-pass), or NOTEQUAL with depth writes; dynamic depth writes needed. EQUAL is allowed (the
+  variant's vertex programs are the same SPIR-V compiled in another pipeline, as the game's own
+  depth pre-pass and colour pass already are; verify compares it), except for pipelines built
+  from graphics pipeline libraries. A variant whose
   translation's descriptors differ from its pipeline's is refused. In mode 1 a host query
   already open in the window counts the real draw (no pre-pass); verify ends the open query
   around the pre-pass so it compares the pre-pass flag with the real draw's count.
+- Further Full-only variants (2026-11-19; 9, 8 and verify 2, never at Standard 3):
+  - a colour draw whose program discards and writes no depth or stencil draws the discard
+    variant in place of itself (early tests change nothing without those writes; not under an
+    open host query, where the draw's own pipeline draws; verify checks these draws through the
+    colour discard pre-pass);
+  - a colour draw whose program discards and writes depth takes the discard pre-pass with colour
+    writes off (the dynamic masks cleared, or a variant whose key has every attachment's writes
+    off: kind 5), then draws as it is;
+  - a colour-off draw without a pixel program takes the host flag variant (no discard, so the
+    flag is exactly "some sample passed");
+  - a mesh draw (native or emulated) whose pixel program is Lean takes the host flag variant
+    (colour off) or the colour flag variant (colour on), in place of the draw.
 - Test values (exact picture, for A/B): 3 colour-off flag variants only, 5 as 3 with the discard
   pre-pass, 8 as 9 without the colour pre-pass.
 
 Logs: the flag line adds "colour flag draws, colour flag pipelines made; pre-pass draws (between
 host queries, skipped: a host query open), made, refused at the draw, refused for their
-descriptors, real draws lost (must be 0); colour pre-pass draws". The census line adds the
-discarding draws' writes and the subgroup operations of colour Lean draws refused for them.
+descriptors, real draws lost (must be 0); colour pre-pass draws; colour discard variant draws".
+The census line adds the discarding draws' writes, the subgroup operations of colour Lean draws
+refused for them, "colour pre-pass candidates by outcome" (the first check that refused a
+subgroup or quad colour Lean draw) and "off other by class" (colour-off draws in "other" by
+pipeline class; mesh pipelines by pixel class as "mesh pixel N").
 
 Test switches (development): FRITCHII_OCCL_FLAG_DUMP=<folder> writes the first 64 colour or
 pre-pass flag pixel programs; FRITCHII_SPIRV_DUMP_DISCARD=<folder> the first 200 discarding
