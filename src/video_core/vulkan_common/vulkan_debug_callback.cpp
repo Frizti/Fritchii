@@ -146,6 +146,7 @@ struct Event {
     bool unbind;
     bool failed;   ///< reported at warning or error severity (a failed binding)
     bool internal; ///< VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT: the driver's own
+    u32 own; ///< 0: the driver reported it; else a VaReport::OwnKind (Fritchii's own note)
 };
 
 constexpr size_t RingSize = 1 << 16;
@@ -204,6 +205,14 @@ const char* ObjectTypeName(VkObjectType type) noexcept {
     }
 }
 
+const char* OwnKindName(u32 kind) noexcept {
+    switch (static_cast<OwnKind>(kind)) {
+    case OwnKind::MultiRangeSparse:
+        return "multi-range sparse buffer (Fritchii's note: reserved addresses)";
+    }
+    return "Fritchii's note";
+}
+
 VkBool32 Callback([[maybe_unused]] VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                   VkDebugUtilsMessageTypeFlagsEXT type,
                   const VkDebugUtilsMessengerCallbackDataEXT* data,
@@ -236,6 +245,7 @@ VkBool32 Callback([[maybe_unused]] VkDebugUtilsMessageSeverityFlagBitsEXT severi
         .failed = (severity & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
                                VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)) != 0,
         .internal = (binding->flags & VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT) != 0,
+        .own = 0,
     };
     State& state = Get();
     std::scoped_lock lock{state.mutex};
@@ -301,6 +311,33 @@ vk::DebugUtilsMessenger CreateMessenger(const vk::Instance& instance) {
     });
 }
 
+void Note(u64 base, u64 size, u64 handle, bool bind, OwnKind kind) noexcept {
+    if (!Requested() || size == 0) {
+        return;
+    }
+    Event event{
+        .address = base,
+        .size = size,
+        .handle = handle,
+        .nanoseconds = NowNanoseconds(),
+        .sequence = 0,
+        .thread = Common::WriteRing::t_thread,
+        .object_type = VK_OBJECT_TYPE_BUFFER,
+        .unbind = !bind,
+        .failed = false,
+        .internal = false,
+        .own = static_cast<u32>(kind),
+    };
+    State& state = Get();
+    std::scoped_lock lock{state.mutex};
+    if (!state.ring) {
+        state.ring = std::make_unique<std::array<Event, RingSize>>();
+    }
+    event.sequence = ++state.events;
+    (event.unbind ? state.unbinds : state.binds) += 1;
+    (*state.ring)[(event.sequence - 1) % RingSize] = event;
+}
+
 void LogOwners(u64 address, u64 precision) noexcept {
     if (!Requested()) {
         return;
@@ -335,7 +372,8 @@ void LogOwners(u64 address, u64 precision) noexcept {
                      "GPU address report: #{} {} {}{}{} handle {:#x}, [{:#x}, {:#x}) {} KiB, {:.1f} ms "
                      "before the report, thread {} ({})",
                      event.sequence, event.unbind ? "UNBIND" : "bind",
-                     ObjectTypeName(event.object_type), event.internal ? " (driver internal)" : "",
+                     event.own != 0 ? OwnKindName(event.own) : ObjectTypeName(event.object_type),
+                     event.internal ? " (driver internal)" : "",
                      event.failed ? " (failed)" : "", event.handle, event.address, event.address + event.size,
                      event.size >> 10, static_cast<double>(now - event.nanoseconds) / 1e6,
                      ThreadName(event.thread), relation);

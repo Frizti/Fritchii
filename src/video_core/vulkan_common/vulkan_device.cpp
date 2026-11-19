@@ -1688,7 +1688,19 @@ void Device::ReportLoss(std::source_location where) const {
     }
     // The report touches the driver, the log and every thread's stack, on a process in an unknown
     // state: whatever gets stuck, the process still ends and the player gets no frozen window.
-    Common::ShutdownWatch::EndProcessAfter(std::chrono::seconds{nsight_aftermath_tracker ? 50 : 35});
+    // FRITCHII_RGD_WAIT_S (default 0, at most 600): seconds the process stays up after the report
+    // so a Radeon GPU Detective capture can finish its dump (the end-process watch waits that
+    // much longer too).
+    static const u32 rgd_wait_s = [] {
+        const char* const value = std::getenv("FRITCHII_RGD_WAIT_S");
+        const long parsed = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+        return static_cast<u32>(std::clamp<long>(parsed, 0, 600));
+    }();
+    Common::ShutdownWatch::EndProcessAfter(
+        std::chrono::seconds{(nsight_aftermath_tracker ? 50 : 35) + rgd_wait_s});
+    // FRITCHII_VA_REPORT: the destroys of the last 60 s (also to destroy_report.txt), first, with
+    // the watch armed: a stuck dump still ends the process.
+    vk::DumpRecentDestroys(60000);
     u64 heap_size{};
     u64 heap_usage{};
     u64 heap_budget{};
@@ -1710,6 +1722,12 @@ void Device::ReportLoss(std::source_location where) const {
     if (nsight_aftermath_tracker) {
         // Give Nsight Aftermath time to write its dump.
         std::this_thread::sleep_for(std::chrono::seconds{15});
+    }
+    if (rgd_wait_s != 0) {
+        LOG_CRITICAL(Render_Vulkan,
+                     "Device loss: waiting {} s for a GPU crash dump (FRITCHII_RGD_WAIT_S)",
+                     rgd_wait_s);
+        std::this_thread::sleep_for(std::chrono::seconds{rgd_wait_s});
     }
     static constexpr const char* FatalError = "the GPU driver lost the Vulkan device";
 #ifdef _WIN32

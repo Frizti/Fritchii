@@ -26,7 +26,13 @@ void NoteDeviceReady() noexcept;
 /// The messenger that fills the ring (an empty handle when the switch is off or the instance has
 /// no VK_EXT_debug_utils).
 [[nodiscard]] vk::DebugUtilsMessenger CreateMessenger(const vk::Instance& instance);
-/// Device loss: logs what the ring knows about the page at `address`.
+/// Fritchii's own ranges the driver does not report (it reports memory binds only, not a sparse
+/// buffer's reserved addresses): kept in the same ring, `kind` names them in LogOwners. Nothing
+/// unless FRITCHII_VA_REPORT=1.
+enum class OwnKind : u32 { MultiRangeSparse = 1 };
+void Note(u64 base, u64 size, u64 handle, bool bind, OwnKind kind) noexcept;
+/// Device loss: logs what the ring knows about the page at `address` (Fritchii's own ranges
+/// among the holders too).
 void LogOwners(u64 address, u64 precision) noexcept;
 } // namespace VaReport
 

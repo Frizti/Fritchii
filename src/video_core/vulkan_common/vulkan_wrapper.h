@@ -401,6 +401,8 @@ bool Load(VkInstance, InstanceDispatch&) noexcept;
 /// callbacks the instance and the device are created and destroyed with, or null when off.
 [[nodiscard]] const VkAllocationCallbacks* HostAllocator() noexcept;
 
+/// FRITCHII_VA_REPORT: logs the driver-owned objects destroyed in the last `window_ms`.
+void DumpRecentDestroys(u64 window_ms);
 void Destroy(VkInstance, const InstanceDispatch&) noexcept;
 void Destroy(VkDevice, const InstanceDispatch&) noexcept;
 

@@ -1157,6 +1157,27 @@ region we never see. Costs a locked ring write per bind (allocations, not draws)
 hunts, not fps runs. Boot lines: "GPU address report (FRITCHII_VA_REPORT=1): messenger on" and
 "the driver reports its GPU address binds", or why it is off.
 
+Fritchii's own ranges (2026-11-19): the driver reports memory binds only, so a multi-range sparse
+buffer's reserved addresses would show as "no holder". MultiRangeBufferCache notes them in the same
+ring when it takes an address and when it retires the buffer (VaReport::Note): they print as
+"multi-range sparse buffer (Fritchii's note: reserved addresses)" among the holders, before any
+"nearest ranges".
+
+Destroy report (2026-11-19, same switch): every vkDestroy* of an object whose memory the driver
+owns (buffers, buffer and image views, images, device memory, pipelines, samplers, pools, events,
+framebuffers, query pools) is kept in a 4,096-entry ring with the time, the thread id and name and
+8 return addresses as exe offsets. On a device loss the first reporter, right after it arms the
+end-process watch, logs the destroys of the last 60 s ("Destroy report: T H destroyed M ms ago on
+thread N "name"; stack exe+..."), up to 48 lines, and writes all of them to
+%APPDATA%/fritchii/log/destroy_report.txt at once (the log may not flush before the process ends).
+A GPU read of a freed driver-owned object faults in the driver's own range, which no binding
+report names. Off: one static bool per destroy.
+
+FRITCHII_RGD_WAIT_S (TEST, default 0, at most 600): after a device-loss report the process stays up
+that many more seconds before it ends ("Device loss: waiting N s for a GPU crash dump"), and the
+end-process watch waits that much longer, so a Radeon GPU Detective capture can finish writing its
+dump (v6.2 ends the process right after the report).
+
 ### FRITCHII_VRAM_REPORT
 
 TEST tool, off by default (helper BF, 2026-11-16). Live: 1 = every 30 frames the main device-local
