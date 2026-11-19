@@ -76,6 +76,7 @@ enum class NgxPerfQuality : int {
 /// DLSS model presets, as NGX numbers them (A = 1 ... M = 13).
 enum class NgxDlssPreset : u32 {
     Default = 0,
+    E = 5,
     J = 10,
     K = 11,
     L = 12,

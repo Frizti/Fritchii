@@ -22,7 +22,8 @@ class MemoryAllocator;
 /// work; for each millisecond of work the GPU did, (factor - 1) ms of a compute dispatch are added
 /// at the end of later submissions, between barriers, so nothing else runs meanwhile. What was
 /// added is measured too and the difference carried over, so the total follows the factor however
-/// long the dispatch really took. Worker thread only.
+/// long the dispatch really took. FRITCHII_SIM_LINK's GPU time (bytes the GPU moves over the
+/// simulated link) is added the same way. Worker thread only.
 class SimGpuSlow {
 public:
     SimGpuSlow();
@@ -30,7 +31,7 @@ public:
 
     /// Off, with nothing in flight: one relaxed load and one compare.
     [[nodiscard]] bool Wanted() const {
-        return Common::LowEndSim::GpuSlowOn() || read != next;
+        return Common::LowEndSim::GpuSlowOn() || Common::LowEndSim::LinkOn() || read != next;
     }
 
     /// After the upload command buffer began: reads finished submissions, stamps this one's start.

@@ -74,6 +74,7 @@
 #include "fritchii/cache_cleanup.h"
 #include "fritchii/known_issues.h"
 #include "fritchii/max_resolution.h"
+#include "fritchii/occlusion_offer.h"
 #include "fritchii/fritchii_ui.h"
 #include "fritchii/perf_overlay.h"
 #include "fritchii/switches_window.h"
@@ -616,6 +617,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         renderer_status_button->setChecked(false);
     } else {
         VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+        FritchiiOcclusionOffer::NoteCards(vk_device_records);
     }
 
     // On macOS, SDL video would pump AppKit events alongside Qt and disrupt native menus.
@@ -693,6 +695,12 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     // Then, once per major version: the common things players will still run into.
     if (!launched_with_game && FritchiiKnownIssues::ShowOnce(this, vk_device_records)) {
+        OnSaveConfig();
+    }
+
+    // Then the faster occlusion mode for AMD, once, when the last game could use it and the app
+    // was closed before it was offered (it is offered after a game otherwise).
+    if (!launched_with_game && FritchiiOcclusionOffer::OfferOnce(this, false)) {
         OnSaveConfig();
     }
 
@@ -2886,6 +2894,19 @@ void MainWindow::OnEmulationStopped() {
     QtCommon::system->HIDCore().ReloadInputDevices();
     UpdateStatusButtons();
     LOG_INFO(Frontend, "Emulation cleanup completed");
+    // The faster occlusion mode for AMD: offered once, a moment after a game that could use it
+    // (or at the next launch when the app is closing now or another window is up).
+    if (FritchiiOcclusionOffer::NoteSession()) {
+        OnSaveConfig();
+    }
+    if (!close_pending) {
+        QTimer::singleShot(800, this, [this] {
+            if (!emulation_running && !boot_in_progress && !close_pending &&
+                FritchiiOcclusionOffer::OfferOnce(this, true)) {
+                OnSaveConfig();
+            }
+        });
+    }
 #ifdef ENABLE_UPDATE_CHECKER
     if (pending_update && !close_pending) {
         QTimer::singleShot(0, this, &MainWindow::OfferPendingUpdate);

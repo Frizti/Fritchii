@@ -330,6 +330,112 @@ int FactorPercent(std::atomic<int>& value, const char* name, int max_percent) {
     return (std::min)(raw < 100 ? raw * 100 : raw, max_percent);
 }
 
+namespace {
+
+std::atomic<s64> g_link_gpu_ns{0};
+std::atomic<u64> g_link_cpu_total_ns{0};
+std::atomic<u64> g_link_gpu_total_ns{0};
+thread_local s64 t_link_debt_ns = 0;
+
+/// Smaller debts wait for the next write: a clock read costs about as much as they do.
+constexpr s64 LinkMinSpinNs = 2'000;
+/// A thread never owes more than this; a load's burst past it is dropped.
+constexpr s64 LinkMaxDebtNs = 50'000'000;
+
+void LinkSpin(s64 ns) {
+    const CpuWaitScope not_work; // FRITCHII_SIM_CPU_SLOW must not multiply it
+    const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds{ns};
+    while (std::chrono::steady_clock::now() < end) {
+#ifdef _WIN32
+        _mm_pause();
+#endif
+    }
+}
+
+[[nodiscard]] s64 LinkNs(u64 bytes) {
+    // 1 MB/s is one byte a microsecond.
+    return static_cast<s64>(bytes * 1000 / static_cast<u64>((std::max)(LinkFreeMbps(), 1)));
+}
+
+[[nodiscard]] int LinkUs() {
+    const int raw = g_link_us.load(std::memory_order_relaxed);
+    return raw < 0 ? LinkValue(g_link_us, "FRITCHII_SIM_LINK_US") : raw;
+}
+
+void AddGpuNs(s64 ns) {
+    g_link_gpu_ns.fetch_add(ns, std::memory_order_relaxed);
+    g_link_gpu_total_ns.fetch_add(static_cast<u64>(ns), std::memory_order_relaxed);
+}
+
+} // Anonymous namespace
+
+int LinkValue(std::atomic<int>& value, const char* name) {
+    int raw = value.load(std::memory_order_relaxed);
+    if (raw < 0) {
+        const char* const text = std::getenv(name);
+        const int parsed = text != nullptr ? (std::max)(std::atoi(text), 0) : 0;
+        int unset = raw;
+        value.compare_exchange_strong(unset, parsed, std::memory_order_relaxed);
+        raw = value.load(std::memory_order_relaxed);
+    }
+    return (std::max)(raw, 0);
+}
+
+int LinkFreeMbps() {
+    const int link = LinkMbps();
+    const int raw = g_link_load_mbps.load(std::memory_order_relaxed);
+    const int load = raw < 0 ? LinkValue(g_link_load_mbps, "FRITCHII_SIM_LINK_LOAD") : raw;
+    return (std::max)(link - load, link / 10);
+}
+
+void LinkChargeCpu(u64 bytes) {
+    if (!LinkOn()) {
+        return;
+    }
+    t_link_debt_ns = (std::min)(t_link_debt_ns + LinkNs(bytes), LinkMaxDebtNs);
+    if (t_link_debt_ns < LinkMinSpinNs) {
+        return;
+    }
+    const s64 ns = t_link_debt_ns;
+    t_link_debt_ns = 0;
+    g_link_cpu_total_ns.fetch_add(static_cast<u64>(ns), std::memory_order_relaxed);
+    LinkSpin(ns);
+}
+
+void LinkChargeGpu(u64 bytes) {
+    if (LinkOn()) {
+        AddGpuNs(LinkNs(bytes));
+    }
+}
+
+void LinkChargeGpuFetch() {
+    if (LinkOn()) {
+        AddGpuNs(s64{LinkUs()} * 1000);
+    }
+}
+
+void LinkRoundTrip() {
+    if (!LinkOn()) {
+        return;
+    }
+    if (const int us = LinkUs(); us > 0) {
+        g_link_cpu_total_ns.fetch_add(u64(us) * 1000, std::memory_order_relaxed);
+        LinkSpin(s64{us} * 1000);
+    }
+}
+
+s64 LinkTakeGpuNs() {
+    return g_link_gpu_ns.exchange(0, std::memory_order_relaxed);
+}
+
+u64 LinkCpuNsTotal() {
+    return g_link_cpu_total_ns.load(std::memory_order_relaxed);
+}
+
+u64 LinkGpuNsTotal() {
+    return g_link_gpu_total_ns.load(std::memory_order_relaxed);
+}
+
 void CpuWorkBeginSlow(CpuClass work_class) {
 #ifdef _WIN32
     ThreadState& state = t_state;

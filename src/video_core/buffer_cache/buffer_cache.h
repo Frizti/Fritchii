@@ -47,6 +47,7 @@
 #include "video_core/one_follower_hooks.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
+#include "video_core/link_stats.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_list_verify.h"
 #include "video_core/nx2_perf.h"
@@ -9134,6 +9135,14 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
             }
             MemReadLog::Staged(MemReadLog::Kind::Upload, device_memory, device_addr, src_pointer,
                                copy.size);
+            // FRITCHII_LINK_STATS=2: the same bytes as last time? From guest memory, the staging
+            // mapping is write-combined.
+            if (LinkStats::ChunkCensusOn()) [[unlikely]] {
+                thread_local std::vector<u8> census_bytes;
+                census_bytes.resize(copy.size);
+                device_memory.ReadBlockUnsafe(device_addr, census_bytes.data(), copy.size);
+                LinkStats::NoteUploadChunks(device_addr, census_bytes.data(), copy.size);
+            }
             // Large uploads are mostly geometry the host GPU now has its own copy of: TickFrame
             // marks their guest memory cold (see TextureCache::RefreshContents).
             if (copy.size >= 256_KiB) {

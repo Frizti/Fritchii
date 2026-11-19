@@ -39,6 +39,7 @@
 #include <kernel/OS.h>
 #elif defined(_WIN32)
 #include <windows.h>
+#include "common/settings.h"
 #include "common/string_util.h"
 #include "common/windows/fritchii_focus.h"
 #include "common/windows/timer_resolution.h"
@@ -479,6 +480,14 @@ namespace {
 //   sibling counted as half a core, one core left for Windows and the driver) and while guest
 //   timers stay on time (two 10 s windows with over 50 late timers a second release it).
 // - 3: strict without guards (v6.1's placement, to compare against).
+// - 4: GPU pinned, also the "Pin GPU to P-cores" setting (hybrid_cpu_placement, Intel only, read
+//   when a game starts; the switch wins when set). As soft, but the threads ThreadPinning would
+//   give cores of their own (GPU front, GPU back, and the third one: the render thread R with one
+//   follower, GPUMem with the memory stage) are held to the performance cores with CPU sets.
+//   VulkanWorker stays soft: ThreadPinning leaves it free too, and on 4 P-core CPUs it wouldn't
+//   fit beside the guest cores. Guards as in strict: they must fit, and two 10 s windows with
+//   over 50 late timers a second release them. Where ThreadPinning already pins those threads
+//   (6 or more P-cores with enough left for the guest cores) there is nothing to add.
 // - 0: off, every thread on every core.
 // Why soft (helper ES, 2026-11-18): about 12 threads call SetCurrentThreadToPerformanceCores,
 // several of them spin (HostTiming up to 600 us per event, the GPU workers). On a 6 P-core Core
@@ -486,7 +495,7 @@ namespace {
 // cores idled: guest timers ran late (2 -> 175 a second), the game scheduled 7x the timer events,
 // the P-cores' clock fell (225% -> 158%) and fps fell 30.9 -> 13.3. No Intel hybrid CPU has
 // enough P-cores for that thread count.
-enum class HybridMode { Off, Soft, Strict, StrictUnguarded };
+enum class HybridMode { Off, Soft, Strict, StrictUnguarded, GpuPinned };
 
 struct WindowsCpuSets {
     std::vector<ULONG> performance;
@@ -499,29 +508,37 @@ struct WindowsCpuSets {
     /// Time-critical threads strict placement keeps on the performance cores (an SMT sibling is
     /// half a core, one core left for Windows and the driver).
     size_t capacity = 0;
-    HybridMode mode = HybridMode::Off;
+    HybridMode mode = HybridMode::Off; ///< from EDEN_HYBRID_CORES; see ActiveHybridMode
+    bool mode_from_switch = false;     ///< EDEN_HYBRID_CORES is set: the setting doesn't count
     bool cpu_hybrid = false; ///< the CPU has performance and efficiency cores
     bool hybrid = false;     ///< cpu_hybrid and placement not off
 };
 
-HybridMode ParseHybridMode() {
+/// EDEN_HYBRID_CORES's value, -1 when it isn't set.
+int HybridSwitchValue() {
     const char* const text = std::getenv("EDEN_HYBRID_CORES");
     if (text == nullptr || text[0] == '\0') {
-        return HybridMode::Soft;
+        return -1;
     }
-    switch (std::strtol(text, nullptr, 10)) {
+    return static_cast<int>(std::strtol(text, nullptr, 10));
+}
+
+HybridMode ParseHybridMode() {
+    switch (HybridSwitchValue()) {
     case 0:
         return HybridMode::Off;
     case 1:
         return HybridMode::Strict;
     case 3:
         return HybridMode::StrictUnguarded;
+    case 4:
+        return HybridMode::GpuPinned;
     default:
         return HybridMode::Soft;
     }
 }
 
-const char* HybridModeName(HybridMode mode) {
+const char* HybridModeName(HybridMode mode, bool from_switch) {
     switch (mode) {
     case HybridMode::Off:
         return "off (EDEN_HYBRID_CORES=0)";
@@ -531,6 +548,9 @@ const char* HybridModeName(HybridMode mode) {
         return "strict with guards (EDEN_HYBRID_CORES=1)";
     case HybridMode::StrictUnguarded:
         return "strict without guards (EDEN_HYBRID_CORES=3, v6.1's placement)";
+    case HybridMode::GpuPinned:
+        return from_switch ? "GPU pinned to P-cores (EDEN_HYBRID_CORES=4)"
+                           : "GPU pinned to P-cores (the Pin GPU to P-cores setting)";
     }
     return "?";
 }
@@ -539,6 +559,7 @@ const WindowsCpuSets& CpuSets() {
     static const WindowsCpuSets sets = [] {
         WindowsCpuSets result;
         result.mode = ParseHybridMode();
+        result.mode_from_switch = HybridSwitchValue() >= 0;
         using PFN_GetSystemCpuSetInformation = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG,
                                                              PULONG, HANDLE, ULONG);
         const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
@@ -632,6 +653,27 @@ const WindowsCpuSets& CpuSets() {
     return sets;
 }
 
+bool IntelCpu() {
+#ifdef ARCHITECTURE_x86_64
+    return Common::g_cpu_caps.manufacturer == Common::CPUCaps::Manufacturer::Intel;
+#else
+    return false;
+#endif
+}
+
+/// The placement now: EDEN_HYBRID_CORES when set, else the setting (Intel only, a config copied
+/// from another PC does nothing elsewhere). The setting can't change while a game runs.
+HybridMode ActiveHybridMode(const WindowsCpuSets& sets) {
+    if (sets.mode_from_switch) {
+        return sets.mode;
+    }
+    return sets.cpu_hybrid && IntelCpu() &&
+                   Settings::values.hybrid_cpu_placement.GetValue() ==
+                       Settings::HybridCpuPlacement::PinGpu
+               ? HybridMode::GpuPinned
+               : HybridMode::Soft;
+}
+
 /// Threads that asked for the performance cores (SetCurrentThreadToPerformanceCores), live ones
 /// only, with a handle strict placement can release them through.
 struct TimeCriticalThread {
@@ -643,6 +685,22 @@ std::vector<TimeCriticalThread> g_time_critical;
 std::atomic<size_t> g_time_critical_count{};
 /// Strict placement given up (too many threads, or a timer storm); every thread on every core.
 std::atomic<bool> g_strict_released{false};
+/// GPU pinned: the threads held to the performance cores (under g_time_critical_mutex).
+std::vector<TimeCriticalThread> g_gpu_pinned;
+std::atomic<size_t> g_gpu_pinned_count{};
+/// GPU pinned given up for this game session.
+std::atomic<bool> g_gpu_pin_released{false};
+
+void DropExitedThreads(std::vector<TimeCriticalThread>& threads) {
+    std::erase_if(threads, [](const TimeCriticalThread& thread) {
+        DWORD code = 0;
+        if (GetExitCodeThread(thread.handle, &code) && code != STILL_ACTIVE) {
+            CloseHandle(thread.handle);
+            return true;
+        }
+        return false;
+    });
+}
 
 using SetThreadSelectedCpuSetsFn = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
 SetThreadSelectedCpuSetsFn SelectCpuSetsFn() {
@@ -655,14 +713,7 @@ SetThreadSelectedCpuSetsFn SelectCpuSetsFn() {
 size_t RegisterTimeCriticalThread() {
     const DWORD id = GetCurrentThreadId();
     std::scoped_lock lock{g_time_critical_mutex};
-    std::erase_if(g_time_critical, [](const TimeCriticalThread& thread) {
-        DWORD code = 0;
-        if (GetExitCodeThread(thread.handle, &code) && code != STILL_ACTIVE) {
-            CloseHandle(thread.handle);
-            return true;
-        }
-        return false;
-    });
+    DropExitedThreads(g_time_critical);
     const bool known = std::any_of(g_time_critical.begin(), g_time_critical.end(),
                                    [id](const TimeCriticalThread& thread) { return thread.id == id; });
     HANDLE handle = nullptr;
@@ -705,6 +756,69 @@ void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
     if (!set(GetCurrentThread(), ids.empty() ? nullptr : ids.data(),
              static_cast<ULONG>(ids.size()))) {
         LOG_WARNING(Common, "SetThreadSelectedCpuSets failed: {}", Common::GetLastErrorMsg());
+    }
+}
+
+/// GPU pinned: the held GPU threads back on every core, once per game session.
+void ReleaseGpuPin(const std::string& why) {
+    if (g_gpu_pin_released.exchange(true)) {
+        return;
+    }
+    size_t released = 0;
+    {
+        std::scoped_lock lock{g_time_critical_mutex};
+        if (const auto set = SelectCpuSetsFn(); set != nullptr) {
+            for (const TimeCriticalThread& thread : g_gpu_pinned) {
+                released += set(thread.handle, nullptr, 0) ? 1 : 0;
+            }
+        }
+    }
+    LOG_WARNING(Common,
+                "Hybrid placement: GPU pin released ({}); {} GPU threads back on every core, "
+                "Windows places them from now on",
+                why, released);
+}
+
+/// GPU pinned: holds the calling GPU thread to the performance cores, while they all fit.
+void HoldGpuThreadOnPerformanceCores() {
+    const WindowsCpuSets& sets = CpuSets();
+    if (!sets.hybrid || ActiveHybridMode(sets) != HybridMode::GpuPinned) {
+        return;
+    }
+    const DWORD id = GetCurrentThreadId();
+    size_t live = 0;
+    {
+        std::scoped_lock lock{g_time_critical_mutex};
+        DropExitedThreads(g_gpu_pinned);
+        if (g_gpu_pinned.empty()) {
+            g_gpu_pin_released.store(false); // A new game session tries again.
+        }
+        const bool known =
+            std::any_of(g_gpu_pinned.begin(), g_gpu_pinned.end(),
+                        [id](const TimeCriticalThread& thread) { return thread.id == id; });
+        HANDLE handle = nullptr;
+        if (!known && DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                                      GetCurrentProcess(), &handle,
+                                      THREAD_SET_LIMITED_INFORMATION |
+                                          THREAD_QUERY_LIMITED_INFORMATION,
+                                      FALSE, 0)) {
+            g_gpu_pinned.push_back({handle, id});
+        }
+        live = g_gpu_pinned.size();
+        g_gpu_pinned_count.store(live, std::memory_order_relaxed);
+    }
+    if (g_gpu_pin_released.load()) {
+        return;
+    }
+    SelectCurrentThreadCpuSets(sets.performance);
+    if (g_gpu_pin_released.load()) {
+        // Released between the check and the selection: the release may have missed this one.
+        SelectCurrentThreadCpuSets({});
+        return;
+    }
+    if (live > sets.capacity) {
+        ReleaseGpuPin(fmt::format("{} GPU threads, the {} performance cores hold {}", live,
+                                  sets.performance_cores, sets.capacity));
     }
 }
 
@@ -926,9 +1040,12 @@ void SetCurrentThreadToPerformanceCores() {
     if (!sets.hybrid) {
         return;
     }
-    // Every mode counts them (the "Hybrid placement in 10 s" line); soft leaves them to Windows.
+    // Every mode counts them (the "Hybrid placement in 10 s" line); soft leaves them to Windows,
+    // and so does GPU pinned (its GPU threads are held in PinCurrentThread).
     const size_t live = RegisterTimeCriticalThread();
-    if (sets.mode == HybridMode::Soft || g_strict_released.load(std::memory_order_relaxed)) {
+    const HybridMode mode = ActiveHybridMode(sets);
+    if (mode == HybridMode::Soft || mode == HybridMode::GpuPinned ||
+        g_strict_released.load(std::memory_order_relaxed)) {
         return;
     }
     SelectCurrentThreadCpuSets(sets.performance);
@@ -937,7 +1054,7 @@ void SetCurrentThreadToPerformanceCores() {
         SelectCurrentThreadCpuSets({});
         return;
     }
-    if (sets.mode == HybridMode::Strict && live > sets.capacity) {
+    if (mode == HybridMode::Strict && live > sets.capacity) {
         ReleaseStrictPlacement(fmt::format("{} time-critical threads, the {} performance cores "
                                            "hold {}",
                                            live, sets.performance_cores, sets.capacity));
@@ -1051,9 +1168,41 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
             pinned.tid.store(static_cast<u32>(GetCurrentThreadId()), std::memory_order_release);
             pin_generation.fetch_add(1, std::memory_order_release);
         }
+    } else if (role != PinnedRole::GuestCore && !plan.Enabled()) {
+        // No core of its own on this CPU: EDEN_HYBRID_CORES=4 or the setting can still hold it
+        // to the performance cores.
+        HoldGpuThreadOnPerformanceCores();
     }
 #else
     (void)role;
+#endif
+}
+
+bool IntelHybridCpu() {
+#ifdef _WIN32
+    return CpuSets().cpu_hybrid && IntelCpu();
+#else
+    return false;
+#endif
+}
+
+int HybridCoresSwitch() {
+#ifdef _WIN32
+    return HybridSwitchValue();
+#else
+    return -1;
+#endif
+}
+
+bool GpuThreadsHaveOwnCores() {
+#ifdef _WIN32
+    static const bool pinned =
+        ThreadPinning::MakePlan(ReadPinningTopology(),
+                                ThreadPinning::ParseMode(std::getenv("EDEN_NX2_PIN_THREADS")))
+            .Enabled();
+    return pinned;
+#else
+    return false;
 #endif
 }
 
@@ -2047,31 +2196,46 @@ void LogCpuPlacement() {
     }
     const int efficiency = std::popcount(sets.efficiency_mask);
     const int low_power = std::popcount(sets.low_power_mask);
+    const HybridMode mode = ActiveHybridMode(sets);
+    const char* const mode_name = HybridModeName(mode, sets.mode_from_switch);
     std::string what;
     if (!sets.cpu_hybrid) {
         what = "off (not a hybrid CPU)";
     } else {
-        switch (sets.mode) {
+        switch (mode) {
         case HybridMode::Off:
-            what = HybridModeName(sets.mode);
+            what = mode_name;
             break;
         case HybridMode::Soft:
             what = fmt::format("{}: time-critical threads left to Windows (performance cores "
                                "first, the others when those are full), quiet background work "
                                "on the {} others",
-                               HybridModeName(sets.mode), sets.efficiency.size());
+                               mode_name, sets.efficiency.size());
             break;
         case HybridMode::Strict:
         case HybridMode::StrictUnguarded:
             what = fmt::format("{}: time-critical threads on the {} performance processors "
                                "({} physical cores, room for {} threads{}), background work on "
                                "the {} others",
-                               HybridModeName(sets.mode), sets.performance.size(),
-                               sets.performance_cores, sets.capacity,
-                               sets.mode == HybridMode::Strict
+                               mode_name, sets.performance.size(), sets.performance_cores,
+                               sets.capacity,
+                               mode == HybridMode::Strict
                                    ? ", released past that or in a timer storm"
                                    : "",
                                sets.efficiency.size());
+            break;
+        case HybridMode::GpuPinned:
+            what = GpuThreadsHaveOwnCores()
+                       ? fmt::format("{}: nothing to add, the GPU threads already have their own "
+                                     "performance cores (see the Thread pinning line)",
+                                     mode_name)
+                       : fmt::format("{}: GPU front, back and render threads on the {} "
+                                     "performance processors ({} physical cores, room for {} "
+                                     "threads, released past that or in a timer storm), other "
+                                     "time-critical threads left to Windows, quiet background "
+                                     "work on the {} others",
+                                     mode_name, sets.performance.size(), sets.performance_cores,
+                                     sets.capacity, sets.efficiency.size());
             break;
         }
     }
@@ -2094,11 +2258,19 @@ void NoteHostTimingWindow(double seconds, u64 late_1ms) {
     static int storm_windows = 0;
     const double late_per_second = static_cast<double>(late_1ms) / seconds;
     storm_windows = late_per_second > 50.0 ? storm_windows + 1 : 0;
-    if (sets.mode == HybridMode::Strict && storm_windows >= 2 &&
+    const HybridMode mode = ActiveHybridMode(sets);
+    if (mode == HybridMode::Strict && storm_windows >= 2 &&
         !g_strict_released.load(std::memory_order_relaxed)) {
         ReleaseStrictPlacement(fmt::format("timer storm: {:.0f} late guest timers a second, two "
                                            "10 s windows running",
                                            late_per_second));
+    }
+    const size_t gpu_pinned = g_gpu_pinned_count.load(std::memory_order_relaxed);
+    if (mode == HybridMode::GpuPinned && storm_windows >= 2 && gpu_pinned != 0 &&
+        !g_gpu_pin_released.load(std::memory_order_relaxed)) {
+        ReleaseGpuPin(fmt::format("timer storm: {:.0f} late guest timers a second, two 10 s "
+                                  "windows running",
+                                  late_per_second));
     }
 
     // How busy each kind of core was (the whole system, this process included), from
@@ -2160,18 +2332,26 @@ void NoteHostTimingWindow(double seconds, u64 late_1ms) {
             }
         }
     }
+    const bool strict = mode == HybridMode::Strict || mode == HybridMode::StrictUnguarded;
+    std::string state;
+    if (strict) {
+        state = g_strict_released.load(std::memory_order_relaxed)
+                    ? std::string{", released"}
+                    : fmt::format(", holding (room for {})", sets.capacity);
+    } else if (mode == HybridMode::GpuPinned) {
+        state = GpuThreadsHaveOwnCores() ? std::string{", GPU threads already on their own cores"}
+                : g_gpu_pin_released.load(std::memory_order_relaxed)
+                    ? std::string{", released"}
+                    : fmt::format(", holding {} GPU threads (room for {})", gpu_pinned,
+                                  sets.capacity);
+    }
     LOG_INFO(Common,
              "Hybrid placement in {:.0f} s: {}{}; {} time-critical threads ({}); late guest "
              "timers {:.1f}/s{}",
-             seconds, HybridModeName(sets.mode),
-             (sets.mode == HybridMode::Strict || sets.mode == HybridMode::StrictUnguarded)
-                 ? (g_strict_released.load(std::memory_order_relaxed)
-                        ? std::string{", released"}
-                        : fmt::format(", holding (room for {})", sets.capacity))
-                 : std::string{},
+             seconds, HybridModeName(mode, sets.mode_from_switch), state,
              g_time_critical_count.load(std::memory_order_relaxed),
-             sets.mode == HybridMode::Soft  ? "left to Windows"
-             : sets.mode == HybridMode::Off ? "every core"
+             mode == HybridMode::Soft || mode == HybridMode::GpuPinned ? "left to Windows"
+             : mode == HybridMode::Off ? "every core"
              : g_strict_released.load(std::memory_order_relaxed)
                  ? "every core"
                  : "on the performance cores",

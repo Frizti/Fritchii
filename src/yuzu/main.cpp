@@ -23,6 +23,7 @@
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/lowend_sim.h"
+#include "common/memory_detect.h"
 #ifdef _WIN32
 #include "common/windows/crash_handler.h"
 #endif
@@ -252,6 +253,11 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     {"FRITCHII_DEPTH_POOL_BIG", "1"},     {"FRITCHII_RAM_GPU_ENTRIES", "1"},
     {"FRITCHII_SMALL_CARD", "2"},         {"FRITCHII_READ_SIDE_COPY", "3"},
     {"FRITCHII_GPU_SIBLINGS_FREE", "1"},  {"FRITCHII_PACE_FIX", "3"},
+    // OoT's zstd decodes (area loads, streamed files) on the host's libzstd; verify mode compared
+    // 995 stream chunks with 0 mismatches (2026-11-19). 0 turns it off.
+    {"FRITCHII_HOST_ZSTD", "3"},
+    // FRITCHII_OCCL_FLAG is not here: the graphics setting "OoT occlusion speed-up" gives its
+    // value when no switch sets it (Standard, the default, is the core: 3).
     // One follower (E/R GPU threads)
     {"FRITCHII_ONEF_LEAN", "1"},          {"FRITCHII_ONEF_AHEAD", "0"},
     {"FRITCHII_ONEF_POSTED", "1"},        {"FRITCHII_ONEF_COPY_E", "1"},
@@ -456,6 +462,7 @@ int main(int argc, char* argv[]) {
     // switches are added.
     ProfilingMode::ReadAtLaunch();
     LoadNx2Switches(argv[0]);
+    Common::InstallCommitLimitNewHandler();
     // Test only, off by default: the low-end PC simulation's limits on this process.
     Common::LowEndSim::ApplyProcessLimits();
     // Fritchii: NVIDIA's driver shader cache must hold OoT's ~120,000 prepared pipelines. Its size

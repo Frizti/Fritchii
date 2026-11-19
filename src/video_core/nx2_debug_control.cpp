@@ -503,6 +503,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_VRAM_POOL_FIT") {
         return &g_vram_pool_fit;
     }
+    if (name == "FRITCHII_VRAM_POOL_FLOOR") {
+        return &g_vram_pool_floor;
+    }
     if (name == "FRITCHII_VRAM_CRITICAL_FIT") {
         return &g_vram_critical_fit;
     }
@@ -517,6 +520,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_TC_CRITICAL_ENFORCE") {
         return &g_tc_critical_enforce;
+    }
+    if (name == "FRITCHII_TC_THRASH_GUARD") {
+        return &g_tc_thrash_guard;
     }
     if (name == "FRITCHII_VRAM_OWNERS") {
         return &g_vram_owners;
@@ -541,6 +547,18 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_SIM_GPU_SLOW") {
         return &Common::LowEndSim::g_gpu_slow;
+    }
+    if (name == "FRITCHII_SIM_LINK") {
+        return &Common::LowEndSim::g_link_mbps;
+    }
+    if (name == "FRITCHII_SIM_LINK_LOAD") {
+        return &Common::LowEndSim::g_link_load_mbps;
+    }
+    if (name == "FRITCHII_SIM_LINK_US") {
+        return &Common::LowEndSim::g_link_us;
+    }
+    if (name == "FRITCHII_SIM_LINK_HOG") {
+        return &Common::LowEndSim::g_link_hog_mibs;
     }
     if (name == "FRITCHII_SIM_CPU_SLOW") {
         return &Common::LowEndSim::g_cpu_slow;
@@ -640,6 +658,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_STAGING_RING") {
         return &g_staging_ring;
+    }
+    if (name == "FRITCHII_LINK_STATS") {
+        return &g_link_stats;
     }
     if (name == "FRITCHII_ZERO_UPLOAD") {
         return &g_zero_upload;

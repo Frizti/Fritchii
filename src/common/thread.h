@@ -236,6 +236,15 @@ void HardwareWaitWhileEqual(const std::atomic<u64>& word, u64 seen, u32 cycles);
 /// placement does with them (EDEN_HYBRID_CORES, thread.cpp). Logging only.
 void LogCpuPlacement();
 
+/// Windows, an Intel CPU with performance and efficiency cores: the hybrid_cpu_placement setting
+/// applies. False everywhere else.
+[[nodiscard]] bool IntelHybridCpu();
+/// EDEN_HYBRID_CORES's value (it overrides hybrid_cpu_placement), -1 when it isn't set.
+[[nodiscard]] int HybridCoresSwitch();
+/// ThreadPinning already gives the GPU threads performance cores of their own on this CPU, so
+/// pinning them adds nothing.
+[[nodiscard]] bool GpuThreadsHaveOwnCores();
+
 /// Windows hybrid CPUs, from HostTiming's 10 s report: `late_1ms` guest timers ran 1 ms or more
 /// late in `seconds`. Logs one "Hybrid placement in 10 s:" line (mode, time-critical threads,
 /// how busy the performance / efficiency / low-power cores were) and runs strict placement's

@@ -115,7 +115,7 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
     if (direct_code_reads) {
-        return m_memory.Read32(vaddr);
+        return HostCode(vaddr, m_memory.Read32(vaddr));
     }
     auto const aligned_vaddr = vaddr & ~Core::Memory::YUZU_PAGEMASK;
     const u32 generation = code_generation.load(std::memory_order_acquire);
@@ -129,7 +129,8 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
             CountCodePageRace(aligned_vaddr);
         }
     }
-    const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    const u32 instruction =
+        HostCode(vaddr, cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)]);
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
         if (!m_window_trace) {
             m_window_trace = WindowTrace::sessions.Find(m_process);
@@ -140,6 +141,51 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     }
     return instruction;
 }
+
+const HostRoutines::Sites& DynarmicCallbacks64::HostSites() {
+    std::call_once(m_host_sites_once, [this] {
+        if (!m_debugger_enabled) {
+            m_host_sites = HostRoutines::SitesFor(m_parent.m_system, *m_process);
+        }
+    });
+    return m_host_sites;
+}
+
+u32 DynarmicCallbacks64::HostCode(u64 vaddr, u32 instruction) {
+    const HostRoutines::Sites& sites = HostSites();
+    if (sites.last == 0 || vaddr < sites.first || vaddr > sites.last) [[likely]] {
+        return instruction;
+    }
+    return HostRoutines::InstructionFor(m_parent.m_system, *m_process, m_memory, vaddr,
+                                        instruction);
+}
+
+namespace {
+/// The running core's registers for a host routine (pinned registers are in the state block
+/// while a callback runs, and reloaded from it after).
+class JitRegisters final : public HostRoutines::Registers {
+public:
+    explicit JitRegisters(Dynarmic::A64::Jit& jit) : m_jit{jit} {}
+    u64 Get(int index) const override {
+        return m_jit.GetRegister(static_cast<std::size_t>(index));
+    }
+    void Set(int index, u64 value) override {
+        m_jit.SetRegister(static_cast<std::size_t>(index), value);
+    }
+    void SetPC(u64 pc) override {
+        m_jit.SetPC(pc);
+    }
+    u32 GetPstate() const override {
+        return m_jit.GetPstate();
+    }
+    void SetPstate(u32 value) override {
+        m_jit.SetPstate(value);
+    }
+
+private:
+    Dynarmic::A64::Jit& m_jit;
+};
+} // Anonymous namespace
 
 void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
     if (CheckMemoryAccess(vaddr, size, Kernel::DebugWatchpointType::Write)) {
@@ -201,6 +247,16 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
 }
 
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
+    if (exception == Dynarmic::A64::Exception::Breakpoint) {
+        // Fritchii host routines: a BRK compiled in place of a hooked entry's first word.
+        const HostRoutines::Sites& sites = HostSites();
+        if (sites.last != 0 && pc >= sites.first && pc <= sites.last) {
+            JitRegisters regs{*m_parent.m_jit};
+            if (HostRoutines::OnBreakpoint(m_parent.m_system, *m_process, m_memory, regs, pc)) {
+                return;
+            }
+        }
+    }
     if (m_window_trace && exception == Dynarmic::A64::Exception::Breakpoint) {
         const auto point = WindowTrace::Identify(m_window_trace->base, pc, m_memory.Read32(pc));
         if (point != WindowTrace::Point::None) {

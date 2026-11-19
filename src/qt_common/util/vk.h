@@ -61,7 +61,7 @@ public:
                     bool fsr4_capable = false, bool nvidia = true,
                     std::string_view device_name = {},
                     VkPhysicalDeviceType device_type = VK_PHYSICAL_DEVICE_TYPE_OTHER,
-                    u64 local_memory = 0);
+                    u64 local_memory = 0, bool amd_proprietary = false);
     ~Record();
 
     const std::string name;
@@ -75,6 +75,7 @@ public:
     const std::string device_name;
     const VkPhysicalDeviceType device_type;
     const u64 local_memory; ///< Largest device-local heap, in bytes
+    const bool amd_proprietary; ///< AMD's own driver (VK_DRIVER_ID_AMD_PROPRIETARY)
 };
 
 /// Whether the card can run DLSS: NVIDIA, and not a GeForce or Quadro from before RTX (GTX, MX,

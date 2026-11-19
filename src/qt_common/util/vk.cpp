@@ -25,10 +25,11 @@ namespace VkDeviceInfo {
 Record::Record(std::string_view name_, const std::vector<VkPresentModeKHR>& vsync_modes_,
                bool has_broken_compute_, std::string_view driver_version_, bool fsr4_capable_,
                bool nvidia_, std::string_view device_name_, VkPhysicalDeviceType device_type_,
-               u64 local_memory_)
+               u64 local_memory_, bool amd_proprietary_)
     : name{name_}, vsync_support{vsync_modes_}, has_broken_compute{has_broken_compute_},
       driver_version{driver_version_}, fsr4_capable{fsr4_capable_}, nvidia{nvidia_},
-      device_name{device_name_}, device_type{device_type_}, local_memory{local_memory_} {}
+      device_name{device_name_}, device_type{device_type_}, local_memory{local_memory_},
+      amd_proprietary{amd_proprietary_} {}
 
 Record::~Record() = default;
 
@@ -104,7 +105,8 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
                                                fsr4_capable,
                                                properties.properties.vendorID == 0x10DE,
                                                summaries[index].name, summaries[index].type,
-                                               summaries[index].local_memory));
+                                               summaries[index].local_memory,
+                                               driverID == VK_DRIVER_ID_AMD_PROPRIETARY));
     }
 } catch (const Vulkan::vk::Exception& exception) {
     LOG_ERROR(Frontend, "Failed to enumerate devices with error: {}", exception.what());

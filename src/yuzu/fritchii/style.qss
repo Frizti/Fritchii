@@ -186,6 +186,15 @@ QDialog#FritchiiMaxResPrompt QPushButton {
     font-size: 15px;
     font-weight: 500;
 }
+/* Faster mode for AMD (fritchii/occlusion_offer.cpp) */
+QDialog#FritchiiOcclPrompt { background: #111113; }
+QDialog#FritchiiOcclPrompt QPushButton {
+    min-height: 40px;
+    padding: 0 28px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 500;
+}
 QFrame#FritchiiMaxResCard { background: #18181b; border: 1px solid #2a2a30; border-radius: 12px; }
 QLabel#FritchiiMaxResSide { font-size: 19px; font-weight: 600; color: #ececf1; }
 QLabel#FritchiiMaxResYours { font-size: 17px; font-weight: 500; color: #a78bfa; }

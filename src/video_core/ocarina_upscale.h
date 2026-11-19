@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -299,6 +300,40 @@ inline std::array<float, 2> OcarinaJitter(unsigned index, bool truncated_viewpor
     };
     const float center = truncated_viewport_edges ? 0.0f : 0.5f;
     return {halton(index, 2) - center, halton(index, 3) - center};
+}
+
+/// FRITCHII_OOT_ACTOR_PARTS (boot, 0 = off): the skinned motion replay also takes the other draws
+/// of the actor's vertex program that use Link's bone palette and origin, not only his recognized
+/// 9702-index draw. Parts left out keep the camera's motion: with a still camera that is none, so
+/// DLSS and FSR blend a part that moves (the hat swaying) with where it was. A wrong part costs
+/// nothing but its replay: the scene depth check drops what the game did not draw there.
+inline bool OcarinaActorParts() {
+    static const bool on = OcarinaSwitch::Read("FRITCHII_OOT_ACTOR_PARTS", 0) != 0;
+    return on;
+}
+
+/// FRITCHII_OOT_ACTOR_TOLERANCE (boot, 16 by default): how far, in steps of the depth format, the
+/// replay's depth may be from the scene's for a pixel to take the skinned motion.
+inline std::uint32_t OcarinaActorDepthTolerance() {
+    static const std::uint32_t tolerance = static_cast<std::uint32_t>(
+        std::max(OcarinaSwitch::Read("FRITCHII_OOT_ACTOR_TOLERANCE", 16), 0));
+    return tolerance;
+}
+
+/// FRITCHII_OOT_ACTOR_TRACE (boot, 0 = off): every 600th frame the log lists the indexed draws
+/// that could carry a character (the actor's vertex program, or its 48-byte vertices).
+inline bool OcarinaActorTrace() {
+    static const bool on = OcarinaSwitch::Read("FRITCHII_OOT_ACTOR_TRACE", 0) != 0;
+    return on;
+}
+
+/// FRITCHII_OOT_MOTION_VIEW (boot, 0 = off): a test view. The game's target gets the motion
+/// vectors instead of the upscaled scene: black where nothing moves, blue with red and green for
+/// the size of the motion elsewhere. With a still camera, only the pixels the skinned replay
+/// reached light up. Shown with outputs up to 1440p (above, the composite shows the scene).
+inline bool OcarinaMotionView() {
+    static const bool on = OcarinaSwitch::Read("FRITCHII_OOT_MOTION_VIEW", 0) != 0;
+    return on;
 }
 
 /// FRITCHII_OOT_LOD_RATIO (boot, 1 = by default): the texture LOD bias follows the render and

@@ -21,6 +21,7 @@
 #include <tlhelp32.h>
 
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/windows/crash_handler.h"
 
 #define LOG_CRASH(...) ::Common::Log::FmtCrashMessage(__FILE__, __LINE__, __func__, __VA_ARGS__)
@@ -121,6 +122,11 @@ void Report(EXCEPTION_POINTERS* pointers) {
     } else {
         LOG_CRASH("Host crash: abort() on thread {} \"{}\"; stack:{}", GetCurrentThreadId(),
                   thread_name, stack);
+    }
+    if (const u64 refusals = Common::CommitRefusals(); refusals != 0) {
+        LOG_CRASH("Windows' commit limit (RAM plus the page file) refused memory {} times after "
+                  "5 s of waiting: this crash is most likely running out of memory",
+                  refusals);
     }
 
     if (!write_dump) {

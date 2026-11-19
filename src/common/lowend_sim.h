@@ -66,6 +66,55 @@ namespace Detail {
     return Detail::FactorOn(g_gpu_slow, "FRITCHII_SIM_GPU_SLOW", MaxGpuSlowPercent);
 }
 
+/// FRITCHII_SIM_LINK (live, MB/s, 0 = off): a slow link between CPU and GPU (PCIe x4, OCuLink,
+/// Thunderbolt). Each transfer that crosses it is charged its time at this speed: CPU writes into
+/// device memory make the writing thread spin, GPU reads and writes of host memory become GPU time
+/// (SimGpuSlow). docs/fritchii/switches.md, "Slow link simulation".
+inline std::atomic<int> g_link_mbps{-1};
+/// FRITCHII_SIM_LINK_LOAD (live, MB/s): bandwidth something else is taking from that link.
+inline std::atomic<int> g_link_load_mbps{-1};
+/// FRITCHII_SIM_LINK_US (live, microseconds): added to each wait for the GPU and each GPU fetch
+/// the renderer knows crosses the link.
+inline std::atomic<int> g_link_us{-1};
+
+/// FRITCHII_SIM_LINK_HOG (MiB/s; set at boot for its queue, the rate is live): real copies on a
+/// transfer queue that share the link with the game (Vulkan::SimLinkHog).
+inline std::atomic<int> g_link_hog_mibs{-1};
+
+/// The switch's value (environment on first use, whole numbers).
+[[nodiscard]] int LinkValue(std::atomic<int>& value, const char* name);
+
+[[nodiscard]] inline int LinkMbps() {
+    const int raw = g_link_mbps.load(std::memory_order_relaxed);
+    return raw < 0 ? LinkValue(g_link_mbps, "FRITCHII_SIM_LINK") : raw;
+}
+[[nodiscard]] inline int LinkHogMibs() {
+    const int raw = g_link_hog_mibs.load(std::memory_order_relaxed);
+    return raw < 0 ? LinkValue(g_link_hog_mibs, "FRITCHII_SIM_LINK_HOG") : raw;
+}
+/// Off: one relaxed load and a compare.
+[[nodiscard]] inline bool LinkOn() {
+    return LinkMbps() > 0;
+}
+
+/// What is left of the link after FRITCHII_SIM_LINK_LOAD, never under a tenth of it.
+[[nodiscard]] int LinkFreeMbps();
+
+/// The calling thread just wrote `bytes` into device memory: it spins for their time on the link
+/// (paid in pieces of 2 us or more, so small writes cost no clock reads each).
+void LinkChargeCpu(u64 bytes);
+/// The GPU moves `bytes` over the link: SimGpuSlow adds their time as GPU work.
+void LinkChargeGpu(u64 bytes);
+/// One GPU fetch across the link: the same, FRITCHII_SIM_LINK_US of it.
+void LinkChargeGpuFetch();
+/// A thread's wait for the GPU ended: the answer takes FRITCHII_SIM_LINK_US to reach it.
+void LinkRoundTrip();
+/// The GPU time owed since the last call, in nanoseconds (the Vulkan worker).
+[[nodiscard]] s64 LinkTakeGpuNs();
+/// The time the link has charged so far: spun on CPU threads, owed to the GPU (log line).
+[[nodiscard]] u64 LinkCpuNsTotal();
+[[nodiscard]] u64 LinkGpuNsTotal();
+
 /// The threads FRITCHII_SIM_CPU_SLOW slows, for its log line.
 enum class CpuClass : u8 { Game, Front, Back, Render, Worker, Count };
 

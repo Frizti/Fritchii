@@ -30,6 +30,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/link_stats.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/one_follower.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -96,6 +97,9 @@ public:
     }
 
     void Sync(size_t start, size_t size) {
+        if (VideoCommon::LinkStats::On()) [[unlikely]] {
+            VideoCommon::LinkStats::NoteQueryResults(size);
+        }
         const auto& dev = device.GetLogical();
         const VkResult query_result = dev.GetQueryResults(
             *query_pool, static_cast<u32>(start), static_cast<u32>(size), sizeof(u64) * size,
@@ -213,6 +217,21 @@ public:
 
     /// FRITCHII_OCCL_FLAG: a counted draw drawn without a flag pipeline (its slot's reports are
     /// "mixed" and not compared).
+    /// FRITCHII_OCCL_FLAG pre-pass (the recording thread): the open slot runs a host query.
+    bool OcclQuerySlotOpen() const {
+        return has_started && !current_flag_slot;
+    }
+
+    /// FRITCHII_OCCL_FLAG pre-pass: ends the open host query before the pre-pass draw, and opens
+    /// the window's next slot (a host query) after it, which the real draw is counted in.
+    void OcclPrepassPause() {
+        PauseCounter();
+    }
+    void OcclPrepassResume() {
+        next_flag_draw = false;
+        StartCounter();
+    }
+
     void NoteOtherCountedDraw(bool blocks = true) {
         if (flag_map.load(std::memory_order_relaxed) == nullptr || !has_started ||
             current_bank_id >= FLAG_BANKS) {
@@ -2231,6 +2250,18 @@ VideoCommon::StreamerInterface* QueryCacheRuntime::GetStreamerInterface(QueryTyp
 
 u64 QueryCacheRuntime::OcclFlagAddress() {
     return impl->sample_streamer.OcclFlagAddress();
+}
+
+bool QueryCacheRuntime::OcclQuerySlotOpen() {
+    return impl->sample_streamer.OcclQuerySlotOpen();
+}
+
+void QueryCacheRuntime::OcclPrepassPause() {
+    impl->sample_streamer.OcclPrepassPause();
+}
+
+void QueryCacheRuntime::OcclPrepassResume() {
+    impl->sample_streamer.OcclPrepassResume();
 }
 
 void QueryCacheRuntime::NoteOtherCountedDraw(bool blocks) {

@@ -449,7 +449,8 @@ private:
     /// FRITCHII_OCCL_FLAG: full's flag variant, translated now (one a frame, shared with the
     /// lean siblings) from the draw's environments; null when not available yet. Sets
     /// full.occl_flag_state to 2 when it cannot be made.
-    GraphicsPipeline* FindOrMakeOcclFlag(GraphicsPipeline& full);
+    /// `kind`: 1 host flag program, 2 colour, 3 pre-pass (GraphicsPipeline::occl_flag_kind).
+    GraphicsPipeline* FindOrMakeOcclFlag(GraphicsPipeline& full, u8 kind = 1);
     /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
     u64 occl_made_frame{~u64{0}};
 
@@ -839,6 +840,8 @@ private:
     size_t pipelines_since_flush{};
     std::chrono::steady_clock::time_point last_flush{};
     std::atomic<size_t> last_cache_size{};
+    /// Data size of our cache file as last read or written; ~0: none (FRITCHII_PCACHE_SAVE).
+    std::atomic<size_t> saved_cache_size{~size_t{0}};
     /// When MemoryOwners last asked the driver for the cache data size.
     std::chrono::steady_clock::time_point last_cache_size_query{};
     std::atomic_bool flush_in_flight{};

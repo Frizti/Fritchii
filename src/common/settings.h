@@ -276,6 +276,11 @@ struct Values {
                                                     Category::Cpu};
     SwitchableSetting<CpuAccuracy, true> cpu_accuracy{linkage, CpuAccuracy::Auto,
                                                       "cpu_accuracy", Category::Cpu};
+    // Intel CPUs with P- and E-cores: Automatic leaves the GPU emulation threads to Windows, PinGpu
+    // holds them on the P-cores (common/thread.cpp). Global only, read when a game starts;
+    // EDEN_HYBRID_CORES wins when it is set.
+    Setting<HybridCpuPlacement> hybrid_cpu_placement{linkage, HybridCpuPlacement::Automatic,
+                                                     "hybrid_cpu_placement", Category::Cpu};
     SwitchableSetting<CpuClock> cpu_clock{linkage,
                                               CpuClock::Normal,
                                               "fast_cpu_time",
@@ -401,12 +406,13 @@ struct Values {
     // value (left in some players' OoT configs) silently overrode the checkbox, which then showed
     // unchecked and greyed once the game ran (2026-11-09, an RTX 5080 player).
     Setting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
-    // The DLSS model (preset) for every mode: K by default (NVIDIA's defaults for Performance and
-    // Ultra Performance drew thin lines); Default leaves the choice to NVIDIA. EDEN_NX2_DLSS_PRESET
-    // still overrides it. Applies live (Apply/OK while playing).
+    // The DLSS model (preset) for every mode. Auto, the default, is K (NVIDIA's defaults for
+    // Performance and Ultra Performance drew thin lines), or E on small cards with
+    // FRITCHII_DLSS_LOW_VRAM_CNN; a player who picks K gets K. Default leaves the choice to
+    // NVIDIA. EDEN_NX2_DLSS_PRESET still overrides it. Applies live (Apply/OK while playing).
     // v5.8.4: per game as well (the owner: "in game settings and not just global").
     SwitchableSetting<DlssPreset> nvidia_dlss_preset{linkage,
-                                           DlssPreset::K,
+                                           DlssPreset::Auto,
                                            "nvidia_dlss_preset",
                                            Category::Renderer,
                                            Specialization::Default,
@@ -669,6 +675,13 @@ struct Values {
                                                           true,
                                                           true,
                                                           &oot_high_refresh};
+    // Ocarina of Time's occlusion tests without host queries (video_core/fritchii_occl_flag.h):
+    // Standard is the core (FRITCHII_OCCL_FLAG=3), Full adds the colour variants and pre-passes
+    // (=9; offered once to AMD players, fritchii/occlusion_offer.cpp). Acts only where one
+    // follower is off (AMD's Windows driver by default). FRITCHII_OCCL_FLAG, when a switch sets
+    // it, wins. Global only; takes effect when the game starts.
+    Setting<OcclusionSpeedup> occlusion_speedup{linkage, OcclusionSpeedup::Standard,
+                                                "occlusion_speedup", Category::RendererAdvanced};
     // Which revision of the Frizti tuned settings (common/frizti_settings.h) this config has had
     // applied once (MainWindow::MigrateFriztiSettings; config/frizti.ini keeps it too).
     Setting<u32> frizti_settings_revision{linkage, 0, "frizti_settings_revision",

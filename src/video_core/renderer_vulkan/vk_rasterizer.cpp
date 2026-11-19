@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
+#include "common/cityhash.h"
 #include "common/dkb_frame_trace.h"
 #include "common/fritchii_write_ring.h"
 #include "common/host_memory.h"
@@ -79,6 +80,9 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/link_stats.h"
+#include "video_core/renderer_vulkan/vk_pcie_link.h"
+#include "video_core/renderer_vulkan/vk_sim_link_hog.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -585,13 +589,16 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     : gpu{gpu_}, device_memory{device_memory_}, device{device_},
       memory_allocator{memory_allocator_}, state_tracker{state_tracker_}, scheduler{scheduler_},
       staging_pool(device, memory_allocator, scheduler,
-                   device.HasSplitAllocators() && device.IsIntegrated() ? 2 : 1),
+                   device.HasSplitAllocators() && device.IsIntegrated() ? 2 : 1,
+                   device.HasSplitAllocators() ? StagingBufferPool::StreamRole::Transfers
+                                               : StagingBufferPool::StreamRole::Everything),
       split_buffer_allocator{device.HasSplitAllocators()
                                  ? std::make_unique<MemoryAllocator>(device, true)
                                  : nullptr},
       split_buffer_staging{split_buffer_allocator ? std::make_unique<StagingBufferPool>(
                                                         device, *split_buffer_allocator,
-                                                        scheduler, 2)
+                                                        scheduler, 2,
+                                                        StagingBufferPool::StreamRole::Buffers)
                                                   : nullptr},
       buffer_memory_allocator{split_buffer_allocator ? *split_buffer_allocator
                                                      : memory_allocator},
@@ -639,6 +646,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     }
     // FRITCHII_STAGING_RING: the texture cache's pool (texture uploads at area loads).
     staging_pool.CreateUploadRing();
+    if (!device.IsIntegrated()) {
+        LogPcieLink(device.GetVendorID(), device.GetDeviceID());
+    }
+    // FRITCHII_SIM_LINK_HOG: a copy load on the transfer queue (test).
+    if (device.HasLinkHogQueue()) {
+        sim_link_hog = std::make_unique<SimLinkHog>(device, memory_allocator);
+    }
     VideoCommon::FritchiiDrawKinds::Init();
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,
@@ -2375,6 +2389,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): with one follower off, an occlusion test draw
     // may take its pipeline's flag variant; a kept flag variant is decided again.
     VideoCommon::OcclFlag::t_census = VideoCommon::OcclFlag::Census::Unknown;
+    VideoCommon::OcclFlag::t_colour_prepass = false;
     const auto occl_flag = [&](GraphicsPipeline* chosen, bool allow_make) -> GraphicsPipeline* {
         if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
             chosen = chosen->occl_flag_parent; // a kept flag variant: decided again
@@ -2384,7 +2399,23 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             !query_cache_runtime.OcclFlagReady()) {
             return chosen;
         }
-        return pipeline_cache.OcclFlagPipeline(chosen, maxwell3d->regs, allow_make);
+        GraphicsPipeline* const flag =
+            pipeline_cache.OcclFlagPipeline(chosen, maxwell3d->regs, allow_make);
+        // The pre-pass records the draw twice: not for indirect and list draws (recording them
+        // consumes their arguments), the delta path and draw counting (they key on the bound
+        // pipeline), or a frame dump's probe.
+        const bool colour_prepass = VideoCommon::OcclFlag::t_colour_prepass;
+        if (flag != nullptr &&
+            (flag->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS || colour_prepass) &&
+            (is_indirect || draw_tracking || frame_dump.CapturingSampled())) [[unlikely]] {
+            VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_fallback);
+            VideoCommon::OcclFlag::t_census =
+                colour_prepass ? VideoCommon::OcclFlag::t_colour_prepass_class
+                               : VideoCommon::OcclFlag::Census::OffDiscards;
+            VideoCommon::OcclFlag::t_colour_prepass = false;
+            return chosen;
+        }
+        return flag;
     };
     GraphicsPipeline* const pipeline{[&]() -> GraphicsPipeline* {
         if (delta_pipeline != nullptr) {
@@ -2834,6 +2865,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     TrackOcarinaCamera(tracker_record ? &*tracker_record : nullptr);
     TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect,
                       tracker_record ? &*tracker_record : nullptr);
+    if (VideoCommon::OcarinaActorTrace()) [[unlikely]] {
+        TraceOcarinaActorDraw(*pipeline, is_indexed);
+    }
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
     if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
@@ -2894,6 +2928,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL &&
             !VideoCore::Nx2Debug::AccuratePart(2)) {
             query_cache_runtime.SetNextFlagDraw(true);
+            // The frontend offers Full once to players whose flags act here (AMD's driver).
+            if (!VideoCommon::OcclFlag::g_full_could_help.load(std::memory_order_relaxed) &&
+                device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY &&
+                device.IsShaderInt64Supported()) [[unlikely]] {
+                VideoCommon::OcclFlag::g_full_could_help.store(true, std::memory_order_relaxed);
+            }
         }
         query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                                   maxwell3d->regs.zpass_pixel_count_enable);
@@ -2910,6 +2950,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                      &address);
             });
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.flag_draws);
+            if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS) {
+                VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_draws);
+            }
+
         } else if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
             query_cache_runtime.NoteOtherCountedDraw(
                 VideoCommon::OcclFlag::Blocks(census)); // nothing without the flag area
@@ -2929,7 +2973,79 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
             VideoCommon::MemStageShadow::BackDrawWindow(false);
         }
-        draw_func();
+        const bool colour_prepass = std::exchange(VideoCommon::OcclFlag::t_colour_prepass, false);
+        if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS ||
+            colour_prepass) [[unlikely]] {
+            // FRITCHII_OCCL_FLAG pre-pass: the variant draws first with depth writes off (and,
+            // for a colour pre-pass, colour writes off) and
+            // stores the flag; a host query open in this slot (verify, or a window that opened
+            // one) does not count it: it ends before and the window's next slot opens after.
+            // In mode 1 a host query already open counts the real draw exactly: no pre-pass.
+            namespace OcclFlag = VideoCommon::OcclFlag;
+            const bool query_open = query_cache_runtime.OcclQuerySlotOpen();
+            const bool prepass = !query_open || OcclFlag::Mode() == OcclFlag::Verify;
+            if (prepass) {
+                if (query_open) {
+                    query_cache_runtime.OcclPrepassPause();
+                    OcclFlag::Add(OcclFlag::g_stats.prepass_paused);
+                }
+                scheduler.Record(
+                    [](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthWriteEnableEXT(false); });
+                const bool clear_masks = colour_prepass && pipeline->occl_flag_kind == 1;
+                if (colour_prepass) {
+                    OcclFlag::Add(OcclFlag::g_stats.colour_prepass_draws);
+                }
+                if (clear_masks) {
+                    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                        static constexpr std::array<VkColorComponentFlags,
+                                                    Maxwell::NumRenderTargets>
+                            none{};
+                        cmdbuf.SetColorWriteMaskEXT(0, none);
+                    });
+                }
+                draw_func();
+                scheduler.Record([enable = maxwell3d->regs.depth_write_enabled != 0](
+                                     vk::CommandBuffer cmdbuf) {
+                    cmdbuf.SetDepthWriteEnableEXT(enable);
+                });
+                if (clear_masks) {
+                    // The draw's own masks again (recorded from its registers).
+                    maxwell3d->dirty.flags[Dirty::Blending] = true;
+                    maxwell3d->dirty.flags[Dirty::ColorMask] = true;
+                    UpdateBlending(maxwell3d->regs, pipeline->occl_flag_parent);
+                }
+                if (query_open) {
+                    query_cache_runtime.OcclPrepassResume();
+                }
+            } else {
+                OcclFlag::Add(OcclFlag::g_stats.prepass_skipped);
+            }
+            // The real draw: the parent bound again with this draw's descriptors. A submission
+            // inside (a descriptor allocation) ends the dynamic states and the open query: set
+            // them again.
+            GraphicsPipeline& parent = *pipeline->occl_flag_parent;
+            const u64 tick = scheduler.CurrentTick();
+            if (parent.ConfigureAfterOcclPrepass(*pipeline)) [[likely]] {
+                if (scheduler.CurrentTick() != tick) [[unlikely]] {
+                    UpdateDynamicStates(&parent);
+                    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                              maxwell3d->regs.zpass_pixel_count_enable);
+                }
+                trace_draw_hashes = {parent.ShaderHashes()[1], parent.ShaderHashes()[5]};
+                draw_func();
+            } else {
+                if (colour_prepass) {
+                    pipeline->occl_same_descriptors = 2; // no more colour pre-passes with it
+                } else {
+                    parent.occl_flag_prepass_state = 2; // later draws take the parent alone
+                }
+                OcclFlag::g_stats.prepass_lost.fetch_add(1, std::memory_order_relaxed);
+                LOG_ERROR(Render_Vulkan, "Occlusion flag pre-pass: the real draw could not be "
+                                         "configured and was not recorded");
+            }
+        } else {
+            draw_func();
+        }
     }
     if (probe) {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
@@ -8913,18 +9029,35 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
     }
 }
 
-/// Capture the skinning pose of the recognized Link draw for frame-to-frame motion.
+namespace {
+constexpr u32 OCARINA_LINK_INDICES = 9702; ///< the index count of Link's recognized draw
+constexpr size_t OCARINA_VERTEX_STRIDE = 48;
+/// The palette bytes that tell skeletons apart: its first 16 bones. A false match only adds a
+/// replay the scene depth check then drops.
+constexpr size_t OCARINA_PALETTE_KEY_BYTES = 16 * 12 * sizeof(f32);
+} // namespace
+
+/// Capture the skinning pose of the recognized Link draw for frame-to-frame motion, and with
+/// FRITCHII_OOT_ACTOR_PARTS (or _TRACE) note the other draws of the same vertex program.
 void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect,
                                          const MemStage::TrackerRecord* record) {
     if (shader_hash != MemStage::TrackerRecord::ActorShader || !is_indexed || is_indirect ||
-        !OcarinaTemporalEnabled() || oot_actor.frame == render_trace_frame) {
+        !OcarinaTemporalEnabled()) {
+        return;
+    }
+    const bool parts = VideoCommon::OcarinaActorParts() || VideoCommon::OcarinaActorTrace();
+    const bool pose_wanted = oot_actor.frame != render_trace_frame;
+    if (!pose_wanted && !parts) {
         return;
     }
     const auto& draw = maxwell3d->draw_manager.draw_state;
     const auto& regs = maxwell3d->regs;
     const auto& stream = regs.vertex_streams[0];
-    if (draw.index_buffer.count != 9702 || draw.index_buffer.FormatSizeInBytes() != 2 ||
-        !stream.IsEnabled() || stream.stride != 48 || regs.vertex_stream_instances.IsInstancingEnabled(0)) {
+    const bool link_draw = pose_wanted && draw.index_buffer.count == OCARINA_LINK_INDICES;
+    if ((!link_draw && (!parts || draw.topology != Maxwell::PrimitiveTopology::Triangles)) ||
+        draw.index_buffer.FormatSizeInBytes() != 2 || !stream.IsEnabled() ||
+        stream.stride != OCARINA_VERTEX_STRIDE ||
+        regs.vertex_stream_instances.IsInstancingEnabled(0)) {
         return;
     }
     const auto attribute = [&](u32 location, VkFormat format, u32 offset) {
@@ -8938,35 +9071,29 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
         return;
     }
 
-    OcarinaActorPose pose{
-        .frame = render_trace_frame,
-        .channel = gpu_memory,
-        .vertex = stream.Address(),
-        .indices = draw.index_buffer.IndexStart(),
-        .base_vertex = static_cast<s32>(draw.base_index),
-    };
+    std::array<f32, 4> origin{};
     bool origin_found{}, bones_found{};
+    DAddr bones_address{};
+    const u8* bones_copied{};
     // Vertex uniform slots 4 (the origin) and 6 (the bones), when not GPU-modified. `copied`: the
     // bytes the packet's fill copied (step 7, the window open), else game memory.
     using Tracker = MemStage::TrackerRecord;
     static_assert(Tracker::OriginBytes == 3 * sizeof(f32));
-    static_assert(Tracker::BonesBytes == sizeof(pose.bones));
+    static_assert(Tracker::BonesBytes == sizeof(OcarinaActorPose::bones));
+    static_assert(OCARINA_PALETTE_KEY_BYTES <= Tracker::BonesBytes);
     const auto sample = [&](u32 index, DAddr address, u32 size, const u8* copied) {
         if (index == 4 && size >= Tracker::OriginOffset + Tracker::OriginBytes) {
             if (copied != nullptr) {
-                std::memcpy(pose.origin.data(), copied, Tracker::OriginBytes);
+                std::memcpy(origin.data(), copied, Tracker::OriginBytes);
             } else {
-                device_memory.ReadBlockUnsafe(address + Tracker::OriginOffset, pose.origin.data(),
+                device_memory.ReadBlockUnsafe(address + Tracker::OriginOffset, origin.data(),
                                               Tracker::OriginBytes);
             }
             origin_found = true;
         }
         if (index == 6 && size == Tracker::BonesSlotSize) {
-            if (copied != nullptr) {
-                std::memcpy(pose.bones.data(), copied, sizeof(pose.bones));
-            } else {
-                device_memory.ReadBlockUnsafe(address, pose.bones.data(), sizeof(pose.bones));
-            }
+            bones_address = address;
+            bones_copied = copied;
             bones_found = true;
         }
     };
@@ -8993,10 +9120,97 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
             sample(index, binding.device_addr, size, nullptr);
         });
     }
-    if (origin_found && bones_found) {
+    if (!origin_found || !bones_found) {
+        return;
+    }
+    const auto read_bones = [&](void* destination, size_t bytes) {
+        if (bones_copied != nullptr) {
+            std::memcpy(destination, bones_copied, bytes);
+        } else {
+            device_memory.ReadBlockUnsafe(bones_address, destination, bytes);
+        }
+    };
+    u64 palette{};
+    if (parts) {
+        std::array<char, OCARINA_PALETTE_KEY_BYTES> key;
+        read_bones(key.data(), key.size());
+        palette = Common::CityHash64(key.data(), key.size());
+    }
+    if (link_draw) {
+        OcarinaActorPose pose{
+            .frame = render_trace_frame,
+            .channel = gpu_memory,
+            .vertex = stream.Address(),
+            .indices = draw.index_buffer.IndexStart(),
+            .base_vertex = static_cast<s32>(draw.base_index),
+            .origin = origin,
+            .palette = palette,
+        };
+        read_bones(pose.bones.data(), sizeof(pose.bones));
         oot_previous_actor = oot_actor;
         oot_actor = pose;
+        return;
     }
+    if (oot_actor_parts_frame != render_trace_frame) {
+        oot_actor_parts_frame = render_trace_frame;
+        oot_actor_part_count = 0;
+    }
+    // Once Link's pose is known, other skeletons (the townsfolk) need no slot.
+    if (oot_actor.frame == render_trace_frame && palette != oot_actor.palette) {
+        return;
+    }
+    const OcarinaActorPart part{
+        .channel = gpu_memory,
+        .vertex = stream.Address(),
+        .indices = draw.index_buffer.IndexStart(),
+        .base_vertex = static_cast<s32>(draw.base_index),
+        .index_count = draw.index_buffer.count,
+        .palette = palette,
+        .origin = origin,
+    };
+    const std::span known{oot_actor_parts.data(), oot_actor_part_count};
+    const bool seen = std::ranges::any_of(known, [&](const OcarinaActorPart& other) {
+        return other.vertex == part.vertex && other.indices == part.indices &&
+               other.base_vertex == part.base_vertex && other.index_count == part.index_count;
+    });
+    if (!seen && oot_actor_part_count < oot_actor_parts.size()) {
+        oot_actor_parts[oot_actor_part_count++] = part;
+    }
+}
+
+void RasterizerVulkan::TraceOcarinaActorDraw(const GraphicsPipeline& pipeline, bool is_indexed) {
+    if (render_trace_frame % 600 != 0 || !is_indexed || !OcarinaTemporalEnabled()) {
+        return;
+    }
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const auto& regs = maxwell3d->regs;
+    const auto& stream = regs.vertex_streams[0];
+    const auto hashes = pipeline.ShaderHashes();
+    if (hashes[1] != MemStage::TrackerRecord::ActorShader && stream.stride != OCARINA_VERTEX_STRIDE) {
+        return;
+    }
+    if (oot_actor_trace_frame != render_trace_frame) {
+        oot_actor_trace_frame = render_trace_frame;
+        oot_actor_trace_lines = 0;
+    }
+    if (oot_actor_trace_lines >= 200) {
+        return;
+    }
+    ++oot_actor_trace_lines;
+    const auto& targets = texture_cache.GetRenderTargets();
+    u32 width{}, height{};
+    if (targets.color_buffer_ids[0]) {
+        const auto& color = texture_cache.GetImageView(targets.color_buffer_ids[0]);
+        width = color.size.width;
+        height = color.size.height;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Ocarina actor trace: frame={} vs={:016x} fs={:016x} indices={} stride={} target={}x{} "
+             "depth_test={} depth_write={} blend={} alpha_test={} alpha_to_coverage={} discard={}",
+             render_trace_frame, hashes[1], hashes[5], draw.index_buffer.count, stream.stride, width,
+             height, regs.depth_test_enable != 0, regs.depth_write_enabled != 0,
+             regs.blend.enable[0] != 0, regs.alpha_test_enabled != 0,
+             regs.anti_alias_alpha_control.alpha_to_coverage != 0, pipeline.FragmentCanDiscard());
 }
 
 /// FRITCHII_MEMSTAGE_SHADOW: the draw packet's record of uniform slots 3, 4 and 6 against what
@@ -9076,27 +9290,77 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
         gpu_memory->ReadBlockUnsafe(address, dst, size);
         return true;
     };
-    constexpr size_t index_count = 9702;
-    constexpr size_t stride = 48;
-    std::vector<u16> indices(index_count);
-    if (!read(now.indices, indices.data(), indices.size() * sizeof(u16))) {
+    constexpr size_t stride = OCARINA_VERTEX_STRIDE;
+    // One draw's triangles and the vertices they use, added to the mesh.
+    const auto append = [&](GPUVAddr vertex, GPUVAddr index_address, s32 base_vertex,
+                            u32 index_count) {
+        if (index_count == 0 || index_count > (1U << 18)) {
+            return false;
+        }
+        std::vector<u16> indices(index_count);
+        if (!read(index_address, indices.data(), indices.size() * sizeof(u16))) {
+            return false;
+        }
+        const auto [minimum, maximum] = std::ranges::minmax(indices);
+        const s64 first = static_cast<s64>(base_vertex) + minimum;
+        const u32 vertex_count = static_cast<u32>(maximum) - minimum + 1;
+        const size_t offset = mesh.vertices.size() / stride;
+        // The replay's indices are 16 bits.
+        if (first < 0 || first > (1 << 20) || vertex_count > 16384 ||
+            offset + vertex_count > 65536) {
+            return false;
+        }
+        mesh.vertices.resize((offset + vertex_count) * stride);
+        if (!read(vertex + first * stride, mesh.vertices.data() + offset * stride,
+                  vertex_count * stride)) {
+            mesh.vertices.resize(offset * stride);
+            return false;
+        }
+        mesh.indices.reserve(mesh.indices.size() + index_count);
+        for (const u16 index : indices) {
+            mesh.indices.push_back(static_cast<u16>(index - minimum + offset));
+        }
+        return true;
+    };
+    if (!append(now.vertex, now.indices, now.base_vertex, OCARINA_LINK_INDICES)) {
         return;
     }
-    const auto [minimum, maximum] = std::ranges::minmax(indices);
-    const s64 first = static_cast<s64>(now.base_vertex) + minimum;
-    const u32 vertex_count = static_cast<u32>(maximum) - minimum + 1;
-    if (first < 0 || first > (1 << 20) || vertex_count > 16384) {
-        return;
-    }
-    std::vector<u8> vertices(vertex_count * stride);
-    if (!read(now.vertex + first * stride, vertices.data(), vertices.size())) {
-        return;
-    }
-    for (u16& index : indices) {
-        index -= minimum;
-    }
+    mesh.current_origin = now.origin;
+    mesh.previous_origin = before.origin;
+    mesh.current_bones = now.bones;
+    mesh.previous_bones = before.bones;
 
-    mesh = {std::move(vertices), std::move(indices), now.origin, before.origin, now.bones, before.bones};
+    const bool add_parts = VideoCommon::OcarinaActorParts();
+    const bool trace = VideoCommon::OcarinaActorTrace() && render_trace_frame % 600 == 0;
+    if ((!add_parts && !trace) || oot_actor_parts_frame != render_trace_frame) {
+        return;
+    }
+    u32 same_skeleton = 0;
+    u32 added = 0;
+    std::string counts;
+    for (const OcarinaActorPart& part : std::span{oot_actor_parts.data(), oot_actor_part_count}) {
+        if (part.channel != now.channel || part.palette != now.palette ||
+            part.origin != now.origin ||
+            (part.vertex == now.vertex && part.indices == now.indices &&
+             part.base_vertex == now.base_vertex && part.index_count == OCARINA_LINK_INDICES)) {
+            continue;
+        }
+        ++same_skeleton;
+        if (trace) {
+            counts += fmt::format(" {}", part.index_count);
+        }
+        if (add_parts && append(part.vertex, part.indices, part.base_vertex, part.index_count)) {
+            ++added;
+        }
+    }
+    if (trace) {
+        LOG_INFO(Render_Vulkan,
+                 "Ocarina actor trace: frame={} Link's draw has {} indices; {} other draws of the "
+                 "program seen, {} with his skeleton (indices:{}), {} replayed; the replay has {} "
+                 "vertices, {} indices",
+                 render_trace_frame, OCARINA_LINK_INDICES, oot_actor_part_count, same_skeleton,
+                 counts, added, mesh.vertices.size() / stride, mesh.indices.size());
+    }
 }
 
 // Here and not in vk_compute_pipeline.cpp, which the Preparing shaders stamp hashes: the same test
@@ -9763,6 +10027,7 @@ void RasterizerVulkan::TickFrame() {
     if (split_buffer_staging) {
         split_buffer_staging->TickFrame();
     }
+    VideoCommon::LinkStats::MaybeLog();
     part_done(FrameEndTimes::Staging);
     {
         std::scoped_lock lock{texture_cache.mutex};

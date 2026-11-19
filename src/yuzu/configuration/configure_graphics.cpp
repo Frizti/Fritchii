@@ -1768,7 +1768,8 @@ void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
     set(values.nvidia_dlss.Id(), tr("NVIDIA DLSS"),
         tr("NVIDIA's upscaler, RTX cards only.\nNeeds NVIDIA's files: use the download button."));
     set(values.nvidia_dlss_preset.Id(), tr("DLSS model:"),
-        tr("Which DLSS version to use. K is the tested one.\nOthers can look sharper or softer."));
+        tr("Which DLSS version to use. Automatic picks one for your card.\nK is the tested one. "
+           "Others can look sharper or softer."));
     set(values.nvidia_dlss_quality.Id(), tr("DLSS quality:"),
         tr("Lower quality runs faster but looks softer.\nNative only smooths edges, no "
            "upscaling."));

@@ -94,8 +94,8 @@ bool CommitVectorPage(uintptr_t addr) noexcept {
         return false;
     }
 
-    void* res2 = VirtualAlloc(reinterpret_cast<LPVOID>(addr), HostPageSize, MEM_COMMIT, PAGE_READWRITE);
-    if (res2 == nullptr) {
+    // Quiet: this runs in the fault handler too. The failure below is logged once it is final.
+    if (!CommitPagesWaiting(reinterpret_cast<void*>(addr), HostPageSize, true)) {
         LOG_ERROR(HW_Memory, "Failed to commit large buffer region at {:#x}, error {}", addr, GetLastError());
         return false;
     }

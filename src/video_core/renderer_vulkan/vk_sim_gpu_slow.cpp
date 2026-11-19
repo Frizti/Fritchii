@@ -285,7 +285,8 @@ void SimGpuSlow::Begin(const Device& device_, vk::CommandBuffer upload_cmdbuf,
         Poll(master);
     }
     const int percent = Common::LowEndSim::GpuSlowPercent();
-    if (percent <= 100) {
+    const bool link = Common::LowEndSim::LinkOn();
+    if (percent <= 100 && !link) {
         // Turned off live: nothing is owed, what is in flight is still read back above.
         debt_ns = 0;
         return;
@@ -293,6 +294,13 @@ void SimGpuSlow::Begin(const Device& device_, vk::CommandBuffer upload_cmdbuf,
     if (!pool && !Create(device_)) {
         failed = true;
         return;
+    }
+    if (link) {
+        debt_ns += Common::LowEndSim::LinkTakeGpuNs();
+        if (debt_ns > MaxDebtNs) {
+            window_dropped_ns += static_cast<u64>(debt_ns - MaxDebtNs);
+            debt_ns = MaxDebtNs;
+        }
     }
     Report(std::chrono::steady_clock::now(), percent);
     if (next - read >= Slots) {

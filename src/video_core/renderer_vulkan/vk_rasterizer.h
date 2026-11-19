@@ -94,6 +94,8 @@ private:
     Scheduler& scheduler;
 };
 
+class SimLinkHog;
+
 class RasterizerVulkan final : public VideoCore::RasterizerInterface,
                                protected VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
 public:
@@ -495,6 +497,8 @@ private:
     void UpdateOcarinaJitter();
     void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect,
                            const MemStage::TrackerRecord* record);
+    /// FRITCHII_OOT_ACTOR_TRACE: one log line for a draw that could carry a character.
+    void TraceOcarinaActorDraw(const GraphicsPipeline& pipeline, bool is_indexed);
     /// FRITCHII_MEMSTAGE_SHADOW: the trackers' record against today's query.
     void VerifyTrackerRecord(const MemStage::TrackerRecord* record);
     // One follower (one_follower.h), on E: a draw lent to R (from step 3 part (c) routes it).
@@ -658,8 +662,24 @@ private:
         GPUVAddr indices{};
         s32 base_vertex{};
         std::array<f32, 4> origin{};
+        u64 palette{}; ///< hash of the palette's first bones (FRITCHII_OOT_ACTOR_PARTS, _TRACE)
         std::array<f32, 280 * 12> bones{};
     } oot_actor, oot_previous_actor;
+    /// FRITCHII_OOT_ACTOR_PARTS, _TRACE: this frame's other draws of the actor's vertex program.
+    struct OcarinaActorPart {
+        const Tegra::MemoryManager* channel{};
+        GPUVAddr vertex{};
+        GPUVAddr indices{};
+        s32 base_vertex{};
+        u32 index_count{};
+        u64 palette{};
+        std::array<f32, 4> origin{};
+    };
+    std::array<OcarinaActorPart, 128> oot_actor_parts{};
+    u32 oot_actor_part_count{};
+    u64 oot_actor_parts_frame{};
+    u32 oot_actor_trace_lines{}; ///< FRITCHII_OOT_ACTOR_TRACE: lines this frame
+    u64 oot_actor_trace_frame{};
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     /// The topology UpdateDynamicStates gives the draw (see there).
@@ -803,6 +823,8 @@ private:
     SetupKeep setup_keep{};
     /// GPUMem: the raw handles of the draw it fills (SEAM 3).
     std::vector<u32> stage_handle_values;
+    /// FRITCHII_SIM_LINK_HOG: last member, so its thread ends before anything else goes.
+    std::unique_ptr<SimLinkHog> sim_link_hog;
 };
 
 } // namespace Vulkan
