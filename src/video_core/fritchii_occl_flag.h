@@ -152,6 +152,11 @@ static_assert(std::size(CensusNames) == static_cast<size_t>(Census::Count));
 inline thread_local Census t_census{};
 /// Set by PipelineCache::OcclFlagPipeline when the host flag variant it returns is for a colour
 /// pre-pass (read and cleared by the draw that follows).
+inline constexpr const char* ColourPrepassReasonNames[] = {
+    "taken", "host failed", "pipeline not built", "no dynamic depth writes", "mesh",
+    "transform feedback (key)", "alpha to coverage (key)", "stores in a stage",
+    "rasterizer discard", "transform feedback", "depth bounds", "stencil writes", "EQUAL",
+    "NOTEQUAL with depth writes", "host not ready", "descriptors differ"};
 inline thread_local bool t_colour_prepass{};
 /// The census class of that draw (restored when the draw cannot take the pre-pass).
 inline thread_local Census t_colour_prepass_class{};
@@ -168,6 +173,9 @@ struct Stats {
     std::atomic<u64> colour_lean_pipelines{}; ///< distinct pipelines of colour Lean draws
     /// Colour Lean draws refused for subgroup operations, by operation (a draw can count twice).
     std::atomic<u64> sg_vote{}, sg_mask{}, sg_shuffle{}, sg_invocation_id{}, sg_helper{};
+    /// Colour pre-pass candidates (subgroup or quad colour Lean draws) by the first check that
+    /// refused them (index: see ColourPrepassReasonNames).
+    std::atomic<u64> cpp_reason[16]{};
     std::atomic<u64> qslot_injectable{}; ///< query slots whose draws were all flag or colour Lean
     std::atomic<u64> qslot_blocked{};    ///< query slots with a blocking draw
     std::atomic<u64> qslot_empty{};      ///< query slots with no counted draw marked
@@ -262,12 +270,24 @@ inline void MaybeLog() {
     LOG_INFO(Render_Vulkan,
              "Occlusion flag census per second: counted draws by class: {}; colour Lean "
              "pipelines {} distinct in the window; colour Lean subgroup draws by operation: vote "
-             "{:.0f}, mask {:.0f}, shuffle {:.0f}, invocation id {:.0f}, helper {:.0f}; query "
+             "{:.0f}, mask {:.0f}, shuffle {:.0f}, invocation id {:.0f}, helper {:.0f}; colour "
+             "pre-pass candidates by outcome: {}; query "
              "slots closed: {:.0f} all flag or colour Lean, "
              "{:.0f} blocked, {:.0f} no draw marked",
              census, g.colour_lean_pipelines.exchange(0, std::memory_order_relaxed),
              take(g.sg_vote), take(g.sg_mask), take(g.sg_shuffle), take(g.sg_invocation_id),
              take(g.sg_helper),
+             [&g, &take] {
+                 std::string reasons;
+                 for (size_t i = 0; i < 16; ++i) {
+                     const double v = take(g.cpp_reason[i]);
+                     if (v > 0) {
+                         reasons += fmt::format("{}{} {:.0f}", reasons.empty() ? "" : ", ",
+                                                ColourPrepassReasonNames[i], v);
+                     }
+                 }
+                 return reasons.empty() ? std::string{"none"} : reasons;
+             }(),
              take(g.qslot_injectable),
              take(g.qslot_blocked), take(g.qslot_empty));
 }

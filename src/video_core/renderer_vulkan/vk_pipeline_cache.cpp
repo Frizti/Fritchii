@@ -3809,6 +3809,53 @@ bool OcclFlagPrepassRegsOk(const Tegra::Engines::Maxwell3D::Regs& regs);
 /// colour and depth writes off; then as it is. Without discards every fragment that passes the
 /// tests is counted, so the host program's flag is the draw's "some sample passed". Needs
 /// dynamic colour write masks (extended dynamic state 3 blending).
+/// Census: the first check that refuses a colour pre-pass (ColourPrepassReasonNames), 0 none.
+u32 OcclFlagColourPrepassReason(const GraphicsPipeline& pipeline,
+                                const Tegra::Engines::Maxwell3D::Regs& regs) {
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    if (!pipeline.UsesExtendedDynamicState()) {
+        return 3;
+    }
+    if (pipeline.IsMeshPipeline()) {
+        return 4;
+    }
+    if (pipeline.Key().state.xfb_enabled != 0) {
+        return 5;
+    }
+    if (pipeline.Key().state.alpha_to_coverage_enabled != 0) {
+        return 6;
+    }
+    if (std::ranges::any_of(pipeline.StageInfos(),
+                            [](const Shader::Info& info) { return OcclFlagStageWrites(info); })) {
+        return 7;
+    }
+    if (regs.rasterize_enable == 0) {
+        return 8;
+    }
+    if (regs.transform_feedback_enabled != 0) {
+        return 9;
+    }
+    if (regs.depth_bounds_enable != 0) {
+        return 10;
+    }
+    if (regs.stencil_enable != 0 &&
+        (regs.stencil_front_mask != 0 ||
+         (regs.stencil_two_side_enable != 0 && regs.stencil_back_mask != 0))) {
+        return 11;
+    }
+    const bool equal = regs.depth_test_func == Regs::ComparisonOp::Equal_D3D ||
+                       regs.depth_test_func == Regs::ComparisonOp::Equal_GL;
+    if (regs.depth_test_enable != 0 && equal) {
+        return 12;
+    }
+    const bool not_equal = regs.depth_test_func == Regs::ComparisonOp::NotEqual_D3D ||
+                           regs.depth_test_func == Regs::ComparisonOp::NotEqual_GL;
+    if (regs.depth_test_enable != 0 && regs.depth_write_enabled != 0 && not_equal) {
+        return 13;
+    }
+    return 0;
+}
+
 bool OcclFlagColourPrepassEligible(const GraphicsPipeline& pipeline,
                                   const Tegra::Engines::Maxwell3D::Regs& regs) {
     return OcclFlagPrepassPipelineOk(pipeline) && OcclFlagPrepassRegsOk(regs);
@@ -3966,6 +4013,16 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
         u8& host_state = dynamic_masks ? pipeline->occl_flag_state
                                        : pipeline->occl_flag_nocolour_state;
         if ((colour_verdict == Census::ColourSubgroup || colour_verdict == Census::ColourQuad) &&
+            OcclFlag::ColourPrepassAllowed()) {
+            // Census: the first check that refuses it (taken, or not ready, counted below).
+            const u32 reason = host_state == 2           ? 1
+                               : !pipeline->IsBuilt()     ? 2
+                                                          : OcclFlagColourPrepassReason(*pipeline, regs);
+            if (reason != 0) {
+                OcclFlag::Add(stats.cpp_reason[reason]);
+            }
+        }
+        if ((colour_verdict == Census::ColourSubgroup || colour_verdict == Census::ColourQuad) &&
             OcclFlag::ColourPrepassAllowed() && host_state != 2 && pipeline->IsBuilt() &&
             OcclFlagColourPrepassEligible(*pipeline, regs)) {
             GraphicsPipeline* host = dynamic_masks ? pipeline->occl_flag.get()
@@ -3978,6 +4035,13 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
                 host_state = 2;
                 OcclFlag::Add(stats.failed);
                 host = nullptr;
+            }
+            if (host != nullptr && host->IsBuilt() && host->occl_same_descriptors != 1) {
+                OcclFlag::Add(stats.cpp_reason[15]);
+            } else if (host == nullptr || !host->IsBuilt()) {
+                OcclFlag::Add(stats.cpp_reason[14]);
+            } else {
+                OcclFlag::Add(stats.cpp_reason[0]);
             }
             if (host != nullptr && host->IsBuilt() && host->occl_same_descriptors == 1) {
                 OcclFlag::t_census = Census::Flag;
