@@ -603,7 +603,10 @@ void RunJob(Job& job) {
     // S4: async draw tails, binds and stores leave no cached writes (ESplitAsyncWrite, must be
     // 0): FlushPlace's "not owed" counts on it, since E1 may decide before E2 ran them. One that
     // does still makes a later flush owed.
-    const bool watch_writes = job.async && job.info.hand != Hand::CbWords;
+    // With FRITCHII_ESPLIT_OWED=1 (the default) a cached write makes nothing owed: the marks
+    // only feed the line's count, kept under the GPU profile.
+    const bool watch_writes = job.async && job.info.hand != Hand::CbWords &&
+                              (!g_owed_shader_rule || Profile::Enabled());
     const u64 mark = watch_writes ? WriteMark() : 0;
     // FRITCHII_ESPLIT_BIND_BATCH's dry count: a bind job's body, 1 in 64 (the rest is the job's
     // own cost, what packing saves).
@@ -1523,7 +1526,8 @@ void PostAsync(void (*function)(void*)) noexcept {
         job.tls = OneF::EngineTls{};
         job.tls.query_kind = OneF::QueryKind::Count;
     }
-    if (g_fill_state.capture != nullptr) {
+    // Only a draw tail installs it on E2 (RunJob's moves_state): the others' copy went unused.
+    if (job.info.hand == Hand::DrawTail && g_fill_state.capture != nullptr) {
         g_fill_state.capture(job.fill_state.data(), true);
     }
     Publish(job.seq);
