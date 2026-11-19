@@ -56,7 +56,7 @@
 // Only this declaration: one_follower.h pulls in nvdata.h, whose enum names (BadValue, ...) the
 // X11 headers vulkan.h includes on Linux define as macros.
 namespace VideoCommon::OneFollower {
-void NoteAmdProprietaryDriver() noexcept;
+void NoteAmdProprietaryDriver(bool integrated) noexcept;
 }
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
@@ -719,7 +719,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (driver_id == VK_DRIVER_ID_AMD_PROPRIETARY) {
         // The one follower's AMD safe default reads it at the split's start (later, on the GPU
         // thread).
-        VideoCommon::OneFollower::NoteAmdProprietaryDriver();
+        VideoCommon::OneFollower::NoteAmdProprietaryDriver(
+            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
     }
 
     const bool is_nvidia = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY;

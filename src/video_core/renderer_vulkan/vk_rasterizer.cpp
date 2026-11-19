@@ -2427,10 +2427,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
             chosen = chosen->occl_flag_parent; // a kept flag variant: decided again
         }
-        // Never with one follower on, lent draws included: the flag store dereferences a pushed
-        // GPU address, and the follower's lent paths were the one place flags ran with it (both
-        // AMD losses read a wild address at the same lent load, 2026-11-18/19).
-        if (onef_play != nullptr || VideoCommon::OneFollower::On() || chosen == nullptr ||
+        // With one follower on, only where FRITCHII_ONEF_OCCL is on (OneFollower::OcclWanted:
+        // unset = AMD's proprietary driver on a discrete GPU). v6.2 kept every draw, lent ones
+        // included, off its flag variants with one follower on, after two AMD losses read a wild
+        // address at a lent load (2026-11-18/19); RGD traced those to a stale vertex-buffer table
+        // (MemPlayer::EnsureVertexBindings), not the flag store, which only stores. OcclWanted
+        // false is exactly that v6.2 rule.
+        if (onef_play != nullptr ||
+            (VideoCommon::OneFollower::On() && !VideoCommon::OneFollower::OcclWanted()) ||
+            chosen == nullptr ||
             VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Off ||
             !query_cache_runtime.OcclFlagReady()) {
             return chosen;

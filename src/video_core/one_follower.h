@@ -485,10 +485,18 @@ enum class FlagOwner : u8 { E, R, Both };
 /// Reads the switches (GpuSplit::MaybeStart, before the back thread exists). Boot ones stick.
 void ReadSwitches();
 /// The Vulkan device names its driver (Device's constructor, before ReadSwitches): on AMD's
-/// proprietary driver the one follower stays off unless FRITCHII_ONEF_AMD=1.
-void NoteAmdProprietaryDriver() noexcept;
+/// proprietary driver the one follower stays off unless FRITCHII_ONEF_AMD=1. `integrated`: the
+/// device is an integrated GPU (an APU).
+void NoteAmdProprietaryDriver(bool integrated) noexcept;
 /// True once the Vulkan device said it runs AMD's proprietary driver (AMD safe defaults read it).
 [[nodiscard]] bool IsAmdProprietaryDriver() noexcept;
+/// AMD's proprietary driver on a discrete GPU (not an integrated one).
+[[nodiscard]] bool IsAmdProprietaryDiscrete() noexcept;
+/// FRITCHII_ONEF_OCCL (boot, read in ReadSwitches): occlusion flag variants with one follower on
+/// (lent draws through the off path's choice, played draws through E's). An explicit value wins;
+/// unset = on only on AMD's proprietary driver on a discrete GPU. False reproduces v6.2's rule
+/// (no flag variant with one follower on).
+[[nodiscard]] bool OcclWanted() noexcept;
 /// FRITCHII_ONEF=1 at boot (R exists).
 [[nodiscard]] bool On() noexcept;
 /// The effective step after nesting (StepLevel), refreshed at frame ends and lent packets.

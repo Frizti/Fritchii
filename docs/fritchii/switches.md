@@ -1126,6 +1126,26 @@ Boot, off by default (helper BJ, 2026-11-16). On AMD's proprietary Vulkan driver
 it on and ran clean with every FRITCHII_ONEF_* line out. Log once: "One follower: off on AMD's
 proprietary driver ...". 1 = keep it on there (tests). RADV, NVIDIA and Intel unchanged.
 
+### FRITCHII_ONEF_OCCL
+
+Boot (2026-11-19). Occlusion flag variants (FRITCHII_OCCL_FLAG) with one follower on. An explicit
+value wins (0 off, anything else on); unset, it is on only on AMD's proprietary driver on a
+discrete GPU, where it was measured, and off on NVIDIA, Intel, RADV and AMD integrated GPUs until
+an A/B there. Log once at boot: "One follower: occlusion flags on|off (FRITCHII_ONEF_OCCL=V |
+unset: AMD proprietary driver, discrete GPU | not an AMD proprietary discrete GPU)".
+- Off: 6.2's rule, exactly: with one follower on no draw takes a flag variant, lent draws
+  included, and a played draw's pipeline from E falls back to its parent.
+- On: lent draws take their variants as with one follower off; E picks a played draw's in-place
+  variant at its own lookup (R only makes the flag area); with FRITCHII_ONEF_OCCL_PREPASS the
+  pre-pass variants too (not for list draws).
+Why: 6.2 turned the flags off with one follower after two AMD losses read a wild address at a lent
+load (0xbef0'xxaf'0000). Radeon GPU Detective put the fault at a DrawIndexed right after a draw
+without vertex buffers, an invalid read with no resource behind it: AMD's vertex-buffer table in
+command-buffer embedded memory read through a stale pointer, fixed by
+MemPlayer::EnsureVertexBindings. The flag program only stores. Without played-draw variants about
+16,000 draws a second at the fountain fall back to host queries (+1.2 ms eGPU a frame) and one
+follower is slower than off under PCIe load.
+
 ### FRITCHII_ASTC_HELD_DEFER
 
 Boot, default 0 (helper BG's fix from 2026-11-16, ported by helper FJ). 1 = an ASTC GPU decode made
@@ -2935,10 +2955,13 @@ Preparing shaders: the extensions change files the stamp hashes, but no prepared
 new SPIR-V path runs only for a variant made during play, never stored on disk; any other module
 is byte-identical; vk_graphics_pipeline.cpp gained draw-time code only). Nx2ShaderStamp.cmake maps
 the new hashes to 6.1's stamp (SameAsReleased, with that reason), so nobody prepares again, with
-Full on or off. Vulkan 1.2 or later; one follower off (the draw path it hooks is the
-one-thread path, which is the path on AMD's Windows driver). With one follower on, no draw takes a
-flag variant, lent draws included (FRITCHII_ONEF_AMD=1 runs on AMD lent every draw and stored flags
-through them; a played draw's pipeline from E falls back to its parent too). Code: fritchii_occl_flag.h,
+Full on or off. Vulkan 1.2 or later. With one follower off the flags act on the one-thread draw
+path. With one follower on they act only where FRITCHII_ONEF_OCCL is on (by default AMD's
+proprietary driver on a discrete GPU): lent draws then take their variants as with one follower
+off, and E picks a played draw's variant at its own lookup. Elsewhere (FRITCHII_ONEF_OCCL off: by
+default NVIDIA, Intel, RADV and AMD integrated GPUs, where one follower is on by default) no draw
+takes a flag variant with one follower on, lent draws included, and a played draw's pipeline from E
+falls back to its parent, as in 6.2. Code: fritchii_occl_flag.h,
 vulkan_occl_flag.frag, PipelineCache::OcclFlagPipeline / FindOrMakeOcclFlag, SamplesStreamer.
 
 Why: OoT's occlusion tests run as host occlusion queries, about 1,100 begin/end pairs a frame at
@@ -3016,7 +3039,7 @@ Risks and limits: a flag variant writes no colour by construction; a draw whose 
 fall outside the Lean class keeps its query. The GPU-side value of a window with several slots goes
 through the existing prefix scan, as windows split by a render pass already do; OoT's 0xe2c
 reads the CPU-written value. No flag area on Qualcomm, ARM or Turnip drivers. The flag area is in
-device-local memory (see above). Not tested on NVIDIA or Intel, nor with one follower on. Not with
+device-local memory (see above). Not tested on NVIDIA or Intel; with one follower on only on AMD (FRITCHII_ONEF_OCCL). Not with
 the memory-stage ring (facts are the parent's key, but not checked).
 
 #### Colour variants and pre-passes (2026-11-18; Full, =9, and verify, =2)

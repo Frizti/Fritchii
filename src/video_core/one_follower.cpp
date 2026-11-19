@@ -1545,14 +1545,27 @@ const DrawValues* NextDraw() noexcept {
 
 namespace {
 std::atomic<bool> g_amd_proprietary{};
+std::atomic<bool> g_integrated_gpu{};
+/// FRITCHII_ONEF_OCCL (boot), decided in ReadSwitches.
+bool g_occl_wanted{};
 } // Anonymous namespace
 
-void NoteAmdProprietaryDriver() noexcept {
+void NoteAmdProprietaryDriver(bool integrated) noexcept {
+    g_integrated_gpu.store(integrated, std::memory_order_relaxed);
     g_amd_proprietary.store(true, std::memory_order_relaxed);
 }
 
 bool IsAmdProprietaryDriver() noexcept {
     return g_amd_proprietary.load(std::memory_order_relaxed);
+}
+
+bool IsAmdProprietaryDiscrete() noexcept {
+    return g_amd_proprietary.load(std::memory_order_relaxed) &&
+           !g_integrated_gpu.load(std::memory_order_relaxed);
+}
+
+bool OcclWanted() noexcept {
+    return g_occl_wanted;
 }
 
 void ReadSwitches() {
@@ -1561,6 +1574,22 @@ void ReadSwitches() {
     }
     g.read = true;
     using namespace VideoCore::Nx2Debug;
+    // FRITCHII_ONEF_OCCL (boot): occlusion flag variants (FRITCHII_OCCL_FLAG) with one follower
+    // on, lent draws and played ones (E picks a played draw's variant). An explicit value wins;
+    // unset, on only on AMD's proprietary driver on a discrete GPU (where it was measured, with
+    // EnsureVertexBindings: the AMD losses were a stale vertex-buffer table, not the flag store),
+    // off elsewhere until an A/B there. 0 is v6.2's rule: no flag variant with one follower on.
+    {
+        const char* const value = std::getenv("FRITCHII_ONEF_OCCL");
+        const bool set = value != nullptr && value[0] != '\0';
+        g_occl_wanted = set ? value[0] != '0' : IsAmdProprietaryDiscrete();
+        LOG_INFO(HW_GPU, "One follower: occlusion flags {} (FRITCHII_ONEF_OCCL={})",
+                 g_occl_wanted ? "on" : "off",
+                 set ? std::string{value}
+                     : fmt::format("unset: {}", IsAmdProprietaryDiscrete()
+                                                    ? "AMD proprietary driver, discrete GPU"
+                                                    : "not an AMD proprietary discrete GPU"));
+    }
     // AMD safe default (2026-11-16): the desktop RX 7900 XT lost the device in game with the one
     // follower on and ran clean with every FRITCHII_ONEF_* line out (EXP123=1 both times). Never
     // run on AMD before, no AMD gate in it. Off on AMD's proprietary driver until that loss is
