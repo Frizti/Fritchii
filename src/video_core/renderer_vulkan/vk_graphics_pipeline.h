@@ -517,6 +517,10 @@ public:
     /// program with colour writes off in its key, 5 pre-pass with colour writes off in its key.
     static constexpr u8 OCCL_KIND_PREPASS = 3;
     static constexpr u8 OCCL_KIND_PREPASS_NOCOLOUR = 5;
+    /// Built from graphics pipeline libraries (its stages compiled apart from each other).
+    [[nodiscard]] bool UsesLibraries() const noexcept {
+        return library_cache != nullptr;
+    }
     /// A discard pre-pass variant (drawn first, then the draw itself with its pipeline).
     [[nodiscard]] bool IsOcclDiscardPrepass() const noexcept {
         return occl_flag_kind == OCCL_KIND_PREPASS || occl_flag_kind == OCCL_KIND_PREPASS_NOCOLOUR;

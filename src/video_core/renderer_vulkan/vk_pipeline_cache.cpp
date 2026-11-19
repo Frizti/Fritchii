@@ -3803,6 +3803,8 @@ bool OcclFlagPrepassPipelineOk(const GraphicsPipeline& pipeline) {
 
 /// Pre-passes (both kinds), the draw's registers: see OcclFlagPrepassEligible.
 bool OcclFlagPrepassRegsOk(const Tegra::Engines::Maxwell3D::Regs& regs);
+bool OcclFlagEqualOk(const GraphicsPipeline& pipeline,
+                     const Tegra::Engines::Maxwell3D::Regs& regs);
 
 /// FRITCHII_OCCL_FLAG colour pre-pass: a counted colour draw whose pixel program is Lean (no
 /// discard, depth or sample mask writes, stores) but uses subgroup or quad operations (the
@@ -3854,13 +3856,26 @@ u32 OcclFlagColourPrepassReason(const GraphicsPipeline& pipeline,
 
 bool OcclFlagColourPrepassEligible(const GraphicsPipeline& pipeline,
                                   const Tegra::Engines::Maxwell3D::Regs& regs) {
-    return OcclFlagPrepassPipelineOk(pipeline) && OcclFlagPrepassRegsOk(regs);
+    return OcclFlagPrepassPipelineOk(pipeline) && OcclFlagPrepassRegsOk(regs) &&
+           OcclFlagEqualOk(pipeline, regs);
+}
+
+/// EQUAL with a flag variant (always a whole-pipeline compile) only when the draw's pipeline is
+/// one too: a library-built pipeline compiles its vertex programs apart, and nothing marks the
+/// position invariant, so the last bit could differ.
+bool OcclFlagEqualOk(const GraphicsPipeline& pipeline,
+                     const Tegra::Engines::Maxwell3D::Regs& regs) {
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    const bool equal = regs.depth_test_func == Regs::ComparisonOp::Equal_D3D ||
+                       regs.depth_test_func == Regs::ComparisonOp::Equal_GL;
+    return regs.depth_test_enable == 0 || !equal || !pipeline.UsesLibraries();
 }
 
 bool OcclFlagPrepassEligible(const GraphicsPipeline& pipeline,
                              const Tegra::Engines::Maxwell3D::Regs& regs) {
     // Mandated early Z: the draw counts samples before its discards, the pre-pass after them.
-    if (!OcclFlagPrepassPipelineOk(pipeline) || pipeline.Key().state.early_z != 0) {
+    if (!OcclFlagPrepassPipelineOk(pipeline) || pipeline.Key().state.early_z != 0 ||
+        !OcclFlagEqualOk(pipeline, regs)) {
         return false;
     }
     const auto& infos = pipeline.StageInfos();
@@ -4053,9 +4068,10 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
         // A colour draw whose program discards and writes depth: the discard pre-pass with colour
         // writes off (the dynamic masks cleared, or a key with every attachment's writes off),
         // then the draw itself.
+        const bool verify = OcclFlag::Mode() == OcclFlag::Verify;
         if (pipeline_class == PipelineClass::Discards && OcclFlag::PrepassAllowed() &&
-            pipeline->IsBuilt() && device.IsShaderInt64Supported() &&
-            !OcclFlagDiscardsNoWrites(*pipeline, regs) &&
+            OcclFlag::ColourAllowed() && pipeline->IsBuilt() && device.IsShaderInt64Supported() &&
+            (verify || !OcclFlagDiscardsNoWrites(*pipeline, regs)) &&
             OcclFlagPrepassEligible(*pipeline, regs)) {
             const bool dynamic_masks = pipeline->Key().state.extended_dynamic_state_3_blend != 0;
             u8& state = dynamic_masks ? pipeline->occl_flag_prepass_state
@@ -4090,10 +4106,11 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
         // variant (early tests, the store after the discards) drawn in its place. Without depth
         // or stencil writes early tests change nothing, and the colour output is the program's.
         if (pipeline_class == PipelineClass::Discards && OcclFlag::PrepassAllowed() &&
-            pipeline->occl_flag_prepass_state != 2 && pipeline->IsBuilt() &&
-            !pipeline->IsMeshPipeline() && pipeline->Key().state.early_z == 0 &&
-            pipeline->Key().state.xfb_enabled == 0 && device.IsShaderInt64Supported() &&
-            OcclFlagDiscardsNoWrites(*pipeline, regs)) {
+            OcclFlag::ColourAllowed() && !verify && pipeline->occl_flag_prepass_state != 2 &&
+            pipeline->IsBuilt() && !pipeline->IsMeshPipeline() &&
+            pipeline->Key().state.early_z == 0 && pipeline->Key().state.xfb_enabled == 0 &&
+            device.IsShaderInt64Supported() && OcclFlagDiscardsNoWrites(*pipeline, regs) &&
+            OcclFlagEqualOk(*pipeline, regs)) {
             GraphicsPipeline* variant = pipeline->occl_flag_prepass.get();
             if (variant == nullptr && allow_make) {
                 variant = FindOrMakeOcclFlag(*pipeline, OCCL_FLAG_BUILD_PREPASS);

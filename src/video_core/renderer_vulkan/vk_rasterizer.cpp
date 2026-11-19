@@ -2417,7 +2417,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_fallback);
             VideoCommon::OcclFlag::t_census =
                 colour_prepass ? VideoCommon::OcclFlag::t_colour_prepass_class
-                               : VideoCommon::OcclFlag::Census::OffDiscards;
+                : VideoCommon::OcclFlag::t_colour_discard_prepass
+                    ? VideoCommon::OcclFlag::Census::ColourDiscards
+                    : VideoCommon::OcclFlag::Census::OffDiscards;
             VideoCommon::OcclFlag::t_colour_prepass = false;
             VideoCommon::OcclFlag::t_colour_discard_prepass = false;
             return chosen;
@@ -2958,7 +2960,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                      &address);
             });
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.flag_draws);
-            if (pipeline->IsOcclDiscardPrepass()) {
+            if (pipeline->IsOcclDiscardPrepass() && !VideoCommon::OcclFlag::t_discard_direct) {
                 VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_draws);
             }
 
@@ -2985,9 +2987,30 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         const bool discard_direct = std::exchange(VideoCommon::OcclFlag::t_discard_direct, false);
         const bool colour_discard_prepass =
             std::exchange(VideoCommon::OcclFlag::t_colour_discard_prepass, false);
+        bool direct_by_parent = false;
         if (discard_direct) {
-            VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.discard_direct_draws);
+            // Early tests count the samples the variant's discards then kill: under an open host
+            // query (another counted draw opened it, or flag slots are not used) the draw's own
+            // pipeline draws instead (its descriptors equal the variant's).
+            if (query_cache_runtime.OcclQuerySlotOpen()) {
+                direct_by_parent = true;
+            } else {
+                VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.discard_direct_draws);
+            }
         }
+        if (direct_by_parent) [[unlikely]] {
+            GraphicsPipeline& parent = *pipeline->occl_flag_parent;
+            if (parent.ConfigureAfterOcclPrepass(*pipeline)) [[likely]] {
+                trace_draw_hashes = {parent.ShaderHashes()[1], parent.ShaderHashes()[5]};
+                draw_func();
+            } else {
+                parent.occl_flag_prepass_state = 2;
+                VideoCommon::OcclFlag::g_stats.prepass_lost.fetch_add(1,
+                                                                      std::memory_order_relaxed);
+                LOG_ERROR(Render_Vulkan, "Occlusion flag discard variant: the draw could not be "
+                                         "configured with its own pipeline and was not recorded");
+            }
+        } else
         if ((pipeline->IsOcclDiscardPrepass() && !discard_direct) || colour_prepass) [[unlikely]] {
             // FRITCHII_OCCL_FLAG pre-pass: the variant draws first with depth writes off (and,
             // for a colour pre-pass, colour writes off) and
@@ -3053,6 +3076,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             } else {
                 if (colour_prepass) {
                     pipeline->occl_same_descriptors = 2; // no more colour pre-passes with it
+                } else if (pipeline->occl_flag_kind ==
+                           GraphicsPipeline::OCCL_KIND_PREPASS_NOCOLOUR) {
+                    parent.occl_flag_prepass_nocolour_state = 2; // later draws: parent alone
                 } else {
                     parent.occl_flag_prepass_state = 2; // later draws take the parent alone
                 }
