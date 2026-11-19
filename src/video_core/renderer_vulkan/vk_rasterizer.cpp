@@ -137,6 +137,37 @@
 
 namespace Vulkan {
 
+namespace {
+/// FRITCHII_SPLIT_BIND_FIX (boot, default 1): a submit between a draw's or dispatch's bind and
+/// its record put the record into a new command buffer with nothing bound (the pipeline, the
+/// descriptor sets, the dynamic state stay in the old one). AMD's driver then reads the
+/// descriptor table through the hardware's stale pointer into the old command buffer's
+/// recycled memory: a GPU page fault in the 32-bit descriptor range (0xbef0xxxxxxxx). 1: the
+/// draw or dispatch configures again in the new command buffer (only when the tick moved, so
+/// the common path costs nothing); a played dispatch (one follower, R), which cannot configure
+/// again, records its bind with the dispatch and the scheduler forgets its descriptor buffer.
+/// 0: as before (counted only).
+bool SplitBindFix() {
+    static const bool on = [] {
+        const char* value = std::getenv("FRITCHII_SPLIT_BIND_FIX");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+std::atomic<u64> g_split_draws{};
+std::atomic<u64> g_split_dispatches{};
+void NoteSplitBind(bool dispatch, u64 shader_hash) {
+    const u64 count = (dispatch ? g_split_dispatches : g_split_draws)
+                          .fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 8 || (count & (count - 1)) == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "Split bind: a submit between the {}'s bind and its record (shader {:016x}; "
+                    "{} so far; FRITCHII_SPLIT_BIND_FIX={})",
+                    dispatch ? "dispatch" : "draw", shader_hash, count, SplitBindFix() ? 1 : 0);
+    }
+}
+} // Anonymous namespace
+
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 using VideoCommon::ImageViewId;
 using VideoCommon::ImageViewType;
@@ -2832,6 +2863,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         VideoCommon::MemStageShadow::BackDrawWindow(true);
     }
     bool configured{};
+    const u64 configure_tick = scheduler.CurrentTick();
     {
         Profile::Scope scope{Profile::Zone::Configure};
         const MemStage::RestAtEnd rest{mem_stage};
@@ -2979,6 +3011,21 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         frame_dump.CapturingSampled() ? frame_dump.BeginProbe() : std::nullopt;
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
+        // FRITCHII_SPLIT_BIND_FIX: Configure (or anything after it) submitted: bind again.
+        if (scheduler.CurrentTick() != configure_tick) [[unlikely]] {
+            NoteSplitBind(false, pipeline->ShaderHashes()[5] != 0 ? pipeline->ShaderHashes()[5]
+                                                                   : pipeline->ShaderHashes()[1]);
+            if (SplitBindFix()) {
+                const MemStage::RestAtEnd rest{mem_stage};
+                if (!pipeline->Configure(is_indexed, keep_last_draw)) {
+                    report_failure("configure failed after a split");
+                    return;
+                }
+                UpdateDynamicStates(pipeline);
+                query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                          maxwell3d->regs.zpass_pixel_count_enable);
+            }
+        }
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
         if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
@@ -5911,12 +5958,20 @@ void RasterizerVulkan::DispatchCompute() {
         mem_stage.FillDispatch(buffer_cache, pipeline->MemFacts());
     }
     bool configured{};
+    // FRITCHII_SPLIT_BIND_FIX: the tick Configure records the bind in (bind_again_after_split).
+    const u64 configure_tick = scheduler.CurrentTick();
+    // A played dispatch (one follower, R) cannot configure again after a split (its packet was
+    // played at the rest; R must not touch E's buffer cache): with the fix on, its bind is
+    // deferred and recorded with the dispatch, and the scheduler's tracker forgets the
+    // descriptor buffer afterwards (the deferred bind binds it behind the tracker's back).
+    const bool defer_split_bind = SplitBindFix() && onef_play != nullptr && !indirect_address;
+    const bool defer_bind = can_replace || marking_effects || defer_split_bind;
     {
         const MemStage::RestAtEnd rest{mem_stage};
         configured = pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                                          texture_cache, texture_cache_runtime,
                                          byte_addressed_shadow,
-                                         can_replace || marking_effects ? &deferred_bind : nullptr);
+                                         defer_bind ? &deferred_bind : nullptr);
     }
     if (!configured) {
         if (onef_play != nullptr) [[unlikely]] {
@@ -5929,6 +5984,30 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
+    // FRITCHII_SPLIT_BIND_FIX, right before the dispatch's record: a submit since Configure
+    // (staging, the grid copy, an upscaler, ...) put the record into a new command buffer with
+    // nothing bound (the submit reset the scheduler's state). A deferred bind is recorded with
+    // the dispatch and needs nothing. Otherwise the dispatch configures again, as draws do: its
+    // bind lands in the new command buffer and the scheduler's state stays true (no compute bind
+    // bypasses Scheduler::UpdateDescriptorBufferChunk). Counted either way. False: that Configure
+    // failed (the dispatch is skipped).
+    const auto bind_again_after_split = [&]() -> bool {
+        if (scheduler.CurrentTick() == configure_tick) [[likely]] {
+            return true;
+        }
+        NoteSplitBind(true, pipeline->ShaderHash());
+        if (!SplitBindFix() || deferred_bind || onef_play != nullptr) {
+            return true;
+        }
+        if (byte_addressed_shadow) {
+            // The first bind's packed shadow: its view is in the submitted command buffer.
+            texture_cache_runtime.RetireByteAddressedShadow(*byte_addressed_shadow);
+        }
+        const MemStage::RestAtEnd rest{mem_stage};
+        return pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
+                                   texture_cache, texture_cache_runtime, byte_addressed_shadow,
+                                   nullptr);
+    };
     // FRITCHII_ASYNC_COMPUTE_SKIP: the written ranges' streaks (G2), for a dispatch recorded
     // here; a played one's came from E's fill (QueueWrites).
     const auto note_write_streaks = [&] {
@@ -6062,6 +6141,9 @@ void RasterizerVulkan::DispatchCompute() {
                 grid_copy = staging_pool.Request(16, MemoryUsage::Download, true);
             }
         }
+        if (!bind_again_after_split()) [[unlikely]] {
+            return;
+        }
         scheduler.Record([this, pipeline, indirect_buffer = indirect_ref.buffer,
                           indirect_offset = indirect_ref.offset,
                           grid_buffer = grid_copy ? grid_copy->buffer : VkBuffer{},
@@ -6191,6 +6273,9 @@ void RasterizerVulkan::DispatchCompute() {
                      hash);
         }
     }
+    if (!bind_again_after_split()) [[unlikely]] {
+        return;
+    }
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
                       barrier_recorded = barrier_first, replacement](vk::CommandBuffer cmdbuf) {
         if (!barrier_recorded) {
@@ -6220,6 +6305,11 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }
     });
+    if (defer_split_bind) {
+        // FRITCHII_SPLIT_BIND_FIX: the played dispatch's bind, recorded with it, bound a
+        // descriptor buffer the scheduler did not track.
+        scheduler.ForgetDescriptorBuffer();
+    }
     // A played dispatch's probes and list page copies are E's (a lent tail after the post).
     if (onef_play == nullptr) {
         dispatch_kinds.extent_probes = mem_stage.Ref(MemStage::Site::DispatchAfter, [&] {
