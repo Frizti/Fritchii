@@ -19,8 +19,10 @@
 #   and an LF one hash differently). For a test build, set FRITCHII_SHADER_STAMP_ANY=1.
 
 set(SkipBlocksIn "vk_graphics_pipeline.h;vk_compute_pipeline.h")
-# v6.1, kept by 6.2: Windows (CRLF checkout), Linux (LF checkout).
-set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392")
+# v6.1, kept by 6.2. This branch's own: linux-port's fixed_pipeline_state.cpp differs from the Windows
+# release (GCC's blend attachments), so its stamps are not the Windows ones. LF checkout (a clone,
+# the AppImage's usual case), then a CRLF checkout mounted from Windows.
+set(KnownStamps "1c910b49171b1323;d293c211bc6e8088")
 
 # The SHA-256 of a file as if its FRITCHII_STAMP_SKIP blocks weren't there, line endings as in the
 # file. file(READ) gives LF line endings on every platform, so CRLF goes back on before hashing.
