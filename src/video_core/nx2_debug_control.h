@@ -144,6 +144,12 @@ inline std::atomic<int> g_report_wait{-1};
 /// its pipeline without the pixel program when that program can change nothing else (1 on,
 /// 2 verify: siblings made and compared, the full pipeline draws, 3 dry: census and timer only).
 inline std::atomic<int> g_occl_lean{-1};
+/// FRITCHII_OCCL_FLAG (TEST, default 0; fritchii_occl_flag.h): occlusion test draws store a flag
+/// from a host pixel program (2 verify: compared with the host queries, which still decide).
+inline std::atomic<int> g_occl_flag{-1};
+/// FRITCHII_TEST_DEVICE_LOSS (live, TEST, default 0): 1 = the next queue submission reports a
+/// device loss, so the report and the exit can be tested (docs/fritchii/switches.md).
+inline std::atomic<int> g_test_device_loss{0};
 /// EDEN_NX2_FEED_MEMORY_OVERLAY: docs/fritchii/switches.md.
 inline std::atomic<int> g_feed_memory_overlay{-1};
 /// FRITCHII_FEED_REARM: docs/fritchii/switches.md.

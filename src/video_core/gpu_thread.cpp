@@ -12,6 +12,7 @@
 
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/lowend_sim.h"
 #include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -96,6 +97,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
             Profile::Report();
+            // FRITCHII_SIM_CPU_SLOW: the front pays for the command it just handled.
+            if (Common::LowEndSim::CpuSlowOn()) [[unlikely]] {
+                Common::LowEndSim::CpuCharge();
+            }
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
@@ -202,6 +207,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 break;
             }
             last_progress = std::chrono::steady_clock::now();
+            // The wait for this command is not work.
+            if (Common::LowEndSim::CpuSlowOn()) [[unlikely]] {
+                Common::LowEndSim::CpuRestart();
+            }
             if (split.Active()) {
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.

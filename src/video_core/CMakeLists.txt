@@ -324,6 +324,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_side_queue.h
     renderer_vulkan/vk_state_tracker.cpp
     renderer_vulkan/vk_state_tracker.h
+    renderer_vulkan/vk_sim_gpu_slow.cpp
+    renderer_vulkan/vk_sim_gpu_slow.h
     renderer_vulkan/vk_submit_times.cpp
     renderer_vulkan/vk_submit_times.h
     renderer_vulkan/vk_swapchain.cpp

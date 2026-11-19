@@ -25,6 +25,7 @@
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
+#include "common/lowend_sim.h"
 #include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
@@ -4549,6 +4550,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     MemoryStageLink& link = MemoryStageLink::Get();
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
+        // FRITCHII_SIM_CPU_SLOW: the back pays for the entries it just ran.
+        if (Common::LowEndSim::CpuSlowOn()) [[unlikely]] {
+            Common::LowEndSim::CpuCharge();
+        }
         // The ring starts and ends here, where everything before read_position is consumed.
         const bool ring_on = link.BackRingTop(read_position);
         MemoryStageLink::BackLimits limits =
@@ -4571,6 +4576,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                     continue;
                 }
             }
+            // The wait below may spin: it is not work (FRITCHII_SIM_CPU_SLOW).
+            SCOPE_EXIT {
+                if (Common::LowEndSim::CpuSlowOn()) [[unlikely]] {
+                    Common::LowEndSim::CpuRestart();
+                }
+            };
             // On the timeline (not through the zone) with the phase the wait reached: 0 = spin,
             // 1 = the idle hook ran, 2 = slept on `wake`, 3 = waited for the memory stage
             // (tools/nx2/critical_path.py).

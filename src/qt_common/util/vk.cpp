@@ -32,6 +32,14 @@ Record::Record(std::string_view name_, const std::vector<VkPresentModeKHR>& vsyn
 
 Record::~Record() = default;
 
+bool RunsDlss(const Record& record) {
+    const std::string& name = record.device_name;
+    const bool pre_rtx = (name.find("GeForce") != std::string::npos ||
+                          name.find("Quadro") != std::string::npos) &&
+                         name.find("RTX") == std::string::npos;
+    return record.nvidia && !pre_rtx;
+}
+
 size_t PickedIndex(const std::vector<Record>& records, u32 saved_index,
                    std::string_view saved_name) {
     std::vector<Vulkan::PhysicalDeviceSummary> summaries;

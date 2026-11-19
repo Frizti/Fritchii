@@ -22,6 +22,10 @@
 
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
+#include "common/lowend_sim.h"
+#ifdef _WIN32
+#include "common/windows/crash_handler.h"
+#endif
 #include "common/shutdown_watch.h"
 #include "startup_checks.h"
 
@@ -438,6 +442,12 @@ static void LoadNx2Switches(const char* argv0) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    // The helper process of a fatal error's report: it writes the dump and ends here.
+    if (int helper_exit_code = 0; Common::Windows::RunDumpHelper(helper_exit_code)) {
+        return helper_exit_code;
+    }
+#endif
 #ifdef ENABLE_UPDATE_CHECKER
     // Before the switches are added to the environment, which a restart must not inherit.
     Updater::PrepareLaunch();
@@ -446,6 +456,8 @@ int main(int argc, char* argv[]) {
     // switches are added.
     ProfilingMode::ReadAtLaunch();
     LoadNx2Switches(argv[0]);
+    // Test only, off by default: the low-end PC simulation's limits on this process.
+    Common::LowEndSim::ApplyProcessLimits();
     // Fritchii: NVIDIA's driver shader cache must hold OoT's ~120,000 prepared pipelines. Its size
     // is a Control Panel setting newer drivers no longer show ("Shader Cache Size"); the driver
     // also reads these variables, for this process only (nothing system-wide changes). A value

@@ -1144,11 +1144,10 @@ VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) 
     auto backend = VideoCommon::SelectOcarinaUpscaler(
         Settings::values.oot_anti_aliasing.GetValue(), Settings::values.nvidia_dlss.GetValue(),
         dlss_available, value ? value : "");
-    // FRITCHII_DLSS_RENDER_SCALE: the patch is applied at boot, before it is known whether DLSS
-    // runs. When it doesn't, FSR 3.1 rebuilds the smaller scene instead of the game stretching
-    // 720p or 1080p itself.
+    // oot_render_height: the patch is applied at boot, before it is known whether DLSS runs.
+    // When it doesn't, FSR 3.1 rebuilds the smaller scene instead of the game stretching it.
     if (backend == VideoCommon::OcarinaUpscaleBackend::Native &&
-        Settings::AppliedOcarinaRenderScale() && (value == nullptr || std::string_view{value} != "native")) {
+        Settings::AppliedOcarinaRenderHeight() && (value == nullptr || std::string_view{value} != "native")) {
         backend = VideoCommon::OcarinaUpscaleBackend::Fsr;
     }
     if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)) {

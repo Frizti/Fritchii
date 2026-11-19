@@ -77,6 +77,10 @@ public:
     const u64 local_memory; ///< Largest device-local heap, in bytes
 };
 
+/// Whether the card can run DLSS: NVIDIA, and not a GeForce or Quadro from before RTX (GTX, MX,
+/// GT, Quadro P: Streamline refuses them). Names it doesn't know stay allowed.
+[[nodiscard]] bool RunsDlss(const Record& record);
+
 /// The card a game would run on for these saved settings (Vulkan::PickPhysicalDevice).
 size_t PickedIndex(const std::vector<Record>& records, u32 saved_index,
                    std::string_view saved_name);

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <source_location>
 #include <span>
 #include <string>
 #include "common/container/unordered_map.h"
@@ -257,8 +258,9 @@ public:
     bool IsFormatSupported(VkFormat wanted_format, VkFormatFeatureFlags wanted_usage,
                            FormatType format_type) const;
 
-    /// Reports a device loss.
-    void ReportLoss() const;
+    /// Reports a device loss and ends the process. It never returns: the first thread to get here
+    /// writes the report, any other waits for the end.
+    void ReportLoss(std::source_location where = std::source_location::current()) const;
 
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;
@@ -697,6 +699,12 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports buffer device address.
     bool IsBufferDeviceAddressSupported() const {
         return extensions.buffer_device_address;
+    }
+
+    /// FRITCHII_OCCL_FLAG: the buffer device address feature is enabled for the flag pipelines
+    /// alone (IsBufferDeviceAddressSupported stays false for everything else).
+    bool IsOcclFlagDeviceAddressEnabled() const {
+        return occl_flag_device_address || extensions.buffer_device_address;
     }
 
     /// Returns true if formatless image load is supported.
@@ -1625,6 +1633,7 @@ private:
     // Telemetry parameters
     std::set<std::string, std::less<>> supported_extensions; ///< Reported Vulkan extensions.
     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
+    bool occl_flag_device_address{}; ///< FRITCHII_OCCL_FLAG kept the BDA feature
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
     bool streamline_attached{};   ///< Streamline has this device.
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.

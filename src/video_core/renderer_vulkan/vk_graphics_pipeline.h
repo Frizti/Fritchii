@@ -486,6 +486,18 @@ public:
     u8 occl_class{};
     GraphicsPipeline* occl_sibling{};
 
+    /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): this pipeline's flag variant (the same key with
+    /// the host flag pixel program), owned here and never in the cache; on a flag variant, the
+    /// pipeline it was made from. occl_flag_state: 0 not tried, 1 made, 2 refused for good.
+    std::unique_ptr<GraphicsPipeline> occl_flag;
+    GraphicsPipeline* occl_flag_parent{};
+    u8 occl_flag_state{};
+
+    /// FRITCHII_OCCL_FLAG: the layout the flag slot address is pushed with.
+    [[nodiscard]] VkPipelineLayout Layout() const noexcept {
+        return *pipeline_layout;
+    }
+
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
     }

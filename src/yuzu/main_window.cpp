@@ -1375,8 +1375,8 @@ void MainWindow::InitializeWidgets() {
     shader_warm_label = new QLabel();
     shader_warm_label->setToolTip(
         tr("Shaders prepared ahead of time so the game stutters less when it first uses them.\n"
-           "It never slows the game down: it builds while the game is paused, or right away "
-           "from Emulation > Prepare Shaders Now."));
+           "It builds while the game is paused. Emulation > Prepare Shaders Now builds right "
+           "away, and the game can slow down until it's done."));
     shader_building_label = new QLabel();
     shader_building_label->setToolTip(tr("The amount of shaders currently being built"));
     res_scale_label = new QLabel();
@@ -2463,6 +2463,16 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         QtConfig per_game_config(config_file_name, Config::ConfigType::PerGameConfig);
         QtCommon::system->HIDCore().ReloadInputDevices();
         QtCommon::system->ApplySettings();
+    }
+
+    // OoT's render height patch is decided while the game loads, before the renderer exists: a DLSS
+    // "on" saved for another card must not lower it (per-game settings are in by now).
+    if (!vk_device_records.empty()) {
+        const size_t card = VkDeviceInfo::PickedIndex(vk_device_records,
+                                                      Settings::values.vulkan_device.GetValue(),
+                                                      Settings::values.vulkan_device_name.GetValue());
+        Settings::SetOcarinaCardRunsDlss(card < vk_device_records.size() &&
+                                         VkDeviceInfo::RunsDlss(vk_device_records[card]));
     }
 
     if (title_id == Settings::MarioKartWorldProgramId && !asked_recommended_mkw_settings) {

@@ -29,6 +29,7 @@
 
 #include <fmt/format.h>
 
+#include "video_core/fritchii_occl_flag.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
@@ -2371,9 +2372,23 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // With rule 3 the packet carries E's pipeline (no lookup on R, and graphics_cache is E's).
     const bool onef_lookup = onef_play != nullptr && onef_play->pipeline == nullptr;
     const size_t onef_entries_before = onef_lookup ? pipeline_cache.GraphicsEntries() : 0;
+    // FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): with one follower off, an occlusion test draw
+    // may take its pipeline's flag variant; a kept flag variant is decided again.
+    VideoCommon::OcclFlag::t_census = VideoCommon::OcclFlag::Census::Unknown;
+    const auto occl_flag = [&](GraphicsPipeline* chosen, bool allow_make) -> GraphicsPipeline* {
+        if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
+            chosen = chosen->occl_flag_parent; // a kept flag variant: decided again
+        }
+        if (onef_play != nullptr || chosen == nullptr ||
+            VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Off ||
+            !query_cache_runtime.OcclFlagReady()) {
+            return chosen;
+        }
+        return pipeline_cache.OcclFlagPipeline(chosen, maxwell3d->regs, allow_make);
+    };
     GraphicsPipeline* const pipeline{[&]() -> GraphicsPipeline* {
         if (delta_pipeline != nullptr) {
-            return delta_pipeline; // EXP118: kept, no lookup
+            return occl_flag(delta_pipeline, false); // EXP118: kept, no lookup (locks held)
         }
         if (onef_play != nullptr && onef_play->pipeline != nullptr) {
             // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looked this draw's pipeline up at its own
@@ -2382,7 +2397,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 static_cast<const GraphicsPipeline*>(onef_play->pipeline));
         }
         Profile::Scope scope{Profile::Zone::PipelineLookup};
-        return pipeline_cache.CurrentGraphicsPipeline();
+        return occl_flag(pipeline_cache.CurrentGraphicsPipeline(), true);
     }()};
     if (onef_lookup &&
         (!pipeline || pipeline_cache.GraphicsEntries() > onef_entries_before)) [[unlikely]] {
@@ -2870,8 +2885,40 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         const Profile::FineScope queries_scope{Profile::Zone::DrawQueries};
         query_cache.NotifySegment(true);
         HandleTransformFeedback();
+        // FRITCHII_OCCL_FLAG=1: a flag draw opens (or keeps) a slot with no host query.
+        // A flag slot reports 4096 when any sample passed, not the count: only for Ocarina of
+        // Time, whose occlusion tests ask "any sample" (0xe2c compares a pair, one of them 0),
+        // and not when the counts are asked to be precise (accurate part 2).
+        const bool flag_draw = pipeline->occl_flag_parent != nullptr;
+        if (flag_draw && VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::On &&
+            Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL &&
+            !VideoCore::Nx2Debug::AccuratePart(2)) {
+            query_cache_runtime.SetNextFlagDraw(true);
+        }
         query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                                   maxwell3d->regs.zpass_pixel_count_enable);
+        query_cache_runtime.SetNextFlagDraw(false);
+        // FRITCHII_OCCL_FLAG: a flag variant stores into the open query's slot (push constant
+        // bytes 40 to 47, unused otherwise); other counted draws mark their slot as mixed.
+        // Census: the class the pipeline lookup gave this draw (Unknown: no lookup).
+        const auto census = std::exchange(VideoCommon::OcclFlag::t_census,
+                                          VideoCommon::OcclFlag::Census::Unknown);
+        if (pipeline->occl_flag_parent != nullptr) {
+            const u64 address = query_cache_runtime.OcclFlagAddress();
+            scheduler.Record([layout = pipeline->Layout(), address](vk::CommandBuffer cmdbuf) {
+                cmdbuf.PushConstants(layout, VK_SHADER_STAGE_ALL_GRAPHICS, 40, sizeof(address),
+                                     &address);
+            });
+            VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.flag_draws);
+        } else if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
+            query_cache_runtime.NoteOtherCountedDraw(
+                VideoCommon::OcclFlag::Blocks(census)); // nothing without the flag area
+            if (VideoCommon::OcclFlag::Mode() != VideoCommon::OcclFlag::Off) [[unlikely]] {
+                VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.other_counted);
+                VideoCommon::OcclFlag::Add(
+                    VideoCommon::OcclFlag::g_stats.census[static_cast<size_t>(census)]);
+            }
+        }
     }
     const std::optional<u32> probe =
         frame_dump.CapturingSampled() ? frame_dump.BeginProbe() : std::nullopt;
@@ -4868,6 +4915,9 @@ void RasterizerVulkan::DrawTexture() {
 
     query_cache.NotifySegment(true);
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
+        query_cache_runtime.NoteOtherCountedDraw(); // FRITCHII_OCCL_FLAG: not a flag draw
+    }
     const auto& draw_texture_state = maxwell3d->draw_manager.draw_texture_state;
     const auto& sampler = texture_cache.GetSampler(draw_texture_state.src_sampler, false);
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
@@ -5247,6 +5297,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     // would begin it outside the pass and end it inside the next draw's pass.
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                               !can_defer_clear && regs.zpass_pixel_count_enable);
+    if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
+        query_cache_runtime.NoteOtherCountedDraw(); // FRITCHII_OCCL_FLAG: not a flag draw
+    }
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;
@@ -5967,7 +6020,10 @@ void RasterizerVulkan::DispatchCompute() {
             return;
         }
         if (replacement) {
-            LOG_WARNING(Render_Vulkan, "Ocarina temporal evaluation failed; dispatching native upscaler");
+            LOG_WARNING(Render_Vulkan,
+                        "Ocarina temporal: {} failed, the game's own upscale runs for the rest of "
+                        "this session",
+                        VideoCommon::OcarinaBackendName(*oot_backend));
         }
         if (bind) {
             bind(cmdbuf);
@@ -8596,13 +8652,18 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
         oot_output_height = output.height;
         const bool max_resolution = Settings::OcarinaMaxResolutionOn();
         const bool fsr_game_size = OcarinaFsrOutputsGameSize(*oot_backend);
+        // The game's scene: 1440p with Max Resolution, or what oot_render_height made it; the
+        // game's dynamic size (1080p at most) without it.
+        const auto render_height = Settings::AppliedOcarinaRenderHeight();
+        const u32 input_height =
+            max_resolution ? Settings::OcarinaRenderHeightFor(render_height) : 1080U;
         const auto plan = VideoCommon::PlanOcarinaPassOutput(
-            output.height, max_resolution,
-            Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale()), false,
+            output.height, max_resolution, Settings::OcarinaRenderHeightFor(render_height), false,
             fsr_game_size);
-        const u32 shown = plan.big_height != 0 ? plan.big_height
-                          : plan.native_aa     ? 1080U
-                                               : 1440U;
+        const u32 shown = plan.big_height != 0   ? plan.big_height
+                          : plan.small_height != 0 ? plan.small_height
+                          : plan.native_aa         ? input_height
+                                                   : 1440U;
         // The status bar: what runs, from what to what (DLSS Native keeps the game's size).
         const bool dlss_backend = *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss;
         const u32 picture_backend =
@@ -8610,7 +8671,6 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
             : Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::Fsr4
                 ? 3U
                 : 2U;
-        const u32 input_height = max_resolution ? 1440U : 1080U;
         oot_picture_backend = picture_backend;
         oot_picture_input = input_height;
         oot_picture_up_to = !max_resolution;
@@ -8627,6 +8687,15 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
                  *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss
                      ? "; DLSS Native keeps the scene's size"
                      : "");
+        if (render_height) {
+            LOG_INFO(Render_Vulkan,
+                     "Ocarina temporal: the game draws its scene at {}x{} (oot_render_height={}, "
+                     "built-in render patch), {} makes {}p",
+                     VideoCommon::OcarinaOutputWidth(*render_height), *render_height,
+                     Settings::values.oot_render_height.GetValue(),
+                     VideoCommon::OcarinaBackendName(*oot_backend),
+                     plan.native_aa ? input_height : shown);
+        }
     }
     return *oot_backend != VideoCommon::OcarinaUpscaleBackend::Native;
 }
@@ -9024,15 +9093,15 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
     const u64 upscale_hash = pipeline.ShaderHash();
-    // FRITCHII_DLSS_RENDER_SCALE: the scale the game started with (whatever quality is chosen
-    // since): its scene is smaller than 2560x1440 and still upscaled to it, by the scaled 1440p
-    // passes (Ultra Performance) or the 3/4 pass (Performance, 1920x1080).
-    const auto render_scale = Settings::AppliedOcarinaRenderScale();
+    // oot_render_height: the height the game started with (the built-in render patch): its
+    // scene is smaller than 2560x1440 and still upscaled to it, by the scaled 1440p passes
+    // (1280x720) or the 3/4 pass (1920x1080).
+    const auto render_height = Settings::AppliedOcarinaRenderHeight();
     const bool scaled_1440p_pass =
-        render_scale && (upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
-                         upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader ||
-                         (upscale_hash == ComputePipeline::OcarinaThreeQuarterShader &&
-                          render_scale == Settings::NvidiaDlssQuality::Performance));
+        render_height && (upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
+                          upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader ||
+                          (upscale_hash == ComputePipeline::OcarinaThreeQuarterShader &&
+                           *render_height == 1080));
     const bool pass_1440p =
         replace && (upscale_hash == ComputePipeline::Ocarina1440pShader || scaled_1440p_pass);
     if ((!replace && upscale_hash != depth_reader) || !OcarinaTemporalEnabled()) {
@@ -9054,7 +9123,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     // the 3/4 pass; FRITCHII_FSR_OUTPUT may make FSR draw the game's own 1440p picture). Above
     // 1440p the output is composited with the game's interface when presented ("4K" below).
     const auto output_plan = VideoCommon::PlanOcarinaPassOutput(
-        oot_output_height, pass_1440p, Settings::OcarinaRenderHeightFor(render_scale),
+        oot_output_height, pass_1440p, Settings::OcarinaRenderHeightFor(render_height),
         native_resolution, OcarinaFsrOutputsGameSize(*oot_backend));
     const bool upscale_4k = output_plan.big_height != 0;
     const VkExtent2D big_extent{VideoCommon::OcarinaOutputWidth(output_plan.big_height),
@@ -9162,10 +9231,10 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
     const bool native_size = upscale_hash == ComputePipeline::OcarinaFullSizeShader;
-    // The render-scale passes take the 16:9 scene the patch gave (1920x1080 or 1280x720).
-    const u32 render_height = Settings::OcarinaRenderHeightFor(render_scale);
+    // The render-height passes take the 16:9 scene the patch gave (1920x1080, 1280x720, ...).
+    const u32 scene_height = Settings::OcarinaRenderHeightFor(render_height);
     const bool scene_1440p_or_scaled =
-        scaled_1440p_pass ? extent.height == render_height && extent.width == render_height * 16 / 9
+        scaled_1440p_pass ? extent.height == scene_height && extent.width == scene_height * 16 / 9
                           : extent.width == 2560 && extent.height == 1440;
     const bool valid_extents =
         pass_1440p ? scene_1440p_or_scaled && target.size.width == 2560 &&
@@ -9187,9 +9256,14 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     // game's sizes.
     VkExtent2D render_extent = extent;
     VkExtent2D target_extent{target.size.width, target.size.height};
-    VkExtent2D output_extent = output_plan.native_aa ? extent
-                               : upscale_4k          ? big_extent
-                                                     : target_extent;
+    // A small output (720p -> 1080p) is stretched into the game's 1440p target by the output
+    // pass (OcarinaUpscaler::Record samples it linearly when the sizes differ).
+    const VkExtent2D small_extent{VideoCommon::OcarinaOutputWidth(output_plan.small_height),
+                                  output_plan.small_height};
+    VkExtent2D output_extent = output_plan.native_aa         ? extent
+                               : upscale_4k                  ? big_extent
+                               : output_plan.small_height != 0 ? small_extent
+                                                             : target_extent;
     bool use_4k = upscale_4k;
     if (scaled_mode) {
         // The scene's colour, depth and the motion made from that depth must share one size;

@@ -471,19 +471,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
         } catch (const vk::Exception& e) {
             // Out of memory: free every idle staging buffer (and EXP104's pooled ones) and try
             // once more.
-            size_t freed = recycler.DropAll();
-            for (StagingBuffersCache* cache :
-                 {&device_local_cache, &upload_cache, &download_cache}) {
-                for (StagingBuffers& level : *cache) {
-                    const size_t before = level.entries.size();
-                    std::erase_if(level.entries, [this](const StagingBuffer& entry) {
-                        return clock.IsFree(entry.tick);
-                    });
-                    freed += before - level.entries.size();
-                    level.iterate_index = 0;
-                    level.delete_index = 0;
-                }
-            }
+            const size_t freed = ReleaseIdleBuffers();
             LOG_WARNING(Render_Vulkan,
                         "Staging buffer of {} MiB could not be made ({}); freed {} idle "
                         "staging buffers and retrying",
@@ -519,6 +507,21 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
         cache_level.entries.push_back(std::move(entry));
     }
     return ref;
+}
+
+size_t StagingBufferPool::ReleaseIdleBuffers() {
+    size_t freed = recycler.DropAll();
+    for (StagingBuffersCache* cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (StagingBuffers& level : *cache) {
+            const size_t before = level.entries.size();
+            std::erase_if(level.entries,
+                          [this](const StagingBuffer& entry) { return clock.IsFree(entry.tick); });
+            freed += before - level.entries.size();
+            level.iterate_index = 0;
+            level.delete_index = 0;
+        }
+    }
+    return freed;
 }
 
 StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage usage) {

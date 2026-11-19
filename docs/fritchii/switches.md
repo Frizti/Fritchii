@@ -630,6 +630,40 @@ all of them before the game starts either way, so a dispatch never waits for a p
 recorded in an earlier session (runtime-translated compute programs are recorded, as are prepared
 ones the game used); this only makes the compute records end earlier within the boot.
 
+### FRITCHII_PREP_COMPUTE_FIRST, FRITCHII_PREP_COMPUTE_CHECK
+
+Why: a compute dispatch can't be skipped while its pipeline compiles, so a compute pipeline the
+driver has to compile in play is a freeze (0.5 to 5 s for OoT's big ones). Tester logs (11-16 to
+11-18): 105 dispatch waits (115 s) on prepared compute pipelines the driver had not kept, and 28
+(50 s) on compute states the preparation lacks. The precompiled file holds its 4,088 compute records
+at its very end, so a driver cache at its size cap (NVIDIA's default ~1 GiB) drops them, and a player
+who presses Play now gets them last.
+
+- `FRITCHII_PREP_COMPUTE_FIRST` (boot, default 1; 0 = as before): the preparation takes every compute
+  record first, in any FRITCHII_PREP_ORDER mode (the used list's ages then rank after compute). Same
+  records and builds, only the order changes, so the preparation takes no longer. A checkpoint of an
+  older build resumes: positions before it as they were, the rest compute first. Logs "Precompiled
+  pipelines in order (...): N compute first, ..." and, once the last compute record ends,
+  "Precompiled compute: all N compute records done T s into the preparation (...)".
+- `FRITCHII_PREP_COMPUTE_CHECK` (boot, default 1; 0 = off; 2 = test). When the stamp says "already
+  prepared", the 6 biggest of 48 sampled kept compute pipelines are built the way a dispatch builds
+  them (kept info and SPIR-V, same layout, flags and program hash) and timed. A driver cache hit takes
+  2-10 ms; half or more over 40 ms means the driver's cache lost the prepared compute pipelines (new
+  exe name, driver update, cleared or full cache). Then the compute records alone are prepared again
+  before play (the Preparing shaders screen shows "n / 4,088"; Play now works as usual). No stamp,
+  checkpoint or kept file is written by that pass. `precompiled_compute_pass.fork-v54.txt` counts the
+  passes per stamp; after 2 the check only warns (a full cache drops them again). 2 = the compute pass
+  runs at every boot (to time it, or to fill a cold driver cache on purpose).
+- Logs: "Prepared compute check: the 6 biggest of 48 sampled kept compute pipelines built in a, b, ...
+  ms (k over 40 ms, T ms in all): the driver's cache holds/lost ...", then "Preparing 4088
+  precompiled pipelines from ... (its compute records only)" and "Precompiled compute pass finished".
+- Run time, every 10 s while any compute pipeline is built in play: "Compute pipelines built at run
+  time in the last 10 s: P from prepared SPIR-V (c compiled by the driver, x ms), T translated now (c
+  compiled, x ms), longest compile L ms; this session N prepared ones compiled again (must be 0 after a
+  finished preparation) for S s, M translated ones compiled for S s". The first 64 driver compiles get
+  a line each: "Compute pipeline H compiled by the driver at run time in N ms (prepared, not in the
+  driver's cache | translated now: a state the preparation lacks)".
+
 ### FRITCHII_OCCLUSION_VISIBLE
 
 TEST, off by default (helper AN, 2026-11-15, idea from DahBard's Blitchii LICHII_FAKE_OCCLUSION);
@@ -847,6 +881,13 @@ them. Exact: the same code, more room. Memory is committed only as code is writt
 per core, 4-6 cores). Log: "FRITCHII_JIT_CACHE_MIB=N: code cache of N MiB per core". Only worth a
 test when FRITCHII_HITCH_SPLIT=1 shows "warm compiles refused" before the load; judge by the load
 cluster's hitch score and its "another core had" time, fresh launches (boot setting).
+### FRITCHII_TEST_DEVICE_LOSS
+
+TEST, off by default (live, debug server only). 1 = the next queue submission goes through the
+device loss report without a real loss: the "Device loss" lines, every thread's stack, the "Host
+crash" line, eden_crash.dmp from the helper process, then the process ends with code 2. It should
+take a few seconds. Never set it in nx2_switches.txt.
+
 ### FRITCHII_SMALL_CARD, FRITCHII_SMALL_CARD_PARTS, FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB
 
 TEST, off by default (helper BY, 2026-11-16). FRITCHII_SMALL_CARD (live): 0 off, 1 on, 2 auto = on
@@ -2688,6 +2729,90 @@ Costs: the register test (~30-50 ns) on every E draw while on; a sibling transla
 ms, once per pipeline a session) when a takeable pipeline first shows up, at most one a frame.
 Lent draws keep R's own lookup (full pipeline). Not compatible with the one-follower build
 compares (step 3 BuildPipeline would see the sibling); FRITCHII_ONEF_LEAN=1 turns those off.
+
+### FRITCHII_OCCL_FLAG (the "Occlusion flags" line)
+
+TEST, off by default (2026-11-18). Live between its values, but **set it at boot**: the device
+keeps the buffer device address feature for the flag area only when FRITCHII_OCCL_FLAG is set
+when the device is made ("Occlusion flags (FRITCHII_OCCL_FLAG): buffer device address enabled
+for the flag area" at boot). Vulkan 1.2 or later; one follower off (the draw path it hooks is the
+one-thread path, which is the path on AMD's Windows driver). Code: fritchii_occl_flag.h,
+vulkan_occl_flag.frag, PipelineCache::OcclFlagPipeline / FindOrMakeOcclFlag, SamplesStreamer.
+
+Why: OoT's occlusion tests run as host occlusion queries, about 1,100 begin/end pairs a frame at
+the market (~55,000 reports a second). On an RX 9070 XT (OCuLink eGPU) a microbenchmark measured
+about 4.3 us of GPU time per pair around real work, rising to about 6.2 us under 3 GiB/s of PCIe
+traffic (the query end waits for the enclosed work; precise or not makes no difference); one
+query around the same work costs nothing extra. The 0xe2c pair test only asks "did any sample
+pass" (census: all calls p0 = 0, one count of every pair 0), and writing sample reports as 0 or
+4096 (FRITCHII_OCCL_TEST=2 on the experiments branch) kept the picture correct day, night and
+with the sun in view.
+
+What it does: a counted draw that writes no colour and whose pixel program can change nothing
+(FRITCHII_OCCL_LEAN's Lean class; not mesh) is drawn with its pipeline's flag variant: the same
+key, a whole pipeline (no libraries) whose pixel stage is the host program
+vulkan_occl_flag.frag. With early fragment tests it runs only for fragments that passed depth
+and stencil and stores 4096 into the 64-bit slot of the open query window, at a buffer device
+address pushed at push constant offset 40 (bytes 40 to 47 are otherwise unused). The variant is
+owned by its pipeline (never in the cache or on disk), made one a frame (shared with the lean
+siblings' budget), and used once built; until then the draw keeps its pipeline and a real query.
+The flag area is device-local memory (not host visible when the device has such a type, so the
+small BAR heap is left alone), one u64 per slot for the first 1,024 banks plus a sink, cleared
+with a fill in the upload command buffer when a bank is reserved. Each sync copies the synced
+slots, and the slots of the running window it carries over, into a host-visible mirror (cached
+memory preferred) that the fencing thread reads.
+
+- 0: off (a relaxed load per draw; counted draws also touch the streamer's mark, which returns at
+  once without the flag area).
+- 2: verify. The host queries stay and decide everything. Flag draws store into the open query's
+  slot; at each report the fencing thread compares "the query counted samples" with "a flag was
+  stored" for reports whose counted draws were all flag draws. Must be 0 disagreements. Reports
+  whose banks were reserved again before the compare are skipped ("bank reused").
+- 1: on, Ocarina of Time only (its program ID) and not with precise counts (accurate part 2): a
+  flag slot reports 4096 when any sample passed, not the count, which is all OoT's 0xe2c pair test
+  asks. A query window's first counted draw opens a flag slot (no host query) when it is a flag
+  draw; any other counted draw (colour on, not Lean, texture draws, draw clears) closes it and
+  opens a query slot, and later flag draws stay in that query slot (the host query counts them
+  exactly), so a window gains at most one slot per segment (the window's value is the sum of its
+  slots, as for a window across submissions). The result copies (GPU) take flag runs from the
+  flag area and query runs from the pool; the fencing thread reads flag runs from the mirror and
+  calls vkGetQueryPoolResults on
+  query runs only, so nothing waits on a query that never ran. A fragment-write to
+  transfer/host-read barrier runs at each sync while the flag area exists.
+
+Log every 10 s: "Occlusion flags (FRITCHII_OCCL_FLAG=N) per second: counted draws F with a flag
+pipeline, O without (not Lean L, regs refused R, not ready Y); flag pipelines made M, failed X;
+flag draws with no open query S; reports compared C: agree A, query 0 flag 1 D1, query 1 flag 0
+D2 (must be 0; T since boot); mixed X, no flag N, bank reused B; slots opened: FS flag (no host
+query), QS with a host query". A second line, "Occlusion flag census per second", counts the
+counted draws without a flag pipeline by reason (colour Lean: colour on, pixel program in the Lean
+class; colour discards / key state / depth or mask / stores / other; alpha test or coverage; off
+not Lean: colour off, pixel program not Lean), the distinct colour Lean pipelines in the window,
+and the query slots closed with only flag or colour Lean draws ("all flag or colour Lean": they
+would need no host query if colour Lean draws stored flags too) vs with another counted draw
+("blocked"). With the switch at 0 the census counters are not touched.
+
+Measured (RX 9070 XT over OCuLink x4, ReBAR off, Core Ultra 7 255H; OoT market fountain,
+1440p -> FSR 4 4K; live toggles in one session, three rounds, screenshots each window):
+- Verify: about 200,000 reports compared, 0 disagreements; picture unchanged.
+- On vs off: GPU busy -1.65 ms a frame idle (17.3/17.1/16.1 -> 15.6/15.4/14.5), -3.1 ms on average
+  under 3 GiB/s of PCIe copies; frame time -1.5 ms idle (about +8% fps); picture correct by day,
+  dusk and night. About 46% of the query slots become flag slots; the rest are windows with
+  counted draws that write colour (about 51,000 a second at the market), which keep real queries.
+- Flag area moved to device-local memory (2026-11-18, three rounds over two sessions): verify about
+  146,000 reports, 0 disagreements, bank reused 0; GPU busy -2.2 ms idle, -1.9 ms under PCIe load;
+  frame time -1.7 ms idle. Within run-to-run noise of the host-memory area.
+- Census at the market fountain (mode 1): about 67,000 slots a second, 45% flag slots. Of the
+  ~37,000 query slots, ~22,000 hold only flag and colour Lean draws (~44,000 colour Lean draws a
+  second from ~28 pipelines); the rest are blocked by colour draws that discard (~12,000 a
+  second) and colour-off draws outside the Lean class (~18,000 a second).
+
+Risks and limits: a flag variant writes no colour by construction; a draw whose regs or pipeline
+fall outside the Lean class keeps its query. The GPU-side value of a window with several slots goes
+through the existing prefix scan, as windows split by a render pass already do; OoT's 0xe2c
+reads the CPU-written value. No flag area on Qualcomm, ARM or Turnip drivers. The flag area lives in system memory (fragment
+stores cross PCIe; the counts above include that). Not tested on NVIDIA or Intel, nor with one
+follower on. Not with the memory-stage ring (facts are the parent's key, but not checked).
 
 ### EDEN_NX2_GPU_PROFILE=2: E's draw method zones (helper CP)
 
@@ -5812,6 +5937,59 @@ compiling 700-7,763 blocks in one frame. Lines: "JIT block list (FRITCHII_JIT_BL
 blocks loaded from ..." at boot; every 10 s with new blocks "... new blocks written, listed;
 warm-up handed out a/b/c/d of K loaded" (per core). The hitch line's warm compile time shows
 what the warm-up costs.
+
+### FRITCHII_OOT_RENDER_STEPS
+
+TEST, off by default (boot). 1 = the picture menu's Resolution (and oot_render_height) also takes
+360p, 540p, 810p, 900p and 1260p: built-in patches of OoT's render scale (0.25, 0.375, 0.5625,
+0.625, 0.875 of 2560x1440), docked, Max Resolution on, DLSS or FSR picked. Off, those heights are
+ignored and the game draws 1440p. They stay behind the switch until a run shows the game draws
+them exactly: a line "no scene camera this frame: the camera's extent isn't the target's" means
+the game padded the size and its own upscale draws instead. To release a height to everyone, add
+it to the list in `OcarinaRenderHeightOffered` (settings.cpp): the menu follows.
+
+Below 720p the output is at most 3x the scene: Auto is 1080p (not 4K), 540p can go to 1440p with
+FSR, 360p makes 1080p only. DLSS gets 1080p only, its exact modes (540p Performance, 360p Ultra
+Performance). Check per height: `Applying built-in patch "540p render (built-in)"`, `the game draws
+its scene at 960x540`, `NVIDIA DLSS (Streamline): 960x540 -> 1920x1080`, no repeating `the game's
+upscale draws frame N`.
+
+### Low-end PC simulation: FRITCHII_SIM_GPU_SLOW, FRITCHII_SIM_CPU, FRITCHII_SIM_CPU_SLOW, FRITCHII_SIM_RAM_LIMIT_MB
+
+TEST, all off by default (helper EY, 2026-11-19). They make a fast PC behave more like a weak one,
+so performance work can be judged for low-end hardware. Nothing on the PC changes: no admin rights,
+no driver, power, registry or Windows setting, no qt-config.ini. Everything is set by this process
+on itself and ends with it. work\lowend_sim.py sets them from presets. VRAM uses the existing
+EDEN_NX2_VRAM_LIMIT_MIB + FRITCHII_VRAM_SIM_OTHERS=1.
+
+- FRITCHII_SIM_GPU_SLOW=<factor> (live, 1 to 10; 3.5 or 350; live values are whole numbers, 350 or
+  3; 0 = off). GPU timestamps around every main-queue submission; for each ms of GPU work,
+  (factor - 1) ms of a one-invocation compute dispatch at the end of later submissions, between
+  full barriers, so nothing runs beside it. The dispatch is measured too and the difference carried
+  over. Line every 10 s: "Low-end simulation, GPU x3.50: work W ms/s, added A ms/s, xR reached, GPU
+  busy B%". R should sit at the factor; a lower R with "dropped" above 0 means the game makes too
+  few submissions to fit the load. Not slowed: the present pass and the side queue.
+- FRITCHII_SIM_CPU=<cores>/<threads> (boot; 6/12, 4/8, 6/6). The process keeps that many of the
+  PC's last cores (always fewer than it has), thread pools size themselves by it and thread
+  pinning plans for it, so a 4-core simulation runs unpinned like a real 4-core PC.
+- FRITCHII_SIM_CPU_SLOW=<factor> (live, 1 to 4). The guest cores, GPU front, GPU back and Vulkan
+  worker spin for (factor - 1) x the CPU time they used, counted in their own cycles, after each
+  stretch of work. Waits are not charged. Not slowed: the memory stage, shader compile workers,
+  audio. Line every ~10 s: "Low-end simulation, CPU x1.70: ... x1.70 in all".
+- There is no CPU cap switch on purpose. A Windows job object's hard CPU cap limits the process's
+  total only, and it stops every thread until the next interval: measured on the owner's PC
+  (lowend_sim.py --measure-cap, 2026-11-19), one thread capped at half a processor ran in turns with
+  stalls of about 307 ms. A slower CPU does nothing like that.
+- FRITCHII_SIM_RAM_LIMIT_MB=<MiB> (boot, 4096 or more): a job object's limit on committed memory.
+  Past it this process's allocations fail and the game may crash; the PC is not affected. It is a
+  failure test, not a 16 GB PC. Not used by the presets; lowend_sim.py reports the game's peak
+  memory instead.
+
+What these do not reproduce: cache size (the 7800X3D's 96 MB L3 helps emulators more than clocks
+do, so a CPU factor has to stand in for it), memory and VRAM bandwidth, PCIe lanes, another GPU's
+balance of geometry, fill and compute, other drivers' behaviour and costs, and upscaler cost on
+other hardware. Use them to find what becomes the limit and to compare builds on the same setting,
+not to promise a frame rate for a named card.
 
 ## Numbered experiments (EDEN_NX2_EXPn)
 

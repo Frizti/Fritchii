@@ -5584,14 +5584,15 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
             LOG_INFO(Render_Vulkan, "Ocarina texture LOD bias 0 (FSR 4 without camera jitter)");
         } else {
             // From the sizes, docked (handheld drops the bias). Max Resolution: the scene is
-            // 1440p tall, or what the DLSS render scale made it, and the output 4K. Without it
+            // 1440p tall, or what oot_render_height made it, and the output 4K (or the picked
+            // output; one below 1440p from a lowered scene is made at its own size). Without it
             // the game's dynamic scene (1080p at most) goes to 1440p. DLAA (the quality when the
             // game started) keeps the scene's size. FRITCHII_DLSS_SCALED: the scaled scene, and
             // a scene above the output is upscaled to its own size (supersampling).
             const bool max_resolution = Settings::OcarinaMaxResolutionOn();
             u32 render_height =
                 max_resolution
-                    ? Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale())
+                    ? Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderHeight())
                     : 1080;
             const auto& resolution = Settings::values.resolution_info;
             if (VideoCommon::OcarinaScaledUpscale() && resolution.active) {
@@ -5605,11 +5606,12 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
             // FRITCHII_FSR_OUTPUT; 1440p without Max Resolution), the scene's size for 1x AA.
             const auto plan = VideoCommon::PlanOcarinaPassOutput(
                 OcarinaUpscaleOutput(device).height, max_resolution,
-                Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale()), dlaa,
+                Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderHeight()), dlaa,
                 OcarinaFsrOutputsGameSize(backend));
             const u32 output_height =
-                plan.native_aa
-                    ? render_height
+                plan.native_aa ? render_height
+                : plan.small_height != 0
+                    ? plan.small_height
                     : std::max(render_height, plan.big_height != 0 ? plan.big_height : 1440U);
             const bool dlss_jitter =
                 VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());

@@ -14,6 +14,7 @@
 #define NX2_IDLE_HAS_PAUSE 1
 #endif
 #include "common/logging.h"
+#include "common/lowend_sim.h"
 #include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
@@ -188,6 +189,11 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         // memory here, outside the scheduler lock).
         if (Common::Nx2Timeline::Guest()) [[unlikely]] {
             NameGuestThreadForTimeline(thread);
+        }
+
+        // FRITCHII_SIM_CPU_SLOW: this core pays for the guest code and kernel calls it just ran.
+        if (Common::LowEndSim::CpuSlowOn()) [[unlikely]] {
+            Common::LowEndSim::CpuCharge();
         }
 
         // Otherwise, run the thread.

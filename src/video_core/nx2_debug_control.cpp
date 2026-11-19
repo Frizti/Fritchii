@@ -10,6 +10,7 @@
 
 #include "common/fritchii_lock_census.h"
 #include "common/host_memory.h"
+#include "common/lowend_sim.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/small_card.h"
 #include "video_core/texture_cache/lost_contents.h"
@@ -344,6 +345,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_OCCL_LEAN") {
         return &g_occl_lean;
     }
+    if (name == "FRITCHII_OCCL_FLAG") {
+        return &g_occl_flag;
+    }
     if (name == "FRITCHII_LOCK_CENSUS") {
         // Lives in common (the cache locks' contended path); -1 until its first read.
         return &Common::LockCensus::g_mode;
@@ -531,6 +535,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_SMALL_CARD") {
         return &SmallCard::g_small_card;
+    }
+    if (name == "FRITCHII_TEST_DEVICE_LOSS") {
+        return &g_test_device_loss;
+    }
+    if (name == "FRITCHII_SIM_GPU_SLOW") {
+        return &Common::LowEndSim::g_gpu_slow;
+    }
+    if (name == "FRITCHII_SIM_CPU_SLOW") {
+        return &Common::LowEndSim::g_cpu_slow;
     }
     if (name == "FRITCHII_E2C_ON_E") {
         return &g_e2c_on_e;

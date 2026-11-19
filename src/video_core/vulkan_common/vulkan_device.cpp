@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include "video_core/fritchii_occl_flag.h"
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <utility>
@@ -31,6 +33,12 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "common/shutdown_watch.h"
+#ifdef _WIN32
+#include "common/windows/crash_handler.h"
+#elif defined(__linux__) && !defined(__ANDROID__)
+#include "common/linux/crash_handler.h"
+#endif
 #include "video_core/churn_counters.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
@@ -1023,9 +1031,27 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         extensions.buffer_device_address = false;
     } else
 #endif
-    if (!extensions.descriptor_buffer) {
+    if (!extensions.descriptor_buffer && VideoCommon::OcclFlag::WantedAtBoot() &&
+        instance_version >= VK_API_VERSION_1_2 &&
+        features.buffer_device_address.bufferDeviceAddress) {
+        // FRITCHII_OCCL_FLAG: the flag pipelines store through buffer device addresses. As for
+        // DLSS above, the feature stays enabled while the emulator's own buffers and VMA stay
+        // as they are without descriptor buffers.
+        extensions.buffer_device_address = false;
+        occl_flag_device_address = true;
+    } else if (!extensions.descriptor_buffer) {
         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+    }
+    // FRITCHII_OCCL_FLAG: whichever branch ran, the feature is still enabled when it was not
+    // removed (the DLSS branch keeps it too).
+    if (VideoCommon::OcclFlag::WantedAtBoot()) {
+        occl_flag_device_address = instance_version >= VK_API_VERSION_1_2 &&
+                                   features.buffer_device_address.bufferDeviceAddress != 0;
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion flags (FRITCHII_OCCL_FLAG): buffer device address {} (instance {}.{})",
+                 occl_flag_device_address ? "enabled for the flag area" : "not available",
+                 VK_API_VERSION_MAJOR(instance_version), VK_API_VERSION_MINOR(instance_version));
     }
 
     // The float16 workarounds above keep shaders from doing float16 arithmetic. Cooperative
@@ -1634,15 +1660,49 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
     return wanted_format;
 }
 
-void Device::ReportLoss() const {
-    LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+void Device::ReportLoss(std::source_location where) const {
+    // The first thread to see the loss reports it and ends the process; the others wait for that.
+    static std::atomic_flag reported;
+    if (reported.test_and_set()) {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::hours{1});
+        }
+    }
+    // The report touches the driver, the log and every thread's stack, on a process in an unknown
+    // state: whatever gets stuck, the process still ends and the player gets no frozen window.
+    Common::ShutdownWatch::EndProcessAfter(std::chrono::seconds{nsight_aftermath_tracker ? 50 : 35});
+    u64 heap_size{};
+    u64 heap_usage{};
+    u64 heap_budget{};
+    const bool has_heap = MainHeapNumbers(heap_size, heap_usage, heap_budget);
+    LOG_CRITICAL(Render_Vulkan,
+                 "Device loss occurred! Seen at {}:{}; GPU {}, driver {} ({:#x}); video memory {}",
+                 where.file_name(), where.line(), GetModelName(), GetDriverName(),
+                 GetDriverVersion(),
+                 has_heap ? fmt::format("{} MiB used of {} MiB, budget {} MiB", heap_usage >> 20,
+                                        heap_size >> 20, heap_budget >> 20)
+                          : std::string{"unknown"});
     PipelineBinary::NoteDeviceLoss();
     ReportDeviceFault();
     // FRITCHII_SLOW_GPU: what the GPU was last given (NVIDIA's fault info has no addresses).
     Common::Nx2Hitch::LogGpuBreadcrumbs("Device loss");
+    // What every thread was doing, as a hang report gives it.
+    Common::Nx2Hitch::LogThreadReport("Device loss", false, 0);
 
-    // Wait for the log to flush and for Nsight Aftermath to dump the results
-    std::this_thread::sleep_for(std::chrono::seconds{15});
+    if (nsight_aftermath_tracker) {
+        // Give Nsight Aftermath time to write its dump.
+        std::this_thread::sleep_for(std::chrono::seconds{15});
+    }
+    static constexpr const char* FatalError = "the GPU driver lost the Vulkan device";
+#ifdef _WIN32
+    Common::Windows::ReportFatalError(FatalError);
+#elif defined(__linux__) && !defined(__ANDROID__)
+    Common::Linux::LogFatalError(FatalError);
+#endif
+    LOG_CRITICAL(Render_Vulkan, "Closing Fritchii: {}", FatalError);
+    // Flushes the log and skips DLL detach, which would run the driver's teardown on the lost
+    // device. An exception from here would only reach std::terminate on a worker thread.
+    Common::ShutdownWatch::EndProcessNow();
 }
 
 void Device::ReportDeviceFault() const {

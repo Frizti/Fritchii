@@ -186,8 +186,27 @@ constexpr OcarinaOutputSetting ResolveOcarinaUpscaleOutput(unsigned requested,
 struct OcarinaPassOutput {
     bool native_aa{};
     unsigned big_height{};
+    /// An output between a lowered scene (oot_render_height) and the game's 1440p picture
+    /// (720p -> 1080p): the upscaler makes that size and the output pass stretches it into the
+    /// game's target. 0 = none.
+    unsigned small_height{};
     constexpr bool operator==(const OcarinaPassOutput&) const = default;
 };
+
+/// The output a scene below 720p gets (oot_render_height 540 and 360): the largest offered height
+/// up to `requested` and within 3x the scene. Auto (0) asks for 1080p here, not 4K: 4K is 4x from
+/// 540p and 6x from 360p, beyond what DLSS and FSR take, and 1080p is an exact DLSS mode from both
+/// (Performance 2x, Ultra Performance 3x). 0 = no offered height fits.
+constexpr unsigned OcarinaLowSceneOutput(unsigned requested, unsigned scene_height) {
+    const unsigned wanted = requested == 0 ? 1080U : requested;
+    unsigned best = 0;
+    for (const unsigned height : OcarinaUpscaleOutputs) {
+        if (height <= wanted && height <= 3 * scene_height) {
+            best = height;
+        }
+    }
+    return best;
+}
 
 /// `output`: oot_upscale_output resolved (0 = Auto). `pass_1440p`: Max Resolution's 1440p pass,
 /// whose target is the game's 1440p picture. `scene_height`: the height the game drew (1440, or
@@ -196,12 +215,22 @@ struct OcarinaPassOutput {
 /// only). DLSS and FSR only enlarge, by up to 3x a side (FSR 3.1's range, DLSS Ultra
 /// Performance), so an output at or below the scene is native AA at the scene's size (the
 /// window's scaling takes it down), and one more than 3x the scene drops to the largest offered
-/// height within 3x.
+/// height within 3x. With a lowered scene (scene_height below 1440: oot_render_height) an output
+/// below 1440p is made at its own size (small_height) or, at most the scene, as native AA; with
+/// the game's 1440p scene the outputs up to 1440p stay the game's target, as before. A scene below
+/// 720p takes OcarinaLowSceneOutput: even the game's 1440p target is over 3x from 360p.
 constexpr OcarinaPassOutput PlanOcarinaPassOutput(unsigned output, bool pass_1440p,
                                                   unsigned scene_height, bool dlss_native,
                                                   bool fsr_game_size) {
     if (dlss_native) {
         return {true, 0};
+    }
+    if (pass_1440p && scene_height < 720) {
+        const unsigned low = OcarinaLowSceneOutput(output, scene_height);
+        if (low == 0) {
+            return {true, 0};
+        }
+        return {false, 0, low < 1440 ? low : 0U};
     }
     if (output == 0) {
         return {false, pass_1440p && !fsr_game_size ? 2160U : 0U};
@@ -209,6 +238,12 @@ constexpr OcarinaPassOutput PlanOcarinaPassOutput(unsigned output, bool pass_144
     if (!pass_1440p) {
         // The 3/4 pass: its target is 4/3 of the scene (1440p at most).
         return {output <= 1080, 0};
+    }
+    if (output < 1440 && scene_height < 1440) {
+        if (output <= scene_height) {
+            return {true, 0};
+        }
+        return {false, 0, output};
     }
     if (output <= 1440) {
         return {false, 0};

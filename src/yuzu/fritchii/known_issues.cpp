@@ -15,7 +15,6 @@
 
 #include "common/logging.h"
 #include "common/settings.h"
-#include "common/cpu_features.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/util/vk.h"
 #include "yuzu/fritchii/cache_cleanup.h"
@@ -34,11 +33,6 @@ struct Item {
 bool NvidiaCard(const std::vector<VkDeviceInfo::Record>& records) {
     const auto index = static_cast<size_t>(Settings::values.vulkan_device.GetValue());
     return index < records.size() && records[index].nvidia;
-}
-
-bool IntelCpu() {
-    const std::string name = Common::g_cpu_caps.cpu_string;
-    return name.find("Intel") != std::string::npos;
 }
 
 /// Only what current builds show (owner 2026-11-18: no outdated items).
@@ -72,16 +66,11 @@ std::vector<Item> Items(const std::vector<VkDeviceInfo::Record>& records) {
                      QObject::tr("Close your browser and other programs while playing. When memory "
                                  "runs out, the game freezes for seconds.")});
     // Compute-written images go back to the game's size at every dispatch, so a lower scale only
-    // shrinks the plain draws (2026-11-18; the game's own render scale fixes it, 6.1 waitlist).
+    // shrinks the plain draws (2026-11-18). oot_render_height, with an upscaler, lowers them too.
     items.push_back({QObject::tr("Lower resolutions"),
-                     QObject::tr("Going below 1080p gives less fps than you'd expect, because part "
-                                 "of OoT's drawing stays at full size. A v6.x update will fix "
-                                 "it.")});
-    if (IntelCpu()) {
-        items.push_back({QObject::tr("Intel 12th-14th gen and Core Ultra"),
-                         QObject::tr("If fps is about half what it should be, add "
-                                     "EDEN_HYBRID_CORES=0 in Tools > Switches.")});
-    }
+                     QObject::tr("With the Upscaler off, going below 1080p gives less fps than "
+                                 "you'd expect, because part of OoT's drawing stays at full size. "
+                                 "With FSR or DLSS, Resolution 720p lowers all of it.")});
     return items;
 }
 

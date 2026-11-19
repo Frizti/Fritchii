@@ -639,7 +639,8 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             });
         if (result != VideoCommon::DlssEvaluationResult::Succeeded && !failed.exchange(true)) {
             LOG_ERROR(Render_Vulkan,
-                      "NVIDIA DLSS recording failed at stage {} (Streamline result {}); using FSR 3.1",
+                      "NVIDIA DLSS failed at stage {} (Streamline result {}): it is off for the "
+                      "rest of this session",
                       static_cast<int>(result), static_cast<int>(api_result));
         }
         if (result != VideoCommon::DlssEvaluationResult::Succeeded) {
