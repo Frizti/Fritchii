@@ -8261,8 +8261,16 @@ void RasterizerVulkan::SyncOperationKeepStamp(std::function<void()>&& func) {
     fence_manager.SyncOperationKeepStamp(std::move(func));
 }
 
+void RasterizerVulkan::OneFollowerDeferredTick() {
+    if (onef_frame_tick_deferred.load(std::memory_order_relaxed) &&
+        onef_frame_tick_deferred.exchange(false, std::memory_order_acq_rel)) [[unlikely]] {
+        TickFrame();
+    }
+}
+
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerDeferredTick();
         OneFollowerCountFence();
         if (OneFollowerFenceClean()) {
             // FRITCHII_ONEF_SEM_E (fable_b 20.3): the guest increment, then (after the buffer
@@ -8291,6 +8299,7 @@ void RasterizerVulkan::SignalSyncPoint(u32 value) {
 
 void RasterizerVulkan::SignalReference() {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerDeferredTick();
         OneFollowerCountFence();
         if (OneFollowerFenceClean()) {
             OneFollowerPostFence(1, 0);
@@ -9904,6 +9913,18 @@ FrameEndTimes g_frame_end_times; ///< only TickFrame touches it (one thread at a
 
 void RasterizerVulkan::TickFrame() {
     ONEF_LEND(FrameEnd, TickFrame())
+    // FRITCHII_ONEF_TICK_ON_E: on R outside a lent call E runs meanwhile: E ticks it (lent).
+    if (VideoCommon::OneFollower::On() && VideoCommon::OneFollower::OnRenderThread() &&
+        !VideoCommon::OneFollower::RenderInLentCall()) [[unlikely]] {
+        static const bool tick_on_e = [] {
+            const char* value = std::getenv("FRITCHII_ONEF_TICK_ON_E");
+            return value == nullptr || std::string_view{value} != "0";
+        }();
+        if (tick_on_e) {
+            onef_frame_tick_deferred.store(true, std::memory_order_release);
+            return;
+        }
+    }
     async_compute_skip.TickFrame(); // FRITCHII_ASYNC_COMPUTE_SKIP's frame clock and 10 s line
     const bool frame_end_times = FrameEndTimes::On();
     if (frame_end_times) [[unlikely]] {
