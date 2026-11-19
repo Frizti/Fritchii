@@ -279,7 +279,8 @@ public:
     }
 
     /// Changes only when the vertex buffer bindings may be gone or replaced: a new command buffer
-    /// (InvalidateState) or a pass that binds its own (DisturbVertexBindings). Vulkan keeps them
+    /// (SubmitExecution) or a pass that binds its own (DisturbVertexBindings). Not at a blit's
+    /// InvalidateState: blits bind no vertex buffers. Vulkan keeps them
     /// across render passes, so a binding recorded at the same epoch is still bound.
     [[nodiscard]] u64 VertexEpoch() const noexcept {
         return vertex_epoch;

@@ -6378,6 +6378,9 @@ void RasterizerVulkan::DispatchCompute() {
             VideoCommon::OneFollower::StopPostDispatch("a played dispatch off the view");
         } else {
             scheduler.InvalidateState();
+            if (replacement) {
+                scheduler.DisturbVertexBindings(); // an upscaler's own recording
+            }
         }
     }
     compute_since_count_barrier = true;

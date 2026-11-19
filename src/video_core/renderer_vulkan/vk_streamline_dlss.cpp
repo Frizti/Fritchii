@@ -574,6 +574,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     });
     // DLSS binds its own pipelines and descriptors on the command buffer.
     scheduler.InvalidateState();
+    scheduler.DisturbVertexBindings(); // conservative: its recording is not ours
     return true;
 }
 
