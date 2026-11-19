@@ -278,6 +278,16 @@ public:
         return recording_epoch;
     }
 
+    /// Changes only when the vertex buffer bindings may be gone or replaced: a new command buffer
+    /// (InvalidateState) or a pass that binds its own (DisturbVertexBindings). Vulkan keeps them
+    /// across render passes, so a binding recorded at the same epoch is still bound.
+    [[nodiscard]] u64 VertexEpoch() const noexcept {
+        return vertex_epoch;
+    }
+    void DisturbVertexBindings() noexcept {
+        ++vertex_epoch;
+    }
+
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) const noexcept {
         return master_semaphore->IsFree(tick);
@@ -605,6 +615,7 @@ private:
 
     State state;
     u64 recording_epoch = 0;
+    u64 vertex_epoch = 0;
     u64 render_pass_serial = 0; ///< BeginRenderPassImpl calls (delta draws)
 
     u32 num_renderpass_images = 0;

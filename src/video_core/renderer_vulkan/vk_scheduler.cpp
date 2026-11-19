@@ -1364,6 +1364,7 @@ void Scheduler::AllocateNewContext() {
 void Scheduler::InvalidateState() {
     SeamHook::Watch(SeamHook::Use::InvalidateState);
     ++recording_epoch;
+    ++vertex_epoch;
     state.graphics_pipeline = nullptr;
     state.rescaling_defined = false;
     state.descriptor_buffer_bound = false;

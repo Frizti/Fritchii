@@ -4186,9 +4186,18 @@ void MemStage::TickThread(int seam) {
     if (ticks) {
         ticks->SetPerThread(Link::RingActive() && Link::Ahead() != 0);
     }
+    // One follower: on unless FRITCHII_MEMSTAGE_FULL_BINDS=0. R starts command buffers E cannot
+    // see (posted fences, the E split), and the cmdbuf invalidation's vertex binding flags are
+    // E's (one_follower_view.cpp): the unchanged bindings were never bound in the new command
+    // buffer. AMD then reads the old command buffer's vertex table: a GPU page fault (Radeon GPU
+    // Detective, 2026-11-19). The player drops the bindings still bound (VertexEpoch).
+    static const bool full_off = [] {
+        const char* value = std::getenv("FRITCHII_MEMSTAGE_FULL_BINDS");
+        return value != nullptr && value[0] == '0';
+    }();
     const bool full =
         Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0 ||
-        link.Mode() == 2;
+        link.Mode() == 2 || (!full_off && VideoCommon::OneFollower::On());
     if (full != Link::FullVertexBinds()) {
         Link::SetFullVertexBinds(full);
         LOG_INFO(Render_Vulkan, "Memory seam full vertex bindings (FRITCHII_MEMSTAGE_FULL_BINDS={}): {}",
@@ -5320,7 +5329,7 @@ void MemPlayer::PlayVertices(u8 flags, u32 first, u32 binding_count, const VkBuf
     // the rebind. Draws re-resolve their vertex streams when the guest rewrites unchanged
     // registers.
     if (!VideoCommon::Nx2Perf::Verify()) {
-        const u64 epoch = scheduler.RecordingEpoch();
+        const u64 epoch = scheduler.VertexEpoch();
         bool unchanged = true;
         for (u32 i = 0; unchanged && i < binding_count; ++i) {
             const BoundVertexBuffer& bound = bound_vertex_buffers[first + i];
