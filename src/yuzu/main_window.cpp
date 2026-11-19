@@ -1002,7 +1002,8 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
 // recommended?" prompt. config/frizti.ini keeps the card they were decided for (hw_card) and what
 // was set (hw.<label>):
 // - set only when nothing was decided for this card yet, the value is still the default and the
-//   player never answered the one-time AMD offer (UISettings fritchii_occl_offer);
+//   player never answered the one-time AMD offer (UISettings fritchii_occl_offer: empty, or
+//   "pending" when a build without these defaults queued the offer and it was not shown yet);
 // - afterwards never set again: a value the player changed stays theirs;
 // - on a card change a value still as set goes back to its default, then the new card decides.
 // A FRITCHII_OCCL_FLAG switch still wins at boot (OcclFlag::ReadAtBoot).
@@ -1070,7 +1071,8 @@ bool MainWindow::ApplyHardwareDefaults() {
     record.hw_card = card_name;
     if (amd_discrete) {
         if (setting.GetValue() == Settings::OcclusionSpeedup::Standard &&
-            (offer.GetValue().empty() || offer.GetValue() == OfferMark)) {
+            (offer.GetValue().empty() || offer.GetValue() == OfferMark ||
+             offer.GetValue() == "pending")) {
             setting.SetValue(Settings::OcclusionSpeedup::Full);
             record.hw.insert_or_assign(label, setting.ToStringGlobal());
             offer.SetValue(OfferMark);
