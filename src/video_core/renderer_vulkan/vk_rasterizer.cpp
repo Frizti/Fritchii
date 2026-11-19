@@ -4206,6 +4206,16 @@ bool RasterizerVulkan::OneFollowerFenceClean() {
         OneF::CountFenceDecision(OneF::FenceDecision::SyncOwed);
         return false;
     }
+    // FRITCHII_ONEF_POST_SYNCS (boot, default 1; 0 = a bisect tool): 0 lends every fence that
+    // owes query syncs (16.2's posted sync targets off).
+    static const bool post_syncs = [] {
+        const char* value = std::getenv("FRITCHII_ONEF_POST_SYNCS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!post_syncs && (!onef_sync_samples.empty() || !onef_sync_payloads.empty())) {
+        OneF::CountFenceDecision(OneF::FenceDecision::SyncOwed);
+        return false;
+    }
     if (buffer_cache.AheadDue()) {
         OneF::CountFenceDecision(OneF::FenceDecision::AheadDue);
         return false;
