@@ -9,7 +9,7 @@ On Fritchii v4 to v6.1 you don't need to download anything: it offers this updat
 Fritchii v6.2: smaller graphics cards, slower PCs and above 60 fps.
 
 ### Good to know
-- **Intel 12th to 14th gen (P-cores and E-cores): you shouldn't need `EDEN_HYBRID_CORES=0` any more.** v6.1 tied the GPU threads tightly to the P-cores, which halved fps on some of these CPUs. v6.2 lets Windows place them by default. If you added the switch, remove it in Tools > Switches: while it's there, the new default and the CPU settings' Intel P-cores choice don't apply. If fps is still about half of what you expect, put it back and tell us on the Discord.
+- **Intel 12th to 14th gen (P-cores and E-cores): you shouldn't need `EDEN_HYBRID_CORES=0` any more.** v6.1 tied the GPU threads tightly to the P-cores, which halved fps on some of these CPUs. v6.2 lets Windows place them by default. If you added it, Fritchii turns it off for you on the first start (the line stays in Tools > Switches as a comment). If fps is still about half of what you expect, remove the # in front of it and tell us on the Discord.
 - **First start asks once: "Use the recommended settings?"** Use recommended applies the settings tuned for OoT and saves your old ones first. Keep my settings changes nothing. You can switch later in Settings > General.
 - No new shader preparation: v6.2 keeps v6.1's prepared shaders.
 

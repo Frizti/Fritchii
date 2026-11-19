@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 #include <string_view>
@@ -144,6 +146,62 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 // in the real environment always wins, so a launcher script can still override one run; between
 // files the later one wins, so the copy next to the executable (shipped with the build) can be
 // overridden by %APPDATA%\fritchii\nx2_switches.txt without editing the one that gets replaced.
+// Fritchii 6.2, once per switch file: v6.1 tied the GPU threads to the P-cores of hybrid Intel
+// CPUs, and players worked around the fps it cost with EDEN_HYBRID_CORES=0. 6.2's default lets
+// Windows place them, and the switch would keep it (and the Intel P-cores setting) from applying.
+// The line is turned into a comment saying why, a marker line records the check, and a line the
+// player adds back afterwards stays. Returns what was done, for the switch summary in the log.
+static std::string RetireHybridCoresOff(const std::filesystem::path& path) {
+    constexpr std::string_view Marker = "# Fritchii 6.2 checked EDEN_HYBRID_CORES";
+    std::ifstream in{path, std::ios::binary};
+    if (!in) {
+        return {};
+    }
+    const std::string text{std::istreambuf_iterator<char>(in), {}};
+    in.close();
+    if (text.find(Marker) != std::string::npos) {
+        return {};
+    }
+    const std::string newline = text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+    std::string out;
+    bool retired = false;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find('\n', start);
+        const bool last = end == std::string::npos;
+        std::string line = text.substr(start, last ? std::string::npos : end - start);
+        start = last ? text.size() : end + 1;
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        std::string bare = line;
+        bare.erase(std::remove_if(bare.begin(), bare.end(),
+                                  [](char c) { return c == ' ' || c == '\t'; }),
+                   bare.end());
+        if (bare == "EDEN_HYBRID_CORES=0") {
+            out += "# " + line + "   (turned off by Fritchii 6.2: no longer needed. Remove the # "
+                   "to use it again.)" + newline;
+            retired = true;
+        } else {
+            out += line;
+            if (!last) {
+                out += newline;
+            }
+        }
+    }
+    if (!out.empty() && out.substr(out.size() - newline.size()) != newline) {
+        out += newline;
+    }
+    out += std::string{Marker} + newline;
+    std::ofstream file{path, std::ios::binary | std::ios::trunc};
+    if (!file || !file.write(out.data(), static_cast<std::streamsize>(out.size()))) {
+        return {};
+    }
+    return retired ? "EDEN_HYBRID_CORES=0 turned off in " + path.filename().string() +
+                         " (no longer needed with 6.2)"
+                   : std::string{};
+}
+
 static void ParseSwitchFile(const std::filesystem::path& path,
                             std::map<std::string, std::string>& entries) {
     std::ifstream file{path};
@@ -385,6 +443,7 @@ static void LoadNx2Switches(const char* argv0) {
     if (!std::filesystem::exists(user_file)) {
         user_file = Nx2LegacyUserSwitchFile();
     }
+    const std::string hybrid_note = RetireHybridCoresOff(user_file);
     {
         std::map<std::string, std::string> file;
         ParseSwitchFile(user_file, file);
@@ -433,6 +492,10 @@ static void LoadNx2Switches(const char* argv0) {
                                             SourceNames[i], groups[i]);
             g_switch_groups.emplace_back(SourceNames[i], groups[i]);
         }
+    }
+
+    if (!hybrid_note.empty()) {
+        g_switch_summary += fmt::format("{}{}", g_switch_summary.empty() ? "" : "; ", hybrid_note);
     }
 
     for (const auto& [name, value] : entries) {
