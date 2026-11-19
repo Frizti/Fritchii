@@ -47,6 +47,26 @@ using Tegra::Engines::Maxwell3D;
 using VideoCommon::QueryType;
 
 namespace {
+/// A samples query copy: past the pool's 256 slots it would read the driver's memory after the
+/// pool (AMD: a GPU page fault in its internal range). Must be 0; such a copy is skipped.
+void GuardedSamplesCopy(vk::CommandBuffer cmdbuf, VkQueryPool pool, u32 first, u32 count,
+                        VkBuffer buffer, VkDeviceSize offset, VkDeviceSize stride,
+                        VkQueryResultFlags flags) {
+    constexpr u32 pool_size = 256; // SamplesQueryBank::BANK_SIZE
+    if (count == 0 || first >= pool_size || count > pool_size - first) [[unlikely]] {
+        static std::atomic<u64> bad{};
+        const u64 n = bad.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 16 || (n & (n - 1)) == 0) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "Samples query copy past its pool: first {} count {} (pool {}), skipped; "
+                         "{} so far (must be 0)",
+                         first, count, pool_size, n);
+        }
+        return;
+    }
+    cmdbuf.CopyQueryPoolResults(pool, first, count, buffer, offset, stride, flags);
+}
+
 class SamplesQueryBank : public VideoCommon::BankBase {
 public:
     static constexpr size_t BANK_SIZE = 256;
@@ -475,7 +495,7 @@ public:
                                           buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
                             if (wait_on_last && count > 1) {
                                 const size_t last = count - 1;
-                                cmdbuf.CopyQueryPoolResults(
+                                GuardedSamplesCopy(cmdbuf,
                                     query_pool, static_cast<u32>(run + last), 1, buffer,
                                     dst + last * SamplesQueryBank::QUERY_SIZE,
                                     SamplesQueryBank::QUERY_SIZE,
@@ -488,12 +508,12 @@ public:
                                 };
                                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
                                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, waited);
-                                cmdbuf.CopyQueryPoolResults(
+                                GuardedSamplesCopy(cmdbuf,
                                     query_pool, static_cast<u32>(run), static_cast<u32>(last),
                                     buffer, dst, SamplesQueryBank::QUERY_SIZE,
                                     VK_QUERY_RESULT_64_BIT);
                             } else {
-                                cmdbuf.CopyQueryPoolResults(
+                                GuardedSamplesCopy(cmdbuf,
                                     query_pool, static_cast<u32>(run), static_cast<u32>(count),
                                     buffer, dst, SamplesQueryBank::QUERY_SIZE,
                                     VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
@@ -538,7 +558,7 @@ public:
                 };
 
                 if (!wait_on_last || amount == 1) {
-                    cmdbuf.CopyQueryPoolResults(
+                    GuardedSamplesCopy(cmdbuf,
                         query_pool, static_cast<u32>(start), static_cast<u32>(amount), buffer,
                         static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
                         VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
@@ -546,7 +566,7 @@ public:
                     const size_t last = amount - 1;
                     const VkDeviceSize last_offset =
                         base_offset + last * SamplesQueryBank::QUERY_SIZE;
-                    cmdbuf.CopyQueryPoolResults(query_pool, static_cast<u32>(start + last), 1,
+                    GuardedSamplesCopy(cmdbuf, query_pool, static_cast<u32>(start + last), 1,
                                                 buffer, last_offset, SamplesQueryBank::QUERY_SIZE,
                                                 VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
                     // Orders the unwaited copy after the waited one.
@@ -563,7 +583,7 @@ public:
                     };
                     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
                                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, waited_barrier);
-                    cmdbuf.CopyQueryPoolResults(
+                    GuardedSamplesCopy(cmdbuf,
                         query_pool, static_cast<u32>(start), static_cast<u32>(last), buffer,
                         static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
                         VK_QUERY_RESULT_64_BIT);
