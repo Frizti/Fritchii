@@ -8,6 +8,8 @@
 #include <functional>
 #include <chrono>
 #include <list>
+#include <thread>
+#include <vector>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -139,6 +141,21 @@ private:
     std::atomic<void*> guest_increment_context{};
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
+
+    /// FRITCHII_SYNCPT_UNLOCKED (default 1): actions run after `guard` is released. A due
+    /// action may run renderer work (the composite executer runs Composite, which with one
+    /// follower drains R on E): under `guard` that blocked every guest thread that registers
+    /// a wait, and deadlocked when R increments (FRITCHII_ONEF_SIGNAL_ON_R). Deregistering an
+    /// action another thread is running waits until it returns (nx2:syncpt re-arms a slot
+    /// right after its cancel: a late run would signal the new request).
+    struct RunningAction {
+        u64 id;
+        std::thread::id thread;
+    };
+    std::vector<RunningAction> running_actions; ///< Under `guard`
+    std::condition_variable running_cv;
+    /// Runs `due` (taken out of the storage under `lk`, listed in running_actions) unlocked.
+    void RunUnlocked(std::unique_lock<std::mutex>& lk, std::list<RegisteredAction>& due);
 };
 
 } // namespace Host1x

@@ -12,9 +12,38 @@
 #include "common/nx2_timeline.h"
 #include "video_core/host1x/syncpoint_manager.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace Tegra {
 
 namespace Host1x {
+
+namespace {
+/// FRITCHII_SYNCPT_UNLOCKED (boot, default 1; 0 = actions run under the lock, as before).
+bool ActionsUnlocked() {
+    static const bool unlocked = [] {
+        const char* value = std::getenv("FRITCHII_SYNCPT_UNLOCKED");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return unlocked;
+}
+} // namespace
+
+void SyncpointManager::RunUnlocked(std::unique_lock<std::mutex>& lk,
+                                   std::list<RegisteredAction>& due) {
+    lk.unlock();
+    for (RegisteredAction& action : due) {
+        action.action();
+    }
+    lk.lock();
+    std::erase_if(running_actions, [&due](const RunningAction& running) {
+        return std::ranges::any_of(due, [&running](const RegisteredAction& action) {
+            return action.id == running.id;
+        });
+    });
+    running_cv.notify_all();
+}
 
 SyncpointManager::ActionHandle SyncpointManager::RegisterAction(
     std::atomic<u32>& syncpoint, std::list<RegisteredAction>& action_storage, u32 expected_value,
@@ -24,8 +53,11 @@ SyncpointManager::ActionHandle SyncpointManager::RegisterAction(
         return {};
     }
 
-    std::scoped_lock lk(guard);
+    std::unique_lock lk(guard);
     if (syncpoint.load(std::memory_order_relaxed) >= expected_value) {
+        if (ActionsUnlocked()) {
+            lk.unlock();
+        }
         action();
         return {};
     }
@@ -44,7 +76,7 @@ void SyncpointManager::DeregisterAction(std::list<RegisteredAction>& action_stor
     if (handle == 0) {
         return;
     }
-    std::scoped_lock lk(guard);
+    std::unique_lock lk(guard);
 
     for (auto it = action_storage.begin(); it != action_storage.end(); it++) {
         if (it->id == handle) {
@@ -52,6 +84,14 @@ void SyncpointManager::DeregisterAction(std::list<RegisteredAction>& action_stor
             return;
         }
     }
+    // Taken by an increment and running unlocked: return once it has run (never from inside
+    // the action itself).
+    const auto self = std::this_thread::get_id();
+    running_cv.wait(lk, [&] {
+        return std::ranges::none_of(running_actions, [&](const RunningAction& running) {
+            return running.id == handle && running.thread != self;
+        });
+    });
 }
 
 void SyncpointManager::DeregisterGuestAction(u32 syncpoint_id, const ActionHandle& handle) {
@@ -132,6 +172,24 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
 
     if (!lk.owns_lock()) {
         lk.lock();
+    }
+    if (ActionsUnlocked()) {
+        auto end = action_storage.begin();
+        while (end != action_storage.end() && end->expected_value <= new_value) {
+            ++end;
+        }
+        wait_cv.notify_all();
+        if (end == action_storage.begin()) {
+            return;
+        }
+        std::list<RegisteredAction> due;
+        due.splice(due.end(), action_storage, action_storage.begin(), end);
+        const auto self = std::this_thread::get_id();
+        for (const RegisteredAction& action : due) {
+            running_actions.push_back({action.id, self});
+        }
+        RunUnlocked(lk, due);
+        return;
     }
     auto it = action_storage.begin();
     while (it != action_storage.end()) {
