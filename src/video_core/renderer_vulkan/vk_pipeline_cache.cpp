@@ -599,6 +599,20 @@ size_t TranslateThreads() {
 /// when the emitted SPIR-V uses an id it never defines or its own result, before the driver gets
 /// it. Off: nothing.
 void SelfCheckSpirv(std::span<const u32> code, u64 shader_hash, const char* stage) {
+    // FRITCHII_SPIRV_DUMP=<folder> with FRITCHII_SPIRV_DUMP_HASHES=<hex,hex,...> (test): the
+    // listed programs' SPIR-V, <folder>/<hash>-<stage>.spv (for spirv-dis).
+    if (const char* folder = std::getenv("FRITCHII_SPIRV_DUMP")) {
+        if (const char* hashes = std::getenv("FRITCHII_SPIRV_DUMP_HASHES");
+            hashes != nullptr && std::string_view{hashes}.find(fmt::format("{:016x}", shader_hash)) !=
+                                     std::string_view::npos) {
+            const auto path = std::filesystem::path{folder} /
+                              fmt::format("{:016x}-{}.spv", shader_hash, stage);
+            std::ofstream file{path, std::ios::binary};
+            file.write(reinterpret_cast<const char*>(code.data()),
+                       static_cast<std::streamsize>(code.size_bytes()));
+            LOG_INFO(Render_Vulkan, "SPIR-V dump: {} ({} words)", path.string(), code.size());
+        }
+    }
     if (!SpirvSelfCheck()) {
         return;
     }
