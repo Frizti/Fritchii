@@ -45,6 +45,7 @@
 #endif
 
 #include "main_window.h"
+#include "yuzu/interface_translations.h"
 #include "fritchii/fritchii_ui.h"
 #include "fritchii/switches_window.h"
 #include "util/profiling_mode.h"
@@ -636,6 +637,8 @@ int main(int argc, char* argv[]) {
     const ExitStep after_app{"QApplication destroyed: static destructors, then the process exit"};
 
     QApplication app(argc, argv);
+    InterfaceTranslations translations;
+    translations.Load({});
 
 #ifdef _WIN32
     OverrideWindowsFont();
@@ -658,7 +661,7 @@ int main(int argc, char* argv[]) {
 
     try {
         const ExitStep after_window{"main window destroyed: QApplication destructor (thread pool)"};
-        MainWindow main_window{has_broken_vulkan};
+        MainWindow main_window{has_broken_vulkan, translations};
         main_window.show();
         app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window,
                     &MainWindow::OnAppFocusStateChanged);

@@ -83,6 +83,14 @@ jobs:
           modules: qtcharts
           cache: true
 
+      - name: Check Brazilian Portuguese coverage
+        shell: pwsh
+        run: |
+          $source = Join-Path $env:RUNNER_TEMP "fritchii-source.ts"
+          lupdate src/yuzu src/qt_common -extensions cpp,h,ui -locations none -no-obsolete -target-language pt_BR -ts $source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/translations/check_catalog.py $source dist/languages/pt_BR.ts
+
       # Reuse the SDK installer already employed by the upstream release workflow.
       # It calls Get-WmiObject, so run it with Windows PowerShell 5.1, not pwsh 7.
       - name: Install Vulkan SDK

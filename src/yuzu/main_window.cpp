@@ -98,7 +98,7 @@
 #include <QFutureWatcher>
 #include <QGuiApplication>
 #include <QInputDialog>
-#include <QLibraryInfo>
+#include "yuzu/interface_translations.h"
 #include <QMimeData>
 #include <QPalette>
 #include <QProgressDialog>
@@ -480,16 +480,15 @@ inline static bool isDarkMode() {
 }
 #endif // _WIN32
 
-MainWindow::MainWindow(bool has_broken_vulkan)
-    : ui{std::make_unique<Ui::MainWindow>()},
+MainWindow::MainWindow(bool has_broken_vulkan, InterfaceTranslations& translations_)
+    : translations{translations_}, ui{std::make_unique<Ui::MainWindow>()},
       input_subsystem{std::make_shared<InputCommon::InputSubsystem>()} {
-    LoadTranslation();
     UserDataMigrator{this};
     QtCommon::Init(this);
 
     Common::FS::CreateEdenPaths();
     this->config = std::make_unique<QtConfig>();
-    LoadTranslation();
+    translations.Load(QString::fromStdString(UISettings::values.language.GetValue()));
     MigrateFriztiSettings(FriztiStart::AskFirst);
     // New mods start disabled: saved at once (from the GUI thread), so a crash keeps it.
     FileSys::PatchManager::SetNewModsCallback([this](u64 title_id) {
@@ -1312,7 +1311,7 @@ void MainWindow::WebBrowserOpenWebPage(const std::string& main_url,
     bool exit_check = false;
 
     // TODO (Morph): Remove this
-    QAction* exit_action = new QAction(tr("Disable Web Applet"), this);
+    QAction* exit_action = TranslatedAction(QT_TRANSLATE_NOOP("MainWindow", "Disable Web Applet"));
     connect(exit_action, &QAction::triggered, this, [this] {
         const auto result = QMessageBox::warning(
             this, tr("Disable Web Applet"),
@@ -2030,7 +2029,7 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Open_Mods_Page, &MainWindow::OnOpenModsPage);
     connect_menu(ui->action_Open_UserHandbook, &MainWindow::OnOpenUserHandbook);
     connect_menu(ui->action_Restart, &MainWindow::OnRestartGame);
-    action_prepare_shaders_now = new QAction(tr("Prepare &Shaders Now"), this);
+    action_prepare_shaders_now = TranslatedAction(QT_TRANSLATE_NOOP("MainWindow", "Prepare &Shaders Now"));
     action_prepare_shaders_now->setEnabled(false);
     ui->menu_Emulation->insertAction(ui->action_Configure, action_prepare_shaders_now);
     ui->menu_Emulation->insertSeparator(ui->action_Configure);
@@ -2164,11 +2163,11 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Data_Manager, &MainWindow::OnDataDialog);
 
 #ifdef ENABLE_UPDATE_CHECKER
-    auto* check_action = new QAction(tr("Check for Updates..."), this);
+    auto* check_action = TranslatedAction(QT_TRANSLATE_NOOP("MainWindow", "Check for Updates..."));
     ui->menu_Help->insertAction(ui->action_About, check_action);
     connect(check_action, &QAction::triggered, this, &MainWindow::OnCheckForUpdates);
 
-    auto* rollback_action = new QAction(tr("Roll Back to the Previous Version..."), this);
+    auto* rollback_action = TranslatedAction(QT_TRANSLATE_NOOP("MainWindow", "Roll Back to the Previous Version..."));
     rollback_action->setVisible(false);
     ui->menu_Help->insertAction(ui->action_About, rollback_action);
     connect(ui->menu_Help, &QMenu::aboutToShow, this, [this, rollback_action] {
@@ -4680,7 +4679,7 @@ void MainWindow::OnExportLog() {
 
 void MainWindow::SetUpProfilingMode() {
     // Help > Profiling Mode (both looks), first in the menu: turn it on, play, Export Log.
-    auto* action = new QAction(tr("Profiling Mode"), this);
+    auto* action = TranslatedAction(QT_TRANSLATE_NOOP("MainWindow", "Profiling Mode"));
     action->setCheckable(true);
     action->setChecked(UISettings::values.profiling_mode.GetValue());
     QAction* first = ui->menu_Help->actions().value(0);
@@ -4731,7 +4730,7 @@ void MainWindow::SetUpProfilingMode() {
 
 void MainWindow::SetUpSwitchesWindow() {
     // Help > Known Issues: "Good to know" again (it shows once per version on its own).
-    QAction* const known = new QAction(tr("Known Issues"), this);
+    QAction* const known = TranslatedAction(QT_TRANSLATE_NOOP("MainWindow", "Known Issues"));
     ui->menu_Help->insertAction(ui->action_About, known);
     connect(known, &QAction::triggered, this,
             [this] { FritchiiKnownIssues::Show(this, vk_device_records); });
@@ -4740,7 +4739,8 @@ void MainWindow::SetUpSwitchesWindow() {
     // can restart Fritchii with its launch environment, so the restart doesn't inherit this
     // process's file switches as environment ones (those would beat the file from then on).
     ui->menu_Tools->addSeparator();
-    QAction* action = ui->menu_Tools->addAction(tr("S&witches..."));
+    QAction* action = TranslatedAction(QT_TRANSLATE_NOOP("MainWindow", "S&witches..."));
+    ui->menu_Tools->addAction(action);
     connect(action, &QAction::triggered, this, [this] {
         const bool restart = FritchiiUi::ShowSwitchesWindow(
             this, [this] { return emulation_running || boot_in_progress; });
@@ -6522,24 +6522,16 @@ void MainWindow::UpdateUITheme() {
 #endif
 }
 
-void MainWindow::LoadTranslation() {
-    qApp->removeTranslator(&translator);
-    qApp->removeTranslator(&qt_translator);
-    const auto& language = UISettings::values.language.GetValue();
-    const QLocale locale = language.empty() ? QLocale::system() : QLocale(QString::fromStdString(language));
-    const QString qt_path = QLibraryInfo::path(QLibraryInfo::TranslationsPath);
-    if (qt_translator.load(locale, QStringLiteral("qt"), QStringLiteral("_"), qt_path) ||
-        qt_translator.load(locale, QStringLiteral("qtbase"), QStringLiteral("_"), qt_path)) {
-        qApp->installTranslator(&qt_translator);
-    }
-    if (translator.load(locale, {}, {}, QStringLiteral(":/languages/"))) {
-        qApp->installTranslator(&translator);
-    }
+QAction* MainWindow::TranslatedAction(const char* source) {
+    auto* action = new QAction(tr(source), this);
+    connect(this, &MainWindow::InterfaceLanguageChanged, action,
+            [action, source] { action->setText(MainWindow::tr(source)); });
+    return action;
 }
 
 void MainWindow::OnLanguageChanged(const QString& locale) {
     UISettings::values.language = locale.toStdString();
-    LoadTranslation();
+    translations.Load(locale);
     QList<QAction*> actions = game_size_actions->actions();
     for (size_t i = 0; i < default_game_icon_sizes.size(); i++) {
         actions.at(i)->setText(GetTranslatedGameIconSize(i));

@@ -74,27 +74,23 @@ inline View Make(const Common::FrameBudget::Sample& sample, double fps) {
     return view;
 }
 
-inline QString Tr(const char* text) {
-    return QCoreApplication::translate("FrameBudgetView", text);
-}
-
 /// "GPU", "front", ... for "Limited by ...", empty for none.
 inline QString LimitText(Limit limit) {
     switch (limit) {
     case Limit::Capped:
-        return Tr("Capped");
+        return QCoreApplication::translate("FrameBudgetView", "Capped");
     case Limit::Gpu:
-        return Tr("Limited by GPU");
+        return QCoreApplication::translate("FrameBudgetView", "Limited by GPU");
     case Limit::Front:
-        return Tr("Limited by front");
+        return QCoreApplication::translate("FrameBudgetView", "Limited by front");
     case Limit::Back:
-        return Tr("Limited by back");
+        return QCoreApplication::translate("FrameBudgetView", "Limited by back");
     case Limit::Render:
-        return Tr("Limited by render");
+        return QCoreApplication::translate("FrameBudgetView", "Limited by render");
     case Limit::Game:
-        return Tr("Limited by game");
+        return QCoreApplication::translate("FrameBudgetView", "Limited by game");
     case Limit::Sync:
-        return Tr("Limited by sync");
+        return QCoreApplication::translate("FrameBudgetView", "Limited by sync");
     case Limit::None:
         break;
     }

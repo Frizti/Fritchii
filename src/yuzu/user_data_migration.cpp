@@ -75,7 +75,7 @@ UserDataMigrator::UserDataMigrator(QMainWindow* main_window) {
                 QMessageBox::Retry | QMessageBox::Close, QMessageBox::Retry);
             if (answer != QMessageBox::Retry) {
                 throw std::runtime_error(
-                    "Import recovery was postponed. Relaunch Fritchii to retry.");
+                    QObject::tr("Import recovery was postponed. Relaunch Fritchii to retry.").toStdString());
             }
             Migration::Recover(state_dir);
         }
@@ -158,7 +158,7 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
     QAbstractButton* button = migration_prompt.clickedButton();
 
     if (button == nullptr) {
-        throw std::runtime_error("Import was postponed. Relaunch Fritchii to choose a profile.");
+        throw std::runtime_error(QObject::tr("Import was postponed. Relaunch Fritchii to choose a profile.").toStdString());
     }
     if (button == fresh) {
         Common::FS::ProfileMigration::MarkFresh(FrontendCommon::ProfileImportStateDirectory());
@@ -173,7 +173,7 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
     MigrateUserData(main_window, clear_shaders->isEnabled() && clear_shaders->isChecked(),
                     strategy);
     if (!migrated) {
-        throw std::runtime_error("Import failed. Relaunch Fritchii to retry or recover.");
+        throw std::runtime_error(QObject::tr("Import failed. Relaunch Fritchii to retry or recover.").toStdString());
     }
 }
 
@@ -890,7 +890,7 @@ void UserDataMigrator::AutoImport(QMainWindow* main_window,
     box.addButton(QObject::tr("Start without it"), QMessageBox::RejectRole);
     box.exec();
     if (box.clickedButton() == later) {
-        throw std::runtime_error("The import will be tried again on the next launch.");
+        throw std::runtime_error(QObject::tr("The import will be tried again on the next launch.").toStdString());
     }
     Migration::MarkFresh(state_dir);
 }

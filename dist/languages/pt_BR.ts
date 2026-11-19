@@ -1773,7 +1773,7 @@ Ao ativar, ignora esses avisos e encerra diretamente a emulação.</translation>
         </message>
         <message>
             <source>Brazilian Portuguese (português do Brasil)</source>
-            <translation>Português do Brasil (Brazilian Portuguese)</translation>
+            <translation>Português do Brasil</translation>
         </message>
         <message>
             <source>Polish (polska)</source>
@@ -2150,7 +2150,7 @@ Ao ativar, ignora esses avisos e encerra diretamente a emulação.</translation>
         <name>ConfigureApplets</name>
         <message>
             <source>Form</source>
-            <translation>Forma</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Applets</source>
@@ -2211,7 +2211,7 @@ Ao ativar, ignora esses avisos e encerra diretamente a emulação.</translation>
         <name>ConfigureCpu</name>
         <message>
             <source>Form</source>
-            <translation>Formato</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>CPU</source>
@@ -2239,7 +2239,7 @@ Ao ativar, ignora esses avisos e encerra diretamente a emulação.</translation>
         </message>
         <message>
             <source>Set by EDEN_HYBRID_CORES=%1 in Tools &gt; Switches.</source>
-            <translation>Definido por EDEN_HYBRID_CORES=%1 em Ferramentas &gt; Switches.</translation>
+            <translation>Definido por EDEN_HYBRID_CORES=%1 em Ferramentas &gt; Parâmetros de inicialização.</translation>
         </message>
         <message>
             <source>Your GPU threads already have their own P-cores.</source>
@@ -2254,7 +2254,7 @@ Ao ativar, ignora esses avisos e encerra diretamente a emulação.</translation>
         <name>ConfigureCpuDebug</name>
         <message>
             <source>Form</source>
-            <translation>Formato</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>CPU</source>
@@ -2706,7 +2706,7 @@ Ao ativar, ignora esses avisos e encerra diretamente a emulação.</translation>
         <name>ConfigureDebugTab</name>
         <message>
             <source>Form</source>
-            <translation>Forma</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Debug</source>
@@ -2831,7 +2831,7 @@ Ao ativar, ignora esses avisos e encerra diretamente a emulação.</translation>
         <name>ConfigureFilesystem</name>
         <message>
             <source>Form</source>
-            <translation>Formato</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Filesystem</source>
@@ -3014,7 +3014,7 @@ Gostaria de deletar o salvamento antigo?</translation>
         <name>ConfigureGeneral</name>
         <message>
             <source>Form</source>
-            <translation>Formato</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>General</source>
@@ -3097,7 +3097,7 @@ Suas configurações atuais serão salvas primeiro: Restaurar configurações as
         <name>ConfigureGraphics</name>
         <message>
             <source>Form</source>
-            <translation>Formato</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Graphics</source>
@@ -3593,7 +3593,7 @@ Exclusivo pode reduzir um pouco o atraso.</translation>
         <name>ConfigureGraphicsAdvanced</name>
         <message>
             <source>Form</source>
-            <translation>Formato</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Advanced</source>
@@ -3608,7 +3608,7 @@ Exclusivo pode reduzir um pouco o atraso.</translation>
         <name>ConfigureGraphicsExtensions</name>
         <message>
             <source>Form</source>
-            <translation>Formar</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Extras</source>
@@ -3989,7 +3989,7 @@ Exclusivo pode reduzir um pouco o atraso.</translation>
         <name>ConfigureInputPerGame</name>
         <message>
             <source>Form</source>
-            <translation>Forma</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Graphics</source>
@@ -4663,7 +4663,7 @@ Os valores atuais são %1% e %2% respectivamente.</translation>
         <name>ConfigureNetwork</name>
         <message>
             <source>Form</source>
-            <translation>Forma</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Network</source>
@@ -4863,7 +4863,7 @@ Os valores atuais são %1% e %2% respectivamente.</translation>
         <name>ConfigurePerGameAddons</name>
         <message>
             <source>Form</source>
-            <translation>Forma</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Add-Ons</source>
@@ -5065,7 +5065,7 @@ Uma vez deletado, esses NÃO podem ser recuperados. Você tem 100% de certeza qu
         <name>ConfigureProfileManager</name>
         <message>
             <source>Form</source>
-            <translation>Formato</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Profiles</source>
@@ -5267,7 +5267,7 @@ UUID: %2</translation>
         <name>ConfigureSystem</name>
         <message>
             <source>Form</source>
-            <translation>Formato</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>System</source>
@@ -5497,7 +5497,7 @@ Arrasta os pontos para mudar a posição, ou dá duplo-clique nas células da ta
         <name>ConfigureUi</name>
         <message>
             <source>Form</source>
-            <translation>Formato</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>UI</source>
@@ -5680,7 +5680,7 @@ Arrasta os pontos para mudar a posição, ou dá duplo-clique nas células da ta
         <name>ConfigureWeb</name>
         <message>
             <source>Form</source>
-            <translation>Formato</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Web</source>
@@ -5776,7 +5776,7 @@ Arrasta os pontos para mudar a posição, ou dá duplo-clique nas células da ta
         <name>DataWidget</name>
         <message>
             <source>Form</source>
-            <translation>Formar</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Tooltip</source>
@@ -7147,7 +7147,7 @@ ou clique para procurar</translation>
         </message>
         <message>
             <source>Use recommended</source>
-            <translation>Usar recomendado</translation>
+            <translation>Usar configurações recomendadas</translation>
         </message>
         <message>
             <source>Keep my settings</source>
@@ -7758,7 +7758,7 @@ Use este recurso apenas para instalar atualizações e DLCs.</translation>
         </message>
         <message>
             <source>S&amp;witches...</source>
-            <translation>C&amp;onfigurações...</translation>
+            <translation>Parâ&amp;metros de inicialização...</translation>
         </message>
         <message>
             <source>Export Log...</source>
@@ -9486,7 +9486,7 @@ p, li { white-space: pre-wrap; }
         <name>PerformanceOverlay</name>
         <message>
             <source>Form</source>
-            <translation>Forma</translation>
+            <translation>Formulário</translation>
         </message>
         <message>
             <source>Frametime</source>
@@ -11020,6 +11020,22 @@ Isso é recomendado se você quiser compartilhar dados entre emuladores.</transl
         <message>
             <source>Title %1 not found in Ryujinx title database.</source>
             <translation>Título %1 não encontrado na base de dados de títulos do Ryujinx.</translation>
+        </message>
+        <message>
+            <source>Import recovery was postponed. Relaunch Fritchii to retry.</source>
+            <translation>A recuperação da importação foi adiada. Abra o Fritchii novamente para tentar de novo.</translation>
+        </message>
+        <message>
+            <source>Import was postponed. Relaunch Fritchii to choose a profile.</source>
+            <translation>A importação foi adiada. Abra o Fritchii novamente para escolher um perfil.</translation>
+        </message>
+        <message>
+            <source>Import failed. Relaunch Fritchii to retry or recover.</source>
+            <translation>Falha na importação. Abra o Fritchii novamente para tentar de novo ou recuperar o perfil.</translation>
+        </message>
+        <message>
+            <source>The import will be tried again on the next launch.</source>
+            <translation>O Fritchii tentará importar novamente na próxima inicialização.</translation>
         </message>
     </context>
     <context>
@@ -12847,6 +12863,37 @@ A maioria dos mods é do tipo RomFS, mas patches (.pchtxt) geralmente são mods 
         <message>
             <source>Failed to create or open shader cache for this title, ensure your app data directory has write permissions.</source>
             <translation>Falha ao criar ou abrir o cache de shaders para este título. Certifique-se de que o diretório de dados do aplicativo tenha permissões de gravação.</translation>
+        </message>
+    </context>
+    <context>
+        <name>FrameBudgetView</name>
+        <message>
+            <source>Capped</source>
+            <translation>Limite de FPS ativo</translation>
+        </message>
+        <message>
+            <source>Limited by GPU</source>
+            <translation>Limitado pela GPU</translation>
+        </message>
+        <message>
+            <source>Limited by front</source>
+            <translation>Limitado pela entrada da GPU</translation>
+        </message>
+        <message>
+            <source>Limited by back</source>
+            <translation>Limitado pelo processamento da GPU</translation>
+        </message>
+        <message>
+            <source>Limited by render</source>
+            <translation>Limitado pela renderização</translation>
+        </message>
+        <message>
+            <source>Limited by game</source>
+            <translation>Limitado pelo jogo</translation>
+        </message>
+        <message>
+            <source>Limited by sync</source>
+            <translation>Limitado pela sincronização</translation>
         </message>
     </context>
 </TS>
