@@ -4241,6 +4241,9 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
             break;
         default:
             OcclFlag::t_census = Census::OffOther;
+            OcclFlag::Add(stats.off_other_class[pipeline->IsMeshPipeline()
+                              ? 16 + static_cast<size_t>(ClassifyOcclPixel(*pipeline)) % 16
+                              : static_cast<size_t>(pipeline_class) % 16]);
             break;
         }
         OcclFlag::Add(stats.not_lean);

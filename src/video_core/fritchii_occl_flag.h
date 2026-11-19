@@ -182,6 +182,9 @@ struct Stats {
     /// Colour pre-pass candidates (subgroup or quad colour Lean draws) by the first check that
     /// refused them (index: see ColourPrepassReasonNames).
     std::atomic<u64> cpp_reason[16]{};
+    /// Colour-off counted draws in "off other", by pipeline class (OcclLean::PipelineClass) and,
+    /// for mesh pipelines, by pixel class + 16.
+    std::atomic<u64> off_other_class[32]{};
     std::atomic<u64> qslot_injectable{}; ///< query slots whose draws were all flag or colour Lean
     std::atomic<u64> qslot_blocked{};    ///< query slots with a blocking draw
     std::atomic<u64> qslot_empty{};      ///< query slots with no counted draw marked
@@ -280,7 +283,7 @@ inline void MaybeLog() {
              "Occlusion flag census per second: counted draws by class: {}; colour Lean "
              "pipelines {} distinct in the window; colour Lean subgroup draws by operation: vote "
              "{:.0f}, mask {:.0f}, shuffle {:.0f}, invocation id {:.0f}, helper {:.0f}; colour "
-             "pre-pass candidates by outcome: {}; query "
+"pre-pass candidates by outcome: {}; off other by class: {}; query "
              "slots closed: {:.0f} all flag or colour Lean, "
              "{:.0f} blocked, {:.0f} no draw marked",
              census, g.colour_lean_pipelines.exchange(0, std::memory_order_relaxed),
@@ -296,6 +299,17 @@ inline void MaybeLog() {
                      }
                  }
                  return reasons.empty() ? std::string{"none"} : reasons;
+             }(),
+             [&g, &take] {
+                 std::string classes;
+                 for (size_t i = 0; i < 32; ++i) {
+                     const double v = take(g.off_other_class[i]);
+                     if (v > 0) {
+                         classes += fmt::format("{}{}{} {:.0f}", classes.empty() ? "" : ", ",
+                                                i >= 16 ? "mesh pixel " : "", i % 16, v);
+                     }
+                 }
+                 return classes.empty() ? std::string{"none"} : classes;
              }(),
              take(g.qslot_injectable),
              take(g.qslot_blocked), take(g.qslot_empty));
