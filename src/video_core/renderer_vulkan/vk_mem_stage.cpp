@@ -709,7 +709,7 @@ MemStage::~MemStage() {
         SeamHook::g_tick_watch.store(false, std::memory_order_release);
     }
     if (pending) {
-        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        ClearPendingWatch();
     }
     if (held != HeldKind::None) {
         SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
@@ -751,7 +751,12 @@ void MemStage::SetPending() {
             }
             UpdateUnplayed();
         }
-        SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
+        if (OneFollowerFill()) {
+            pending_engine = true;
+            SeamHook::g_watch_engine.value.store(1, std::memory_order_relaxed);
+        } else {
+            SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -814,7 +819,7 @@ void MemStage::PlayPending([[maybe_unused]] bool late) {
         UpdateUnplayed();
     }
     last_entry = ~0U;
-    SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    ClearPendingWatch();
 }
 
 void MemStage::Play() {
@@ -1265,7 +1270,7 @@ void MemStage::TakeHeld(HeldKind kind) {
     last_entry = ~0U;
     if (pending) {
         pending = false;
-        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        ClearPendingWatch();
     }
     held = kind;
     t_holding = true;
@@ -1949,7 +1954,7 @@ void MemStage::PushRingDraw() {
     last_entry = ~0U;
     if (pending) {
         pending = false;
-        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        ClearPendingWatch();
     }
     ring_pushed = true;
     t_holding = false;
@@ -2097,7 +2102,7 @@ bool MemStage::PostPendingOp() {
     play_cursor = end;
     pending = false;
     last_entry = ~0U;
-    SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    ClearPendingWatch();
     UpdateUnplayed();
     return true;
 }
@@ -2323,7 +2328,7 @@ void MemStage::PushRingDispatch(const std::vector<u32>& values, bool null_pointe
     last_entry = ~0U;
     if (pending) {
         pending = false;
-        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        ClearPendingWatch();
     }
     ring_pushed = true;
     t_holding = false;

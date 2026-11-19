@@ -992,6 +992,15 @@ private:
     std::array<DiffSite, DIFF_SITES> diff_site_table{};
     bool claim_deferring{};
     bool pending{};
+    bool pending_engine{}; ///< `pending` counted in SeamHook::g_watch_engine (E's fill)
+    /// Uncounts `pending` from the word SetPending counted it in.
+    void ClearPendingWatch() noexcept {
+        if (std::exchange(pending_engine, false)) {
+            SeamHook::g_watch_engine.value.store(0, std::memory_order_relaxed);
+        } else {
+            SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
     /// The site of the bracket the first pending entry was recorded in (PostPendingOp).
     Site pending_site{Site::Count};
     u32 play_cursor{};

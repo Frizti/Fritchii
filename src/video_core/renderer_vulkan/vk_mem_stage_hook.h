@@ -26,6 +26,15 @@ enum class Use : u8 {
 
 inline std::atomic<u32> g_watch{0};
 
+/// E's pending entries (a one follower fill on E or E2): 0 or 1, set and cleared with plain
+/// stores by the one fill thread, on a line of its own. g_watch is RMW'd by R too, and E paid a
+/// locked RMW on R's hot line twice a draw for it.
+struct alignas(64) EngineWatch {
+    std::atomic<u32> value{0};
+    u8 pad[60]{};
+};
+inline EngineWatch g_watch_engine{};
+
 void OnUse(Use use, const std::source_location& location);
 
 /// This thread holds a filled draw or dispatch packet (SEAM = 2/3) whose plays have not run yet:
@@ -34,7 +43,8 @@ void OnUse(Use use, const std::source_location& location);
 
 inline void Watch(Use use,
                   const std::source_location& location = std::source_location::current()) {
-    if (g_watch.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+    if (g_watch.load(std::memory_order_relaxed) != 0 ||
+        g_watch_engine.value.load(std::memory_order_relaxed) != 0) [[unlikely]] {
         OnUse(use, location);
     }
 }

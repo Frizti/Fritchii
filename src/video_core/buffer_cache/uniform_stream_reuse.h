@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <cstdlib>
@@ -38,12 +39,20 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
 };
 
 /// EDEN_NX2_UBOREUSE=0 turns the reuse off (every small uniform buffer is copied, as before).
+/// The switch reads below are cached in plain atomics (-1: not read yet), not in function-local
+/// statics: a streamed bind made several of these calls, each a thread-safe-static guard check
+/// (a TLS epoch read) on the back's hottest path.
+inline std::atomic<int> g_uboreuse_switch{-1};
+inline std::atomic<int> g_ubo_inplace_switch{-1};
+
 [[nodiscard]] inline bool UniformStreamReuseEnabled() noexcept {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_UBOREUSE");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
+    int value = g_uboreuse_switch.load(std::memory_order_relaxed);
+    if (value < 0) [[unlikely]] {
+        const char* const env = std::getenv("EDEN_NX2_UBOREUSE");
+        value = (env == nullptr || env[0] != '0') ? 1 : 0;
+        g_uboreuse_switch.store(value, std::memory_order_relaxed);
+    }
+    return value != 0;
 }
 
 /// EDEN_NX2_UBO_INPLACE=1 (default off): BindSmallUniformReusing compares a buffer whose device
@@ -52,10 +61,13 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
 /// copied at all; changed ones are copied once into the slot and the stream copy is made from the
 /// slot, so the two never differ (as the scratch snapshot guaranteed before).
 [[nodiscard]] inline bool UniformInPlaceCompareEnabled() noexcept {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_UBO_INPLACE");
-        return value != nullptr && value[0] != '0';
-    }();
+    int value = g_ubo_inplace_switch.load(std::memory_order_relaxed);
+    if (value < 0) [[unlikely]] {
+        const char* const env = std::getenv("EDEN_NX2_UBO_INPLACE");
+        value = (env != nullptr && env[0] != '0') ? 1 : 0;
+        g_ubo_inplace_switch.store(value, std::memory_order_relaxed);
+    }
+    const bool enabled = value != 0;
     // EXP93 (live, 0 = as the env says, 1 = on): the same, switchable in one session. Both modes
     // compare against the slot's own bytes, so a change between two binds is safe.
     return enabled || VideoCore::Nx2Debug::Experiment(93) != 0;
@@ -157,8 +169,23 @@ public:
 };
 
 template <class Ref>
-[[nodiscard]] inline UniformStreamReuse<Ref>& UniformStreamReuseState() noexcept {
+[[nodiscard]] inline UniformStreamReuse<Ref>& UniformStreamReuseStateSlow() noexcept {
     static UniformStreamReuse<Ref> state;
+    return state;
+}
+
+/// The state's address once made (no thread-safe-static guard on the bind path).
+template <class Ref>
+inline std::atomic<UniformStreamReuse<Ref>*> g_uniform_reuse_state{nullptr};
+
+template <class Ref>
+[[nodiscard]] inline UniformStreamReuse<Ref>& UniformStreamReuseState() noexcept {
+    if (UniformStreamReuse<Ref>* const state =
+            g_uniform_reuse_state<Ref>.load(std::memory_order_acquire)) [[likely]] {
+        return *state;
+    }
+    UniformStreamReuse<Ref>& state = UniformStreamReuseStateSlow<Ref>();
+    g_uniform_reuse_state<Ref>.store(&state, std::memory_order_release);
     return state;
 }
 
