@@ -142,6 +142,8 @@ struct HostBindings {
     boost::container::static_vector<u64, NUM_VERTEX_BUFFERS> strides;
     u32 min_index{NUM_VERTEX_BUFFERS};
     u32 max_index{0};
+    /// Full vertex binds: a run of bindings that are not dirty (the player keeps the bound size).
+    bool clean{false};
 };
 
 class BufferCacheChannelInfo : public ChannelInfo {

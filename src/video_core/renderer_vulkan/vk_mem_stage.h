@@ -74,6 +74,7 @@ public:
         Barrier = 2,
         DynamicState = 4,
         ForgetOnly = 8,
+        KeepSize = 0x10, ///< Full vertex binds: a clean run, dropped while still bound at any size
         Played = 0x80, ///< Played early by a sync inside a held fill (SEAM = 2)
     };
 

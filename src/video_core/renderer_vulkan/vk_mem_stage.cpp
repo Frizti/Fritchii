@@ -5330,11 +5330,14 @@ void MemPlayer::PlayVertices(u8 flags, u32 first, u32 binding_count, const VkBuf
     // registers.
     if (!VideoCommon::Nx2Perf::Verify()) {
         const u64 epoch = scheduler.VertexEpoch();
+        // A clean run (full vertex binds) only re-states what is bound: still bound at any size,
+        // as before full binds (its size follows the draw, the binding did not change).
+        const bool keep_size = (flags & MemStage::KeepSize) != 0;
         bool unchanged = true;
         for (u32 i = 0; unchanged && i < binding_count; ++i) {
             const BoundVertexBuffer& bound = bound_vertex_buffers[first + i];
             unchanged = bound.epoch == epoch && bound.buffer == handles[i] &&
-                        bound.offset == offsets[i] && bound.size == sizes[i] &&
+                        bound.offset == offsets[i] && (keep_size || bound.size == sizes[i]) &&
                         bound.stride == strides[i];
         }
         if (unchanged) {

@@ -4361,6 +4361,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
                 return;
             }
             bindings.max_index = bindings.min_index + static_cast<u32>(bindings.buffers.size());
+            bindings.clean = !run_dirty;
             runtime.BindVertexBuffers(bindings);
             bindings = HostBindings<Buffer>{};
             last_index = (std::numeric_limits<u32>::max)();

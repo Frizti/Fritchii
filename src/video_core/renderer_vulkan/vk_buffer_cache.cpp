@@ -1105,7 +1105,9 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     // min_binding is bindings.min_index here (binding_count is 0 otherwise). The player skips the
     // rebind when the same buffers are still bound in this command buffer.
     mem_stage.PushVertices(
-        device.IsExtExtendedDynamicStateSupported() ? MemStage::DynamicState : 0,
+        static_cast<u8>(
+            (device.IsExtExtendedDynamicStateSupported() ? MemStage::DynamicState : 0) |
+            (bindings.clean ? MemStage::KeepSize : 0)),
         bindings.min_index,
         std::span<const VkBuffer>{buffer_handles.data(), binding_count},
         std::span<const VkDeviceSize>{bindings.offsets.data(), binding_count},
