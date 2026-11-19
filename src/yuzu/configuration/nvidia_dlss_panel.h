@@ -14,6 +14,7 @@ class QLabel;
 class QPushButton;
 
 class NvidiaDlssPanel : public QWidget {
+    Q_OBJECT
 public:
     explicit NvidiaDlssPanel(QWidget* parent);
 

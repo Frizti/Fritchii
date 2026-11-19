@@ -8,6 +8,7 @@
 class QListWidget;
 
 class ProfileAvatarDialog : public QDialog {
+    Q_OBJECT
 public:
     explicit ProfileAvatarDialog(QWidget* parent);
     ~ProfileAvatarDialog();

@@ -1177,7 +1177,8 @@ void ConfigureInputPlayer::UpdateInputDevices() {
     input_devices = input_subsystem->GetInputDevices();
     ui->comboDevices->clear();
     for (const auto& device : input_devices) {
-        ui->comboDevices->addItem(QString::fromStdString(device.Get("display", "Unknown")), {});
+        const auto name = device.Get("display", "");
+        ui->comboDevices->addItem(name.empty() ? tr("Unknown") : QString::fromStdString(name), {});
     }
 }
 

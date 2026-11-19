@@ -53,11 +53,13 @@ void MainWindow::SetUpFritchiiUi() {
         }
     };
 
-    FritchiiUi::RestructureMenus(
+    auto translate_menus = FritchiiUi::RestructureMenus(
         *ui, *this,
         {.export_log = [this] { OnExportLog(); },
          .whats_new = [this] { FritchiiUi::ShowWhatsNew(this); },
          .delete_shader_cache = [delete_shader_cache] { delete_shader_cache(OcarinaOfTime); }});
+
+    connect(this, &MainWindow::InterfaceLanguageChanged, this, std::move(translate_menus));
 
     // "What's new" once per version after an update, when nothing else is on screen: no other
     // dialog (first-launch question, update offer, restart note) and no game running.
@@ -111,7 +113,10 @@ void MainWindow::SetUpFritchiiUi() {
         .open_effects = [this] { OnPostProcessingShaders(); },
 #endif
     };
-    statusBar()->insertPermanentWidget(0, FritchiiUi::MakeGraphicsButton(this, graphics));
+    auto* graphics_button = FritchiiUi::MakeGraphicsButton(this, graphics);
+    statusBar()->insertPermanentWidget(0, graphics_button);
+    connect(this, &MainWindow::InterfaceLanguageChanged, graphics_button,
+            [graphics_button] { graphics_button->setText(QObject::tr("GRAPHICS")); });
 
     // Home screen and rail.
     FritchiiUi::HomeHooks home{
@@ -137,6 +142,7 @@ void MainWindow::SetUpFritchiiUi() {
     };
     fritchii_home = new FritchiiUi::Home(this, ui->horizontalLayout, game_list,
                                          game_list_placeholder, std::move(home));
+    connect(this, &MainWindow::InterfaceLanguageChanged, fritchii_home, &FritchiiUi::Home::Retranslate);
     connect(this, &MainWindow::EmulationStarting, fritchii_home,
             &FritchiiUi::Home::OnEmulationStarting);
 

@@ -45,7 +45,7 @@ struct MenuHooks {
     std::function<void()> delete_shader_cache; ///< OoT's, after a confirmation
 };
 /// Plain names and Fritchii's grouping for the classic menus (File, Game, View, Tools, Help).
-void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& hooks);
+std::function<void()> RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& hooks);
 
 struct GraphicsHooks {
     std::function<void()> refresh;          ///< after a change: update the status bar state

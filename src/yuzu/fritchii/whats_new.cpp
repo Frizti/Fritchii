@@ -10,6 +10,7 @@
 #include <QFile>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLocale>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QStringList>
@@ -38,7 +39,8 @@ QString CleanReleaseNotes(const QString& markdown) {
     for (int i = 0; i < head; ++i) {
         if (lines[i].trimmed() == QStringLiteral("---")) {
             const QString before = lines.mid(0, i).join(QLatin1Char('\n'));
-            if (before.contains(QStringLiteral("Download"), Qt::CaseInsensitive)) {
+            if (before.contains(QStringLiteral("Download"), Qt::CaseInsensitive) ||
+                before.contains(QStringLiteral("Baixe"), Qt::CaseInsensitive)) {
                 lines = lines.mid(i + 1);
             }
             break;
@@ -50,7 +52,12 @@ QString CleanReleaseNotes(const QString& markdown) {
 QString BundledNotes() {
     // FRITCHII_NOTES_PREVIEW=<notes.md> shows a draft before it is bundled (for the release notes).
     const QString preview = qEnvironmentVariable("FRITCHII_NOTES_PREVIEW");
-    QFile file(preview.isEmpty() ? QStringLiteral(":/fritchii/whats-new.md") : preview);
+    const auto& language = UISettings::values.language.GetValue();
+    const QLocale locale = language.empty() ? QLocale::system() : QLocale(QString::fromStdString(language));
+    const QString bundled = locale.name() == QStringLiteral("pt_BR")
+                                ? QStringLiteral(":/fritchii/whats-new.pt_BR.md")
+                                : QStringLiteral(":/fritchii/whats-new.md");
+    QFile file(preview.isEmpty() ? bundled : preview);
     if (!file.open(QFile::ReadOnly | QFile::Text)) {
         return {};
     }

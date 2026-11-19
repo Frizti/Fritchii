@@ -40,10 +40,6 @@ namespace {
 
 namespace FfxRuntime = Vulkan::FfxRuntime;
 
-QString Tr(const char* text) {
-    return QCoreApplication::translate("AmdFsr4Panel", text);
-}
-
 QString PathText(const std::filesystem::path& path) {
     return QString::fromStdWString(path.wstring());
 }
@@ -116,15 +112,15 @@ AmdFsr4Panel::AmdFsr4Panel(QWidget* parent) : QWidget(parent) {
     QHBoxLayout* button_row = new QHBoxLayout;
     button_row->setContentsMargins(24, 0, 0, 0);
     download_button = new QPushButton(this);
-    folder_button = new QPushButton(Tr("Open Folder"), this);
+    folder_button = new QPushButton(tr("Open Folder"), this);
     QLabel* about = new QLabel(
         QStringLiteral("<a href=\"%1\">%2</a>")
             .arg(QString::fromUtf8(FfxRuntime::RELEASE_PAGE.data(),
                                    static_cast<qsizetype>(FfxRuntime::RELEASE_PAGE.size())),
-                 Tr("Where do these files come from?")),
+                 tr("Where do these files come from?")),
         this);
     about->setOpenExternalLinks(true);
-    about->setToolTip(Tr("AMD's FidelityFX SDK release on GitHub. The files are in "
+    about->setToolTip(tr("AMD's FidelityFX SDK release on GitHub. The files are in "
                          "Kits\\FidelityFX\\signedbin."));
     button_row->addWidget(download_button);
     button_row->addWidget(folder_button);
@@ -156,16 +152,16 @@ void AmdFsr4Panel::Refresh() {
     icon_label->setText(ready ? QStringLiteral("<span style=\"color:#2ea043\">&#10004;</span>")
                               : QStringLiteral("<span style=\"color:#d29922\">&#9888;</span>"));
     status_label->setText(
-        ready ? Tr("<b>Ready.</b> Found AMD's FidelityFX runtime from FidelityFX SDK %1. FSR 4 runs "
+        ready ? tr("<b>Ready.</b> Found AMD's FidelityFX runtime from FidelityFX SDK %1. FSR 4 runs "
                    "if AMD's driver offers it for this GPU; otherwise FSR 3.1 does.")
                     .arg(version)
-              : Tr("<b>AMD's files needed:</b> the FidelityFX runtime from AMD's FidelityFX SDK %1 "
+              : tr("<b>AMD's files needed:</b> the FidelityFX runtime from AMD's FidelityFX SDK %1 "
                    "(amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll). Until then, "
                    "FSR 3.1 is used.")
                     .arg(version));
-    status_label->setToolTip(Tr("Folder: %1").arg(PathText(FfxRuntime::Folder())));
+    status_label->setToolTip(tr("Folder: %1").arg(PathText(FfxRuntime::Folder())));
     download_button->setText(
-        Tr("Download from AMD (%1 MB)").arg((DownloadSize() + (1 << 20) - 1) >> 20));
+        tr("Download from AMD (%1 MB)").arg((DownloadSize() + (1 << 20) - 1) >> 20));
     download_button->setVisible(!ready);
 }
 
@@ -173,8 +169,8 @@ void AmdFsr4Panel::Download() {
     const std::filesystem::path folder = FfxRuntime::Folder();
     const auto fail = [this](const std::string& error) {
         LOG_ERROR(Frontend, "AMD FSR 4 download failed: {}", error);
-        QMessageBox::warning(this, Tr("AMD FSR 4"),
-                             Tr("Could not download AMD's files: %1. FSR 3.1 is used.")
+        QMessageBox::warning(this, tr("AMD FSR 4"),
+                             tr("Could not download AMD's files: %1. FSR 3.1 is used.")
                                  .arg(QString::fromStdString(error)));
         Refresh();
     };
@@ -182,8 +178,8 @@ void AmdFsr4Panel::Download() {
     std::string error;
     std::optional<std::string> licence;
     {
-        QProgressDialog busy(Tr("Contacting AMD's download..."), QString{}, 0, 0, this);
-        busy.setWindowTitle(Tr("AMD FSR 4"));
+        QProgressDialog busy(tr("Contacting AMD's download..."), QString{}, 0, 0, this);
+        busy.setWindowTitle(tr("AMD FSR 4"));
         busy.setWindowModality(Qt::WindowModal);
         busy.setMinimumDuration(0);
         busy.show();
@@ -196,10 +192,10 @@ void AmdFsr4Panel::Download() {
     }
 
     QDialog dialog(this);
-    dialog.setWindowTitle(Tr("Download AMD FSR 4"));
+    dialog.setWindowTitle(tr("Download AMD FSR 4"));
     QVBoxLayout* layout = new QVBoxLayout(&dialog);
     QLabel* intro = new QLabel(
-        Tr("Fritchii will download amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll "
+        tr("Fritchii will download amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll "
            "from AMD's FidelityFX SDK %1 release on GitHub into %2.<br>These files are AMD's, under "
            "AMD's licence terms below. Fritchii checks AMD's signature before using them.")
             .arg(QString::fromUtf8(FfxRuntime::SDK_VERSION.data(),
@@ -211,7 +207,7 @@ void AmdFsr4Panel::Download() {
     licence_text->setReadOnly(true);
     licence_text->setMinimumSize(640, 380);
     QDialogButtonBox* buttons = new QDialogButtonBox(&dialog);
-    buttons->addButton(Tr("Accept and Download"), QDialogButtonBox::AcceptRole);
+    buttons->addButton(tr("Accept and Download"), QDialogButtonBox::AcceptRole);
     buttons->addButton(QDialogButtonBox::Cancel);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
@@ -222,8 +218,8 @@ void AmdFsr4Panel::Download() {
         return;
     }
 
-    QProgressDialog progress(Tr("Downloading AMD's FSR 4 files..."), Tr("Cancel"), 0, 1000, this);
-    progress.setWindowTitle(Tr("AMD FSR 4"));
+    QProgressDialog progress(tr("Downloading AMD's FSR 4 files..."), tr("Cancel"), 0, 1000, this);
+    progress.setWindowTitle(tr("AMD FSR 4"));
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(0);
     progress.setValue(0);
@@ -295,7 +291,7 @@ void AmdFsr4Panel::Download() {
     progress.setValue(1000);
     progress.close();
     Refresh();
-    QMessageBox::information(this, Tr("AMD FSR 4"),
-                             Tr("AMD's FSR 4 runtime is ready. It is used the next time a game "
+    QMessageBox::information(this, tr("AMD FSR 4"),
+                             tr("AMD's FSR 4 runtime is ready. It is used the next time a game "
                                 "starts."));
 }

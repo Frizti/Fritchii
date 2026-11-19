@@ -13,6 +13,7 @@ class QLabel;
 class QPushButton;
 
 class AmdFsr4Panel : public QWidget {
+    Q_OBJECT
 public:
     explicit AmdFsr4Panel(QWidget* parent);
 

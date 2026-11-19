@@ -96,7 +96,7 @@ ConfigureUi::ConfigureUi(Core::System& system_, QWidget* parent)
     InitializeLanguageComboBox();
 
     for (const auto& theme : UISettings::themes) {
-        ui->theme_combobox->addItem(QString::fromUtf8(theme.first),
+        ui->theme_combobox->addItem(tr(theme.first),
                                     QString::fromUtf8(theme.second));
     }
 
@@ -209,6 +209,12 @@ void ConfigureUi::changeEvent(QEvent* event) {
 
 void ConfigureUi::RetranslateUI() {
     ui->retranslateUi(this);
+    ui->language_combobox->setItemText(0, tr("<System>"));
+    ui->language_combobox->setItemText(1, tr("English"));
+    int theme_index = 0;
+    for (const auto& theme : UISettings::themes) {
+        ui->theme_combobox->setItemText(theme_index++, tr(theme.first));
+    }
 
     for (int i = 0; i < ui->folder_icon_size_combobox->count(); i++) {
         ui->folder_icon_size_combobox->setItemText(
@@ -231,8 +237,12 @@ void ConfigureUi::InitializeLanguageComboBox() {
         QString locale = it.next();
         locale.truncate(locale.lastIndexOf(QLatin1Char{'.'}));
         locale.remove(0, locale.lastIndexOf(QLatin1Char{'/'}) + 1);
-        const QString lang = QLocale::languageToString(QLocale(locale).language());
-        const QString country = QLocale::territoryToString(QLocale(locale).territory());
+        if (locale == QStringLiteral("en")) {
+            continue;
+        }
+        const QLocale language(locale);
+        const QString lang = language.nativeLanguageName();
+        const QString country = language.nativeTerritoryName();
         ui->language_combobox->addItem(QStringLiteral("%1 (%2)").arg(lang, country), locale);
     }
 

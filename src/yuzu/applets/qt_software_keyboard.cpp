@@ -1068,7 +1068,7 @@ void QtSoftwareKeyboardDialog::ChangeBottomOSKIndex() {
             ui->button_shift_shift->setIconSize(ui->button_shift->iconSize());
             ui->button_backspace_shift->setIconSize(ui->button_backspace->iconSize());
 
-            ui->label_shift_shift->setText(QStringLiteral("Caps Lock"));
+            ui->label_shift_shift->setText(tr("Caps Lock"));
 
             bottom_osk_index = BottomOSKIndex::LowerCase;
             ui->bottomOSK->setCurrentIndex(static_cast<int>(bottom_osk_index));
@@ -1082,7 +1082,7 @@ void QtSoftwareKeyboardDialog::ChangeBottomOSKIndex() {
             ui->button_shift_shift->setIconSize(ui->button_shift->iconSize());
             ui->button_backspace_shift->setIconSize(ui->button_backspace->iconSize());
 
-            ui->label_shift_shift->setText(QStringLiteral("Caps Lock Off"));
+            ui->label_shift_shift->setText(tr("Caps Lock Off"));
         }
         break;
     case BottomOSKIndex::NumberPad:

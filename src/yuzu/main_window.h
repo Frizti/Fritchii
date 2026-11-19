@@ -206,6 +206,8 @@ signals:
      */
     void EmulationStopping();
 
+    void InterfaceLanguageChanged();
+
     // Signal that tells widgets to update icons to use the current theme
     void UpdateThemedIcons();
 
@@ -615,7 +617,6 @@ private:
     // Stores what suffix to add to the FPS counter, e.g. Unlocked.
     QString m_fpsSuffix{};
 
-    UserDataMigrator user_data_migrator;
     std::unique_ptr<QtConfig> config;
     bool launched_with_game = false; ///< Started with a game path (skips the first-launch question)
 
@@ -650,6 +651,7 @@ private:
 
     HotkeyRegistry hotkey_registry;
 
+    QTranslator qt_translator;
     QTranslator translator;
 
     // Install progress dialog

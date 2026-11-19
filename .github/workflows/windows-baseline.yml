@@ -1,0 +1,212 @@
+name: Hakas Fritchii 6.2 Windows
+
+# CI for review only. Does not modify nx2, tag commits, or publish releases.
+on:
+  push:
+    branches: [feat/pt-br-v6.2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hakas-windows-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-baseline:
+    name: Build Fritchii 6.2 Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify Fritchii source
+        shell: pwsh
+        run: |
+          $version = (Get-Content dist/frizti_version.txt -Raw).Trim()
+          if ($version -ne "6.2") { throw "Unexpected Fritchii version: $version" }
+          foreach ($source in @("fritchii_ui.cpp", "home.cpp", "precompile_gate.cpp")) {
+            if (-not (Test-Path "src/yuzu/fritchii/$source")) { throw "Missing Fritchii UI source: $source" }
+          }
+
+      - name: Set up Visual Studio 2022 x64 SDK and runtime
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          vsversion: "2022"
+
+      # This follows the maintainer's local toolchain, not the MSVC/MinGW release matrix.
+      # Pin a real LLVM 22 release; windows-2022 currently has LLVM 20 on PATH.
+      # https://github.com/llvm/llvm-project/releases/tag/llvmorg-22.1.8
+      - name: Install pinned clang-cl 22.1.8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $llvmVersion = "22.1.8"
+          $llvmRoot = Join-Path $env:RUNNER_TEMP "hakas-llvm-$llvmVersion"
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$llvmVersion-win64.exe"
+          $uri = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvmVersion/LLVM-$llvmVersion-win64.exe"
+          Invoke-WebRequest -Uri $uri -OutFile $installer
+          $expectedHash = "16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c"
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne $expectedHash) {
+            throw "LLVM installer SHA-256 differs from the pinned release asset"
+          }
+          # LLVM 22's installer is NSIS. /D must be the last argument.
+          $process = Start-Process -FilePath $installer -ArgumentList "/S /D=$llvmRoot" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "LLVM installer failed: $($process.ExitCode)" }
+          $clangCl = Join-Path $llvmRoot "bin/clang-cl.exe"
+          if (-not (Test-Path $clangCl)) { throw "Missing pinned clang-cl: $clangCl" }
+          $versionOutput = & $clangCl --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $versionOutput | Write-Host
+          if (($versionOutput -join [Environment]::NewLine) -notmatch 'clang version 22\.1\.8\b') {
+            throw "Installed clang-cl does not match LLVM $llvmVersion"
+          }
+          if (($versionOutput -join [Environment]::NewLine) -notmatch 'Target: x86_64-pc-windows-msvc') {
+            throw "Expected the Windows x64 MSVC ABI target"
+          }
+          "HAKAS_CLANG_CL=$($clangCl -replace '\\', '/')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          (Join-Path $llvmRoot "bin") | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Qt 6.8.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      # Reuse the SDK installer already employed by the upstream release workflow.
+      # It calls Get-WmiObject, so run it with Windows PowerShell 5.1, not pwsh 7.
+      - name: Install Vulkan SDK
+        shell: powershell
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Check toolchain
+        shell: pwsh
+        run: |
+          cmake --version
+          ninja --version
+          glslangValidator --version
+          & $env:HAKAS_CLANG_CL --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($tool in @("link.exe", "rc.exe", "mt.exe")) {
+            (Get-Command $tool -ErrorAction Stop).Source | Write-Host
+          }
+          if (-not $env:WindowsSdkDir -or -not $env:WindowsSDKVersion) {
+            throw "Visual Studio Windows SDK environment is missing"
+          }
+          $sdkVersion = $env:WindowsSDKVersion.TrimEnd('\')
+          $sdkHeader = Join-Path $env:WindowsSdkDir "Include/$sdkVersion/um/Windows.h"
+          $sdkLibrary = Join-Path $env:WindowsSdkDir "Lib/$sdkVersion/um/x64/kernel32.lib"
+          foreach ($sdkFile in @($sdkHeader, $sdkLibrary)) {
+            if (-not (Test-Path $sdkFile)) { throw "Missing Windows x64 SDK component: $sdkFile" }
+          }
+          Write-Host "Windows SDK: $env:WindowsSdkDir $sdkVersion"
+          Write-Host "Visual C++ runtime/tools: $env:VCToolsInstallDir"
+
+      - name: Restore CMake dependency downloads
+        uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: hakas-win-cpm-v1-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/**', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            hakas-win-cpm-v1-
+
+      - name: Configure localized frontend
+        shell: pwsh
+        run: |
+          cmake -S . -B build/windows-ci -G Ninja `
+            "-DCMAKE_C_COMPILER=$env:HAKAS_CLANG_CL" `
+            "-DCMAKE_CXX_COMPILER=$env:HAKAS_CLANG_CL" `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_TESTING=OFF `
+            -DYUZU_TESTS=OFF `
+            -DYUZU_CMD=ON `
+            -DYUZU_ROOM=OFF `
+            -DYUZU_ROOM_STANDALONE=OFF `
+            -DYUZU_USE_BUNDLED_QT=OFF `
+            -DYUZU_USE_BUNDLED_SDL3=ON `
+            -DENABLE_UPDATE_CHECKER=ON `
+            -DLICHII_BUILD_TAG=hakas-ci-${{ github.run_number }} `
+            -DLICHII_BUILD_PLATFORM=windows-x86_64 `
+            -DUSE_DISCORD_PRESENCE=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Fail before a costly build if CMake silently picked cl.exe or MinGW.
+      # Keep the upstream warning policy and MSVC /MD runtime selection.
+      - name: Verify configured compiler and ABI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($language in @("C", "CXX")) {
+            $metadata = @(Get-ChildItem "build/windows-ci/CMakeFiles/*/CMake$($language)Compiler.cmake")
+            if ($metadata.Count -ne 1) { throw "Expected one CMake $language compiler record" }
+            $compiler = Get-Content $metadata[0].FullName -Raw
+            $prefix = 'set\(CMAKE_' + $language + '_'
+            foreach ($setting in @(
+              ($prefix + 'COMPILER_ID "Clang"\)'),
+              ($prefix + 'COMPILER_VERSION "22\.1\.8"\)'),
+              ($prefix + 'COMPILER_FRONTEND_VARIANT "MSVC"\)'),
+              ($prefix + 'SIMULATE_ID "MSVC"\)')
+            )) {
+              if ($compiler -notmatch $setting) { throw "Unexpected CMake $language compiler metadata: $setting" }
+            }
+            Select-String -Path $metadata[0].FullName -Pattern "COMPILER_ID", "COMPILER_VERSION", "FRONTEND_VARIANT", "SIMULATE_ID", "LINKER"
+          }
+          $cache = Get-Content build/windows-ci/CMakeCache.txt -Raw
+          if ($cache -notmatch '(?m)^ENABLE_WERROR:BOOL=ON\r?$') {
+            throw "Upstream warnings-as-errors must remain enabled"
+          }
+          if ($cache -notmatch '(?m)^Qt6_DIR:PATH=.*msvc2022_64') {
+            throw "CMake did not use the requested MSVC ABI Qt kit"
+          }
+          $commands = Get-Content build/windows-ci/compile_commands.json -Raw | ConvertFrom-Json
+          $coreCommands = @($commands | Where-Object { $_.file -match '[/\\]video_core[/\\]engines[/\\](kepler_compute|maxwell_3d)\.cpp$' })
+          if ($coreCommands.Count -ne 2) { throw "Expected both GPU engine compilation records" }
+          foreach ($entry in $coreCommands) {
+            if ($entry.command -notmatch 'clang-cl\.exe' -or $entry.command -match '/we445[6789]\b') {
+              throw "GPU engine did not select the upstream clang-cl flags: $($entry.file)"
+            }
+          }
+
+      - name: Verify generated Fritchii identity
+        shell: pwsh
+        run: |
+          $identity = Get-Content build/windows-ci/src/common/scm_rev.cpp -Raw
+          if ($identity -notmatch '#define BUILD_NAME "Fritchii"') { throw "Fritchii UI would be disabled by build identity" }
+          if ($identity -notmatch '#define BUILD_VERSION "v6.2"') { throw "Incorrect Fritchii build version" }
+
+      - name: Build localized frontend and CLI
+        shell: pwsh
+        run: |
+          cmake --build build/windows-ci --target yuzu yuzu-cmd --parallel 4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify executables and deploy Qt
+        shell: pwsh
+        run: |
+          foreach ($exe in @("fritchii.exe", "lichii.exe", "eden-cli.exe")) {
+            if (-not (Test-Path "build/windows-ci/bin/$exe")) {
+              throw "Missing expected Windows executable: $exe"
+            }
+          }
+          windeployqt --release build/windows-ci/bin/fritchii.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # A CI artifact is a compile/dependency check, NOT a gameplay-tested Hakas release.
+      - name: Upload Windows CI build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hakas-Fritchii-6.2-pt-BR-Windows-x64-${{ github.sha }}
+          path: build/windows-ci/bin/
+          if-no-files-found: error
+          retention-days: 7

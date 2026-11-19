@@ -207,13 +207,13 @@ QWidget* Home::MakeRail() {
     library_button->setCheckable(true);
     connect(library_button, &QToolButton::clicked, this, &Home::ShowHome);
 
-    QToolButton* settings = RailButton(QStringLiteral("settings"), tr("Settings"));
-    connect(settings, &QToolButton::clicked, this, [this] { hooks.open_settings(); });
+    settings_button = RailButton(QStringLiteral("settings"), tr("Settings"));
+    connect(settings_button, &QToolButton::clicked, this, [this] { hooks.open_settings(); });
 
-    QToolButton* help = RailButton(QStringLiteral("help"), tr("Help"));
-    connect(help, &QToolButton::clicked, this, [this, help] {
+    help_button = RailButton(QStringLiteral("help"), tr("Help"));
+    connect(help_button, &QToolButton::clicked, this, [this] {
         if (hooks.help_menu) {
-            hooks.help_menu->exec(help->mapToGlobal(QPoint(help->width() + 8, 0)));
+            hooks.help_menu->exec(help_button->mapToGlobal(QPoint(help_button->width() + 8, 0)));
         }
     });
 
@@ -221,8 +221,8 @@ QWidget* Home::MakeRail() {
     for (QMenu* menu : hooks.classic_menus) {
         classic->addMenu(menu);
     }
-    QToolButton* menu_button = RailButton(QStringLiteral("menu"), tr("Menu"));
-    connect(menu_button, &QToolButton::clicked, this, [classic, menu_button] {
+    menu_button = RailButton(QStringLiteral("menu"), tr("Menu"));
+    connect(menu_button, &QToolButton::clicked, this, [this, classic] {
         const QSize size = classic->sizeHint();
         classic->exec(menu_button->mapToGlobal(
             QPoint(menu_button->width() + 8, menu_button->height() - size.height())));
@@ -230,8 +230,8 @@ QWidget* Home::MakeRail() {
 
     // Discord and Donate are on the home page itself (MakePage), with their names.
     layout->addWidget(library_button);
-    layout->addWidget(settings);
-    layout->addWidget(help);
+    layout->addWidget(settings_button);
+    layout->addWidget(help_button);
     layout->addStretch(1);
     layout->addWidget(menu_button);
     return rail;
@@ -280,25 +280,25 @@ QWidget* Home::MakePage() {
         return button;
     };
     // v5.8.3: the Saves window (export, import, copy between Fritchii, Eden and Lichii).
-    auto* saves = new QPushButton(Icon(QStringLiteral("list"), 18), tr("Saves"), page);
-    saves->setObjectName(QStringLiteral("FritchiiLink"));
-    saves->setIconSize(QSize(18, 18));
-    saves->setCursor(Qt::PointingHandCursor);
-    saves->setFocusPolicy(Qt::NoFocus);
-    connect(saves, &QPushButton::clicked, this, [this] {
+    saves_button = new QPushButton(Icon(QStringLiteral("list"), 18), tr("Saves"), page);
+    saves_button->setObjectName(QStringLiteral("FritchiiLink"));
+    saves_button->setIconSize(QSize(18, 18));
+    saves_button->setCursor(Qt::PointingHandCursor);
+    saves_button->setFocusPolicy(Qt::NoFocus);
+    connect(saves_button, &QPushButton::clicked, this, [this] {
         ShowSavesWindow(window, hooks.emulation_running);
     });
-    links->addWidget(saves);
+    links->addWidget(saves_button);
     links->addWidget(link(QStringLiteral("community"), tr("Discord"), &OpenDiscord));
     // Buy Me a Coffee (owner, 2026-11-12): the support link in its own yellow, so it is seen.
-    auto* coffee = new QPushButton(IconTinted(QStringLiteral("coffee"), QColor(0x1b, 0x1b, 0x1f), 18),
+    coffee_button = new QPushButton(IconTinted(QStringLiteral("coffee"), QColor(0x1b, 0x1b, 0x1f), 18),
                                    tr("Buy me a coffee"), page);
-    coffee->setObjectName(QStringLiteral("FritchiiCoffee"));
-    coffee->setIconSize(QSize(18, 18));
-    coffee->setCursor(Qt::PointingHandCursor);
-    coffee->setFocusPolicy(Qt::NoFocus);
-    connect(coffee, &QPushButton::clicked, this, [] { OpenDonate(); });
-    links->addWidget(coffee);
+    coffee_button->setObjectName(QStringLiteral("FritchiiCoffee"));
+    coffee_button->setIconSize(QSize(18, 18));
+    coffee_button->setCursor(Qt::PointingHandCursor);
+    coffee_button->setFocusPolicy(Qt::NoFocus);
+    connect(coffee_button, &QPushButton::clicked, this, [] { OpenDonate(); });
+    links->addWidget(coffee_button);
     layout->addLayout(links);
     layout->addSpacing(28);
 
@@ -342,6 +342,16 @@ QWidget* Home::MakePage() {
     layout->addWidget(row_box);
     layout->addStretch(1);
     return page;
+}
+
+void Home::Retranslate() {
+    library_button->setToolTip(tr("Library"));
+    settings_button->setToolTip(tr("Settings"));
+    help_button->setToolTip(tr("Help"));
+    menu_button->setToolTip(tr("Menu"));
+    saves_button->setText(tr("Saves"));
+    coffee_button->setText(tr("Buy me a coffee"));
+    Refresh();
 }
 
 void Home::Refresh() {

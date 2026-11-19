@@ -833,7 +833,7 @@ void UserDataMigrator::AutoImport(QMainWindow* main_window,
             text += QObject::tr("\n\n%1 was too big to copy, so it is shared with the old folder. "
                                 "Keep that folder.")
                         .arg(import.linked.size() == 1 ? import.linked[0]
-                                                       : QStringLiteral("nand and sdmc"));
+                                                       : QObject::tr("nand and sdmc"));
         }
         if (requested) {
             text += QObject::tr("\n\nFritchii's previous data is kept next to it, in the folders "

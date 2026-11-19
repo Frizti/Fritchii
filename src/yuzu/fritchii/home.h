@@ -49,6 +49,7 @@ public:
 
     /// A game is starting in the main window: the render view takes the space.
     void OnEmulationStarting();
+    void Retranslate();
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -71,6 +72,11 @@ private:
     QWidget* rail = nullptr;
     QWidget* page = nullptr;
     QToolButton* library_button = nullptr;
+    QToolButton* settings_button = nullptr;
+    QToolButton* help_button = nullptr;
+    QToolButton* menu_button = nullptr;
+    QPushButton* saves_button = nullptr;
+    QPushButton* coffee_button = nullptr;
     QLabel* cover = nullptr;
     QLabel* title = nullptr;
     QPushButton* play = nullptr;
