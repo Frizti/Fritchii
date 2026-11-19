@@ -590,7 +590,17 @@ void MemStage::Fill::Open(Site site_, u32 index_) {
         }
         if (stage.ticks && IsOpSite(site)) {
             u64 number;
-            if (stage.ticks->PerThread() && Link::OnStageThread()) {
+            // FRITCHII_ONEF_OP_MARK (boot, default 1): with one follower, E's operation opens its
+            // number under the close's lock with E's mark, as GPUMem's does: R closes ticks while
+            // E fills (posted fences), and an unmarked number could be published (its staging
+            // freed or reused) before R recorded the copy that reads it (onef-audit finding 1).
+            static const bool op_mark = [] {
+                const char* value = std::getenv("FRITCHII_ONEF_OP_MARK");
+                return value == nullptr || value[0] != '0';
+            }();
+            const bool engine_mark = op_mark && VideoCommon::OneFollower::OnEngineThread() &&
+                                     FillSide() && TwoThreadRing();
+            if ((stage.ticks->PerThread() && Link::OnStageThread()) || engine_mark) {
                 // Step 7, stamps per thread: an operation on GPUMem (a served call) opens its
                 // number under the close's lock with GPUMem's mark, as a draw does, and its
                 // stamps carry it until the bracket ends.
@@ -734,6 +744,11 @@ void MemStage::SetPending() {
         if (ticks) {
             // The caller's packet (step 7, stamps per thread; `open` otherwise, as before).
             pending_from = ticks->Mine();
+            // FRITCHII_ONEF_OP_MARK: E's operation stamped its staging from its own number on;
+            // its pending entries keep that number (Mine() may be later once E's mark clears).
+            if (stage_op_from != 0 && stage_op_from < pending_from && FillSide()) {
+                pending_from = stage_op_from;
+            }
             UpdateUnplayed();
         }
         SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
