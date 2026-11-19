@@ -517,6 +517,14 @@ public:
     /// program with colour writes off in its key, 5 pre-pass with colour writes off in its key.
     static constexpr u8 OCCL_KIND_PREPASS = 3;
     static constexpr u8 OCCL_KIND_PREPASS_NOCOLOUR = 5;
+    /// The stages its push constant range covers (what every push to its layout names).
+    [[nodiscard]] VkShaderStageFlags PushStageFlags() const noexcept {
+        return mesh_emulation ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT
+               : IsMeshPipeline()
+                   ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                         VK_SHADER_STAGE_MESH_BIT_EXT
+                   : VK_SHADER_STAGE_ALL_GRAPHICS;
+    }
     /// Built from graphics pipeline libraries (its stages compiled apart from each other).
     [[nodiscard]] bool UsesLibraries() const noexcept {
         return library_cache != nullptr;

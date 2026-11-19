@@ -3515,6 +3515,8 @@ std::string OcclShaders(const GraphicsPipelineCacheKey& key) {
 /// FRITCHII_OCCL_LEAN: why `pipeline`'s pixel program must stay for a draw that writes no
 /// colour (Lean: it cannot change depth, stencil, the counted samples or memory). Fixed per
 /// pipeline: the key and the programs' infos never change.
+VideoCommon::OcclLean::PipelineClass ClassifyOcclPixel(const GraphicsPipeline& pipeline);
+
 VideoCommon::OcclLean::PipelineClass ClassifyOcclPipeline(const GraphicsPipeline& pipeline) {
     using VideoCommon::OcclLean::PipelineClass;
     const GraphicsPipelineCacheKey& key = pipeline.Key();
@@ -3528,6 +3530,17 @@ VideoCommon::OcclLean::PipelineClass ClassifyOcclPipeline(const GraphicsPipeline
         })) {
         return PipelineClass::Mesh;
     }
+    return ClassifyOcclPixel(pipeline);
+}
+
+/// FRITCHII_OCCL_FLAG: the class of `pipeline`'s pixel program alone (mesh pipelines too).
+VideoCommon::OcclLean::PipelineClass ClassifyOcclPixel(const GraphicsPipeline& pipeline) {
+    using VideoCommon::OcclLean::PipelineClass;
+    const GraphicsPipelineCacheKey& key = pipeline.Key();
+    if (key.unique_hashes[5] == 0) {
+        return PipelineClass::NoPixel;
+    }
+    const auto& infos = pipeline.StageInfos();
     // The alpha test is emulated in the pixel program (MakeRuntimeInfo); dual source blending
     // names the pixel program's second output.
     if (key.state.alpha_test_func.Value() !=
@@ -3980,10 +3993,14 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
     }
     if (!verdict.colour_off) {
         // Census: what a flag store in the draw's own pixel program would need.
-        const Census colour_verdict = pipeline_class == PipelineClass::Lean &&
-                                              !pipeline->IsMeshPipeline()
-                                          ? OcclFlagColourVerdict(*pipeline)
-                                          : Census::Unknown;
+        // Mesh pipelines whose pixel program is Lean take the colour variant too (in place of
+        // the draw; never a pre-pass: the mesh emulation must run once).
+        const bool mesh_lean = pipeline_class == PipelineClass::Mesh &&
+                               ClassifyOcclPixel(*pipeline) == PipelineClass::Lean;
+        const Census colour_verdict =
+            (pipeline_class == PipelineClass::Lean && !pipeline->IsMeshPipeline()) || mesh_lean
+                ? OcclFlagColourVerdict(*pipeline)
+                : Census::Unknown;
         if (colour_verdict == Census::ColourSubgroup) {
             const auto& infos = pipeline->StageInfos();
             const Shader::Info& pixel = infos[infos.size() - 1];
@@ -4192,12 +4209,16 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
             return pipeline;
         }
     }
-    // A draw without a pixel program takes the host flag variant only at Full (or verify / 8):
-    // Standard (3) stays v6.2's reviewed core.
+    // A draw without a pixel program, and a mesh draw whose pixel program is Lean, take the
+    // colour-off host flag variant only at Full (or verify / 8): Standard (3) stays v6.2's
+    // reviewed core.
     const bool no_pixel_flag =
         pipeline_class == PipelineClass::NoPixel && OcclFlag::ColourAllowed();
-    if ((pipeline_class != PipelineClass::Lean && !no_pixel_flag) ||
-        pipeline->IsMeshPipeline() || pipeline->occl_flag_state == 2) {
+    const bool mesh_lean_off = pipeline_class == PipelineClass::Mesh &&
+                               OcclFlag::ColourAllowed() &&
+                               ClassifyOcclPixel(*pipeline) == PipelineClass::Lean;
+    if ((pipeline_class != PipelineClass::Lean && !no_pixel_flag && !mesh_lean_off) ||
+        (pipeline->IsMeshPipeline() && !mesh_lean_off) || pipeline->occl_flag_state == 2) {
         switch (pipeline->occl_flag_state == 2 ? PipelineClass::Failed
                 : pipeline->IsMeshPipeline()     ? PipelineClass::Mesh
                                                  : pipeline_class) {

@@ -2955,8 +2955,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                           VideoCommon::OcclFlag::Census::Unknown);
         if (pipeline->occl_flag_parent != nullptr) {
             const u64 address = query_cache_runtime.OcclFlagAddress();
-            scheduler.Record([layout = pipeline->Layout(), address](vk::CommandBuffer cmdbuf) {
-                cmdbuf.PushConstants(layout, VK_SHADER_STAGE_ALL_GRAPHICS, 40, sizeof(address),
+            scheduler.Record([layout = pipeline->Layout(), stages = pipeline->PushStageFlags(),
+                              address](vk::CommandBuffer cmdbuf) {
+                cmdbuf.PushConstants(layout, stages, 40, sizeof(address),
                                      &address);
             });
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.flag_draws);
