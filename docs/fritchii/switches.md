@@ -1196,6 +1196,87 @@ submits as before. Log once: "ASTC GPU decode inside a held draw fill: submit le
 flush". Watch RADV for BC3 flashes (the submit once hid a race there); NVIDIA, where SEAM 3 is the
 default, now takes this path too.
 
+### FRITCHII_SPLIT_BIND_FIX
+
+Boot, default 1 (2026-11-19; reworked for 6.2). A submit between a draw's or dispatch's bind and
+its record puts the record into a new command buffer with nothing bound; AMD's driver then reads
+the descriptor table through a stale pointer into the old command buffer's recycled memory (a GPU
+page fault in the 0xbef0xxxxxxxx range). 1: when the tick moved between Configure and the record,
+the draw or dispatch configures again in the new command buffer (nothing on the common path). A
+played dispatch (one follower, R) cannot configure again (its packet was played): it records its
+bind with the dispatch and the scheduler forgets its descriptor buffer
+(Scheduler::ForgetDescriptorBuffer), so no compute bind leaves the tracker's chunk stale. 0: as
+before. Either way the splits are counted and logged ("Split bind: a submit between the draw's |
+dispatch's bind and its record (shader S; N so far; FRITCHII_SPLIT_BIND_FIX=1)"). 0 were seen at
+the fountain: insurance.
+
+### FRITCHII_SYNCPT_UNLOCKED
+
+Boot, default 1 (2026-11-19). Sync point actions run after the manager's lock is released. A due
+action may run renderer work (the composite executer runs Composite, which with one follower
+drains R on E): under the lock that blocked every guest thread registering a wait, and deadlocked
+when R increments. Deregistering an action another thread is running waits until it returns.
+0 = under the lock, as before.
+
+### FRITCHII_ONEF_TICK_ON_E
+
+Boot, default 1 (2026-11-19). With one follower, a frame end R reaches outside a lent call (the
+composite executer of an increment R played) leaves TickFrame to E, which lends it at its next
+fence: TickFrame ticks E's staging pools, memory stage and caches, which R must not touch while E
+runs. 0 = R ticks there, as before.
+
+### FRITCHII_ONEF_OP_MARK
+
+Boot, default 1 (2026-11-19). With one follower, E's operation packets open their number under the
+close's lock with E's mark, as GPUMem's do: R closes ticks while E fills (posted fences), and an
+unmarked number could be published (its staging freed or reused) before R recorded the copy that
+reads it. 0 = as before.
+
+### FRITCHII_DESC_FRAME_GUARD
+
+Boot, default 1 (2026-11-19). The descriptor payload of a frame (UpdateDescriptorQueue, reused
+FRAMES_IN_FLIGHT frames later) is reused only once the scheduler's worker has recorded that frame:
+its Record lambdas read the entries when the worker runs them (push descriptors, descriptor
+buffers, and FRITCHII_DESCRIPTOR_SETS' UpdateDescriptorSet alike), and a worker that fell that far
+behind recorded overwritten descriptors (garbage view and buffer handles). 0 = as before.
+
+### FRITCHII_ONEF_MESH_EMU, FRITCHII_ONEF_MESH_EMU_ASYNC
+
+Boot, default 1 (2026-11-19). FRITCHII_ONEF_MESH_EMU: with one follower and E's pipeline lookup
+(FRITCHII_ONEF_E_PIPELINE), emulated mesh draws (no VK_EXT_mesh_shader, as on AMD's drivers with
+Mesh Shaders on Automatic) are posted like any draw: E fills the packet and R runs the emulation as
+for a lent one. Indirect and list emulated draws stay lent. 0 = lent, as before.
+FRITCHII_ONEF_MESH_EMU_ASYNC: with FRITCHII_ESPLIT's async tail they take it too (fountain idle
+18.3 -> 18.2 ms, checks 0); 0 = lockstep tails for them.
+
+### FRITCHII_ESPLIT_WAKE_EACH, FRITCHII_ESPLIT_GUARD_HOLD
+
+Boot, test switches (2026-11-19, the E2 per-draw cuts). FRITCHII_ESPLIT_WAKE_EACH=1: E2's fenced
+wake check of E1 after every job, as before; by default E2's `done` is a release store and the
+fenced check runs after every draw tail, every 8th job and the last job it saw.
+FRITCHII_ESPLIT_GUARD_HOLD=1: E2's stream-write guard always takes the held path; by default it
+first tests the texture pages unheld and holds only on a possible hit.
+
+### FRITCHII_ONEF_POST_KINDS, FRITCHII_ONEF_POST_SYNCS, FRITCHII_ONEF_TRACE_LENDS
+
+Boot, bisect and trace tools (2026-11-19). FRITCHII_ONEF_POST_KINDS=<mask> (default all): which
+fence kinds one follower may post, the others lent: 1 sync points, 2 references, 4 forced
+releases, 8 SignalFence callbacks, 16 fence-flagged payload reports, 32 counter reports.
+FRITCHII_ONEF_POST_SYNCS=0 (default 1): every fence that owes query syncs is lent.
+FRITCHII_ONEF_TRACE_LENDS=1: the DKB frame trace lends every draw again (it made every
+one-follower measurement a fully lent one; by default it no longer does).
+
+### FRITCHII_SPIRV_DUMP, FRITCHII_SPIRV_DUMP_HASHES
+
+Test (2026-11-19). FRITCHII_SPIRV_DUMP=<folder> with FRITCHII_SPIRV_DUMP_HASHES=<hex,hex,...>: the
+listed programs' SPIR-V as <folder>/<hash>-<stage>.spv (for spirv-dis). Not
+FRITCHII_SPIRV_DUMP_DISCARD, which dumps the first discarding programs.
+
+### Samples query copies past their pool (no switch)
+
+2026-11-19: a samples query result copy whose range reaches past its pool is skipped and logged
+(must be 0): such a copy is invalid in Vulkan.
+
 ### FRITCHII_VA_REPORT
 
 TEST tool, off by default (helper FJ, 2026-11-19). Boot: 1 = the instance enables VK_EXT_debug_utils
@@ -5828,7 +5909,11 @@ command buffer, so the recorded commands stay the same; repacked bindings are le
 one again runs its conversion). It is what the stage will need instead of the scheduler's
 command buffer flags (step 6b). With EXP123 >= 1 the seam's stats line adds "memory seam full
 vertex bindings": vertex bind runs recorded and dropped as still bound a second. Independent of
-FRITCHII_MEMSTAGE_THREAD 0 and 1; THREAD = 2 turns it on by itself.
+FRITCHII_MEMSTAGE_THREAD 0 and 1; THREAD = 2 turns it on by itself. One follower does not need it
+(2026-11-19): R binds the remembered vertex bindings again once in each new command buffer
+(MemPlayer::EnsureVertexBindings; the AMD device loss at 0xbef011af0000 read the old command
+buffer's vertex table), and a vertex-binding epoch (Scheduler::VertexEpoch: new command buffers
+and passes that bind vertex buffers) drops a clean run still bound.
 
 ### FRITCHII_JIT_DISPATCH_BITS
 
