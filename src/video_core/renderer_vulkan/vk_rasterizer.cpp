@@ -4179,6 +4179,19 @@ void RasterizerVulkan::OneFollowerMirrorDraw() {
     }
 }
 
+namespace {
+/// FRITCHII_ONEF_POST_KINDS (boot, default all; a bisect tool): which fence kinds may be posted
+/// (the others are lent): 1 sync points, 2 references, 4 forced releases, 8 SignalFence
+/// callbacks, 16 fence-flagged payload reports, 32 counter reports.
+bool OneFollowerPostKind(u32 bit) {
+    static const u32 mask = [] {
+        const char* value = std::getenv("FRITCHII_ONEF_POST_KINDS");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : ~0U;
+    }();
+    return (mask & bit) != 0;
+}
+} // Anonymous namespace
+
 bool RasterizerVulkan::OneFollowerFenceClean() {
     // fable_b 16.3 and 19.6: R's fence must not enter the buffer cache. Its three ways in: the
     // commit's buffer half (E runs it at the fence's place, R skips it), the query sync (none
@@ -6549,7 +6562,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             if (type == VideoCommon::QueryType::Payload && synced &&
                 VideoCore::Nx2Debug::Experiment(33) == 0 && OneF::SemOnE()) {
                 if (const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(gpu_addr);
-                    device && OneFollowerFenceClean()) {
+                    device && OneFollowerPostKind(16) && OneFollowerFenceClean()) {
                     const OneFollowerPayloadNote note{
                         *device, gpu_addr, payload, subreport,
                         True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)};
@@ -6569,7 +6582,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             if (type != VideoCommon::QueryType::Payload && OneF::PostFenceReportOn() &&
                 VideoCore::Nx2Debug::Experiment(33) == 0 && query_cache.ReportLandsLater(type)) {
                 if (const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(gpu_addr);
-                    device && OneFollowerFenceClean()) {
+                    device && OneFollowerPostKind(32) && OneFollowerFenceClean()) {
                     if (onef_report_pages == nullptr) [[unlikely]] {
                         onef_report_pages = std::make_unique<VideoCommon::PageFilter>();
                     }
@@ -8330,7 +8343,7 @@ void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
         // FRITCHII_ONEF_SIGNAL_ON_R: the callback writes game memory the guest acts on; it runs
         // on R at R's place, which (the callback may touch E's caches) means lent.
         if (VideoCommon::OneFollower::SemOnE() && !VideoCommon::OneFollower::SignalOnR() &&
-            OneFollowerFenceClean()) {
+            OneFollowerPostKind(8) && OneFollowerFenceClean()) {
             VideoCommon::OneFollower::NoteEngineSignal("a SignalFence callback");
             OneFollowerPostFence(4, 0, &func);
             return;
@@ -8372,7 +8385,7 @@ void RasterizerVulkan::SignalSyncPoint(u32 value) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         OneFollowerDeferredTick();
         OneFollowerCountFence();
-        if (OneFollowerFenceClean()) {
+        if (OneFollowerPostKind(1) && OneFollowerFenceClean()) {
             // FRITCHII_ONEF_SEM_E (fable_b 20.3): the guest increment, then (after the buffer
             // half, as the fence's callback runs at once) the host increment, both at E's
             // place; R makes an empty fence. The game's wait on the sync point then ends when E
@@ -8401,7 +8414,7 @@ void RasterizerVulkan::SignalReference() {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         OneFollowerDeferredTick();
         OneFollowerCountFence();
-        if (OneFollowerFenceClean()) {
+        if (OneFollowerPostKind(2) && OneFollowerFenceClean()) {
             OneFollowerPostFence(1, 0);
             return;
         }
@@ -8420,7 +8433,7 @@ void RasterizerVulkan::ReleaseFences(bool force) {
         return;
     }
     if (VideoCommon::OneFollower::ShouldLend() && force) [[unlikely]] {
-        if (OneFollowerFenceClean()) {
+        if (OneFollowerPostKind(4) && OneFollowerFenceClean()) {
             OneFollowerPostFence(2, 0);
             return;
         }
@@ -8650,7 +8663,7 @@ void RasterizerVulkan::WaitForIdle() {
         // E only stops waiting for the wait for idle itself); 2 also with R behind but no
         // posted fence with report landings unplayed (13.0), to test that dependency.
         namespace OneF = VideoCommon::OneFollower;
-        if (const int mode = OneF::PostIdleOn(); mode != 0) {
+        if (const int mode = OneFollowerPostKind(64) ? OneF::PostIdleOn() : 0; mode != 0) {
             if (onef_sync_owed) {
                 OneF::CountIdleDecision(OneF::IdleDecision::LentSyncOwed);
             } else if (OneF::RenderCaughtUp()) {
