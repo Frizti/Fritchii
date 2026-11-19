@@ -132,6 +132,14 @@ TEST_CASE("The Frizti record round-trips", "[frizti_settings]") {
     CHECK_FALSE(parsed.oot_folded);
     record.oot_folded = true;
     CHECK(Frizti::ParseRecord(Frizti::SerializeRecord(record)).oot_folded);
+    CHECK(parsed.hw_card.empty());
+    CHECK(parsed.hw.empty());
+    record.hw_card = "AMD Radeon RX 9070 XT";
+    record.hw = {{"occlusion_speedup", "2"}};
+    const auto with_hw = Frizti::ParseRecord(Frizti::SerializeRecord(record));
+    CHECK(with_hw.hw_card == record.hw_card);
+    CHECK(with_hw.hw == record.hw);
+    CHECK(with_hw.global == record.global);
 
     const auto empty = Frizti::ParseRecord("");
     CHECK(empty.revision == 0);

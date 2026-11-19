@@ -2978,6 +2978,22 @@ numbered "everything" 1, here it is 9); 2 verify (every flag store of 9, the hos
 decide; any game); 5 as 3 with the discard pre-pass and 8 as 9 without the colour pre-pass (A/B).
 Any other value is off.
 
+Full is set by default on AMD's proprietary driver on a discrete GPU (Windows; 2026-11-19,
+MainWindow::ApplyHardwareDefaults, right after the cards are read): one follower runs there at Full
+(FRITCHII_ONEF_AMD) and its win over off comes from Full's pre-pass variants. Only while the player
+has not chosen: nothing decided for this card yet in config/frizti.ini (hw_card), the setting still
+Standard, and the AMD offer below never answered (UISettings fritchii_occl_offer empty). Then
+frizti.ini keeps hw_card and hw.occlusion_speedup, and the offer's state reads "set by hardware
+defaults" (so the offer never asks over it). It is never set again: a player who moves off Full
+keeps their value ("changed by the player after hardware defaults"), on any card. On a card change
+a value still as set goes back to Standard, then the new card decides. No settings revision bump
+(no "Use recommended?" prompt). Log: "Hardware defaults: occlusion speed-up Full on CARD (...)",
+or "... left as the player has it ...". A FRITCHII_OCCL_FLAG switch still wins at boot. No
+shaderInt64 test (the frontend's card records have none; every AMD proprietary Windows driver has
+it, and the colour variants check it at the draw). Measured only over OCuLink x4 (Full against
+Standard: host query slots 37k -> 14.5k a second, GPU -0.4 to -1.3 ms): confirm on a desktop x16
+card before main dev takes it.
+
 Full is offered once to players it can help (fritchii/occlusion_offer.cpp): when a game ends in
 which the flags acted in OoT on AMD's Windows driver with shaderInt64 (the rasterizer sets
 OcclFlag::g_full_could_help), the setting is still Standard and no switch sets

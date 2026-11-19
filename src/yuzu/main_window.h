@@ -273,6 +273,11 @@ private:
         Keep,     ///< after Restore Settings: the restored settings stay, this revision handled
     };
     void MigrateFriztiSettings(FriztiStart start = FriztiStart::Silent);
+    /// Hardware-gated defaults, once the cards are known (after NoteCards): today the occlusion
+    /// speed-up Full on AMD's proprietary driver on a discrete GPU (Windows). Set only while the
+    /// player has not chosen (config/frizti.ini remembers what it set, and for which card).
+    /// True when it changed a setting (saved already).
+    bool ApplyHardwareDefaults();
 
     /// Updates an action's shortcut and text to reflect an updated hotkey from the hotkey registry.
     void LinkActionShortcut(QAction* action, const QString& action_name,
