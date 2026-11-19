@@ -14,7 +14,9 @@
 #include <QVBoxLayout>
 
 #include "common/logging.h"
+#include "common/scm_rev.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/util/vk.h"
 #include "yuzu/fritchii/cache_cleanup.h"
@@ -37,7 +39,16 @@ bool NvidiaCard(const std::vector<VkDeviceInfo::Record>& records) {
 
 /// Only what current builds show (owner 2026-11-18: no outdated items).
 std::vector<Item> Items(const std::vector<VkDeviceInfo::Record>& records) {
-    std::vector<Item> items{
+    std::vector<Item> items;
+    // v6.1 tied the GPU threads to the P-cores, which halved fps on some 12th to 14th gen Intel
+    // CPUs; 6.2 lets Windows place them and turns off a leftover EDEN_HYBRID_CORES=0 (main.cpp).
+    if (Common::IntelHybridCpu()) {
+        items.push_back({QObject::tr("Fixed in 6.2: Intel 12th to 14th gen"),
+                         QObject::tr("The fps drop on Intel CPUs with P-cores and E-cores is fixed. "
+                                     "You don't need EDEN_HYBRID_CORES=0 any more: if you had "
+                                     "added it, Fritchii turned it off for you.")});
+    }
+    items.insert(items.end(), {
         {QObject::tr("Killing enemies"),
          QObject::tr("Short hitches can still happen (fewer than before).")},
         {QObject::tr("Unlimited fps with VSync off"),
@@ -48,11 +59,11 @@ std::vector<Item> Items(const std::vector<VkDeviceInfo::Record>& records) {
         {QObject::tr("New areas"),
          QObject::tr("The first visit can show brief pop-in or a short stutter while shaders "
                      "build. It's smooth after.")},
-    };
+    });
     if (NvidiaCard(records)) {
         items.push_back({QObject::tr("DLSS presets L and M"),
-                         QObject::tr("They look great but cost a lot of fps. K is the tested "
-                                     "default.")});
+                         QObject::tr("They look great but cost a lot of fps. Automatic (K) is the "
+                                     "tested default.")});
     }
     items.push_back({QObject::tr("Mods"),
                      QObject::tr("A mod that changes the same game code as Fritchii can turn off "
@@ -176,8 +187,12 @@ void Show(QWidget* parent, const std::vector<VkDeviceInfo::Record>& records) {
 }
 
 bool ShowOnce(QWidget* parent, const std::vector<VkDeviceInfo::Record>& records) {
-    const std::string version = FritchiiCacheCleanup::MajorVersion();
-    if (version.empty()) {
+    // Once per release (6.2: the major version alone kept 6.1 players from seeing it again).
+    std::string version{Common::g_build_version};
+    if (const auto end = version.find(' '); end != std::string::npos) {
+        version.resize(end);
+    }
+    if (version.empty() || FritchiiCacheCleanup::MajorVersion().empty()) {
         return false;
     }
     const QByteArray mode = qgetenv("FRITCHII_KNOWN_ISSUES");
