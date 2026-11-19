@@ -12,6 +12,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
+#include <fmt/format.h>
 #include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -311,7 +313,6 @@ void LogOwners(u64 address, u64 precision) noexcept {
     precision = (std::max)(precision, u64{1});
     const u64 lower = address & ~(precision - 1);
     const u64 upper = lower + precision;
-    constexpr u64 NearBytes = 4ULL << 20; // ranges within 4 MiB, when none holds the page
     State& state = Get();
     // The process ends after the report: never wait long on a messenger stuck mid-event.
     std::unique_lock lock{state.mutex, std::defer_lock};
@@ -329,7 +330,7 @@ void LogOwners(u64 address, u64 precision) noexcept {
                  "GPU address report for [{:#x}, {:#x}): {} events this session ({} binds, {} "
                  "unbinds), the last {} kept; holders newest first:",
                  lower, upper, state.events, state.binds, state.unbinds, count);
-    const auto describe = [&](const Event& event, const char* relation) {
+    const auto describe = [&](const Event& event, std::string_view relation) {
         LOG_CRITICAL(Render_Vulkan,
                      "GPU address report: #{} {} {}{}{} handle {:#x}, [{:#x}, {:#x}) {} KiB, {:.1f} ms "
                      "before the report, thread {} ({})",
@@ -347,22 +348,102 @@ void LogOwners(u64 address, u64 precision) noexcept {
             ++holders;
         }
     }
+    // The whole ring's spread, and what the driver tells us about its own objects: whether a
+    // region the fault lies in is reported at all (VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT
+    // ranges are the driver's choice to report).
+    u64 lowest = ~u64{0};
+    u64 highest = 0;
+    u64 internal_events = 0;
+    u64 region_events = 0;
+    u64 region_internal = 0;
+    u64 region_low = ~u64{0};
+    u64 region_high = 0;
+    const u64 region = lower >> 32; // the same 4 GiB window as the fault
+    for (u64 i = 0; i < count; ++i) {
+        const Event& event = (*state.ring)[(state.events - 1 - i) % RingSize];
+        if (event.size == 0) {
+            continue;
+        }
+        lowest = (std::min)(lowest, event.address);
+        highest = (std::max)(highest, event.address + event.size);
+        internal_events += event.internal ? 1 : 0;
+        if ((event.address >> 32) == region || ((event.address + event.size - 1) >> 32) == region) {
+            ++region_events;
+            region_internal += event.internal ? 1 : 0;
+            region_low = (std::min)(region_low, event.address);
+            region_high = (std::max)(region_high, event.address + event.size);
+        }
+    }
+    LOG_CRITICAL(Render_Vulkan,
+                 "GPU address report: the ring's ranges span [{:#x}, {:#x}); {} events of driver "
+                 "internal objects; in the fault's 4 GiB window [{:#x}, {:#x}): {} events ({} "
+                 "internal){}",
+                 lowest == ~u64{0} ? 0 : lowest, highest, internal_events, region << 32,
+                 (region + 1) << 32, region_events, region_internal,
+                 region_events != 0
+                     ? fmt::format(", spanning [{:#x}, {:#x})", region_low, region_high)
+                     : std::string{});
+    u32 region_listed = 0;
+    for (u64 i = 0; i < count && region_listed < 8; ++i) {
+        const Event& event = (*state.ring)[(state.events - 1 - i) % RingSize];
+        if (event.size != 0 && (event.address >> 32) == region && event.internal) {
+            describe(event, "driver internal, in the fault's 4 GiB window");
+            ++region_listed;
+        }
+    }
     if (holders != 0) {
         return;
     }
+    // The nearest ranges below and above the page within 256 MiB, nearest first (each range once,
+    // its newest event).
+    constexpr u64 NeighbourBytes = 256ULL << 20;
     LOG_CRITICAL(Render_Vulkan, "GPU address report: no range in the ring holds the page (older "
-                                "than the ring, or never reported); nearest within 4 MiB:");
-    u32 nearby = 0;
-    for (u64 i = 0; i < count && nearby < 8; ++i) {
+                                "than the ring, or never reported); nearest within 256 MiB:");
+    struct Near {
+        u64 distance;
+        u64 index;
+        bool below;
+    };
+    std::vector<Near> below_list;
+    std::vector<Near> above_list;
+    for (u64 i = 0; i < count; ++i) {
         const Event& event = (*state.ring)[(state.events - 1 - i) % RingSize];
+        if (event.size == 0) {
+            continue;
+        }
         const u64 end = event.address + event.size;
-        const bool before = end <= lower && lower - end <= NearBytes;
-        const bool after = event.address >= upper && event.address - upper <= NearBytes;
-        if (before || after) {
-            describe(event, before ? "ends below the page" : "starts above the page");
-            ++nearby;
+        if (end <= lower && lower - end <= NeighbourBytes) {
+            below_list.push_back({lower - end, i, true});
+        } else if (event.address >= upper && event.address - upper <= NeighbourBytes) {
+            above_list.push_back({event.address - upper, i, false});
         }
     }
+    const auto list_nearest = [&](std::vector<Near>& list, const char* relation) {
+        // Nearest first; for the same range, the newest event (smallest ring age) first.
+        std::ranges::sort(list, [](const Near& a, const Near& b) {
+            return a.distance != b.distance ? a.distance < b.distance : a.index < b.index;
+        });
+        u32 shown = 0;
+        u64 last_address = ~u64{0};
+        for (const Near& near_range : list) {
+            const Event& event = (*state.ring)[(state.events - 1 - near_range.index) % RingSize];
+            if (event.address == last_address) {
+                continue; // older events of the same range
+            }
+            last_address = event.address;
+            describe(event, fmt::format("{} the page by {} KiB",
+                                        near_range.below ? "ends below" : "starts above",
+                                        near_range.distance >> 10));
+            if (++shown >= 6) {
+                break;
+            }
+        }
+        if (shown == 0) {
+            LOG_CRITICAL(Render_Vulkan, "GPU address report: nothing {} within 256 MiB", relation);
+        }
+    };
+    list_nearest(below_list, "below");
+    list_nearest(above_list, "above");
 }
 
 } // namespace VaReport

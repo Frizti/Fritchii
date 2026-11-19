@@ -104,6 +104,11 @@
 #include <QMimeData>
 #include <QPalette>
 #include <QProgressDialog>
+#include <QBoxLayout>
+#include <QDialog>
+#include <QLabel>
+#include <QMessageBox>
+#include <QPushButton>
 #include <QScreen>
 #include <QShortcut>
 #include <QStatusBar>
@@ -484,7 +489,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     Common::FS::CreateEdenPaths();
     this->config = std::make_unique<QtConfig>();
-    MigrateFriztiSettings();
+    MigrateFriztiSettings(FriztiStart::AskFirst);
     // New mods start disabled: saved at once (from the GUI thread), so a crash keeps it.
     FileSys::PatchManager::SetNewModsCallback([this](u64 title_id) {
         QMetaObject::invokeMethod(
@@ -826,6 +831,66 @@ void ShowOotSettingsMoved(QWidget* parent, const std::vector<std::pair<u32, std:
     box->setAttribute(Qt::WA_DeleteOnClose);
     box->open();
 }
+
+// At start, before the window and any game: true for "Use recommended". Closing the window
+// counts as "Keep my settings".
+bool AskUseRecommendedSettings() {
+    QString version = QString::fromLatin1(Common::g_build_version);
+    if (version.startsWith(QLatin1Char('v'))) {
+        version.remove(0, 1);
+    }
+    const QString title = MainWindow::tr("Use the recommended settings?");
+    const QString lead =
+        (!version.isEmpty() && version.front().isDigit()
+             ? MainWindow::tr("Fritchii %1 comes with settings tuned for OoT.").arg(version)
+             : MainWindow::tr("Fritchii comes with settings tuned for OoT.")) +
+        QLatin1Char(' ') + MainWindow::tr("Your own changes would be replaced.");
+    if (!FritchiiUi::ApplyTheme()) {
+        QMessageBox box(QMessageBox::Question, QStringLiteral("Fritchii"), title,
+                        QMessageBox::NoButton);
+        box.setInformativeText(lead);
+        QPushButton* const use =
+            box.addButton(MainWindow::tr("Use recommended"), QMessageBox::AcceptRole);
+        box.addButton(MainWindow::tr("Keep my settings"), QMessageBox::RejectRole);
+        box.setDefaultButton(use);
+        box.exec();
+        return box.clickedButton() == use;
+    }
+    QDialog dialog;
+    dialog.setObjectName(QStringLiteral("FritchiiSettingsPrompt"));
+    dialog.setWindowTitle(QStringLiteral("Fritchii"));
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(40, 34, 40, 30);
+    layout->setSpacing(14);
+    auto* heading = new QLabel(title);
+    heading->setObjectName(QStringLiteral("FritchiiDialogTitle"));
+    layout->addWidget(heading);
+    auto* sentence = new QLabel(lead);
+    sentence->setObjectName(QStringLiteral("FritchiiLead"));
+    layout->addWidget(sentence);
+    // Settings > General has Reset to Defaults and Restore Settings (the backup made below).
+    auto* later = new QLabel(MainWindow::tr("You can switch later in Settings > General."));
+    later->setObjectName(QStringLiteral("FritchiiLead"));
+    layout->addWidget(later);
+    layout->addSpacing(14);
+    auto* row = new QHBoxLayout;
+    row->setSpacing(10);
+    row->addStretch(1);
+    auto* keep = new QPushButton(MainWindow::tr("Keep my settings"));
+    keep->setAutoDefault(false);
+    auto* use = new QPushButton(MainWindow::tr("Use recommended"));
+    use->setDefault(true);
+    QObject::connect(keep, &QPushButton::clicked, &dialog, &QDialog::reject);
+    QObject::connect(use, &QPushButton::clicked, &dialog, &QDialog::accept);
+    row->addWidget(keep);
+    row->addWidget(use);
+    layout->addLayout(row);
+#ifdef _WIN32
+    // The window's own dark title bar is not set up yet.
+    ApplyDarkToTopLevel(&dialog, true);
+#endif
+    return dialog.exec() == QDialog::Accepted;
+}
 } // namespace
 
 // Frizti builds change the defaults Ocarina of Time needs, but a default only reaches a config
@@ -833,15 +898,50 @@ void ShowOotSettingsMoved(QWidget* parent, const std::vector<std::pair<u32, std:
 // theirs. Once per revision, set the tuned values and drop Ocarina's per-game overrides of them.
 // Between revisions the player's changes in Frizti are kept, and those another build made are
 // undone: config/frizti.ini, which only Frizti writes, holds what Frizti last wrote.
-void MainWindow::MigrateFriztiSettings() {
+void MainWindow::MigrateFriztiSettings(FriztiStart start) {
     namespace Frizti = Settings::Frizti;
     const auto tuned = Frizti::TunedSettings(Settings::values);
     auto record = LoadFriztiRecord();
     // Other builds keep qt-config.ini's revision key but never write frizti.ini; either one
     // missing or older applies the whole set again.
-    const u32 applied =
-        (std::min)(Settings::values.frizti_settings_revision.GetValue(), record.revision);
-    const bool full = applied < Frizti::Revision;
+    const u32 stored = Settings::values.frizti_settings_revision.GetValue();
+    const u32 applied = (std::min)(stored, record.revision);
+    bool full = applied < Frizti::Revision;
+    if (start == FriztiStart::Keep) {
+        full = false;
+    } else if (start == FriztiStart::AskFirst) {
+        // A player coming from an earlier Fritchii is asked before their settings are replaced
+        // (FRITCHII_SETTINGS_PROMPT: "ask" asks in any case, "0" keeps them without asking).
+        const std::string prompt =
+            qEnvironmentVariable("FRITCHII_SETTINGS_PROMPT").trimmed().toStdString();
+        switch (Frizti::DecideStartup(stored, record.revision, prompt)) {
+        case Frizti::StartupApply::Reconcile:
+            if (full) {
+                LOG_INFO(Frontend, "Settings: kept the player's settings, revision {} -> {} "
+                                   "(FRITCHII_SETTINGS_PROMPT=0)",
+                         applied, Frizti::Revision);
+            }
+            full = false;
+            break;
+        case Frizti::StartupApply::Full:
+            break;
+        case Frizti::StartupApply::Ask:
+            full = AskUseRecommendedSettings();
+            if (full) {
+                const QString backup = FritchiiUi::BackupSettings();
+                LOG_INFO(Frontend,
+                         "Settings: the player chose the recommended settings, revision {} -> {}; "
+                         "previous settings saved in {}",
+                         applied, Frizti::Revision,
+                         backup.isEmpty() ? std::string{"(backup failed)"} : backup.toStdString());
+            } else {
+                LOG_INFO(Frontend,
+                         "Settings: the player kept their settings, revision {} -> {}", applied,
+                         Frizti::Revision);
+            }
+            break;
+        }
+    }
 #ifdef __linux__
     auto& docked = Settings::values.use_docked_mode;
     const auto console_mode = docked.GetValue(true);
@@ -4242,6 +4342,9 @@ void MainWindow::OnConfigure() {
             Settings::values.players.GetValue(true) = old_players;
             MigrateFriztiSettings();
             config->SaveAllValues();
+        } else if (fritchii) {
+            // A restored set stays as it is, and the next start does not ask about it again.
+            MigrateFriztiSettings(FriztiStart::Keep);
         }
 
         InitializeRecentFileMenuActions();

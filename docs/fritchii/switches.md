@@ -1148,7 +1148,12 @@ address VK_EXT_device_fault names is looked up: "GPU address report: #N bind|UNB
 handle H, [A, B) K KiB, T ms before the report, thread X (holds the page)". An UNBIND newest =
 the GPU used a freed object (a lifetime bug); a live bind = a bad range inside a live object
 (sparse page, out of bounds past the robustness checks); no holder = a driver internal range or
-one older than the ring. Costs a locked ring write per bind (allocations, not draws): for loss
+one older than the ring. Then, for every fault: the span of all ranges the ring saw, how many events were the
+driver's own objects (VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT; reporting them is the driver's choice),
+the events in the fault's 4 GiB window (and up to 8 internal ones there); with no holder, the 6
+nearest ranges below and above within 256 MiB, nearest first. Two AMD losses read pages at
+0xbef0'xxaf'0000 that no reported range was near: these lines show whether that window is a driver
+region we never see. Costs a locked ring write per bind (allocations, not draws): for loss
 hunts, not fps runs. Boot lines: "GPU address report (FRITCHII_VA_REPORT=1): messenger on" and
 "the driver reports its GPU address binds", or why it is off.
 
@@ -2910,7 +2915,9 @@ new SPIR-V path runs only for a variant made during play, never stored on disk; 
 is byte-identical; vk_graphics_pipeline.cpp gained draw-time code only). Nx2ShaderStamp.cmake maps
 the new hashes to 6.1's stamp (SameAsReleased, with that reason), so nobody prepares again, with
 Full on or off. Vulkan 1.2 or later; one follower off (the draw path it hooks is the
-one-thread path, which is the path on AMD's Windows driver). Code: fritchii_occl_flag.h,
+one-thread path, which is the path on AMD's Windows driver). With one follower on, no draw takes a
+flag variant, lent draws included (FRITCHII_ONEF_AMD=1 runs on AMD lent every draw and stored flags
+through them; a played draw's pipeline from E falls back to its parent too). Code: fritchii_occl_flag.h,
 vulkan_occl_flag.frag, PipelineCache::OcclFlagPipeline / FindOrMakeOcclFlag, SamplesStreamer.
 
 Why: OoT's occlusion tests run as host occlusion queries, about 1,100 begin/end pairs a frame at

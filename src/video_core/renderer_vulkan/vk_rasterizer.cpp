@@ -2394,7 +2394,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
             chosen = chosen->occl_flag_parent; // a kept flag variant: decided again
         }
-        if (onef_play != nullptr || chosen == nullptr ||
+        // Never with one follower on, lent draws included: the flag store dereferences a pushed
+        // GPU address, and the follower's lent paths were the one place flags ran with it (both
+        // AMD losses read a wild address at the same lent load, 2026-11-18/19).
+        if (onef_play != nullptr || VideoCommon::OneFollower::On() || chosen == nullptr ||
             VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Off ||
             !query_cache_runtime.OcclFlagReady()) {
             return chosen;
@@ -2423,9 +2426,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
         if (onef_play != nullptr && onef_play->pipeline != nullptr) {
             // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looked this draw's pipeline up at its own
-            // position; R binds it and looks nothing up.
-            return const_cast<GraphicsPipeline*>(
+            // position; R binds it and looks nothing up. Never a flag variant (one follower on).
+            auto* const played = const_cast<GraphicsPipeline*>(
                 static_cast<const GraphicsPipeline*>(onef_play->pipeline));
+            return played->occl_flag_parent != nullptr ? played->occl_flag_parent : played;
         }
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return occl_flag(pipeline_cache.CurrentGraphicsPipeline(), true);
@@ -5983,6 +5987,11 @@ void RasterizerVulkan::DispatchCompute() {
                 });
                 return MemStage::BufferRef{buffer->Handle(), offset};
             }();
+        // An unmapped argument address gives the null buffer, which has no VkBuffer where the
+        // device has nullDescriptor: a dispatch would read GPU address 0. Nothing to run.
+        if (indirect_ref.buffer == VK_NULL_HANDLE) [[unlikely]] {
+            return;
+        }
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
