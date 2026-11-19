@@ -4630,7 +4630,12 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         return lend(blocker);
     }
     // Readers of the dispatch on R or of E's state on R, and the stage's own modes.
-    if (onef_draw->Diagnostic() || Common::DkbFrameTrace::Enabled() || InvalidateBeforeUse() ||
+    static const bool trace_lends = [] {
+        const char* value = std::getenv("FRITCHII_ONEF_TRACE_LENDS");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (onef_draw->Diagnostic() || (trace_lends && Common::DkbFrameTrace::Enabled()) ||
+        InvalidateBeforeUse() ||
         (MemStage::VerifyBits() & MemStage::VerifyHandles) != 0 ||
         VideoCommon::MemStageStats::Enabled() ||
         VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed) ||

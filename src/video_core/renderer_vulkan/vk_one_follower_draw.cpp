@@ -310,8 +310,14 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
     if (stream_write) {
         return LentReason::StreamWrite;
     }
+    // The DKB frame trace no longer lends every draw unless FRITCHII_ONEF_TRACE_LENDS=1 asks
+    // (it made every one-follower measurement a fully lent one).
+    static const bool trace_lends = [] {
+        const char* value = std::getenv("FRITCHII_ONEF_TRACE_LENDS");
+        return value != nullptr && value[0] == '1';
+    }();
     if (diagnostic.load(std::memory_order_relaxed) || env_traces ||
-        Common::DkbFrameTrace::Enabled()) {
+        (trace_lends && Common::DkbFrameTrace::Enabled())) {
         return LentReason::Diagnostic;
     }
     // Transient: what R's view or R's path cannot carry yet. Each test counts itself (fable_b
