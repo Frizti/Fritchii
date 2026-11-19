@@ -158,6 +158,9 @@ inline constexpr const char* ColourPrepassReasonNames[] = {
     "rasterizer discard", "transform feedback", "depth bounds", "stencil writes", "EQUAL",
     "NOTEQUAL with depth writes", "host not ready", "descriptors differ"};
 inline thread_local bool t_colour_prepass{};
+/// Set by PipelineCache::OcclFlagPipeline when the discard variant it returns is drawn in place
+/// of the draw (a colour draw that discards and writes no depth or stencil): no pre-pass.
+inline thread_local bool t_discard_direct{};
 /// The census class of that draw (restored when the draw cannot take the pre-pass).
 inline thread_local Census t_colour_prepass_class{};
 
@@ -189,6 +192,7 @@ struct Stats {
     std::atomic<u64> colour_flag_draws{}; ///< counted colour-writing draws with a flag pipeline
     std::atomic<u64> prepass_draws{};  ///< counted discarding draws drawn with the pre-pass
     std::atomic<u64> colour_prepass_draws{}; ///< counted colour draws drawn with the colour pre-pass
+    std::atomic<u64> discard_direct_draws{}; ///< counted colour discarding draws drawn with the discard variant
     std::atomic<u64> prepass_made{};   ///< pre-pass pipelines made
     std::atomic<u64> prepass_fallback{}; ///< pre-pass refused at the draw (indirect, delta, dump)
     std::atomic<u64> prepass_paused{}; ///< pre-passes drawn between two host queries
@@ -245,7 +249,8 @@ inline void MaybeLog() {
                  prepass_fallback = take(g.prepass_fallback),
                  prepass_paused = take(g.prepass_paused),
                  prepass_skipped = take(g.prepass_skipped),
-                 colour_prepass_draws = take(g.colour_prepass_draws);
+                 colour_prepass_draws = take(g.colour_prepass_draws),
+                 discard_direct_draws = take(g.discard_direct_draws);
     LOG_INFO(Render_Vulkan,
              "Occlusion flags (FRITCHII_OCCL_FLAG={}) per second: counted draws {:.0f} with a "
              "flag pipeline, {:.0f} without (not Lean {:.0f}, regs refused {:.0f}, not ready "
@@ -256,13 +261,14 @@ inline void MaybeLog() {
              "draws {:.0f}, colour flag pipelines made {:.0f}; pre-pass draws {:.0f} ({:.0f} "
              "between host queries, {:.0f} skipped: a host query open), made {:.0f}, refused at "
              "the draw {:.0f}, refused for their descriptors {} since boot, real draws lost {} "
-             "(must be 0); colour pre-pass draws {:.0f}",
+             "(must be 0); colour pre-pass draws {:.0f}; colour discard variant draws {:.0f}",
              RawMode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
              mixed, no_flag, reused, flag_slots, query_slots, colour_flag_draws, colour_made,
              prepass_draws, prepass_paused, prepass_skipped, prepass_made, prepass_fallback,
              g.prepass_refused.load(std::memory_order_relaxed),
-             g.prepass_lost.load(std::memory_order_relaxed), colour_prepass_draws);
+             g.prepass_lost.load(std::memory_order_relaxed), colour_prepass_draws,
+             discard_direct_draws);
     std::string census;
     for (size_t i = 0; i < static_cast<size_t>(Census::Count); ++i) {
         census += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", CensusNames[i], take(g.census[i]));

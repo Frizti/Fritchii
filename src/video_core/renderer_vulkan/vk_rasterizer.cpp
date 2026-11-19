@@ -2390,6 +2390,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // may take its pipeline's flag variant; a kept flag variant is decided again.
     VideoCommon::OcclFlag::t_census = VideoCommon::OcclFlag::Census::Unknown;
     VideoCommon::OcclFlag::t_colour_prepass = false;
+    VideoCommon::OcclFlag::t_discard_direct = false;
     const auto occl_flag = [&](GraphicsPipeline* chosen, bool allow_make) -> GraphicsPipeline* {
         if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
             chosen = chosen->occl_flag_parent; // a kept flag variant: decided again
@@ -2408,8 +2409,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // consumes their arguments), the delta path and draw counting (they key on the bound
         // pipeline), or a frame dump's probe.
         const bool colour_prepass = VideoCommon::OcclFlag::t_colour_prepass;
-        if (flag != nullptr &&
-            (flag->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS || colour_prepass) &&
+        const bool discard_prepass = flag != nullptr &&
+                                     flag->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS &&
+                                     !VideoCommon::OcclFlag::t_discard_direct;
+        if (flag != nullptr && (discard_prepass || colour_prepass) &&
             (is_indirect || draw_tracking || frame_dump.CapturingSampled())) [[unlikely]] {
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_fallback);
             VideoCommon::OcclFlag::t_census =
@@ -2978,7 +2981,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             VideoCommon::MemStageShadow::BackDrawWindow(false);
         }
         const bool colour_prepass = std::exchange(VideoCommon::OcclFlag::t_colour_prepass, false);
-        if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS ||
+        const bool discard_direct = std::exchange(VideoCommon::OcclFlag::t_discard_direct, false);
+        if (discard_direct) {
+            VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.discard_direct_draws);
+        }
+        if ((pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS && !discard_direct) ||
             colour_prepass) [[unlikely]] {
             // FRITCHII_OCCL_FLAG pre-pass: the variant draws first with depth writes off (and,
             // for a colour pre-pass, colour writes off) and

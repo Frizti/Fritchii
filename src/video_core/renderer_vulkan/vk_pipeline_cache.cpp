@@ -3843,11 +3843,6 @@ u32 OcclFlagColourPrepassReason(const GraphicsPipeline& pipeline,
          (regs.stencil_two_side_enable != 0 && regs.stencil_back_mask != 0))) {
         return 11;
     }
-    const bool equal = regs.depth_test_func == Regs::ComparisonOp::Equal_D3D ||
-                       regs.depth_test_func == Regs::ComparisonOp::Equal_GL;
-    if (regs.depth_test_enable != 0 && equal) {
-        return 12;
-    }
     const bool not_equal = regs.depth_test_func == Regs::ComparisonOp::NotEqual_D3D ||
                            regs.depth_test_func == Regs::ComparisonOp::NotEqual_GL;
     if (regs.depth_test_enable != 0 && regs.depth_write_enabled != 0 && not_equal) {
@@ -3886,13 +3881,11 @@ bool OcclFlagPrepassRegsOk(const Tegra::Engines::Maxwell3D::Regs& regs) {
          (regs.stencil_two_side_enable != 0 && regs.stencil_back_mask != 0));
     const bool not_equal = regs.depth_test_func == Regs::ComparisonOp::NotEqual_D3D ||
                            regs.depth_test_func == Regs::ComparisonOp::NotEqual_GL;
-    // EQUAL: the pre-pass's positions come from a separate (whole pipeline) compile of the
-    // vertex programs; a last-bit difference would decide an equal test.
-    const bool equal = regs.depth_test_func == Regs::ComparisonOp::Equal_D3D ||
-                       regs.depth_test_func == Regs::ComparisonOp::Equal_GL;
+    // EQUAL is allowed: the variant's vertex programs are the same SPIR-V compiled in another
+    // pipeline, as the game's own depth pre-pass and colour pass already are (the equal test
+    // the game draws with depends on that); verify compares it.
     return regs.rasterize_enable != 0 && regs.transform_feedback_enabled == 0 &&
            regs.depth_bounds_enable == 0 && !stencil_writes &&
-           !(regs.depth_test_enable != 0 && equal) &&
            !(regs.depth_test_enable != 0 && regs.depth_write_enabled != 0 && not_equal);
 }
 
@@ -4051,6 +4044,35 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
                 return host;
             }
             if (host_state != 2 && (host == nullptr || !host->IsBuilt())) {
+                OcclFlag::t_census = Census::NotReady;
+                OcclFlag::Add(stats.not_ready);
+                return pipeline;
+            }
+        }
+        // A colour draw whose program discards and that writes no depth or stencil: the discard
+        // variant (early tests, the store after the discards) drawn in its place. Without depth
+        // or stencil writes early tests change nothing, and the colour output is the program's.
+        if (pipeline_class == PipelineClass::Discards && OcclFlag::PrepassAllowed() &&
+            pipeline->occl_flag_prepass_state != 2 && pipeline->IsBuilt() &&
+            !pipeline->IsMeshPipeline() && pipeline->Key().state.early_z == 0 &&
+            pipeline->Key().state.xfb_enabled == 0 && device.IsShaderInt64Supported() &&
+            OcclFlagDiscardsNoWrites(*pipeline, regs)) {
+            GraphicsPipeline* variant = pipeline->occl_flag_prepass.get();
+            if (variant == nullptr && allow_make) {
+                variant = FindOrMakeOcclFlag(*pipeline, OCCL_FLAG_BUILD_PREPASS);
+            }
+            if (variant != nullptr && variant->Failed()) [[unlikely]] {
+                pipeline->occl_flag_prepass_state = 2;
+                OcclFlag::Add(stats.failed);
+                variant = nullptr;
+            }
+            if (variant != nullptr && variant->IsBuilt()) {
+                OcclFlag::t_census = Census::Flag;
+                OcclFlag::t_discard_direct = true;
+                variant->MarkUsed(frame_count);
+                return variant;
+            }
+            if (pipeline->occl_flag_prepass_state != 2) {
                 OcclFlag::t_census = Census::NotReady;
                 OcclFlag::Add(stats.not_ready);
                 return pipeline;
