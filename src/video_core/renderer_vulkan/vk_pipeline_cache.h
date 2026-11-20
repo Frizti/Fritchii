@@ -101,6 +101,7 @@ struct TranslationRecord;
 
 namespace PrecompiledKept {
 class Index;
+class PageCacheWarmer;
 struct Record;
 } // namespace PrecompiledKept
 
@@ -741,6 +742,9 @@ private:
     mutable std::mutex kept_mutex;
     std::shared_ptr<const PrecompiledKept::Index> kept_index;
     std::atomic<bool> kept_available{};
+    /// FRITCHII_PREP_FASTPATH_IO: reads the kept and precompiled files into the OS file cache
+    /// in the background (started by LoadKept, replaced under kept_mutex, stopped at exit).
+    std::unique_ptr<PrecompiledKept::PageCacheWarmer> kept_warmer;
     /// GPU thread: keys whose precompiled build failed or whose audit differed.
     std::unordered_set<u64> precompiled_rejected;
     /// GPU thread: precompiled graphics pipelines not built yet (checked by TickFrame).
@@ -757,11 +761,24 @@ private:
         u32 audit_differ{};
         std::chrono::steady_clock::duration gpu_time{};
         std::chrono::steady_clock::duration gpu_worst{};
+        /// gpu_time split: positional reads of the kept and precompiled files, the checks
+        /// (environments, infos decoded, recorded answers compared) and the pipeline objects.
+        std::chrono::steady_clock::duration read_time{};
+        std::chrono::steady_clock::duration check_time{};
+        std::chrono::steady_clock::duration create_time{};
+        /// GPU thread time of checks that sent a key back (not in gpu_time), and its reads.
+        std::chrono::steady_clock::duration miss_time{};
+        std::chrono::steady_clock::duration miss_read_time{};
         std::vector<std::pair<const char*, u32>> misses; ///< By reason (string literals)
         u64 bytes_at_window{};
         std::chrono::steady_clock::time_point window{};
     } precompiled_stats;
     void NotePrecompiledMiss(const char* reason);
+    /// The fast path's GPU thread time of one key, for the 10 s line and the frame tally:
+    /// `checks` (file reads included, `read_ns` of them) and `create`, the pipeline object.
+    /// `created` false: a miss.
+    void NoteFastPathTime(std::chrono::steady_clock::duration checks, u64 read_ns,
+                          std::chrono::steady_clock::duration create, bool created);
 
     /// Builds a disk-cached graphics pipeline from the first of its records (newest first) that
     /// loads. When none does, the GPU thread's build of it is stored again.

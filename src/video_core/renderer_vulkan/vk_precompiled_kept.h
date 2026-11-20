@@ -41,6 +41,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -83,6 +84,29 @@ static_assert(sizeof(Record) == 72 && std::is_trivially_copyable_v<Record> &&
 
 /// Bytes read from kept files and recorded environments at run time (for the 10 s line).
 std::atomic<u64>& BytesRead();
+
+/// Nanoseconds the calling thread has spent in PositionalFile reads so far (the GPU thread's
+/// fast path splits its time into read I/O and the rest with it).
+u64& ThreadReadNanoseconds();
+
+/// FRITCHII_PREP_FASTPATH_IO: reads `files` once, front to back in 4 MiB chunks, on a thread of
+/// its own at idle CPU and very low I/O priority, so the fast path's later positional reads of
+/// them hit the OS file cache instead of the disk. Files are taken in order while twice their
+/// running total fits in the free physical memory; the rest are skipped (logged). Destroying it
+/// stops the reading promptly (a read in progress is cancelled on Windows) and joins the thread.
+class PageCacheWarmer {
+public:
+    explicit PageCacheWarmer(std::vector<std::filesystem::path> files);
+    ~PageCacheWarmer();
+    PageCacheWarmer(const PageCacheWarmer&) = delete;
+    PageCacheWarmer& operator=(const PageCacheWarmer&) = delete;
+
+private:
+    void Run(std::vector<std::filesystem::path> files);
+
+    std::atomic<bool> stop{};
+    std::thread thread;
+};
 
 /// The seed of the boot check's sample: the running exe's size and modification time, hashed.
 /// The same build checks the same pipelines on every boot; each new build checks others, so a
