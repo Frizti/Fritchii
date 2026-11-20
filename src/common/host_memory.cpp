@@ -412,17 +412,32 @@ public:
         // the write-trap protections, thousands a second, queued behind them. Any interleaving
         // ends as a Protect done wholly before or after the Map or Unmap: a view in place is the
         // range's final view, a placeholder sends the call to the locked path.
+        // The one exception is a partial Unmap that splits a view: it unmaps the whole view and
+        // maps the kept parts again with PAGE_READWRITE (UnmapOnePlaceholder), which would wipe
+        // a protection that landed on the old view. split_unmap_seq is odd across that sequence;
+        // a call that saw it odd or changed is redone under the lock (VirtualProtect is
+        // idempotent), after the remap.
         const bool unlocked = ProtectUnlocked();
+        bool redo = false;
         if (unlocked) {
-            DWORD old_flags{};
-            if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
-                NoteProtect(true);
-                return;
+            const u64 seq_before = split_unmap_seq.load(std::memory_order_seq_cst);
+            if ((seq_before & 1) != 0) {
+                redo = true;
+            } else {
+                DWORD old_flags{};
+                if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    if (split_unmap_seq.load(std::memory_order_seq_cst) == seq_before) {
+                        NoteProtect(ProtectPath::Unlocked);
+                        return;
+                    }
+                    redo = true;
+                }
             }
         }
         std::scoped_lock lock{placeholder_mutex};
         if (unlocked) {
-            NoteProtect(false);
+            NoteProtect(redo ? ProtectPath::SplitRedo : ProtectPath::Fallback);
         }
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
         while (it != end) {
@@ -449,13 +464,20 @@ public:
         return value > 0;
     }
 
-    /// Counts Protect calls done without the lock and ones that fell back to it, and logs both
-    /// every 10 s while the switch is on (the fallbacks are the calls that still wait).
-    static void NoteProtect(bool without_lock) {
+    enum class ProtectPath { Unlocked, Fallback, SplitRedo };
+
+    /// Counts Protect calls done without the lock, ones that fell back to it and ones redone
+    /// under it after a split Unmap (split_unmap_seq), and logs them every 10 s while the switch
+    /// is on (the fallbacks and redos are the calls that still wait).
+    static void NoteProtect(ProtectPath path) {
         static std::atomic<u64> fast{};
         static std::atomic<u64> locked{};
+        static std::atomic<u64> redone{};
         static std::atomic<u64> next_report_ns{};
-        (without_lock ? fast : locked).fetch_add(1, std::memory_order_relaxed);
+        (path == ProtectPath::Unlocked   ? fast
+         : path == ProtectPath::Fallback ? locked
+                                         : redone)
+            .fetch_add(1, std::memory_order_relaxed);
         const u64 now = Common::Nx2Hitch::NowNs();
         u64 due = next_report_ns.load(std::memory_order_relaxed);
         if (now < due) {
@@ -468,11 +490,13 @@ public:
         }
         const u64 fast_count = fast.exchange(0, std::memory_order_relaxed);
         const u64 locked_count = locked.exchange(0, std::memory_order_relaxed);
+        const u64 redone_count = redone.exchange(0, std::memory_order_relaxed);
         if (due != 0) {
             LOG_INFO(HW_Memory,
                      "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): {} without the "
-                     "lock, {} took the lock (placeholder or several views)",
-                     fast_count, locked_count);
+                     "lock, {} took the lock (placeholder or several views), {} redone under the "
+                     "lock (a split Unmap ran alongside)",
+                     fast_count, locked_count, redone_count);
         }
     }
 
@@ -571,6 +595,11 @@ private:
 
         const bool split_left = unmap_begin > placeholder_begin;
         const bool split_right = unmap_end < placeholder_end;
+        const bool splits = split_left || split_right;
+        if (splits) {
+            // Odd until the kept parts are mapped again: unlocked Protects redo (Protect).
+            split_unmap_seq.fetch_add(1, std::memory_order_seq_cst);
+        }
 
         if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder_begin,
                                   MEM_PRESERVE_PLACEHOLDER)) {
@@ -592,6 +621,9 @@ private:
                     placeholder_end - unmap_end);
         }
         // End panic region
+        if (splits) {
+            split_unmap_seq.fetch_add(1, std::memory_order_seq_cst);
+        }
 
         size_t coalesce_begin = unmap_begin;
         if (!split_left) {
@@ -674,6 +706,9 @@ private:
     PFN_UnmapViewOfFile2 pfn_UnmapViewOfFile2{};
 
     std::mutex placeholder_mutex;                                 ///< Mutex for placeholders
+    /// Odd while UnmapOnePlaceholder splits a view (unmapped whole, kept parts mapped again);
+    /// bumped twice per split. Read by Protect's unlocked path (FRITCHII_PROTECT_UNLOCKED).
+    std::atomic<u64> split_unmap_seq{0};
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
 };
