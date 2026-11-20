@@ -4028,6 +4028,27 @@ bool OcclFlagPrepassRegsOk(const Tegra::Engines::Maxwell3D::Regs& regs) {
            !(regs.depth_test_enable != 0 && regs.depth_write_enabled != 0 && not_equal);
 }
 
+/// FRITCHII_OCCL_FLAG: two stages' texture lists describe the same textures, census_use aside.
+/// census_use is not stored with a kept info (info_serialize.cpp), so a parent from the
+/// precompiled fast path has 0 there while a fresh translation of the same draw sets it. It is
+/// only a hint for the texture cache's depth census, never a binding or layout difference.
+static bool SameTextures(const Shader::TextureDescriptors& a,
+                         const Shader::TextureDescriptors& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        auto x = a[i];
+        auto y = b[i];
+        x.census_use = 0;
+        y.census_use = 0;
+        if (x != y) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// FRITCHII_OCCL_FLAG pre-pass: the variant was translated again from the draw's environments
 /// (storage buffers found from the live constant buffers); the parent binds the descriptors the
 /// variant's Configure acquired, so both must describe the same descriptors, stage by stage.
@@ -4042,7 +4063,7 @@ bool OcclFlagSameDescriptors(const GraphicsPipeline& a, const GraphicsPipeline& 
             x[i].storage_buffers_descriptors != y[i].storage_buffers_descriptors ||
             x[i].texture_buffer_descriptors != y[i].texture_buffer_descriptors ||
             x[i].image_buffer_descriptors != y[i].image_buffer_descriptors ||
-            x[i].texture_descriptors != y[i].texture_descriptors ||
+            !SameTextures(x[i].texture_descriptors, y[i].texture_descriptors) ||
             x[i].image_descriptors != y[i].image_descriptors ||
             x[i].uses_rescaling_uniform != y[i].uses_rescaling_uniform ||
             x[i].uses_render_area != y[i].uses_render_area) {
@@ -4074,7 +4095,7 @@ bool OcclVariantFitsParent(const GraphicsPipeline& variant, const GraphicsPipeli
             x[i].storage_buffers_descriptors != y[i].storage_buffers_descriptors ||
             x[i].texture_buffer_descriptors != y[i].texture_buffer_descriptors ||
             x[i].image_buffer_descriptors != y[i].image_buffer_descriptors ||
-            x[i].texture_descriptors != y[i].texture_descriptors ||
+            !SameTextures(x[i].texture_descriptors, y[i].texture_descriptors) ||
             x[i].image_descriptors != y[i].image_descriptors) {
             return false;
         }
@@ -10724,7 +10745,7 @@ namespace {
 /// FRITCHII_OCCL_FLAG_PERSIST: the occlusion file, vulkan-frizti-occl.fork-v<N>.bin beside the
 /// disk cache. A header (OcclFileMagic, the cache version, the key size), then records back to
 /// back: a marker, the type, the payload's size and CityHash64, the payload.
-constexpr std::array<char, 8> OcclFileMagic{'o', 'c', 'c', 'l', '_', 'v', '2', '\0'};
+constexpr std::array<char, 8> OcclFileMagic{'o', 'c', 'c', 'l', '_', 'v', '3', '\0'};
 constexpr u32 OcclRecordMarker = 0x5243434F; // "OCCR"
 /// u8 kind, the parent's key, the key built (kinds 4/5: attachments zeroed; 0: no pixel
 /// program), u64 the parent's descriptor signature (OcclDescriptorSignature) when recorded,
