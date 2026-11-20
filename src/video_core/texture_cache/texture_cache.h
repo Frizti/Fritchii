@@ -2665,10 +2665,12 @@ void TextureCache<P>::SweepColdImages() {
     // FRITCHII_COLD_SWEEP_KEEP_RESAMPLED (live, default 1): GPU-written targets at an address and
     // shape the game sampled again after an earlier sweep lost them (cold_resampled) stay, by
     // the regular sweep and by covered retire, while device memory is under the collector's
-    // line (minimum_memory). Over it they go as before, and the collector's rules apply.
+    // expected threshold (expected_memory). Over it they go as before, and the collector's rules apply.
     const int keep_mode = VideoCore::Nx2Debug::SwitchValue(
         VideoCore::Nx2Debug::g_cold_sweep_keep_resampled, "FRITCHII_COLD_SWEEP_KEEP_RESAMPLED", 1);
-    const u64 keep_limit = minimum_memory != 0 ? minimum_memory : expected_memory / 2;
+    // The expected threshold: the collector starts deleting by age above minimum_memory (1.5 GiB),
+    // which play exceeds at once on large cards, so that line kept nothing in practice.
+    const u64 keep_limit = expected_memory;
     const bool keep_room = total_used_memory < keep_limit;
     const auto keep_rule = [&](Image& image) {
         return keep_mode > 0 && True(image.flags & ImageFlagBits::GpuModified) &&
