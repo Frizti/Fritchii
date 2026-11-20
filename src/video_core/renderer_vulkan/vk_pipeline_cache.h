@@ -454,9 +454,9 @@ private:
     /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
     u64 occl_made_frame{~u64{0}};
 
-    /// FRITCHII_PREP_OCCL_VARIANTS: the occlusion flag variant kinds (bit per kind 2, 3, 5) a
+    /// FRITCHII_PREP_OCCL_VARIANTS: the occlusion flag variant kinds (bit per kind 1-5) a
     /// pipeline can need, from its key and programs' infos alone (no draw): what the preparation
-    /// builds and keeps for it. Only kinds of OcclPrepMask (the device's, not the settings').
+    /// builds and keeps for it. Only kinds of OcclPrepMask (the device's; play and hints narrow them).
     [[nodiscard]] u8 OcclPrepKinds(const GraphicsPipelineCacheKey& key,
                                    std::span<const Shader::Info> infos,
                                    bool emulated_mesh) const;

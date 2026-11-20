@@ -2043,12 +2043,13 @@ int PrepComputeCheckMode() {
 }
 
 // FRITCHII_PREP_OCCL_VARIANTS: "Preparing shaders" also builds and keeps the occlusion flag
-// variants (FRITCHII_OCCL_FLAG) whose translation from a snapshot often did not fit its parent
-// (colour, pre-pass, pre-pass no-colour: OcclPrepMask), so a draw attaches them from the kept
-// SPIR-V (MakeKeptOcclVariant); the host flag kinds (1, 4) are made from the parent's own kept
-// record, not prepared. 0 (default, until the preparation's time and disk are measured on AMD,
-// NVIDIA and Intel) = as before: the kept file, its stamp and play unchanged. 1: on; switching
-// it prepares once (the kept file's layout and stamp say whether it holds variants).
+// variants (FRITCHII_OCCL_FLAG): the five kinds as far as this device builds them (OcclPrepMask),
+// narrowed to the kinds play draws (OcclPrepPlayMask) and the recipe's hints, so a draw attaches
+// them from the kept SPIR-V (MakeKeptOcclVariant; the host kinds 1 and 4 were compiled by the
+// preparation, so the driver's cache holds them). 0 (default, until the preparation's time and
+// disk are measured on AMD, NVIDIA and Intel) = as before: the kept file, its stamp and play
+// unchanged. 1: on; switching it prepares once (the kept file's layout and stamp say whether it
+// holds variants).
 int PrepOcclVariantsMode() {
     static const int mode = [] {
         const char* const env = std::getenv("FRITCHII_PREP_OCCL_VARIANTS");
@@ -3985,9 +3986,9 @@ constexpr u8 OCCL_FLAG_BUILD_PREPASS_NOCOLOUR = 5; ///< the pre-pass, colour wri
 /// occl_queue's job of kind 0), for FRITCHII_OCCL_FLAG_COMPILE_THREADS' lane and the counts.
 thread_local bool t_occl_sibling_build{};
 
-// FRITCHII_PREP_OCCL_VARIANTS: the variant kinds (colour, pre-pass, pre-pass no-colour) play
-// will draw this session, from the inputs play reads: the occlusion level (FRITCHII_OCCL_FLAG
-// or the setting, read at device creation: Standard draws none of these kinds, Full all), and
+// FRITCHII_PREP_OCCL_VARIANTS: the variant kinds play will draw this session (OcclKindWanted's
+// rule), from the inputs play reads: the occlusion level (FRITCHII_OCCL_FLAG or the setting,
+// read at device creation: Standard draws the host kind 1 only, Full all five), and
 // one follower, which plays flags only with FRITCHII_ONEF_OCCL (unset: AMD's proprietary driver
 // on a discrete GPU) and its pre-pass kinds only with FRITCHII_ONEF_OCCL_PREPASS (default 1).
 // The preparation runs before OneFollower::ReadSwitches, so its decision is made here the way
@@ -4030,7 +4031,13 @@ static u8 OcclPrepPlayMask(const Device& device, std::string& why) {
         const char* const prepass = std::getenv("FRITCHII_ONEF_OCCL_PREPASS");
         prepass_ok = prepass == nullptr || prepass[0] != '0';
     }
-    u8 mask = 0;
+    // The host flag kind (1) at every level; the host no-colour kind (4: the colour pre-pass)
+    // where the colour pre-pass is allowed; with one follower on, the pre-pass kinds only with
+    // FRITCHII_ONEF_OCCL_PREPASS.
+    u8 mask = static_cast<u8>(1U << OCCL_FLAG_BUILD_HOST);
+    if (OcclFlag::ColourPrepassAllowed() && prepass_ok) {
+        mask |= static_cast<u8>(1U << OCCL_FLAG_BUILD_NOCOLOUR);
+    }
     if (OcclFlag::ColourAllowed()) {
         mask |= static_cast<u8>(1U << OCCL_FLAG_BUILD_COLOUR);
     }
@@ -4439,9 +4446,26 @@ u8 PipelineCache::OcclPrepKinds(const GraphicsPipelineCacheKey& key,
     const PipelineClass pipeline_class = ClassifyOcclPipeline(key, infos, false);
     const bool mesh_lean =
         pipeline_class == PipelineClass::Mesh && ClassifyOcclPixel(key, infos) == PipelineClass::Lean;
-    if (((pipeline_class == PipelineClass::Lean && !mesh) || mesh_lean) &&
-        OcclFlagColourVerdict(key, infos) == Census::Flag) {
+    const Census colour_verdict = ((pipeline_class == PipelineClass::Lean && !mesh) || mesh_lean)
+                                      ? OcclFlagColourVerdict(key, infos)
+                                      : Census::Unknown;
+    if (colour_verdict == Census::Flag) {
         kinds |= static_cast<u8>(1U << OCCL_FLAG_BUILD_COLOUR);
+    }
+    // The host flag kinds (OcclFlagPipeline): 1 for colour-off draws of a Lean pipeline (and,
+    // at Full, of one without a pixel program or a mesh one whose pixel program is Lean), and
+    // for the colour pre-pass of a colour draw whose Lean program uses subgroup or quad
+    // operations with dynamic colour masks; 4 for that pre-pass without them (a key with every
+    // attachment's writes off). Prepared, they are whole pipelines compiled by the preparation
+    // (the driver's cache holds them), also for a parent kept for libraries, which cannot lend
+    // its own record (MakeKeptOcclVariant).
+    if ((pipeline_class == PipelineClass::Lean && !mesh) || mesh_lean ||
+        pipeline_class == PipelineClass::NoPixel) {
+        kinds |= static_cast<u8>(1U << OCCL_FLAG_BUILD_HOST);
+    }
+    if (!dyn &&
+        (colour_verdict == Census::ColourSubgroup || colour_verdict == Census::ColourQuad)) {
+        kinds |= static_cast<u8>(1U << OCCL_FLAG_BUILD_NOCOLOUR);
     }
     if (pipeline_class == PipelineClass::Discards) {
         if (OcclFlagPrepassPipelinePart(key, infos)) {
@@ -4458,16 +4482,20 @@ u8 PipelineCache::OcclPrepKinds(const GraphicsPipelineCacheKey& key,
 }
 
 u8 PipelineCache::OcclPrepMask() const {
-    // The kinds whose translation from a draw's snapshot often did not fit its parent (colour,
-    // pre-pass, pre-pass no-colour), as far as this device can build them (all three store a
-    // 64-bit address): fixed per boot of a device, never the Occlusion setting's kinds or the
-    // one-follower switches. The host flag kinds (1, 4) come from the parent's own record
-    // (MakeKeptOcclVariant).
-    if (!device.IsOcclFlagDeviceAddressEnabled() || !device.IsShaderInt64Supported()) {
+    // The kinds this device can build: the host flag kinds (1, 4) with the flag area alone, the
+    // guest-program kinds whose translation from a draw's snapshot often did not fit its parent
+    // (colour, pre-pass, pre-pass no-colour: they store a 64-bit address) with 64-bit integers
+    // too. Fixed per boot of a device; the kinds play draws (OcclPrepPlayMask) and the recipe's
+    // hints narrow them in PreparePrecompiled.
+    if (!device.IsOcclFlagDeviceAddressEnabled()) {
         return 0;
     }
-    return static_cast<u8>((1U << OCCL_FLAG_BUILD_COLOUR) | (1U << OCCL_FLAG_BUILD_PREPASS) |
-                           (1U << OCCL_FLAG_BUILD_PREPASS_NOCOLOUR));
+    u8 mask = static_cast<u8>((1U << OCCL_FLAG_BUILD_HOST) | (1U << OCCL_FLAG_BUILD_NOCOLOUR));
+    if (device.IsShaderInt64Supported()) {
+        mask |= static_cast<u8>((1U << OCCL_FLAG_BUILD_COLOUR) | (1U << OCCL_FLAG_BUILD_PREPASS) |
+                                (1U << OCCL_FLAG_BUILD_PREPASS_NOCOLOUR));
+    }
+    return mask;
 }
 
 GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
@@ -4824,7 +4852,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPip
             break;
         }
     }
-    // The host flag kinds (1 and 4) are never prepared: the parent's own record is that variant,
+    // The host flag kinds (1 and 4) without a prepared record of their own (a file prepared
+    // before they were, or a kind the hints left out): the parent's own record is that variant,
     // as CreateGraphicsPipeline translates it (the same stages, the guest pixel program kept for
     // its info and replaced by the host flag program). A whole pipeline, so not from a record
     // emitted for libraries (other bindings): that parent takes the translation path.

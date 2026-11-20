@@ -633,19 +633,25 @@ ones the game used); this only makes the compute records end earlier within the 
 ### FRITCHII_PREP_OCCL_VARIANTS
 
 Boot, default 0 (the kept file, its stamp and play as before). 1: "Preparing shaders" (with
-EDEN_NX2_PRECOMPILED_FAST) also builds and keeps occlusion flag variants (colour, pre-pass,
-pre-pass no-colour) beside their pipelines in the kept file, from the recipe's variant hints
-(docs/fritchii/recipe-merge.md). The kinds prepared are the device's (64-bit integers and the flag
-area's buffer device address) AND the kinds play will draw this session, decided before the
-preparation from the inputs play reads (2026-11-20, cross-vendor review): the occlusion level
-(FRITCHII_OCCL_FLAG, else the setting: Standard draws none of these kinds, Full all three) and one
+EDEN_NX2_PRECOMPILED_FAST) also builds and keeps occlusion flag variants (1 host, 2 colour, 3
+pre-pass, 4 host no-colour, 5 pre-pass no-colour) beside their pipelines in the kept file, from the
+recipe's variant hints (docs/fritchii/recipe-merge.md). The kinds prepared are the device's (the
+flag area's buffer device address for 1 and 4, 64-bit integers too for 2, 3 and 5) AND the kinds
+play will draw this session, decided before the preparation from the inputs play reads
+(2026-11-20, cross-vendor review): the occlusion level (FRITCHII_OCCL_FLAG, else the setting:
+Standard draws kind 1 only, Full all five; 4 needs the colour pre-pass, Full or 2) and one
 follower as OneFollower::ReadSwitches will decide it (FRITCHII_ONEF_LEAN=1 or FRITCHII_ONEF=1; on
 AMD's proprietary driver an explicit FRITCHII_ONEF_AMD, else a discrete GPU at Full). With one
 follower on only FRITCHII_ONEF_OCCL (unset: AMD's proprietary driver on a discrete GPU) plays flags,
 and its pre-pass kinds only with FRITCHII_ONEF_OCCL_PREPASS (default 1); so NVIDIA, Intel and RADV
 with one follower on prepare none. No hints for the file (no recipe note, another recipe, records
-dropped): no variant is prepared (was every kind). The Preparing-shaders stamp is unchanged. Logs:
-"Precompiled occlusion variants (FRITCHII_PREP_OCCL_VARIANTS=1): kinds 0x.. (device 0x2c, played
+dropped): no variant is prepared (was every kind). The host kinds 1 and 4 are prepared since
+2026-11-20 (before, only 2, 3 and 5): a kept parent can lend its own record for them, but then
+the driver compiles them in play, and a parent kept for libraries cannot lend it (translated in
+play); prepared, they are whole pipelines in the driver's cache. A file prepared before keeps
+working (kinds 1 and 4 from the parent's record); it gains them only when prepared again (Prepare
+Shaders Now): neither stamp changed. The Preparing-shaders stamp is unchanged. Logs:
+"Precompiled occlusion variants (FRITCHII_PREP_OCCL_VARIANTS=1): kinds 0x.. (device 0x3e, played
 0x..: occlusion level N, one follower on|off | one follower on without occlusion flags
 (FRITCHII_ONEF_OCCL=...) | occlusion speed-up off (N))", then "... hints from ..." or "...: no
 hints (<why>), no variant is prepared (play translates them as before)".
