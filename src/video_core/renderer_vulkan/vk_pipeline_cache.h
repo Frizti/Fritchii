@@ -471,12 +471,14 @@ private:
     /// and siblings, retires the rest, sweeps wedged jobs.
     void TickOcclVariants();
     void AdoptOcclJob(std::unique_ptr<TranslationJob> job);
-    /// A finished lean sibling job: its pipeline when usable; `retry` when it is to be
-    /// translated again. Marks the parent Failed when it made none (or failed too often).
-    std::unique_ptr<GraphicsPipeline> AdoptOcclSibling(std::unique_ptr<TranslationJob> job,
-                                                       bool& retry);
-    /// A draw whose own key is a lean sibling still queued on occl_queue (its entry empty):
-    /// as AdoptTranslation (`pending`: skip the draw meanwhile).
+    /// A finished lean sibling job: its pipeline when usable. Null when it made none (the
+    /// parent marked Failed, as the synchronous path's failure) or when it was unusable (a stale
+    /// texture descriptor, a guarded read that gave up: counted, and after MaxTranslateFailures
+    /// the sibling is made on the lookup thread instead).
+    std::unique_ptr<GraphicsPipeline> AdoptOcclSibling(std::unique_ptr<TranslationJob> job);
+    /// A draw whose own key is a lean sibling still on occl_queue (its entry empty): adopts the
+    /// finished job; else skips the draw (`pending`) when it may be skipped with the
+    /// asynchronous shaders on; else builds the key here from this draw, as a new key.
     std::unique_ptr<GraphicsPipeline> AdoptOcclSiblingForDraw(bool& pending);
     /// FRITCHII_OCCL_FLAG_ASYNC: the parent's state for variant `kind` (1-5).
     static u8& OcclFlagStateOf(GraphicsPipeline& full, u8 kind);
@@ -484,8 +486,28 @@ private:
     u32 occl_async_per_frame{4};
     u64 occl_enqueue_frame{~u64{0}};
     u32 occl_enqueued_in_frame{};
-    /// Unusable translations per parent key and kind (0 sibling, 1-5 variants).
-    std::unordered_map<GraphicsPipelineCacheKey, std::array<u8, 6>> occl_failures;
+    /// FRITCHII_OCCL_FLAG_ASYNC: a parent's unusable translations by kind (0 sibling, 1-5
+    /// variants). Tied to the parent object: one made again under the same key starts afresh.
+    /// A kind's counts are cleared when one of its translations is used; the record goes when
+    /// its parent leaves graphics_cache (TickOcclVariants, every 60 frames).
+    struct OcclFailures {
+        const GraphicsPipeline* parent{};
+        std::array<u8, 6> stale{}; ///< stale texture descriptors, guarded reads that gave up
+        std::array<u8, 6> swept{}; ///< translations still running after TranslateSweepAge
+        u8 sync_only{}; ///< bit per kind: made on the lookup thread (the synchronous path)
+    };
+    std::unordered_map<GraphicsPipelineCacheKey, OcclFailures> occl_failures;
+    /// The record of `parent_key`'s pipeline `parent` (a fresh one for another object).
+    OcclFailures& OcclFailuresOf(const GraphicsPipelineCacheKey& parent_key,
+                                 const GraphicsPipeline& parent);
+    /// A translation of `kind` was used: its counts are forgotten.
+    void ClearOcclFailures(const GraphicsPipelineCacheKey& parent_key,
+                           const GraphicsPipeline& parent, u8 kind);
+    /// Whether `full`'s `kind` is made on the lookup thread (it kept going stale off it).
+    [[nodiscard]] bool OcclSyncOnly(const GraphicsPipeline& full, u8 kind) const;
+    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS: whether the build on this thread is a flag variant
+    /// whose driver compile goes to occl_compile_workers (never a cache entry, never waited on).
+    [[nodiscard]] bool OcclLaneBuild() const;
 
     /// The pointer slots kept for the current key (evicted_pointer_slots), null when none
     [[nodiscard]] const VideoCommon::EvictedPointerSlots::Slots* KeptPointers() const;
@@ -881,8 +903,9 @@ private:
     std::atomic_bool save_again{};
 
     Common::ThreadWorker workers;
-    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS (default 2; 0 none): the driver compiles of occlusion
-    /// flag variants and lean siblings, at the lowest priority, apart from the shared workers.
+    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS (default 2 with FRITCHII_OCCL_FLAG_ASYNC=1, else 0;
+    /// 0 none): the driver compiles of occlusion flag variants, at the lowest priority, apart
+    /// from the shared workers. Lean siblings (cache entries draws may wait on) stay on those.
     std::unique_ptr<Common::ThreadWorker> occl_compile_workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;

@@ -153,13 +153,21 @@ public:
     [[nodiscard]] std::vector<GraphicsPipelineCacheKey> Sweep(
         std::chrono::steady_clock::duration age);
 
-    /// Sweep, giving each abandoned job's kind and parent key too (the occlusion queue).
+    /// Sweep, giving each abandoned job's kind and parent key too (the occlusion queue). With
+    /// `from_start` the age counts from when a thread began translating the job (time spent
+    /// queued is not a wedge), so a job still queued is never swept. Jobs are picked and
+    /// abandoned under one lock: a job that has finished is never swept.
     struct Swept {
         GraphicsPipelineCacheKey key{};
         u8 kind{};
         GraphicsPipelineCacheKey parent_key{};
     };
-    [[nodiscard]] std::vector<Swept> SweepJobs(std::chrono::steady_clock::duration age);
+    [[nodiscard]] std::vector<Swept> SweepJobs(std::chrono::steady_clock::duration age,
+                                               bool from_start = false);
+
+    /// Waits up to `cap` until no job is queued or translating (abandoned ones included), so no
+    /// thread of this queue queues a driver compile after it returns. True when idle.
+    [[nodiscard]] bool WaitIdle(std::chrono::milliseconds cap);
 
     /// Every finished job not taken yet (removed from the queue): the draws that asked for them
     /// have not come back, and the cache adopts them between frames.
@@ -183,6 +191,8 @@ private:
         std::unique_ptr<TranslationJob> job; ///< Null while a thread translates it
         bool done{};
         std::chrono::steady_clock::time_point enqueued{};
+        /// When a thread took the job (unset while it is queued)
+        std::chrono::steady_clock::time_point started{};
         GraphicsPipelineCacheKey parent_key{}; ///< The job's (kept for Sweep while it runs)
     };
 
@@ -194,6 +204,8 @@ private:
     /// Jobs whose entry was abandoned while they translated, for RetireAbandoned. Under `mutex`.
     std::vector<std::unique_ptr<TranslationJob>> abandoned;
     u64 next_id{1};
+    /// Runs queued and not ended yet (abandoned ones included), for WaitIdle. Under `mutex`.
+    size_t runs_pending{};
     const size_t max_in_flight;
     Translate translate;
     Retire retire;
