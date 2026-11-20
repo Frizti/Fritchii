@@ -8515,3 +8515,10 @@ held to the P-cores with CPU sets, released when they don't fit or after two 10 
 50 late guest timers a second. It adds nothing where `Thread pinning:` already gave them cores of
 their own. 1 = strict with guards, 3 = strict without, 0 = off. Check the `CPU placement:` and
 `Hybrid placement in 10 s:` lines.
+
+- FRITCHII_COVERED_RETIRE_WRITEBACK (live, default 0 = off): covered retire (FRITCHII_COVERED_RETIRE) writes a
+  GPU-written target back to guest memory before deleting it, as the cold sweep does, so a later sample is not cleared
+  to zero ("Lost contents sampled ... cold sweep"). OoT Market A/B (RX 9070 XT): cold sweep losses 29 -> 12-15 a run and
+  "sampled again where one was deleted" 26 -> 10, pictures correct, but 11-14k write-backs a run for ~20 re-reads and a
+  slightly worse first camera spin in both runs. Off until a cheaper selection is measured. The covered retire line
+  reports "({} written back first)".

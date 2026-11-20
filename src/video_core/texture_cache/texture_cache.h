@@ -2734,11 +2734,13 @@ void TextureCache<P>::SweepColdImages() {
                         ++index;
                         continue;
                     }
-                    // FRITCHII_COVERED_RETIRE_WRITEBACK (live, default 1): written back to guest memory first, as
+                    // FRITCHII_COVERED_RETIRE_WRITEBACK (live, default 0 = off): written back to guest memory first, as
                     // the cold sweep does (LostWriteback), so a later sample of this target is not cleared to
-                    // zero; deleted when the write-back lands, kept if used again first. 0 = deleted at once.
+                    // zero; deleted when the write-back lands, kept if used again first. Market A/B: cold sweep
+                    // losses 29 -> 12-15, but 11-14k write-backs a run for ~20 re-reads; off until a cheaper
+                    // selection (only shapes likely to be read again) is measured.
                     if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_covered_retire_writeback,
-                                                         "FRITCHII_COVERED_RETIRE_WRITEBACK", 1) != 0) {
+                                                         "FRITCHII_COVERED_RETIRE_WRITEBACK", 0) != 0) {
                         const LostWriteback wb = QueueLostWriteback(image_id, image, LostPathCold);
                         if (wb == LostWriteback::Queued) {
                             ++covered_deleted;
