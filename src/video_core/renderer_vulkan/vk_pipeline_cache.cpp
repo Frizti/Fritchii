@@ -65,6 +65,7 @@
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_precompile.h"
+#include "video_core/nx2_recipe.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/pipeline_cache_policy.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
@@ -1996,6 +1997,49 @@ int PrepOcclVariantsMode() {
 // the host pixel replacement, the kinds OcclPrepKinds chooses, how MakeKeptOcclVariant builds
 // them): none of that is in NX2_SHADER_STAMP, and the boot sample checks only a few variants.
 constexpr u32 OcclVariantTranslationVersion = 1;
+
+// FRITCHII_PREP_OCCL_VARIANTS: the occlusion variant hints (docs/fritchii/recipe-merge.md, "What
+// the preparer reads") of the recipe the precompiled file was assembled from: one kind mask per
+// record of the file, in file order (before FRITCHII_PREP_ORDER). Only when the file's note
+// names that very recipe by size and content hash; nullopt (no note, another recipe, no hints,
+// records dropped by the assembly) means all kinds, as before. Never part of any stamp: a merge
+// that adds hints leaves the assembled file's bytes, and so the preparation, as they were.
+std::optional<VideoCommon::Nx2Recipe::VariantHints> PrepOcclHints(
+    u64 title_id, const std::filesystem::path& title_dir, const std::filesystem::path& file,
+    u32 file_record_count, std::string& source) {
+    if (title_id == 0) {
+        return std::nullopt;
+    }
+    auto note_path = file;
+    note_path += ".recipe.txt";
+    std::ifstream note(note_path, std::ios::binary);
+    if (!note) {
+        source = "no recipe note beside the file";
+        return std::nullopt;
+    }
+    const std::string noted{std::istreambuf_iterator<char>(note), {}};
+    const auto recipe = VideoCommon::Nx2Precompile::FindRecipe(title_id, title_dir, CACHE_VERSION);
+    if (!recipe ||
+        noted != fmt::format("recipe {} {:016x}\n", recipe->size, recipe->content_hash)) {
+        source = "the file was not assembled from the recipe found";
+        return std::nullopt;
+    }
+    std::ifstream in(recipe->path, std::ios::binary);
+    const std::vector<u8> bytes{std::istreambuf_iterator<char>(in), {}};
+    if (bytes.size() != recipe->size ||
+        Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size()) !=
+            recipe->content_hash) {
+        source = "the recipe changed while it was read";
+        return std::nullopt;
+    }
+    source = recipe->path.filename().string();
+    try {
+        return VideoCommon::Nx2Recipe::HintsForFile(bytes, file_record_count);
+    } catch (const std::exception& e) {
+        source += fmt::format(" ({})", e.what());
+        return std::nullopt;
+    }
+}
 
 // Compute pipelines built in play, and the ones the driver compiled (a build over
 // RuntimeCompileSlowMs; a cache hit takes 2-10 ms): a dispatch that needs one waits for it. The
@@ -6667,7 +6711,7 @@ void PipelineCache::StartPrecompiled(u64 title_id, const std::filesystem::path& 
         bool force = false;
         for (;;) {
             shader_notify.PrecompileStarted();
-            PreparePrecompiled(base_dir, stop, {}, file, force);
+            PreparePrecompiled(base_dir, stop, {}, file, force, title_id);
             shader_notify.SetWarmProgress(0, 0, 0);
             shader_notify.SetPrecompilePending(false);
             shader_notify.PrecompileEnded();
@@ -6715,7 +6759,8 @@ void PipelineCache::CanonicalizeNativeKey(
 void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                                        std::stop_token stop_loading,
                                        const VideoCore::DiskResourceLoadCallback& callback,
-                                       const std::filesystem::path& file, bool force) {
+                                       const std::filesystem::path& file, bool force,
+                                       u64 title_id) {
     // Ported for Fritchii: it runs beside the game (precompile_thread) instead of
     // before the first frame, on threads of its own at idle priority instead of the boot's
     // pipeline workers, and reads each record from the file when it is built instead of
@@ -6878,6 +6923,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     /// Which records are compute ones (the compute pass takes only those).
     std::vector<u8> record_compute;
     const auto used_keys = precompile_used_keys;
+    // FRITCHII_PREP_OCCL_VARIANTS: the recipe's variant hints for the file's records, by index in
+    // file order (the records' `index`, whatever order FRITCHII_PREP_ORDER takes them in).
+    std::optional<VideoCommon::Nx2Recipe::VariantHints> occl_hints;
     try {
         std::ifstream in(path, std::ios::binary);
         in.exceptions(std::ifstream::failbit);
@@ -6897,6 +6945,24 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         if (u64{env_count} * 16 > file_size || u64{record_count} * 8 > file_size) {
             LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged", path_text);
             return;
+        }
+        if (occl_mask != 0 && !compute_only) {
+            std::string hint_source;
+            occl_hints = PrepOcclHints(title_id, base_dir, path, record_count, hint_source);
+            if (occl_hints) {
+                const auto hinted = std::ranges::count_if(
+                    occl_hints->kinds, [](u8 kinds) { return kinds != 0; });
+                LOG_INFO(Render_Vulkan,
+                         "Precompiled occlusion variants: hints from {} ({} occlusion files): "
+                         "{} of {} records had variants built in play, only their kinds are "
+                         "prepared",
+                         hint_source, occl_hints->sources, hinted, record_count);
+            } else {
+                LOG_INFO(Render_Vulkan,
+                         "Precompiled occlusion variants: no hints{}{}, every kind the device "
+                         "takes is prepared",
+                         hint_source.empty() ? "" : " (", hint_source.empty() ? "" : hint_source + ")");
+            }
         }
         env_index.resize(env_count);
         in.read(reinterpret_cast<char*>(env_index.data()),
@@ -7189,6 +7255,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         std::array<std::atomic<size_t>, 6> occl_kept{};
         std::array<std::atomic<size_t>, 6> occl_failed{};
         std::array<std::atomic<size_t>, 6> occl_unfit{};
+        /// Built (kept, failed or not fitting), and left out by the recipe's hints.
+        std::array<std::atomic<size_t>, 6> occl_built{};
+        std::array<std::atomic<size_t>, 6> occl_hint_skipped{};
         std::atomic<size_t> occl_parents{};
         std::atomic<u64> occl_us{};
     } state;
@@ -7481,9 +7550,19 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                             // the same recorded environments (so of the parent's shape), kept
                             // under its key and environments for MakeKeptOcclVariant. Some are
                             // never drawn: the draw's registers decide the rest at play.
-                            const u8 occl_kinds =
+                            u8 occl_kinds =
                                 occl_mask & OcclPrepKinds(record_key, pipeline->StageInfos(),
                                                           pipeline->IsEmulatedMesh());
+                            if (occl_hints && occl_kinds != 0) {
+                                const u8 hinted =
+                                    static_cast<u8>(occl_kinds & occl_hints->kinds[index]);
+                                for (u8 kind = 1; kind <= PrecompiledKept::MaxOcclKind; ++kind) {
+                                    if ((occl_kinds & ~hinted & (1U << kind)) != 0) {
+                                        ++state.occl_hint_skipped[kind];
+                                    }
+                                }
+                                occl_kinds = hinted;
+                            }
                             if (occl_kinds != 0) {
                                 ++state.occl_parents;
                                 const auto occl_begin = std::chrono::steady_clock::now();
@@ -7493,6 +7572,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                                         stop_loading.stop_requested()) {
                                         continue;
                                     }
+                                    ++state.occl_built[occl_kind];
                                     t_occl_flag_build = occl_kind;
                                     SCOPE_EXIT {
                                         t_occl_flag_build = 0;
@@ -7633,16 +7713,19 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 continue;
             }
             kept_total += state.occl_kept[kind].load();
-            by_kind += fmt::format("{}{} ({}): {} kept, {} failed, {} not fitting",
-                                   by_kind.empty() ? "" : "; ", kind, kind_names[kind],
-                                   state.occl_kept[kind].load(), state.occl_failed[kind].load(),
-                                   state.occl_unfit[kind].load());
+            by_kind += fmt::format(
+                "{}{} ({}): {} built: {} kept, {} failed, {} not fitting; {} skipped by hints",
+                by_kind.empty() ? "" : "; ", kind, kind_names[kind], state.occl_built[kind].load(),
+                state.occl_kept[kind].load(), state.occl_failed[kind].load(),
+                state.occl_unfit[kind].load(), state.occl_hint_skipped[kind].load());
         }
         LOG_INFO(Render_Vulkan,
-                 "Precompiled occlusion variants (FRITCHII_PREP_OCCL_VARIANTS={}, kinds {:#x}): "
+                 "Precompiled occlusion variants (FRITCHII_PREP_OCCL_VARIANTS={}, kinds {:#x}, "
+                 "hints {}): "
                  "{} kept for {} pipelines this run, {:.1f} s of thread time added ({:.1f} ms "
                  "each); {}",
-                 PrepOcclVariantsMode(), occl_mask, kept_total, state.occl_parents.load(),
+                 PrepOcclVariantsMode(), occl_mask, occl_hints ? "used" : "none", kept_total,
+                 state.occl_parents.load(),
                  static_cast<double>(state.occl_us.load()) / 1e6,
                  kept_total != 0 ? static_cast<double>(state.occl_us.load()) / 1e3 /
                                        static_cast<double>(kept_total)

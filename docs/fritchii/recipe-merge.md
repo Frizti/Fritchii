@@ -65,7 +65,8 @@ programs.
 ## Variant hints (`--occl`)
 
 The occlusion file (`vulkan-frizti-occl.fork-v<N>.bin`, `FRITCHII_OCCL_FLAG_PERSIST`) holds, per
-variant built, its kind and its parent's key. Each variant's parent key is compared with the merged
+variant built, its kind and its parent's key (magic `occl_v1`, `occl_v2` or `occl_v3`: all three start a
+variant record with these; v3 is v2's layout, bumped by the census_use fix). Each variant's parent key is compared with the merged
 recipe's records as above (key only) and sets bit `kind` of every matching record's mask:
 
 | bit | kind |
@@ -119,3 +120,11 @@ The preparer (or whatever reads the precompiled file) gets them so:
 `Nx2Recipe::ReadVariantHints(recipe)` gives the masks per recipe record, and
 `Assemble(..., &hints)` gives them per record of the file it writes, dropped records left out (the
 tool's `assemble` prints how many records have hints).
+
+`PipelineCache::PreparePrecompiled` does this with `FRITCHII_PREP_OCCL_VARIANTS=1`
+(`PrepOcclHints` in `vk_pipeline_cache.cpp`): the kinds it builds for record `i` are
+`OcclPrepKinds(...) & kinds[i]`, `i` the record's index in the file whatever order
+`FRITCHII_PREP_ORDER` takes them in. Its log says where the hints came from (or why there are
+none) and, per kind, how many variants were built and how many the hints left out. Neither the
+prepared stamp nor the kept file's stamp names the hints: a new recipe with other hints prepares
+again only when the precompiled file it assembles changes (or with Prepare Shaders Now).

@@ -4,6 +4,7 @@
 #include "video_core/nx2_recipe.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <map>
@@ -630,8 +631,13 @@ size_t EnvironmentSize(Bytes bytes) {
     return EnvHeaderSize + code + tables + tail;
 }
 
-// The occlusion file (vk_pipeline_cache.cpp, FRITCHII_OCCL_FLAG_PERSIST).
-constexpr std::string_view OcclMagic{"occl_v2\0", 8};
+// The occlusion file (vk_pipeline_cache.cpp, FRITCHII_OCCL_FLAG_PERSIST). Every version so far
+// starts a variant record's payload with the kind and the parent's key, all the merge reads:
+// v1 (no descriptor signature after the keys), v2 (the signature), v3 (v2's layout, the magic
+// bumped by the census_use fix to drop the old refusal memos).
+constexpr std::array<std::string_view, 3> OcclMagics{
+    std::string_view{"occl_v1\0", 8}, std::string_view{"occl_v2\0", 8},
+    std::string_view{"occl_v3\0", 8}};
 constexpr u32 OcclRecordMarker = 0x5243434F; // "OCCR"
 constexpr u8 OcclRecordVariant = 1;
 constexpr u8 OcclRecordRefused = 2;
@@ -1746,7 +1752,11 @@ std::vector<u8> Merge(std::span<const u8> recipe, const X::Result& extracted,
     for (const auto& source : occlusion) {
         const Bytes bytes = source.bytes;
         if (bytes.size() < OcclHeaderSize ||
-            std::memcmp(bytes.data(), OcclMagic.data(), OcclMagic.size()) != 0 ||
+            std::ranges::none_of(OcclMagics,
+                                 [&](std::string_view magic) {
+                                     return std::memcmp(bytes.data(), magic.data(),
+                                                        magic.size()) == 0;
+                                 }) ||
             Load<u32>(bytes, 8) != d.header.cache_version ||
             Load<u32>(bytes, 12) != GraphicsKeySize) {
             note(fmt::format("{}: not an occlusion file of version {}", source.name,

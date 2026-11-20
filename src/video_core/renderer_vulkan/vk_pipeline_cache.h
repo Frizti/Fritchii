@@ -864,9 +864,11 @@ private:
     /// the guest's shaders and find the driver's compiled code. Runs once per precompiled file,
     /// driver and release (or again when `force`). Fritchii runs it on precompile_thread,
     /// so `callback` (the loading screen in the ported feature) is empty and progress goes to ShaderNotify.
+    /// `title_id`: the recipe whose occlusion variant hints apply (FRITCHII_PREP_OCCL_VARIANTS).
     void PreparePrecompiled(const std::filesystem::path& base_dir, std::stop_token stop_loading,
                             const VideoCore::DiskResourceLoadCallback& callback,
-                            const std::filesystem::path& file = {}, bool force = false);
+                            const std::filesystem::path& file = {}, bool force = false,
+                            u64 title_id = 0);
     /// A graphics key read from the precompiled file, as draws key it on this device: its driver
     /// fields rewritten, canonical with EDEN_NX2_CANONICAL_KEYS=1.
     void RecordedKeyForThisDevice(GraphicsPipelineCacheKey& key) const noexcept;
