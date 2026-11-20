@@ -928,6 +928,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_COVERED_RETIRE_WRITEBACK") {
         return &g_covered_retire_writeback;
     }
+    if (name == "FRITCHII_COLD_SWEEP_KEEP_MIB") {
+        return &g_cold_sweep_keep_mib;
+    }
     if (name == "FRITCHII_COVERED_RETIRE") {
         return &g_covered_retire;
     }

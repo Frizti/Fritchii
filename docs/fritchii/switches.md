@@ -8522,3 +8522,8 @@ their own. 1 = strict with guards, 3 = strict without, 0 = off. Check the `CPU p
   "sampled again where one was deleted" 26 -> 10, pictures correct, but 11-14k write-backs a run for ~20 re-reads and a
   slightly worse first camera spin in both runs. Off until a cheaper selection is measured. The covered retire line
   reports "({} written back first)".
+
+- FRITCHII_COLD_SWEEP_KEEP_MIB (live, MiB, default 256; 0 = keep only below the critical line): the budget for targets
+  FRITCHII_COLD_SWEEP_KEEP_RESAMPLED keeps, whatever the texture cache's size. In play the cache went past its critical
+  line (9.7 GiB on a 16 GiB card) and a memory line released 1,515 of 1,642 kept targets; a fixed budget bounds the
+  extra memory instead, and the collector stays the backstop. The "Cold sweep keep" line reports the budget in use.

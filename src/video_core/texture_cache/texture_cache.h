@@ -2674,6 +2674,25 @@ void TextureCache<P>::SweepColdImages() {
     // the expected line (6 GiB on a 16 GiB card), so that line kept nothing; the kept targets are
     // small (~40 mostly 1280x720 a run) and above critical the collector's rules apply as before.
     const u64 keep_limit = critical_memory;
+    // FRITCHII_COLD_SWEEP_KEEP_MIB (live, MiB, default 256; 0 = the critical line above instead):
+    // kept targets count against a fixed budget, whatever the cache's size. Play went past the
+    // critical line (9.7 GiB on a 16 GiB card), where the line released 1,515 of 1,642 kept
+    // targets; the budget bounds the extra memory and the collector stays the backstop.
+    const int keep_mib = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_cold_sweep_keep_mib, "FRITCHII_COLD_SWEEP_KEEP_MIB", 256);
+    const u64 keep_budget = keep_mib > 0 ? static_cast<u64>(keep_mib) << 20 : 0;
+    u64 keep_spent = 0;
+    const auto keep_fits = [&](Image& image) {
+        if (keep_budget == 0) {
+            return total_used_memory < keep_limit;
+        }
+        const u64 bytes = ImageMemoryBytes(image);
+        if (keep_spent + bytes > keep_budget) {
+            return false;
+        }
+        keep_spent += bytes;
+        return true;
+    };
     const bool keep_room = total_used_memory < keep_limit;
     const auto keep_rule = [&](Image& image) {
         return keep_mode > 0 && True(image.flags & ImageFlagBits::GpuModified) &&
@@ -2714,7 +2733,7 @@ void TextureCache<P>::SweepColdImages() {
             // Before the coverage check (it is not spent on a kept image). Covered retire was
             // what lost them: 28 of 29 cold sweep losses in a 3-minute market run.
             const bool keep = keep_rule(image);
-            if (keep && keep_room) {
+            if (keep && keep_fits(image)) {
                 count_kept(image);
                 ++index;
                 continue;
@@ -2780,7 +2799,7 @@ void TextureCache<P>::SweepColdImages() {
         // FRITCHII_COLD_SWEEP_KEEP_RESAMPLED (above). Before EXP58's checks: a kept image costs
         // no ColdSuperseded walk a frame.
         const bool keep = keep_rule(image);
-        if (keep && keep_room) {
+        if (keep && keep_fits(image)) {
             count_kept(image);
             ++index;
             continue;
@@ -2927,11 +2946,12 @@ void TextureCache<P>::SweepColdImages() {
                  "({} MiB), {} deleted all the same as memory was over the line; re-sampled set "
                  "{} entries (+{}); lost contents sampled {} ({} dropped by the cold sweep, {} of "
                  "those at an address and shape already in the set; not recorded {}); device "
-                 "memory {} MiB, keep line {} MiB{}",
+                 "memory {} MiB, keep line {} MiB{}; keep budget {} MiB (in use {} MiB)",
                  keep_mode, k.kept_new, k.kept_sampled, k.kept_now, k.kept_now_bytes >> 20,
                  k.released, cold_resampled.size(), k.learned, k.lost_all, k.lost_cold,
                  k.lost_cold_known, k.lost_not_recorded, total_used_memory >> 20,
-                 keep_limit >> 20, keep_room ? "" : " (over: not keeping)");
+                 keep_limit >> 20, keep_room ? "" : " (over the line)", keep_budget >> 20,
+                 keep_spent >> 20);
         k = {};
         // The image families made in those frames, most made first (fable52_answer_13 sec. 6).
         std::vector<std::pair<std::pair<u32, u32>, const MadeShapes*>> families;

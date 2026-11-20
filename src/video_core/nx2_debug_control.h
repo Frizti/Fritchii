@@ -607,6 +607,7 @@ inline std::atomic<int> g_cold_sweep_max{-1};
 /// the game sampled again after an earlier sweep lost them (TextureCache::cold_resampled).
 inline std::atomic<int> g_cold_sweep_keep_resampled{-1};
 inline std::atomic<int> g_covered_retire_writeback{-1};
+inline std::atomic<int> g_cold_sweep_keep_mib{-1};
 /// FRITCHII_COVERED_RETIRE (live, frames, default 0 = off): a GPU-written render target whose
 /// whole memory newer GPU-written images cover (OoT's pot room: per-object D32 targets bump-
 /// allocated over last frames' ones, 20-300 dead ones under each new clear) is deleted without a
