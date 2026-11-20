@@ -454,20 +454,21 @@ private:
     /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
     u64 occl_made_frame{~u64{0}};
 
-    /// FRITCHII_PREP_OCCL_VARIANTS: the occlusion flag variant kinds (bit per kind 1-5) a
+    /// FRITCHII_PREP_OCCL_VARIANTS: the occlusion flag variant kinds (bit per kind 2, 3, 5) a
     /// pipeline can need, from its key and programs' infos alone (no draw): what the preparation
-    /// builds and keeps for it. Only kinds OcclKindWanted allows.
+    /// builds and keeps for it. Only kinds of OcclPrepMask (the device's, not the settings').
     [[nodiscard]] u8 OcclPrepKinds(const GraphicsPipelineCacheKey& key,
                                    std::span<const Shader::Info> infos,
                                    bool emulated_mesh) const;
-    /// The kinds 1-5 this configuration and device make at all (bit per kind; 0 none).
+    /// The kinds the preparation makes on this device at all (bit per kind; 0 none).
     [[nodiscard]] u8 OcclPrepMask() const;
     /// FRITCHII_PREP_OCCL_VARIANTS: `full`'s `kind` variant built from the kept infos and SPIR-V
-    /// the preparation made for it (full came from the kept file), on the occlusion lane; null
-    /// when there is none, it does not fit full, or this frame's budget is spent (`later`).
+    /// the preparation made for it, or for kinds 1 and 4 from full's own record (full came from
+    /// the kept file), on the occlusion lane; null when there is none, it does not fit full, or
+    /// this frame's budget is spent (`later`).
     std::unique_ptr<GraphicsPipeline> MakeKeptOcclVariant(GraphicsPipeline& full, u8 kind,
                                                           bool& later);
-    /// Kept variants started a frame, and this frame's count.
+    /// Kept variants tried a frame (fitting or not), and this frame's count.
     static constexpr u32 OcclKeptPerFrame = 16;
     u64 occl_kept_frame{~u64{0}};
     u32 occl_kept_in_frame{};
@@ -484,7 +485,8 @@ private:
     GraphicsPipeline* AttachOcclFlag(GraphicsPipeline& full, u8 kind,
                                      std::unique_ptr<GraphicsPipeline> made,
                                      std::shared_ptr<const OcclEnvs> envs = nullptr,
-                                     const GraphicsPipelineCacheKey* built_key = nullptr);
+                                     const GraphicsPipelineCacheKey* built_key = nullptr,
+                                     bool descriptors_checked = false);
     /// FRITCHII_OCCL_FLAG_ASYNC: queues `key`'s translation on occl_queue from snapshot
     /// environments of the current draw (`kind` 1-5 a flag variant of `parent_key`, 0 a lean
     /// sibling). Later when this frame's budget is spent or the queue is full (try again at a
@@ -732,7 +734,8 @@ private:
     /// What a kept file must have been written for, beyond the prepared stamp (which holds the
     /// release, driver and GPU): the cache version, the settings SPIR-V depends on, the library
     /// split, the OoT visual workaround and canonical keys. Not the build: CheckKeptSample.
-    [[nodiscard]] std::string KeptStamp(const std::string& prepared_stamp) const;
+    /// `variants`: the file holds occlusion flag variants (FRITCHII_PREP_OCCL_VARIANTS).
+    [[nodiscard]] std::string KeptStamp(const std::string& prepared_stamp, bool variants) const;
 
     /// Set by LoadKept; read by the GPU thread when a new key is looked up.
     mutable std::mutex kept_mutex;

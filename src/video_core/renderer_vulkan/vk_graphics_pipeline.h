@@ -490,11 +490,11 @@ public:
     // Only what can't change a pipeline the driver compiles belongs here.
     /// FRITCHII_PREP_OCCL_VARIANTS: on a pipeline made from the kept infos and SPIR-V
     /// (CreatePrecompiledGraphicsPipeline), the index it came from (a PrecompiledKept::Index)
-    /// and its record's environments: its occlusion flag variants prepared with it are found by
-    /// them (PipelineCache::MakeKeptOcclVariant). kept_occl_tried: bit per kind looked up.
+    /// and its record there (a PrecompiledKept::Record, alive as long as the index): its
+    /// occlusion flag variants are made from them (PipelineCache::MakeKeptOcclVariant).
+    /// kept_occl_tried: bit per kind looked up.
     std::shared_ptr<const void> kept_index;
-    std::array<u32, 5> kept_envs{};
-    u8 kept_env_count{};
+    const void* kept_record{};
     u8 kept_occl_tried{};
     /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): this pipeline's flag variant (the same key with
     /// the host flag pixel program), owned here and never in the cache; on a flag variant, the

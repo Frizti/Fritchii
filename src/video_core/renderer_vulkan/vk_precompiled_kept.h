@@ -12,10 +12,11 @@
 // 10 MB for 132k pipelines); every info, SPIR-V and recorded environment is read from disk with
 // a positional read when a pipeline needs it, never the whole file.
 //
-// Layout: "NX2KEPT6", u32 stamp size, the stamp, then entries: u8 1 (info) or 2 (SPIR-V, one
+// Layout: "NX2KEPT4" (no occlusion variants) or "NX2KEPT6", u32 stamp size, the stamp, then entries: u8 1 (info) or 2 (SPIR-V, one
 // zstd frame of its words), u64 content hash, u32 size, the bytes; u8 3 (record), u32 record
 // index in the precompiled file, then a Record (72 bytes); u8 4 ends the entries. Then the
-// index: u32 graphics count, u32 compute count, u32 blob count, u32 variant count, the Records
+// index: u32 graphics count, u32 compute count, u32 blob count, u32 variant count (NX2KEPT6
+// only), the Records
 // sorted by key hash (graphics, compute, then the occlusion variants), per blob u64 offset,
 // u32 size, u32 0, then per Record (graphics, then compute; not the variants) the u64 offset of
 // its record in the precompiled file. Last, u64 index offset and "NX2KEPTE".
@@ -147,6 +148,9 @@ public:
     [[nodiscard]] std::span<const Record> AllCompute() const noexcept {
         return compute;
     }
+    [[nodiscard]] std::span<const Record> AllVariants() const noexcept {
+        return variants;
+    }
     /// Where the precompiled file's record of AllGraphics()[position] (compute: of
     /// AllCompute()[position]) starts.
     [[nodiscard]] bool RecordOffset(bool compute_record, size_t position, u64& offset) const;
@@ -186,8 +190,10 @@ public:
     /// Starts `part` for `stamp`, or with `resume` continues it when it was started for the same
     /// stamp (the entries up to the last complete one are kept). `total`: the precompiled
     /// file's record count. False when the file cannot be written.
+    /// `variants`: the NX2KEPT6 layout, which can hold occlusion flag variant records (a
+    /// preparation that keeps them); otherwise NX2KEPT4, as before them.
     bool Open(const std::filesystem::path& part, const std::string& stamp, bool resume,
-              size_t total);
+              size_t total, bool variants = false);
     /// Records kept from an earlier, interrupted preparation.
     [[nodiscard]] size_t Resumed() const noexcept {
         return resumed;
@@ -248,6 +254,7 @@ private:
     size_t resumed{};
     u64 spirv_bytes{};
     bool failed{};
+    bool variant_layout{};
 };
 
 } // namespace Vulkan::PrecompiledKept

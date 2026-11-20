@@ -30,7 +30,12 @@ set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392")
 # changed. Every new SPIR-V path runs only for a module translated with
 # RuntimeInfo::occl_flag_store or occl_flag_store_at_end (EmitContext::UsesOcclFlagStore), which
 # only PipelineCache::FindOrMakeOcclFlag sets: a variant made during play, owned by its parent,
-# never stored in the disk cache (CreateGraphicsPipeline(nullptr, false)), so never prepared.
+# never stored in the disk cache (CreateGraphicsPipeline(nullptr, false)), so never prepared as a
+# pipeline of its own. (Later, FRITCHII_PREP_OCCL_VARIANTS=1, off by default, makes "Preparing
+# shaders" build such variants too, kept only in the kept file beside their parents: its stamp
+# then names them with OcclVariantTranslationVersion in vk_pipeline_cache.cpp, which is not
+# hashed here and is bumped by hand with any change to their translation, and the boot sample
+# translates some of them again. The prepared stamp and the parents are unchanged.)
 # Any other module's SPIR-V is byte-identical (the two other edits: a static_vector's capacity
 # and "force_early_z || UsesOcclFlagStore()"). vk_graphics_pipeline.cpp gained a draw-time copy
 # of the push constants (ConfigureImpl) and ConfigureAfterOcclPrepass: no create info changed.

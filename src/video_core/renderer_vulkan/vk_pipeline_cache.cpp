@@ -1976,16 +1976,26 @@ int PrepComputeCheckMode() {
 }
 
 // FRITCHII_PREP_OCCL_VARIANTS: "Preparing shaders" also builds and keeps the occlusion flag
-// variants (FRITCHII_OCCL_FLAG) each prepared pipeline can need in the current configuration,
-// so a draw attaches them from the kept SPIR-V (MakeKeptOcclVariant) instead of translating them
-// from a snapshot of its state. 1 (default); 0 = as before (the variants are made in play).
+// variants (FRITCHII_OCCL_FLAG) whose translation from a snapshot often did not fit its parent
+// (colour, pre-pass, pre-pass no-colour: OcclPrepMask), so a draw attaches them from the kept
+// SPIR-V (MakeKeptOcclVariant); the host flag kinds (1, 4) are made from the parent's own kept
+// record, not prepared. 0 (default, until the preparation's time and disk are measured on AMD,
+// NVIDIA and Intel) = as before: the kept file, its stamp and play unchanged. 1: on; switching
+// it prepares once (the kept file's layout and stamp say whether it holds variants).
 int PrepOcclVariantsMode() {
     static const int mode = [] {
         const char* const env = std::getenv("FRITCHII_PREP_OCCL_VARIANTS");
-        return env == nullptr || *env == '\0' ? 1 : std::atoi(env);
+        return env == nullptr || *env == '\0' ? 0 : std::atoi(env);
     }();
     return mode;
 }
+
+// FRITCHII_PREP_OCCL_VARIANTS: the version of the prepared variants' translation, in the kept
+// stamp of a file that holds them (KeptStamp). Bump it with any change to how a variant kind is
+// translated or what it means (t_occl_flag_build -> occl_flag_store / occl_flag_store_at_end,
+// the host pixel replacement, the kinds OcclPrepKinds chooses, how MakeKeptOcclVariant builds
+// them): none of that is in NX2_SHADER_STAMP, and the boot sample checks only a few variants.
+constexpr u32 OcclVariantTranslationVersion = 1;
 
 // Compute pipelines built in play, and the ones the driver compiled (a build over
 // RuntimeCompileSlowMs; a cache hit takes 2-10 ms): a dispatch that needs one waits for it. The
@@ -4245,62 +4255,47 @@ u8 PipelineCache::OcclPrepKinds(const GraphicsPipelineCacheKey& key,
     namespace OcclFlag = VideoCommon::OcclFlag;
     using VideoCommon::OcclLean::PipelineClass;
     using OcclFlag::Census;
-    if (OcclFlag::Mode() == OcclFlag::Off || !device.IsOcclFlagDeviceAddressEnabled() ||
-        emulated_mesh || infos.size() != Maxwell::MaxShaderStage) {
+    // Not the Occlusion setting nor the one-follower switches (OcclKindWanted): a kind a draw
+    // never asks for is never used, one not prepared is translated in play as before.
+    const u8 mask = OcclPrepMask();
+    if (mask == 0 || emulated_mesh || infos.size() != Maxwell::MaxShaderStage) {
         return 0; // a mesh-emulated pipeline is never kept (the fast path declines it)
     }
     u8 kinds = 0;
-    const auto add = [&](u8 kind) {
-        if (OcclKindWanted(kind)) {
-            kinds |= static_cast<u8>(1U << kind);
-        }
-    };
     const bool dyn = key.state.extended_dynamic_state_3_blend != 0;
     const bool mesh = infos[0].is_task || infos[0].is_mesh;
     const PipelineClass pipeline_class = ClassifyOcclPipeline(key, infos, false);
     const bool mesh_lean =
         pipeline_class == PipelineClass::Mesh && ClassifyOcclPixel(key, infos) == PipelineClass::Lean;
-    if (pipeline_class == PipelineClass::Lean && !mesh) {
-        add(OCCL_FLAG_BUILD_HOST); // colour-off draws
-    }
-    if ((pipeline_class == PipelineClass::Lean && !mesh) || mesh_lean) {
-        const Census verdict = OcclFlagColourVerdict(key, infos);
-        if (verdict == Census::Flag) {
-            add(OCCL_FLAG_BUILD_COLOUR);
-        } else if ((verdict == Census::ColourSubgroup || verdict == Census::ColourQuad) &&
-                   !mesh && OcclFlag::ColourPrepassAllowed()) {
-            add(dyn ? OCCL_FLAG_BUILD_HOST : OCCL_FLAG_BUILD_NOCOLOUR);
-        }
-    }
-    if ((pipeline_class == PipelineClass::NoPixel || mesh_lean) && OcclFlag::ColourAllowed()) {
-        add(OCCL_FLAG_BUILD_HOST);
+    if (((pipeline_class == PipelineClass::Lean && !mesh) || mesh_lean) &&
+        OcclFlagColourVerdict(key, infos) == Census::Flag) {
+        kinds |= static_cast<u8>(1U << OCCL_FLAG_BUILD_COLOUR);
     }
     if (pipeline_class == PipelineClass::Discards) {
         if (OcclFlagPrepassPipelinePart(key, infos)) {
-            add(OCCL_FLAG_BUILD_PREPASS);
-            if (OcclFlag::ColourAllowed()) {
-                add(dyn ? OCCL_FLAG_BUILD_PREPASS : OCCL_FLAG_BUILD_PREPASS_NOCOLOUR);
+            kinds |= static_cast<u8>(1U << OCCL_FLAG_BUILD_PREPASS);
+            if (!dyn) {
+                kinds |= static_cast<u8>(1U << OCCL_FLAG_BUILD_PREPASS_NOCOLOUR); // colour draws
             }
         }
-        if (OcclFlag::ColourAllowed() && OcclFlagDiscardDirectPipelineOk(key, infos)) {
-            add(OCCL_FLAG_BUILD_PREPASS);
+        if (OcclFlagDiscardDirectPipelineOk(key, infos)) {
+            kinds |= static_cast<u8>(1U << OCCL_FLAG_BUILD_PREPASS);
         }
     }
-    return kinds;
+    return static_cast<u8>(kinds & mask);
 }
 
 u8 PipelineCache::OcclPrepMask() const {
-    u8 mask = 0;
-    if (VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Off ||
-        !device.IsOcclFlagDeviceAddressEnabled()) {
+    // The kinds whose translation from a draw's snapshot often did not fit its parent (colour,
+    // pre-pass, pre-pass no-colour), as far as this device can build them (all three store a
+    // 64-bit address): fixed per boot of a device, never the Occlusion setting's kinds or the
+    // one-follower switches. The host flag kinds (1, 4) come from the parent's own record
+    // (MakeKeptOcclVariant).
+    if (!device.IsOcclFlagDeviceAddressEnabled() || !device.IsShaderInt64Supported()) {
         return 0;
     }
-    for (u8 kind = 1; kind <= PrecompiledKept::MaxOcclKind; ++kind) {
-        if (OcclKindWanted(kind)) {
-            mask |= static_cast<u8>(1U << kind);
-        }
-    }
-    return mask;
+    return static_cast<u8>((1U << OCCL_FLAG_BUILD_COLOUR) | (1U << OCCL_FLAG_BUILD_PREPASS) |
+                           (1U << OCCL_FLAG_BUILD_PREPASS_NOCOLOUR));
 }
 
 GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
@@ -4639,19 +4634,31 @@ u8& PipelineCache::OcclFlagStateOf(GraphicsPipeline& full, u8 kind) {
 std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPipeline& full,
                                                                      u8 kind, bool& later) {
     namespace OcclFlag = VideoCommon::OcclFlag;
+    using PrecompiledKept::NoBlob;
     later = false;
-    if (!full.kept_index || kind == 0 || kind > PrecompiledKept::MaxOcclKind) {
+    if (!full.kept_index || full.kept_record == nullptr || kind == 0 ||
+        kind > PrecompiledKept::MaxOcclKind) {
         return nullptr;
     }
     const auto index = std::static_pointer_cast<const PrecompiledKept::Index>(full.kept_index);
+    const auto& parent = *static_cast<const PrecompiledKept::Record*>(full.kept_record);
+    const bool host_pixel = kind == OCCL_FLAG_BUILD_HOST || kind == OCCL_FLAG_BUILD_NOCOLOUR;
     const PrecompiledKept::Record* matched = nullptr;
     for (const PrecompiledKept::Record& record : index->Variants(full.Key().Hash())) {
-        if (record.occl_kind == kind && record.env_count == full.kept_env_count &&
+        if (record.occl_kind == kind && record.env_count == parent.env_count &&
             std::equal(record.envs.begin(), record.envs.begin() + record.env_count,
-                       full.kept_envs.begin())) {
+                       parent.envs.begin())) {
             matched = &record;
             break;
         }
+    }
+    // The host flag kinds (1 and 4) are never prepared: the parent's own record is that variant,
+    // as CreateGraphicsPipeline translates it (the same stages, the guest pixel program kept for
+    // its info and replaced by the host flag program). A whole pipeline, so not from a record
+    // emitted for libraries (other bindings): that parent takes the translation path.
+    if (matched == nullptr && host_pixel &&
+        (parent.flags & PrecompiledKept::FlagLibraries) == 0) {
+        matched = &parent;
     }
     if (matched == nullptr) {
         full.kept_occl_tried |= static_cast<u8>(1U << kind);
@@ -4666,26 +4673,46 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPip
         return nullptr;
     }
     full.kept_occl_tried |= static_cast<u8>(1U << kind);
-    auto infos = std::make_unique<std::array<Shader::Info, Maxwell::MaxShaderStage>>();
+    ++occl_kept_in_frame; // one that turns out unfit spent its reads too
+    // Infos: a stage whose blob is the parent's (blobs are content-hashed, KeepBlob) is full's
+    // info as it is: no read, and it fits by identity. Only a differing stage (a prepared kind's
+    // pixel stage, as a rule) is read and checked, as AttachOcclFlag and the occlusion file's
+    // checks do: the variant must read memory and textures as its parent does.
+    const auto& parent_infos = full.StageInfos();
+    std::unique_ptr<std::array<Shader::Info, Maxwell::MaxShaderStage>> read;
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> info_ptrs{};
+    const bool prepass = kind == OCCL_FLAG_BUILD_PREPASS || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR;
     for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
-        if (matched->infos[stage] == PrecompiledKept::NoBlob) {
+        const u32 blob = matched->infos[stage];
+        if ((blob == NoBlob) != (parent.infos[stage] == NoBlob)) {
+            OcclFlag::Add(OcclFlag::g_stats.prepared_unfit);
+            return nullptr; // another shape of pipeline
+        }
+        if (blob == NoBlob) {
             continue;
         }
-        if (!index->ReadInfo(matched->infos[stage], (*infos)[stage])) {
+        if (blob == parent.infos[stage]) {
+            info_ptrs[stage] = &parent_infos[stage];
+            continue;
+        }
+        if (!read) {
+            read = std::make_unique<std::array<Shader::Info, Maxwell::MaxShaderStage>>();
+        }
+        Shader::Info& info = (*read)[stage];
+        if (!index->ReadInfo(blob, info)) {
             return nullptr;
         }
-        info_ptrs[stage] = &(*infos)[stage];
+        info_ptrs[stage] = &info;
+        // Per stage: the pixel stage of a host kind is not the guest's (no fit to check).
+        const std::span<const Shader::Info> x{&info, 1};
+        const std::span<const Shader::Info> y{&parent_infos[stage], 1};
+        const bool check_fit = !(host_pixel && stage + 1 == Maxwell::MaxShaderStage);
+        if ((check_fit && !OcclVariantFitsParent(x, y, OCCL_FLAG_BUILD_COLOUR)) ||
+            (prepass && !OcclFlagSameDescriptors(x, y))) {
+            OcclFlag::Add(OcclFlag::g_stats.prepared_unfit);
+            return nullptr;
+        }
     }
-    // As AttachOcclFlag and the occlusion file's checks: the variant must read memory and
-    // textures as its parent does (prepared from the same recorded environments, it does).
-    const bool prepass = kind == OCCL_FLAG_BUILD_PREPASS || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR;
-    if (!OcclVariantFitsParent(*infos, full.StageInfos(), kind) ||
-        (prepass && !OcclFlagSameDescriptors(*infos, full.StageInfos()))) {
-        OcclFlag::Add(OcclFlag::g_stats.prepared_unfit);
-        return nullptr;
-    }
-    ++occl_kept_in_frame;
     GraphicsPipelineCacheKey key = full.Key();
     if (kind == OCCL_FLAG_BUILD_NOCOLOUR || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
         for (auto& attachment : key.state.attachments) {
@@ -4694,14 +4721,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPip
     }
     // The host flag kinds replace the pixel program with the host flag module (its guest info
     // kept), as CreateGraphicsPipeline does for them; never libraries (a whole pipeline).
-    const bool host_pixel = kind == OCCL_FLAG_BUILD_HOST || kind == OCCL_FLAG_BUILD_NOCOLOUR;
     GraphicsPipeline::EmitStagesFunc emit_stages =
         [this, index, blobs = matched->spirv, hashes = key.unique_hashes,
          host_pixel](std::array<u128, Maxwell::MaxShaderStage>&) {
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
             std::vector<u32> words;
             for (size_t stage = 0; stage < modules.size(); ++stage) {
-                if (blobs[stage] == PrecompiledKept::NoBlob || (host_pixel && stage == 4)) {
+                if (blobs[stage] == NoBlob || (host_pixel && stage == 4)) {
                     continue;
                 }
                 if (!index->ReadSpirv(blobs[stage], words)) {
@@ -4740,7 +4766,8 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
         OcclFlagStateOf(full, kind) != OCCL_FLAG_STATE_QUEUED) {
         bool later = false;
         if (auto made = MakeKeptOcclVariant(full, kind, later)) {
-            return AttachOcclFlag(full, kind, std::move(made));
+            // Its descriptors were checked against full's (MakeKeptOcclVariant).
+            return AttachOcclFlag(full, kind, std::move(made), nullptr, nullptr, true);
         }
         if (later) {
             return nullptr;
@@ -4842,7 +4869,8 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
 GraphicsPipeline* PipelineCache::AttachOcclFlag(GraphicsPipeline& full, u8 kind,
                                                 std::unique_ptr<GraphicsPipeline> made,
                                                 std::shared_ptr<const OcclEnvs> envs,
-                                                const GraphicsPipelineCacheKey* built_key) {
+                                                const GraphicsPipelineCacheKey* built_key,
+                                                bool descriptors_checked) {
     namespace OcclFlag = VideoCommon::OcclFlag;
     u8& state = OcclFlagStateOf(full, kind);
     if (!made) {
@@ -4855,7 +4883,8 @@ GraphicsPipeline* PipelineCache::AttachOcclFlag(GraphicsPipeline& full, u8 kind,
     // noted too (the memo is keyed by this parent's shape, the record by the variant's). A
     // prebuilt one was checked by AdoptOcclJob and is neither. Never anything that changes what
     // is drawn.
-    const bool refused = (kind == OCCL_FLAG_BUILD_PREPASS ||
+    const bool refused = !descriptors_checked &&
+                         (kind == OCCL_FLAG_BUILD_PREPASS ||
                           kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) &&
                          !OcclFlagSameDescriptors(*made, full);
     if (built_key != nullptr) {
@@ -6737,28 +6766,25 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const std::string scale_part =
         scale.active ? fmt::format(" scale {}/{}", scale.up_scale, 1U << scale.down_shift)
                      : std::string{};
-    // FRITCHII_PREP_OCCL_VARIANTS: the occlusion flag variant kinds this configuration makes
-    // (OcclKindWanted on this device) are prepared too, so they are part of the stamp: a change
-    // of them prepares again. Empty with none (the occlusion flag off, or the switch at 0), so
-    // such installs keep their stamp.
-    const u8 occl_mask = PrecompiledFastMode() != 0 && PrepOcclVariantsMode() != 0
-                             ? OcclPrepMask()
-                             : u8{0};
-    const std::string occl_part =
-        occl_mask != 0 ? fmt::format(" occl {:#x}", occl_mask) : std::string{};
-    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}{}{}\n", file_size, modified,
+    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}{}\n", file_size, modified,
                                           device.GetDriverVersion(), NX2_SHADER_STAMP,
                                           device.GetModelName(), PipelineBinary::StampSuffix(),
-                                          scale_part, occl_part);
+                                          scale_part);
     // EDEN_NX2_PRECOMPILED_FAST: the preparation keeps each pipeline's infos and SPIR-V too
     // (vk_precompiled_kept.h), for this release, its settings and GPU. Whether this build
     // translates them the same is checked on a sample at boot (CheckKeptSample), not stamped.
     const bool keep = PrecompiledFastMode() != 0;
+    // FRITCHII_PREP_OCCL_VARIANTS: the occlusion flag variants are kept beside the pipelines, in
+    // the kept file only (its NX2KEPT6 layout and the variant token in its stamp): the prepared
+    // stamp never names them. The kinds come from the device alone (OcclPrepMask), never from
+    // the Occlusion setting or the one-follower switches (read on another thread).
+    const bool prep_variants = keep && PrepOcclVariantsMode() != 0;
+    const u8 occl_mask = prep_variants ? OcclPrepMask() : u8{0};
     const auto kept_path =
         base_dir / fmt::format("precompiled_infos.fork-v{}.bin", CACHE_VERSION);
     auto kept_part = kept_path;
     kept_part += ".part";
-    const std::string kept_stamp = keep ? KeptStamp(stamp) : std::string{};
+    const std::string kept_stamp = keep ? KeptStamp(stamp, prep_variants) : std::string{};
     // FRITCHII_PREP_COMPUTE_CHECK: the compute records alone, prepared again over a finished
     // preparation whose compute pipelines the driver's cache lost. Its file holds the stamp and
     // how many such passes ran for it: a driver that drops them again after two (a cache at its
@@ -7004,7 +7030,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         "draw from)",
                         space.available >> 20, Common::FS::PathToUTF8String(base_dir),
                         KeptSpaceNeeded >> 20);
-        } else if (!writer.Open(kept_part, kept_stamp, start_index > 0, total)) {
+        } else if (!writer.Open(kept_part, kept_stamp, start_index > 0, total, prep_variants)) {
             LOG_WARNING(Render_Vulkan, "Precompiled pipelines: cannot write {}",
                         Common::FS::PathToUTF8String(kept_part));
         } else {
@@ -7016,7 +7042,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                          start_index);
                 start_index = 0;
                 restarts = 0;
-                keeping = writer.Open(kept_part, kept_stamp, false, total);
+                keeping = writer.Open(kept_part, kept_stamp, false, total, prep_variants);
             } else if (writer.Resumed() != 0) {
                 // The earlier run can have been another build: its entries are kept only when
                 // a sample of them translates the same with this one, as for a finished file.
@@ -7036,7 +7062,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                              writer.Resumed());
                     start_index = 0;
                     restarts = 0;
-                    keeping = writer.Open(kept_part, kept_stamp, false, total);
+                    keeping = writer.Open(kept_part, kept_stamp, false, total, prep_variants);
                 }
             }
         }
@@ -7741,7 +7767,7 @@ void PipelineCache::RecordedKeyForThisDevice(GraphicsPipelineCacheKey& key) cons
     }
 }
 
-std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
+std::string PipelineCache::KeptStamp(const std::string& prepared_stamp, bool variants) const {
     // What is cheap to compare and decides a translation of the same environments: beyond the
     // prepared stamp (the precompiled file, driver, release and GPU), the cache version, the
     // settings SPIR-V depends on, the graphics pipeline library split (stages are emitted with
@@ -7756,14 +7782,19 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // EDEN_NX2_LIGHT_TABLE_ARRAYS translates the light tables to descriptor arrays: kept pipelines
     // of the other setting are not this translation (the boot sample only sees that when it hits
     // a light table shader). Named only when on, so the stamp with it off stays what it was.
-    // NX2KEPT6: the file's own format (occlusion flag variant records, the file magic too).
-    return fmt::format("{}kept NX2KEPT6 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
-                       "{}{}\n",
+    // FRITCHII_PREP_OCCL_VARIANTS: a file that holds occlusion flag variants (NX2KEPT6 layout)
+    // names them and their translation's version (OcclVariantTranslationVersion); without them
+    // the stamp is what it was.
+    const std::string variant_part =
+        variants ? fmt::format(" occl-variants {}", OcclVariantTranslationVersion) : std::string{};
+    return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
+                       "{}{}{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(device),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
                        oot_visual_workaround ? 1 : 0, visual_workaround_title,
                        CanonicalKeys() ? 1 : 0,
-                       host_info.support_handle_table_arrays ? " light-tables 1" : "");
+                       host_info.support_handle_table_arrays ? " light-tables 1" : "",
+                       variant_part);
 }
 
 std::shared_ptr<const PrecompiledKept::Index> PipelineCache::KeptIndex() const {
@@ -7956,29 +7987,55 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
     // (sorted by key hash, so spread over the programs too). About 6 ms of translation each.
     constexpr size_t GraphicsSample = 64;
     constexpr size_t ComputeSample = 16;
+    // FRITCHII_PREP_OCCL_VARIANTS: the prepared occlusion flag variants too, whose translation
+    // is decided in this file (not an NX2_SHADER_STAMP input; OcclVariantTranslationVersion).
+    constexpr size_t VariantSample = 16;
     const auto begin = std::chrono::steady_clock::now();
     const u64 seed = PrecompiledKept::SampleSeed();
-    std::vector<std::pair<bool, size_t>> items; // compute, position
+    // 0 graphics, 1 compute, 2 occlusion variant; the position among them.
+    std::vector<std::pair<u8, size_t>> items;
     for (const size_t position :
          PrecompiledKept::SamplePositions(index.GraphicsCount(), GraphicsSample, seed)) {
-        items.emplace_back(false, position);
+        items.emplace_back(u8{0}, position);
     }
     for (const size_t position : PrecompiledKept::SamplePositions(
              index.ComputeCount(), ComputeSample, seed ^ 0x6B65707443505554ULL)) {
-        items.emplace_back(true, position);
+        items.emplace_back(u8{1}, position);
+    }
+    for (const size_t position : PrecompiledKept::SamplePositions(
+             index.VariantCount(), VariantSample, seed ^ 0x4F43434C56415249ULL)) {
+        items.emplace_back(u8{2}, position);
     }
     // What differs in one sampled pipeline, empty when it is equal. Translated from the
     // precompiled file's key and environments as the preparation did, into pools of its own,
     // and each program emitted once (EmitSPIRV changes the IR it emits).
-    const auto check_one = [&](bool compute, size_t position, u64& key_hash,
+    const auto check_one = [&](u8 type, size_t position, u64& key_hash,
                                size_t& stage) -> std::string {
         stage = 0;
-        const PrecompiledKept::Record& record =
-            compute ? index.AllCompute()[position] : index.AllGraphics()[position];
+        const bool compute = type == 1;
+        const PrecompiledKept::Record& record = compute     ? index.AllCompute()[position]
+                                                : type == 2 ? index.AllVariants()[position]
+                                                            : index.AllGraphics()[position];
         key_hash = record.key_hash;
+        // A variant is translated from its parent's precompiled record (its key, the same
+        // environments). One without a parent is never used (MakeKeptOcclVariant): passed.
+        size_t record_position = position;
+        if (type == 2) {
+            const auto parents = index.Graphics(record.key_hash);
+            const auto parent = std::ranges::find_if(parents, [&](const PrecompiledKept::Record& p) {
+                return p.env_count == record.env_count &&
+                       std::equal(p.envs.begin(), p.envs.begin() + p.env_count,
+                                  record.envs.begin());
+            });
+            if (parent == parents.end()) {
+                return {};
+            }
+            record_position = static_cast<size_t>(&*parent - index.AllGraphics().data());
+        }
         u64 offset{};
         std::array<u8, 4> head{};
-        if (!index.RecordOffset(compute, position, offset) || !index.ReadPrecompiled(offset, head)) {
+        if (!index.RecordOffset(compute, record_position, offset) ||
+            !index.ReadPrecompiled(offset, head)) {
             return "its precompiled record (unreadable)";
         }
         const u8 count = head[1];
@@ -8048,9 +8105,21 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
                 TranslationRecord translated;
                 translated.translate_only = true;
                 translated.keep_infos = true;
+                // An occlusion flag variant as the preparation translated it (0: the pipeline).
+                GraphicsPipelineCacheKey translated_key = record_key;
+                if (record.occl_kind == OCCL_FLAG_BUILD_NOCOLOUR ||
+                    record.occl_kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
+                    for (auto& attachment : translated_key.state.attachments) {
+                        attachment.raw = 0; // no colour writes, no blending
+                    }
+                }
+                t_occl_flag_build = record.occl_kind;
+                SCOPE_EXIT {
+                    t_occl_flag_build = 0;
+                };
                 [[maybe_unused]] const auto none =
-                    CreateGraphicsPipeline(pools, record_key, MakeSpan(env_ptrs), nullptr, false,
-                                           nullptr, nullptr, false, &translated);
+                    CreateGraphicsPipeline(pools, translated_key, MakeSpan(env_ptrs), nullptr,
+                                           false, nullptr, nullptr, false, &translated);
                 if (!translated.complete) {
                     return "the pipeline (its translation failed)";
                 }
@@ -8067,7 +8136,7 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
         return KeptDifference(index, record, spirv, infos, stage);
     };
     struct Difference {
-        bool compute;
+        u8 type;
         u64 key_hash;
         size_t stage;
         std::string what;
@@ -8091,16 +8160,16 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
                     if (item >= items.size()) {
                         break;
                     }
-                    const auto [compute, position] = items[item];
+                    const auto [type, position] = items[item];
                     u64 key_hash{};
                     size_t stage{};
-                    std::string what = check_one(compute, position, key_hash, stage);
+                    std::string what = check_one(type, position, key_hash, stage);
                     if (what.empty()) {
                         equal.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                     std::scoped_lock lock{mutex};
-                    differences.push_back({compute, key_hash, stage, std::move(what)});
+                    differences.push_back({type, key_hash, stage, std::move(what)});
                     // The answer is known; a few more are only for the log.
                     if (differences.size() >= 4) {
                         stop.store(true, std::memory_order_relaxed);
@@ -8112,22 +8181,27 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - begin)
                           .count();
-    const size_t graphics_items = std::min(index.GraphicsCount(), GraphicsSample);
-    const size_t compute_items = items.size() - graphics_items;
+    const auto items_of = [&](u8 type) {
+        return static_cast<size_t>(std::ranges::count_if(
+            items, [type](const std::pair<u8, size_t>& item) { return item.first == type; }));
+    };
     if (differences.empty()) {
         LOG_INFO(Render_Vulkan,
                  "Kept precompiled pipelines checked: {} of {} equal, kept file valid ({} "
-                 "graphics of {} and {} compute of {} translated again by this build, {}, {:.0f} "
-                 "ms on {} threads)",
-                 equal.load(), items.size(), graphics_items, index.GraphicsCount(), compute_items,
-                 index.ComputeCount(), file_name, ms, threads);
+                 "graphics of {}, {} compute of {} and {} occlusion variants of {} translated "
+                 "again by this build, {}, {:.0f} ms on {} threads)",
+                 equal.load(), items.size(), items_of(0), index.GraphicsCount(), items_of(1),
+                 index.ComputeCount(), items_of(2), index.VariantCount(), file_name, ms, threads);
         return true;
     }
     for (const Difference& difference : differences) {
         LOG_WARNING(Render_Vulkan,
                     "Kept precompiled pipelines: {} pipeline {:016x} stage {}: {} differ from "
                     "this build's translation",
-                    difference.compute ? "compute" : "graphics", difference.key_hash,
+                    difference.type == 1   ? "compute"
+                    : difference.type == 2 ? "occlusion variant of graphics"
+                                           : "graphics",
+                    difference.key_hash,
                     difference.stage, difference.what);
     }
     LOG_WARNING(Render_Vulkan,
@@ -8412,12 +8486,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         }
     }
     pipeline->SetMappedPointers(std::move(mapped_pointers));
-    // FRITCHII_PREP_OCCL_VARIANTS: its occlusion flag variants prepared with it are found by its
-    // record (MakeKeptOcclVariant).
-    if (index->VariantCount() != 0) {
+    // FRITCHII_PREP_OCCL_VARIANTS: its occlusion flag variants are made from its record, the
+    // prepared ones found by it (MakeKeptOcclVariant). The record lives as long as the index.
+    if (PrepOcclVariantsMode() != 0) {
         pipeline->kept_index = index;
-        pipeline->kept_envs = matched->envs;
-        pipeline->kept_env_count = matched->env_count;
+        pipeline->kept_record = matched;
     }
     precompiled_pending.push_back(graphics_key);
     ++precompiled_stats.graphics;

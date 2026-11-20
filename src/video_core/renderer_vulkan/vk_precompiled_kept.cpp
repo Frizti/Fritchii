@@ -28,9 +28,12 @@ namespace {
 // A new layout, or a Shader::Info field the serializer learns (info_serialize.cpp), needs a new
 // magic: kept files written before are then prepared again. 2: the precompiled record offsets
 // (the boot check reads each sampled record's key from them). 4: Shader::Info's
-// storage_read_extents. 6: occlusion flag variant records (Record::occl_kind, the variant count
-// in the index), so an older build never takes a variant for its parent.
-constexpr std::string_view Magic{"NX2KEPT6"};
+// storage_read_extents. VariantMagic, 6: the layout with occlusion flag variant records
+// (Record::occl_kind, a fourth count in the index), written only by a preparation that keeps
+// variants (FRITCHII_PREP_OCCL_VARIANTS), so an older build never takes a variant for its parent
+// and a preparation without them writes (and reads) exactly the NX2KEPT4 layout as before.
+constexpr std::string_view Magic{"NX2KEPT4"};
+constexpr std::string_view VariantMagic{"NX2KEPT6"};
 constexpr std::string_view EndMagic{"NX2KEPTE"};
 constexpr u8 EntryInfo = 1;
 constexpr u8 EntrySpirv = 2;
@@ -242,11 +245,18 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
     // Header and stamp.
     std::array<char, 8> magic{};
     u32 stamp_size{};
-    if (kept_size < 32 || !Get(file, 0, magic) || !Get(file, 8, stamp_size) ||
-        std::string_view{magic.data(), magic.size()} != Magic) {
+    if (kept_size < 32 || !Get(file, 0, magic) || !Get(file, 8, stamp_size)) {
         why = "another format";
         return nullptr;
     }
+    const std::string_view magic_view{magic.data(), magic.size()};
+    if (magic_view != Magic && magic_view != VariantMagic) {
+        why = "another format";
+        return nullptr;
+    }
+    // NX2KEPT6: a fourth count, the occlusion variants (its stamp names them as well).
+    const bool variant_layout = magic_view == VariantMagic;
+    const u64 counts_bytes = variant_layout ? 16 : 12;
     if (stamp_size != stamp.size()) {
         why = "made for another file, driver, release or settings";
         return nullptr;
@@ -266,9 +276,11 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
         why = "not finished";
         return nullptr;
     }
-    // Graphics, compute, blob and occlusion variant counts.
+    // Graphics, compute, blob and (NX2KEPT6) occlusion variant counts.
     std::array<u32, 4> counts{};
-    if (index_offset > kept_size - 16 - 16 || !Get(file, index_offset, counts)) {
+    if (index_offset > kept_size - 16 - counts_bytes ||
+        !file.ReadAt(index_offset, std::span(reinterpret_cast<u8*>(counts.data()),
+                                             static_cast<size_t>(counts_bytes)))) {
         why = "damaged";
         return nullptr;
     }
@@ -276,7 +288,8 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
     const u64 records_bytes = base_records_bytes + u64{counts[3]} * sizeof(Record);
     const u64 blobs_bytes = u64{counts[2]} * 16;
     const u64 offsets_bytes = (u64{counts[0]} + counts[1]) * sizeof(u64);
-    if (index_offset + 16 + records_bytes + blobs_bytes + offsets_bytes + 16 != kept_size) {
+    if (index_offset + counts_bytes + records_bytes + blobs_bytes + offsets_bytes + 16 !=
+        kept_size) {
         why = "damaged";
         return nullptr;
     }
@@ -284,7 +297,7 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
     index->compute.resize(counts[1]);
     index->variants.resize(counts[3]);
     std::vector<std::array<u32, 4>> blob_entries(counts[2]);
-    u64 at = index_offset + 16;
+    u64 at = index_offset + counts_bytes;
     if (!file.ReadAt(at, std::span(reinterpret_cast<u8*>(index->graphics.data()),
                                    index->graphics.size() * sizeof(Record))) ||
         !file.ReadAt(at + counts[0] * sizeof(Record),
@@ -462,7 +475,8 @@ bool Writer::Scan(const std::filesystem::path& part, const std::string& stamp, u
     std::array<char, 8> magic{};
     u32 stamp_size{};
     if (!Get(in, 0, magic) || !Get(in, 8, stamp_size) ||
-        std::string_view{magic.data(), magic.size()} != Magic || stamp_size != stamp.size()) {
+        std::string_view{magic.data(), magic.size()} != (variant_layout ? VariantMagic : Magic) ||
+        stamp_size != stamp.size()) {
         return false;
     }
     std::string file_stamp(stamp_size, '\0');
@@ -496,7 +510,7 @@ bool Writer::Scan(const std::filesystem::path& part, const std::string& stamp, u
             if (!Get(in, at + 1, index) || !Get(in, at + 5, record)) {
                 break;
             }
-            if (index < records.size() && record.occl_kind != 0 &&
+            if (index < records.size() && record.occl_kind != 0 && variant_layout &&
                 ValidRecord(record, blobs.size(), ~size_t{0})) {
                 variant_records[u64{index} * 8 + record.occl_kind] = record;
             } else if (index < records.size() && ValidRecord(record, blobs.size(), ~size_t{0})) {
@@ -518,8 +532,9 @@ bool Writer::Scan(const std::filesystem::path& part, const std::string& stamp, u
 }
 
 bool Writer::Open(const std::filesystem::path& part, const std::string& stamp, bool resume,
-                  size_t total) {
+                  size_t total, bool variants) {
     std::scoped_lock lock{mutex};
+    variant_layout = variants;
     if (file.is_open()) {
         file.close();
     }
@@ -562,7 +577,8 @@ bool Writer::Open(const std::filesystem::path& part, const std::string& stamp, b
         failed = true;
         return false;
     }
-    file.write(Magic.data(), Magic.size());
+    const std::string_view magic = variant_layout ? VariantMagic : Magic;
+    file.write(magic.data(), static_cast<std::streamsize>(magic.size()));
     Put(file, static_cast<u32>(stamp.size()));
     file.write(stamp.data(), static_cast<std::streamsize>(stamp.size()));
     offset = 12 + stamp.size();
@@ -610,7 +626,8 @@ void Writer::Keep(size_t index, u8 kind, u8 flags, u64 key_hash, std::span<const
     }
     std::scoped_lock lock{mutex};
     if (failed || !file.is_open() || index >= records.size() || envs.empty() ||
-        envs.size() > 5 || occl_kind > MaxOcclKind || (occl_kind != 0 && kind != 0)) {
+        envs.size() > 5 || occl_kind > MaxOcclKind || (occl_kind != 0 && kind != 0) ||
+        (occl_kind != 0 && !variant_layout)) {
         return;
     }
     Record record{};
@@ -761,7 +778,9 @@ bool Writer::Finish(std::span<const u64> record_offsets) {
     Put(file, static_cast<u32>(graphics.size()));
     Put(file, static_cast<u32>(compute.size()));
     Put(file, static_cast<u32>(blobs.size()));
-    Put(file, static_cast<u32>(variants.size()));
+    if (variant_layout) {
+        Put(file, static_cast<u32>(variants.size()));
+    }
     for (const Record& record : graphics) {
         Put(file, record);
     }
@@ -781,7 +800,8 @@ bool Writer::Finish(std::span<const u64> record_offsets) {
     }
     Put(file, index_offset);
     file.write(EndMagic.data(), EndMagic.size());
-    offset += 16 + (graphics.size() + compute.size()) * (sizeof(Record) + sizeof(u64)) +
+    offset += (variant_layout ? 16 : 12) +
+              (graphics.size() + compute.size()) * (sizeof(Record) + sizeof(u64)) +
               variants.size() * sizeof(Record) + blobs.size() * 16 + 16;
     file.flush();
     const bool ok = static_cast<bool>(file);
