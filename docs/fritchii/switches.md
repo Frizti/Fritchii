@@ -6546,6 +6546,29 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   8 GB cards. The cold sweep (4 frames, on by default) and EXP64 already do that here, at most 16
   a frame; this raises the cap. Line every 600 frames "Cold sweep cap (...)" whenever the cap was
   reached (also with the switch at 0): frames that stopped at the cap, images watched.
+- FRITCHII_COLD_SWEEP_KEEP_RESAMPLED (live or boot, default 1; 0 = as before): the cold sweep
+  keeps render targets the game samples again. When a sampled image shows lost contents ("Lost
+  contents sampled ... dropped by: cold sweep"), the dropped target's GPU address and shape (and
+  the sampled image's own, when chain-shaped) go into a re-sampled set (at most 4,096 keys, the
+  least recently seen out). A GPU-written target at such an address and shape is then skipped by
+  the regular sweep and by covered retire (FRITCHII_COVERED_RETIRE) while device memory is under
+  the collector's line (the "minimum" texture cache threshold, 1,536 MiB in the 9070 XT runs); over
+  it the sweep deletes it as before and the collector's rules apply, so the VRAM protection
+  stays. 2 also keeps from both any target sampled in a frame after its last GPU write
+  (GuardSampled). Why: at the OoT market 27-30 targets a 3-minute run (mostly 1280x720, also
+  240x135 / 480x270 / 192x192 / 384x384) were sampled after the sweep took them and showed
+  zeros ("upload skipped as stale, cleared to zero"; an RTX 5090 user logged 717 in 87 min, a
+  pause-menu background in blocks). 28 of 29 came from covered retire (built-in
+  FRITCHII_COVERED_RETIRE=4, "no write-back on that path"), which ignores EDEN_NX2_TC_COLD_FRAMES:
+  that is why K=60 did not help. Turning the sweep off filled the card (14.3 of 14.3 GB) and
+  crashed. Cost: nothing while the set is empty; then one cached lookup per cold candidate (the
+  answer is kept per image until the set changes). Line every 600 frames "Cold sweep keep
+  (FRITCHII_COLD_SWEEP_KEEP_RESAMPLED=N)": images newly kept, kept now and their MiB, deletes
+  let through over the line, set size (+ keys learned), lost contents sampled in those frames
+  (by the cold sweep, of those at a key already in the set, not recorded), device memory and the
+  keep line. The lost-contents attribution ring (StaleDropRing) is 4,096 drops now (was 1,024):
+  covered retire alone records ~140 a second there, so drops read again 7+ s later were "not
+  recorded" (9-11 a run) and could not be learned.
 
 ### Pot room VRAM (helper CC)
 

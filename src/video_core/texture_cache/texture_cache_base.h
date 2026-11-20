@@ -1323,6 +1323,35 @@ private:
     /// Addresses retired as covered (emptied at 65,536), for sampled_after.
     std::unordered_map<GPUVAddr, u64> covered_swept;
     u32 covered_sampled_logged{};
+    /// FRITCHII_COLD_SWEEP_KEEP_RESAMPLED (live, default 1, 0 = off): the re-sampled set, keyed by
+    /// (GPU address, RelocationShapeKey) of GPU-written targets the cold sweep (covered retire
+    /// included) deleted and the game then sampled with lost contents, plus the sampled image's
+    /// own address and shape; the value is the frame last seen. At most ColdResampledMax, the
+    /// least recently seen out. A target made again at such an address and shape is kept by the
+    /// sweep while device memory is under the collector's line (minimum_memory); over it the
+    /// sweep deletes it as before. 2 also keeps images sampled in a frame after their last GPU
+    /// write (GuardSampled), from both.
+    static constexpr size_t ColdResampledMax = 4096;
+    ::Common::unordered_map<u64, u64> cold_resampled;
+    u32 cold_resampled_gen = 1; ///< Bumped by every change of the set (ImageBase::cold_keep_gen)
+    [[nodiscard]] static u64 ColdResampledKey(GPUVAddr gpu_addr, u64 shape_key) noexcept {
+        return (gpu_addr * 0x9E3779B97F4A7C15ULL) ^ shape_key;
+    }
+    void LearnColdResampled(GPUVAddr gpu_addr, u64 shape_key);
+    /// Whether the sweep keeps this GPU-written image under the rule (cached per set generation).
+    [[nodiscard]] bool ColdKeepResampled(ImageBase& image, int mode);
+    struct ColdKeepStats {
+        u64 kept_new{};        ///< Images kept by the rule for the first time
+        u64 kept_now{};        ///< Images kept in the report's frame
+        u64 kept_now_bytes{};  ///< Their device memory
+        u64 kept_sampled{};    ///< Of kept_new: by the sampled-after-write rule (mode 2)
+        u64 released{};        ///< Would be kept, deleted as memory was over the line
+        u64 learned{};         ///< Keys added to the set
+        u64 lost_all{};        ///< Lost contents sampled (any drop)
+        u64 lost_cold{};       ///< ... dropped by the cold sweep
+        u64 lost_cold_known{}; ///< ... whose drop's key was in the set already
+        u64 lost_not_recorded{}; ///< ... with no drop on record
+    } cold_keep_stats{};
     std::vector<std::pair<DAddr, DAddr>> covered_ranges; ///< Scratch for CoveredByNewerWrites
     std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
     ::Common::unordered_set<ImageId> cold_watch_set;
@@ -1598,7 +1627,10 @@ private:
         u64 shape_key; ///< RelocationShapeKey (a relocation's loss guards the shape)
     };
     static constexpr u8 LostReasonRelocate = 0x40;
-    static constexpr size_t StaleDropRing = 1024;
+    // 4096 (was 1024): covered retire alone records ~140 drops a second at the OoT market, so a
+    // drop sampled again 7+ s later had left the ring ("not recorded", 9-11 a 3-minute run).
+    // Scanned only for a sampled image with lost contents (tens a run).
+    static constexpr size_t StaleDropRing = 4096;
     std::array<StaleDrop, StaleDropRing> stale_drops{};
     size_t stale_drop_next{};
     size_t stale_drop_count{};

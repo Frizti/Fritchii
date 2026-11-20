@@ -178,6 +178,12 @@ struct ImageBase {
     /// Why a drop path deleted it without a write-back (TextureCache::LostWhy), for the lost
     /// contents counter's attribution; 0 = no write-back was tried.
     u8 lost_drop_why = 0;
+    /// FRITCHII_COLD_SWEEP_KEEP_RESAMPLED: the re-sampled set's generation this image was last
+    /// looked up at (0 = never) and the answer (bit 0), whether it was counted as newly kept
+    /// (bit 1), and the frame it was last counted in the kept-now total.
+    u32 cold_keep_gen = 0;
+    u32 cold_keep_frame = 0;
+    u8 cold_keep = 0;
 
     /// Unmapped images (TextureCache::UnmapGPUMemory): the frame + 1 at which an unmap of its GPU
     /// memory flagged it Remapped (0 = none did, or it was found again since) and its device
