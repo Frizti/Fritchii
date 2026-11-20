@@ -1321,16 +1321,97 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     // variants (the device kept the flag area's buffer device address: FRITCHII_OCCL_FLAG was
     // not 0 at boot) or lean siblings (FRITCHII_OCCL_LEAN) can be made this session. Neither
     // depends on the asynchronous shaders: a variant not ready yet draws as its parent with a
-    // host query, exactly as one not built yet.
-    const bool occl_variants_possible =
-        device.IsOcclFlagDeviceAddressEnabled() || VideoCommon::OcclLean::Mode() != 0;
-    if (occl_variants_possible) {
+    // host query, exactly as one not built yet. The threads are made now only where variants
+    // will be made: AMD's proprietary driver on a discrete GPU (one follower carries flags
+    // there), FRITCHII_ONEF_OCCL=1, one follower not asked for (FRITCHII_ONEF_LEAN and
+    // FRITCHII_ONEF not 1: flags with one follower off), or FRITCHII_OCCL_LEAN set. Otherwise
+    // one follower decides (OneFollower::ReadSwitches, after this): with it on and
+    // FRITCHII_ONEF_OCCL off (NVIDIA, Intel, RADV by default) no variant is ever asked for, so
+    // the threads are made at the first variant or sibling request (EnsureOcclLanes), never
+    // otherwise.
+    const bool occl_flags_possible = device.IsOcclFlagDeviceAddressEnabled();
+    const int occl_lean_mode = VideoCommon::OcclLean::Mode();
+    if (occl_flags_possible || occl_lean_mode != 0) {
         // FRITCHII_OCCL_FLAG_ASYNC=0 alone is v6.2: the lane defaults to none then.
         const bool occl_async = OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC", 1, 0, 1) != 0;
-        const int compile_threads =
-            OcclAsyncSwitch("FRITCHII_OCCL_FLAG_COMPILE_THREADS", occl_async ? 4 : 0, 0, 8);
-        if (compile_threads > 0) {
-            const auto count = static_cast<size_t>(compile_threads);
+        // Defaults scale with the logical processors, (n - 1) * 2 / 7 held to 1-4 (16: 4,
+        // 12: 3, 8: 2, 6 or fewer: 1); the compile lane also within the legacy AMD cap
+        // (CapLegacyAmdBuildThreads). An explicit value wins.
+        const unsigned cores = std::max(1U, Common::LowEndSim::LogicalProcessors());
+        const int scaled = std::clamp((static_cast<int>(cores) - 1) * 2 / 7, 1, 4);
+        const int compile_default =
+            occl_async ? static_cast<int>(CapLegacyAmdBuildThreads(
+                             device, static_cast<size_t>(scaled)))
+                       : 0;
+        occl_lane_compile_threads =
+            OcclAsyncSwitch("FRITCHII_OCCL_FLAG_COMPILE_THREADS", compile_default, 0, 8);
+        if (occl_async) {
+            occl_queue_threads = static_cast<size_t>(
+                OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_THREADS", scaled, 1, 8));
+            occl_async_per_frame =
+                static_cast<u32>(OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME", 8, 1, 64));
+        }
+        // FRITCHII_OCCL_FLAG_PERSIST (boot, default 1): the occlusion file (vulkan-frizti-occl).
+        occl_persist = OcclAsyncSwitch("FRITCHII_OCCL_FLAG_PERSIST", 1, 0, 1) != 0;
+        const auto starts_one = [](const char* name) {
+            const char* const value = std::getenv(name);
+            return value != nullptr && value[0] == '1';
+        };
+        const char* const onef_occl = std::getenv("FRITCHII_ONEF_OCCL");
+        const bool onef_occl_set = onef_occl != nullptr && onef_occl[0] != '\0';
+        const bool amd_discrete =
+            device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY && !device.IsIntegrated();
+        const char* now_why = nullptr;
+        if (occl_lean_mode != 0) {
+            now_why = "FRITCHII_OCCL_LEAN set";
+        } else if (onef_occl_set && onef_occl[0] != '0') {
+            now_why = "FRITCHII_ONEF_OCCL=1";
+        } else if (amd_discrete && !onef_occl_set) {
+            now_why = "AMD proprietary driver, discrete GPU: one follower carries flags";
+        } else if (!starts_one("FRITCHII_ONEF_LEAN") && !starts_one("FRITCHII_ONEF")) {
+            now_why = "one follower not asked for: flags with it off";
+        }
+        const bool any_lane = occl_queue_threads != 0 || occl_lane_compile_threads != 0;
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion variants: translated {} (FRITCHII_OCCL_FLAG_ASYNC={}), flag "
+                 "variants' driver compiles on {} (FRITCHII_OCCL_FLAG_COMPILE_THREADS; lean "
+                 "siblings on the shared pipeline workers), {} logical processors; threads {}; "
+                 "kept on disk: {} (FRITCHII_OCCL_FLAG_PERSIST)",
+                 occl_queue_threads != 0
+                     ? fmt::format("on {} threads of their own (FRITCHII_OCCL_FLAG_ASYNC_THREADS), "
+                                   "at most {} queued a frame",
+                                   occl_queue_threads, occl_async_per_frame)
+                     : std::string{"on the lookup thread, one a frame"},
+                 occl_async ? 1 : 0,
+                 occl_lane_compile_threads != 0
+                     ? fmt::format("{} lowest-priority threads of their own",
+                                   occl_lane_compile_threads)
+                     : std::string{"the shared pipeline workers"},
+                 cores,
+                 !any_lane       ? std::string{"none"}
+                 : now_why       ? fmt::format("made now ({})", now_why)
+                                 : std::string{"made at the first variant request (one follower "
+                                               "decides; none with it on and "
+                                               "FRITCHII_ONEF_OCCL off)"},
+                 occl_persist ? (occl_async ? "yes" : "yes (recorded; prebuilt only with "
+                                                      "FRITCHII_OCCL_FLAG_ASYNC=1)")
+                              : "no");
+        if (any_lane) {
+            occl_lanes_state.store(OcclLanesPending, std::memory_order_release);
+            if (now_why != nullptr) {
+                EnsureOcclLanes(nullptr);
+            }
+        }
+    }
+}
+
+void PipelineCache::EnsureOcclLanes(const char* why) {
+    if (occl_lanes_state.load(std::memory_order_acquire) != OcclLanesPending) {
+        return;
+    }
+    std::call_once(occl_lanes_once, [this, why] {
+        if (occl_lane_compile_threads > 0) {
+            const auto count = static_cast<size_t>(occl_lane_compile_threads);
             occl_compile_workers = std::unique_ptr<Common::ThreadWorker>(new Common::ThreadWorker(
                 count, "VkOcclBuilder", {}, Common::ThreadPlacement::Background));
 #ifdef _WIN32
@@ -1344,41 +1425,26 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                 });
             }
 #endif
+            occl_compile_live.store(occl_compile_workers.get(), std::memory_order_release);
         }
-        if (occl_async) {
-            const auto threads =
-                static_cast<size_t>(OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_THREADS", 4, 1, 8));
-            occl_async_per_frame =
-                static_cast<u32>(OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME", 8, 1, 64));
-            occl_queue_threads = threads;
+        if (occl_queue_threads > 0) {
             occl_queue = std::make_unique<TranslateQueue>(
-                threads, MaxOcclJobsInFlight,
+                occl_queue_threads, MaxOcclJobsInFlight,
                 [this](TranslationJob& job) { TranslateOnWorker(job); },
                 [this](std::unique_ptr<GraphicsPipeline> pipeline) {
                     RetireTranslatedPipeline(std::move(pipeline));
                 },
                 "VkOcclTranslate", Common::ThreadPlacement::Background);
+            occl_queue_live.store(occl_queue.get(), std::memory_order_release);
         }
-        // FRITCHII_OCCL_FLAG_PERSIST (boot, default 1): the occlusion file (vulkan-frizti-occl).
-        occl_persist = OcclAsyncSwitch("FRITCHII_OCCL_FLAG_PERSIST", 1, 0, 1) != 0;
-        LOG_INFO(Render_Vulkan,
-                 "Occlusion variants: translated {} (FRITCHII_OCCL_FLAG_ASYNC={}), flag "
-                 "variants' driver compiles on {} (FRITCHII_OCCL_FLAG_COMPILE_THREADS; lean "
-                 "siblings on the shared pipeline workers); kept on disk: {} "
-                 "(FRITCHII_OCCL_FLAG_PERSIST)",
-                 occl_queue ? fmt::format("on {} threads of their own, at most {} queued a "
-                                          "frame",
-                                          occl_queue_threads,
-                                          occl_async_per_frame)
-                            : std::string{"on the lookup thread, one a frame"},
-                 occl_queue ? 1 : 0,
-                 occl_compile_workers
-                     ? fmt::format("{} lowest-priority threads of their own", compile_threads)
-                     : std::string{"the shared pipeline workers"},
-                 occl_persist ? (occl_queue ? "yes" : "yes (recorded; prebuilt only with "
-                                                      "FRITCHII_OCCL_FLAG_ASYNC=1)")
-                              : "no");
-    }
+        occl_lanes_state.store(OcclLanesMade, std::memory_order_release);
+        if (why != nullptr) {
+            LOG_INFO(Render_Vulkan,
+                     "Occlusion variants: threads made at the first request ({}): {} translate, "
+                     "{} compile",
+                     why, occl_queue_threads, occl_lane_compile_threads);
+        }
+    });
 }
 
 namespace {
@@ -2002,7 +2068,7 @@ constexpr u32 OcclVariantTranslationVersion = 1;
 // the preparer reads") of the recipe the precompiled file was assembled from: one kind mask per
 // record of the file, in file order (before FRITCHII_PREP_ORDER). Only when the file's note
 // names that very recipe by size and content hash; nullopt (no note, another recipe, no hints,
-// records dropped by the assembly) means all kinds, as before. Never part of any stamp: a merge
+// records dropped by the assembly) means no variant is prepared. Never part of any stamp: a merge
 // that adds hints leaves the assembled file's bytes, and so the preparation, as they were.
 std::optional<VideoCommon::Nx2Recipe::VariantHints> PrepOcclHints(
     u64 title_id, const std::filesystem::path& title_dir, const std::filesystem::path& file,
@@ -2734,6 +2800,8 @@ PipelineCache::~PipelineCache() {
     // Its threads build with the members below (a translation in progress finishes).
     translate_queue.reset();
     // FRITCHII_OCCL_FLAG_ASYNC: the same, before the workers and graphics_cache.
+    occl_lanes_state.store(OcclLanesNone, std::memory_order_release); // none made from now
+    occl_queue_live.store(nullptr, std::memory_order_release);
     occl_queue.reset();
     StopBackgroundPipelines();
     Common::NoteShutdownProgress();
@@ -3917,6 +3985,66 @@ constexpr u8 OCCL_FLAG_BUILD_PREPASS_NOCOLOUR = 5; ///< the pre-pass, colour wri
 /// occl_queue's job of kind 0), for FRITCHII_OCCL_FLAG_COMPILE_THREADS' lane and the counts.
 thread_local bool t_occl_sibling_build{};
 
+// FRITCHII_PREP_OCCL_VARIANTS: the variant kinds (colour, pre-pass, pre-pass no-colour) play
+// will draw this session, from the inputs play reads: the occlusion level (FRITCHII_OCCL_FLAG
+// or the setting, read at device creation: Standard draws none of these kinds, Full all), and
+// one follower, which plays flags only with FRITCHII_ONEF_OCCL (unset: AMD's proprietary driver
+// on a discrete GPU) and its pre-pass kinds only with FRITCHII_ONEF_OCCL_PREPASS (default 1).
+// The preparation runs before OneFollower::ReadSwitches, so its decision is made here the way
+// ReadSwitches makes it (wanted with FRITCHII_ONEF_LEAN=1 or FRITCHII_ONEF=1; on AMD's
+// proprietary driver an explicit FRITCHII_ONEF_AMD wins, else on only for a discrete GPU at
+// Full). `why` says what decided it.
+static u8 OcclPrepPlayMask(const Device& device, std::string& why) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    const auto text = [](const char* name) -> const char* {
+        const char* const value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' ? value : nullptr;
+    };
+    const auto starts_one = [&](const char* name) {
+        const char* const value = text(name);
+        return value != nullptr && value[0] == '1';
+    };
+    const int level = OcclFlag::RawMode();
+    if (OcclFlag::Mode() == OcclFlag::Off) {
+        why = fmt::format("occlusion speed-up off ({})", level);
+        return 0;
+    }
+    const bool amd = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
+    const bool integrated = device.IsIntegrated();
+    bool onef = starts_one("FRITCHII_ONEF_LEAN") || starts_one("FRITCHII_ONEF");
+    if (onef && amd) {
+        const char* const keep = text("FRITCHII_ONEF_AMD");
+        onef = keep != nullptr ? keep[0] != '0' : !integrated && level == OcclFlag::Full;
+    }
+    bool prepass_ok = true;
+    if (onef) {
+        const char* const occl = text("FRITCHII_ONEF_OCCL");
+        const bool carries = occl != nullptr ? occl[0] != '0' : amd && !integrated;
+        if (!carries) {
+            why = fmt::format("one follower on without occlusion flags (FRITCHII_ONEF_OCCL={})",
+                              occl != nullptr ? std::string{occl}
+                                              : std::string{"unset: not an AMD proprietary "
+                                                            "discrete GPU"});
+            return 0;
+        }
+        const char* const prepass = std::getenv("FRITCHII_ONEF_OCCL_PREPASS");
+        prepass_ok = prepass == nullptr || prepass[0] != '0';
+    }
+    u8 mask = 0;
+    if (OcclFlag::ColourAllowed()) {
+        mask |= static_cast<u8>(1U << OCCL_FLAG_BUILD_COLOUR);
+    }
+    if (OcclFlag::PrepassAllowed() && prepass_ok) {
+        mask |= static_cast<u8>(1U << OCCL_FLAG_BUILD_PREPASS);
+        if (OcclFlag::ColourAllowed()) {
+            mask |= static_cast<u8>(1U << OCCL_FLAG_BUILD_PREPASS_NOCOLOUR);
+        }
+    }
+    why = fmt::format("occlusion level {}, one follower {}{}", level, onef ? "on" : "off",
+                      onef && !prepass_ok ? " (FRITCHII_ONEF_OCCL_PREPASS=0)" : "");
+    return mask;
+}
+
 /// FRITCHII_OCCL_FLAG: why `pipeline`'s guest pixel program (Lean class: no discard, depth or
 /// sample mask writes, stores) cannot take the flag store with early fragment tests for a
 /// colour-writing draw, or Flag when it can: no subgroup or helper operations (early tests
@@ -4788,7 +4916,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPip
         };
     // FRITCHII_OCCL_FLAG_COMPILE_THREADS: the occlusion lane, as a translated variant's.
     Common::ThreadWorker* const thread_worker =
-        occl_compile_workers ? occl_compile_workers.get() : &workers;
+        OcclCompileLane() != nullptr ? OcclCompileLane() : &workers;
     GraphicsPipeline::LibraryParams library_params{};
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, PlayPipelineCache(), &shader_notify, device,
@@ -4802,6 +4930,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPip
 
 GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 kind) {
     namespace OcclFlag = VideoCommon::OcclFlag;
+    // FRITCHII_OCCL_FLAG_ASYNC: the occlusion threads, when they wait for a first request.
+    EnsureOcclLanes("a flag variant");
     // FRITCHII_PREP_OCCL_VARIANTS: the variant "Preparing shaders" built and kept with full
     // (full came from the kept file): from its SPIR-V, no snapshot or translation, not recorded
     // in the occlusion file (nothing to record), before the memo (it fits full by construction).
@@ -4829,7 +4959,7 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
         return nullptr;
     }
     // A variant whose translations off this thread kept going stale is made here, as in v6.2.
-    if (occl_queue && !OcclSyncOnly(full, kind)) {
+    if (OcclQueue() && !OcclSyncOnly(full, kind)) {
         // FRITCHII_OCCL_FLAG_ASYNC: queued (state 3) from snapshot environments of this draw,
         // never translated here; null until TickOcclVariants attaches it (the draw takes its
         // parent with a host query meanwhile). Only while the current key names full's programs
@@ -4982,6 +5112,7 @@ GraphicsPipeline* PipelineCache::AttachOcclFlag(GraphicsPipeline& full, u8 kind,
 
 GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
     namespace OcclLean = VideoCommon::OcclLean;
+    EnsureOcclLanes("a lean sibling"); // FRITCHII_OCCL_FLAG_ASYNC, as FindOrMakeOcclFlag
     OcclLean::Stats& stats = OcclLean::g_stats;
     GraphicsPipelineCacheKey key = full.Key();
     key.unique_hashes[5] = 0;
@@ -4993,7 +5124,7 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
     }
     // The environments come from the registers of this draw (shader_infos from the lookup that
     // gave `full`): only while the current key names full's programs.
-    if (occl_queue && !OcclSyncOnly(full, 0)) {
+    if (OcclQueue() && !OcclSyncOnly(full, 0)) {
         // FRITCHII_OCCL_FLAG_ASYNC: queued on occl_queue under an empty entry (as the translate
         // queue's), filled by TickOcclVariants; a draw of this very key adopts it or builds it
         // (AdoptOcclSiblingForDraw). One that kept going stale is made below, as in v6.2.
@@ -5417,13 +5548,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             if (IntelFetchesCacheWhenIdle(device)) {
                 // FRITCHII_OCCL_FLAG_ASYNC / _COMPILE_THREADS build with the same cache: the
                 // occlusion translations first (they queue compiles), then every compile.
-                if (occl_queue && !occl_queue->WaitIdle(std::chrono::seconds{10})) {
+                if (OcclQueue() && !OcclQueue()->WaitIdle(std::chrono::seconds{10})) {
                     LOG_WARNING(Render_Vulkan, "Occlusion variants: a translation still runs "
                                                "after 10 s; fetching the pipeline cache anyway");
                 }
                 workers.WaitForRequests();
-                if (occl_compile_workers) {
-                    occl_compile_workers->WaitForRequests();
+                if (OcclCompileLane() != nullptr) {
+                    OcclCompileLane()->WaitForRequests();
                 }
             }
             SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -6821,10 +6952,21 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const bool keep = PrecompiledFastMode() != 0;
     // FRITCHII_PREP_OCCL_VARIANTS: the occlusion flag variants are kept beside the pipelines, in
     // the kept file only (its NX2KEPT6 layout and the variant token in its stamp): the prepared
-    // stamp never names them. The kinds come from the device alone (OcclPrepMask), never from
-    // the Occlusion setting or the one-follower switches (read on another thread).
+    // stamp never names them. The kinds are the device's (OcclPrepMask) that play will draw
+    // this session (OcclPrepPlayMask: the occlusion level and one follower, decided here as
+    // play will decide them), and only with the recipe's hints (below); never in a stamp.
     const bool prep_variants = keep && PrepOcclVariantsMode() != 0;
-    const u8 occl_mask = prep_variants ? OcclPrepMask() : u8{0};
+    u8 occl_mask = 0;
+    if (prep_variants) {
+        std::string play_why;
+        const u8 device_mask = OcclPrepMask();
+        const u8 play_mask = OcclPrepPlayMask(device, play_why);
+        occl_mask = static_cast<u8>(device_mask & play_mask);
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled occlusion variants (FRITCHII_PREP_OCCL_VARIANTS={}): kinds {:#x} "
+                 "(device {:#x}, played {:#x}: {})",
+                 PrepOcclVariantsMode(), occl_mask, device_mask, play_mask, play_why);
+    }
     const auto kept_path =
         base_dir / fmt::format("precompiled_infos.fork-v{}.bin", CACHE_VERSION);
     auto kept_part = kept_path;
@@ -6958,10 +7100,14 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                          "prepared",
                          hint_source, occl_hints->sources, hinted, record_count);
             } else {
+                // Without hints nothing says which records' variants play builds: preparing
+                // every kind for every record cost the preparation's time and disk for variants
+                // mostly never drawn, so none is prepared (play translates them as before).
+                occl_mask = 0;
                 LOG_INFO(Render_Vulkan,
-                         "Precompiled occlusion variants: no hints{}{}, every kind the device "
-                         "takes is prepared",
-                         hint_source.empty() ? "" : " (", hint_source.empty() ? "" : hint_source + ")");
+                         "Precompiled occlusion variants: no hints ({}), no variant is prepared "
+                         "(play translates them as before)",
+                         hint_source.empty() ? std::string{"no title id"} : hint_source);
             }
         }
         env_index.resize(env_count);
@@ -9142,7 +9288,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         if (pipeline && !precompiled && evicted_pointer_slots.Size() != 0) {
             evicted_pointer_slots.Forget(graphics_key.Hash());
         }
-    } else if (!pipeline && occl_queue && occl_queue->Contains(graphics_key, 0)) {
+    } else if (!pipeline && OcclQueue() && OcclQueue()->Contains(graphics_key, 0)) {
         // FRITCHII_OCCL_FLAG_ASYNC: this key is a lean sibling still on occl_queue.
         bool pending{};
         pipeline = AdoptOcclSiblingForDraw(pending);
@@ -9315,7 +9461,7 @@ void PipelineCache::TickFrame() {
     if (translate_queue) {
         TickTranslations();
     }
-    if (occl_queue) {
+    if (OcclQueue()) {
         TickOcclVariants();
     }
     if (occl_persist) {
@@ -10719,7 +10865,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const bool occl_lane = OcclLaneBuild();
     Common::ThreadWorker* const thread_worker{
         build_in_parallel && !libraries_only
-            ? (occl_lane ? occl_compile_workers.get() : &workers)
+            ? (occl_lane ? OcclCompileLane() : &workers)
             : nullptr};
     GraphicsPipeline::LibraryParams library_params{
         .library_cache = use_libraries ? &graphics_libraries : nullptr,
@@ -11610,7 +11756,7 @@ bool PipelineCache::OcclSyncOnly(const GraphicsPipeline& full, u8 kind) const {
 }
 
 bool PipelineCache::OcclLaneBuild() const {
-    return occl_compile_workers != nullptr && t_occl_flag_build != 0;
+    return t_occl_flag_build != 0 && OcclCompileLane() != nullptr;
 }
 
 void PipelineCache::TickOcclVariants() {
@@ -12447,26 +12593,45 @@ void PipelineCache::TickOcclPersist() {
                 occl_disk_pending.push_back(index);
             }
             const size_t records = occl_disk_records.size();
-            if (!occl_queue) {
+            // FRITCHII_OCCL_FLAG_ASYNC: with the occlusion threads still to be made (one
+            // follower decides), the records wait for them (below).
+            const bool lanes_pending =
+                occl_queue_threads != 0 &&
+                occl_lanes_state.load(std::memory_order_acquire) == OcclLanesPending;
+            if (!OcclQueue() && !lanes_pending) {
                 // Only the memo and the recording are used.
                 occl_disk_records.clear();
                 occl_disk_index.clear();
                 occl_disk_pending.clear();
             }
-            const size_t ready = occl_queue ? ScanOcclDiskPending(false) : 0;
+            const size_t ready = OcclQueue() ? ScanOcclDiskPending(false) : 0;
             LOG_INFO(Render_Vulkan,
                      "Occlusion variants on disk: {} records ({} refusals, {} parents in the "
                      "memo), {} with their parent built at boot{} (FRITCHII_OCCL_FLAG_PERSIST, {})",
                      records, load->memo_records, occl_refused_memo.size(), ready,
-                     occl_queue ? fmt::format(", {} later or never (when a draw asks, or their "
+                     OcclQueue() ? fmt::format(", {} later or never (when a draw asks, or their "
                                               "parent is built; or not wanted at this level)",
                                               records - ready)
-                                : std::string{"; not prebuilt with FRITCHII_OCCL_FLAG_ASYNC=0"},
+                     : lanes_pending
+                         ? std::string{"; prebuilt once the occlusion threads are made (a "
+                                       "variant is asked for)"}
+                         : std::string{"; not prebuilt with FRITCHII_OCCL_FLAG_ASYNC=0"},
                      Common::FS::PathToUTF8String(*occl_persist_path));
             occl_disk_backlog = !occl_disk_pending.empty();
         }
     }
-    if (!occl_queue || occl_disk_records.empty()) {
+    if (!OcclQueue() && !occl_disk_records.empty() && frame_count != 0 &&
+        frame_count % 15 == 0 &&
+        occl_lanes_state.load(std::memory_order_acquire) == OcclLanesPending) {
+        // Records wait for the occlusion threads: made once a kind of theirs is wanted now.
+        for (u8 kind = 0; kind <= 5; ++kind) {
+            if (OcclKindWanted(kind)) {
+                EnsureOcclLanes("records of the occlusion file");
+                break;
+            }
+        }
+    }
+    if (!OcclQueue() || occl_disk_records.empty()) {
         return;
     }
     if (occl_disk_pending.empty()) {

@@ -630,6 +630,26 @@ all of them before the game starts either way, so a dispatch never waits for a p
 recorded in an earlier session (runtime-translated compute programs are recorded, as are prepared
 ones the game used); this only makes the compute records end earlier within the boot.
 
+### FRITCHII_PREP_OCCL_VARIANTS
+
+Boot, default 0 (the kept file, its stamp and play as before). 1: "Preparing shaders" (with
+EDEN_NX2_PRECOMPILED_FAST) also builds and keeps occlusion flag variants (colour, pre-pass,
+pre-pass no-colour) beside their pipelines in the kept file, from the recipe's variant hints
+(docs/fritchii/recipe-merge.md). The kinds prepared are the device's (64-bit integers and the flag
+area's buffer device address) AND the kinds play will draw this session, decided before the
+preparation from the inputs play reads (2026-11-20, cross-vendor review): the occlusion level
+(FRITCHII_OCCL_FLAG, else the setting: Standard draws none of these kinds, Full all three) and one
+follower as OneFollower::ReadSwitches will decide it (FRITCHII_ONEF_LEAN=1 or FRITCHII_ONEF=1; on
+AMD's proprietary driver an explicit FRITCHII_ONEF_AMD, else a discrete GPU at Full). With one
+follower on only FRITCHII_ONEF_OCCL (unset: AMD's proprietary driver on a discrete GPU) plays flags,
+and its pre-pass kinds only with FRITCHII_ONEF_OCCL_PREPASS (default 1); so NVIDIA, Intel and RADV
+with one follower on prepare none. No hints for the file (no recipe note, another recipe, records
+dropped): no variant is prepared (was every kind). The Preparing-shaders stamp is unchanged. Logs:
+"Precompiled occlusion variants (FRITCHII_PREP_OCCL_VARIANTS=1): kinds 0x.. (device 0x2c, played
+0x..: occlusion level N, one follower on|off | one follower on without occlusion flags
+(FRITCHII_ONEF_OCCL=...) | occlusion speed-up off (N))", then "... hints from ..." or "...: no
+hints (<why>), no variant is prepared (play translates them as before)".
+
 ### FRITCHII_PREP_COMPUTE_FIRST, FRITCHII_PREP_COMPUTE_CHECK
 
 Why: a compute dispatch can't be skipped while its pipeline compiles, so a compute pipeline the
@@ -1145,7 +1165,7 @@ desktop card. RADV, NVIDIA and Intel unchanged. The settings' Full row follows t
 Boot (helper BJ, 2026-11-16; changed 2026-11-19). On AMD's proprietary driver EDEN_NX2_EXP123 (the
 memory seam, 3 built in) is kept at its value when one follower is on, and held to 1 when it is
 off (there SEAM 3 is about 0.6 ms slower than 1 on AMD). The original SEAM 3 loss at the title was
-the ASTC decoder's submit inside a held packet, skipped by FRITCHII_ASTC_HELD_DEFER (default 1). 0 =
+the ASTC decoder's submit inside a held packet, skipped by FRITCHII_ASTC_HELD_DEFER (default 1 on AMD's proprietary driver). 0 =
 held to 1; 1 = kept either way (tests). Log once: "Memory seam: EXP123=N kept on AMD's proprietary
 driver (one follower on | FRITCHII_SEAM_AMD=1)" or "... held to 1 ... (one follower off |
 FRITCHII_SEAM_AMD=0)".
@@ -1183,8 +1203,10 @@ draws lost 0, checks 0, picture unchanged.
 
 ### FRITCHII_ASTC_HELD_DEFER
 
-Boot, default 1 since 2026-11-19 (helper BG's fix from 2026-11-16, ported by helper FJ; 6.2 had it
-at 0). An ASTC GPU decode made while this thread holds a filled draw or dispatch packet (EXP123 >= 2)
+Boot (helper BG's fix from 2026-11-16, ported by helper FJ). Unset: 1 on AMD's proprietary driver
+(VK_DRIVER_ID_AMD_PROPRIETARY, where the losses were), 0 everywhere else (6.2's submit: RADV, NVIDIA,
+Intel and the rest; 2026-11-20, after a cross-vendor review, was 1 everywhere from 2026-11-19). An
+explicit value wins on any driver. An ASTC GPU decode made while this thread holds a filled draw or dispatch packet (EXP123 >= 2)
 does not submit: the decode and its barrier stay in the current command buffer, ahead of the draw,
 and the next flush takes them (Scheduler::DeferFlushUntilWanted: the back submits when it idles;
 in Finish mode, EDEN_NX2_ASTC_FLUSH=0, too, where the wait is pacing only). It acts only inside a
@@ -1192,9 +1214,12 @@ held packet (SEAM 2/3), so it is inert elsewhere. Why: that submit splits a held
 command buffers ("Memory seam (5.5) ... ASTCDecoderPass"), and both AMD cards (RX 7900 XT, RX 9070
 XT) lost the device 10-15 ms after one at the title; with the skip, SEAM 3 on AMD passed the title
 and the fountain in every run since. 0, or the old FRITCHII_ASTC_HELD_FLUSH=1 of exp/onef-amd,
-submits as before. Log once: "ASTC GPU decode inside a held draw fill: submit left to the next
-flush". Watch RADV for BC3 flashes (the submit once hid a race there); NVIDIA, where SEAM 3 is the
-default, now takes this path too.
+submits as before (FRITCHII_ASTC_HELD_FLUSH=1 counts only while FRITCHII_ASTC_HELD_DEFER is unset).
+Logs once, at the first decode that would submit: "ASTC GPU decode inside a held draw fill: submit
+left to the next flush | submitted at once (FRITCHII_ASTC_HELD_DEFER=<value> | unset: AMD
+proprietary driver | unset: not AMD's proprietary driver)", then once "... submit left to the next
+flush (FRITCHII_ASTC_HELD_DEFER=1)" at the first skip. To try it on RADV (watch for BC3 flashes: the
+submit once hid a race there), NVIDIA or Intel, set it to 1.
 
 ### FRITCHII_SPLIT_BIND_FIX
 
@@ -3274,20 +3299,40 @@ built yet. A variant waits in state 3 (queued).
   while it translates the draw is skipped only where an unbuilt pipeline's draw would be (the
   asynchronous shaders on and a draw that may be skipped); otherwise the job is given up and the key
   built at once from that draw, as any new key (also when the job made none or was unusable).
-- Made only when FRITCHII_OCCL_FLAG was not 0 at boot or FRITCHII_OCCL_LEAN is set.
+- Planned only when FRITCHII_OCCL_FLAG was not 0 at boot or FRITCHII_OCCL_LEAN is set. The threads
+  (these and FRITCHII_OCCL_FLAG_COMPILE_THREADS') are made at boot only where variants will be made:
+  AMD's proprietary driver on a discrete GPU (one follower carries flags there; FRITCHII_ONEF_OCCL
+  unset), FRITCHII_ONEF_OCCL=1, one follower not asked for (FRITCHII_ONEF_LEAN and FRITCHII_ONEF not
+  1: flags with it off), or FRITCHII_OCCL_LEAN set at boot. Otherwise (NVIDIA, Intel, RADV, AMD
+  integrated by default: one follower on, FRITCHII_ONEF_OCCL off, so no variant is ever asked for)
+  they are made at the first flag variant or lean sibling request, or once a record of the occlusion
+  file is of a wanted kind (2026-11-20, cross-vendor review; were always made). Boot log:
+  "Occlusion variants: translated on N threads of their own (FRITCHII_OCCL_FLAG_ASYNC_THREADS), at
+  most 8 queued a frame (FRITCHII_OCCL_FLAG_ASYNC=1), flag variants' driver compiles on M
+  lowest-priority threads of their own (...), P logical processors; threads made now (<why>) | made
+  at the first variant request (one follower decides; none with it on and FRITCHII_ONEF_OCCL off);
+  kept on disk: ...", and when made later "Occlusion variants: threads made at the first request (a
+  flag variant | a lean sibling | records of the occlusion file): N translate, M compile".
 - On Intel's driver (FRITCHII_INTEL_PCACHE_FETCH) the translations and both compile lanes are
   drained before the pipeline cache is fetched between programs.
-- FRITCHII_OCCL_FLAG_ASYNC_THREADS (boot, default 4, 1-8; was 2): its threads.
+- FRITCHII_OCCL_FLAG_ASYNC_THREADS (boot, 1-8): its threads. Default clamp((logical processors -
+  1) * 2 / 7, 1, 4): 16 or more logical processors 4 (the measured arm), 12 3, 8 2, 6 or fewer 1
+  (2026-11-20; was 4 everywhere, before that 2). An explicit value wins.
 - FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME (boot, default 8, 1-64; was 4): jobs queued a frame at most
   (each copies the draw's environments on the lookup thread); at most 32 in flight. Over either,
   the variant is asked again at a later draw.
 - The defaults of these two and of FRITCHII_OCCL_FLAG_COMPILE_THREADS (4/8/4, were 2/4/2) are
-  the arms that won the A/B runs at the Market fountain.
+  the arms that won the A/B runs at the Market fountain (a 16-thread Core Ultra 7 255H); the thread
+  counts now scale down from there on smaller CPUs.
 
 ### FRITCHII_OCCL_FLAG_COMPILE_THREADS (occlusion variant compile lane)
 
-FRITCHII_OCCL_FLAG_COMPILE_THREADS (boot, default 4 (was 2) with FRITCHII_OCCL_FLAG_ASYNC=1 and 0 with it at
-0, 0-8; 0 = the shared pipeline workers, as v6.2). The driver compiles of occlusion flag variants run
+FRITCHII_OCCL_FLAG_COMPILE_THREADS (boot, 0-8; 0 = the shared pipeline workers, as v6.2). Default
+with FRITCHII_OCCL_FLAG_ASYNC=1: clamp((logical processors - 1) * 2 / 7, 1, 4), as
+FRITCHII_OCCL_FLAG_ASYNC_THREADS (16 logical processors: 4), held within the legacy AMD cap (GCN4 or
+older on AMD's driver: 2, or EDEN_NX2_PIPELINE_WORKERS); 0 with FRITCHII_OCCL_FLAG_ASYNC=0. An
+explicit value wins (was 4 everywhere, before that 2). Made at boot or at the first variant request,
+as FRITCHII_OCCL_FLAG_ASYNC's threads (above). The driver compiles of occlusion flag variants run
 on threads of their own ("VkOcclBuilder", lowest priority), so they never queue ahead of the game's
 own pipelines on the shared workers. No draw waits for one: flag variants are never cache entries
 and are drawn only once built. Such a build takes no emission-budget reservation (its SPIR-V is

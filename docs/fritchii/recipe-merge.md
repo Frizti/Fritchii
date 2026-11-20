@@ -111,8 +111,8 @@ The preparer (or whatever reads the precompiled file) gets them so:
 2. `Nx2Recipe::HintsForFile(recipe_bytes, file_record_count)`, `file_record_count` the u32 at
    offset 16 of the `.nx2prep` header: one mask per record of the file in **file order** (the
    records section's order, before `FRITCHII_PREP_ORDER` reordering). nullopt (no hints, or the
-   assembly dropped records so indices no longer line up, or another recipe) means no hints: keep
-   today's behaviour, all kinds;
+   assembly dropped records so indices no longer line up, or another recipe) means no hints: the
+   preparer prepares no variant (since 2026-11-20; it was all kinds);
 3. for record `i`, build occlusion variant kind `k` only when `kinds[i] & (1 << k)`; `sources` is
    the number of occlusion files learned from. A record with mask 0 had no variant in those
    sessions (records the merge added from caches start at 0).

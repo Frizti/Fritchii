@@ -1034,10 +1034,16 @@ private:
     std::atomic_bool save_again{};
 
     Common::ThreadWorker workers;
-    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS (default 4 with FRITCHII_OCCL_FLAG_ASYNC=1, else 0;
-    /// 0 none): the driver compiles of occlusion flag variants, at the lowest priority, apart
-    /// from the shared workers. Lean siblings (cache entries draws may wait on) stay on those.
+    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS (default clamp((logical processors - 1) * 2 / 7, 1, 4)
+    /// with FRITCHII_OCCL_FLAG_ASYNC=1, else 0; 0 none): the driver compiles of occlusion flag
+    /// variants, at the lowest priority, apart from the shared workers. Lean siblings (cache
+    /// entries draws may wait on) stay on those. Made by EnsureOcclLanes; read through
+    /// OcclCompileLane (preparation threads read it too).
     std::unique_ptr<Common::ThreadWorker> occl_compile_workers;
+    std::atomic<Common::ThreadWorker*> occl_compile_live{};
+    [[nodiscard]] Common::ThreadWorker* OcclCompileLane() const {
+        return occl_compile_live.load(std::memory_order_acquire);
+    }
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
 
@@ -1067,9 +1073,25 @@ private:
     std::unique_ptr<TranslateQueue> translate_queue;
     /// FRITCHII_OCCL_FLAG_ASYNC (default 1): occlusion flag variants and lean siblings
     /// translated on threads of their own instead of on the lookup thread. Null with the switch
-    /// 0 (the synchronous path), or when neither feature can run this session. Reset first in
-    /// the destructor, with translate_queue.
+    /// 0 (the synchronous path), or when neither feature can run this session, or until
+    /// EnsureOcclLanes makes it (FRITCHII_OCCL_FLAG_ASYNC_THREADS threads, default as the compile
+    /// lane's). Read through OcclQueue. Reset first in the destructor, with translate_queue.
     std::unique_ptr<TranslateQueue> occl_queue;
+    std::atomic<TranslateQueue*> occl_queue_live{};
+    [[nodiscard]] TranslateQueue* OcclQueue() const {
+        return occl_queue_live.load(std::memory_order_acquire);
+    }
+    /// The occlusion threads (occl_queue, occl_compile_workers): none planned, planned but not
+    /// made (one follower decides whether a variant is ever asked for), made.
+    static constexpr u8 OcclLanesNone = 0;
+    static constexpr u8 OcclLanesPending = 1;
+    static constexpr u8 OcclLanesMade = 2;
+    std::atomic<u8> occl_lanes_state{OcclLanesNone};
+    std::once_flag occl_lanes_once;
+    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS as decided at construction (0 none).
+    int occl_lane_compile_threads{};
+    /// Makes the planned occlusion threads once (thread safe); `why` logged when not null.
+    void EnsureOcclLanes(const char* why);
     /// Keys whose translations kept failing their checks or were swept: built on the GPU thread.
     std::unordered_set<GraphicsPipelineCacheKey> translate_sync_only;
     /// Unusable translations per key (a stale texture descriptor, a guarded read that gave up).
