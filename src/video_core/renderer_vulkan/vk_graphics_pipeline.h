@@ -496,6 +496,15 @@ public:
     std::shared_ptr<const void> kept_index;
     const void* kept_record{};
     u8 kept_occl_tried{};
+    /// FRITCHII_PREP_OCCL_VARIANTS: a pipeline built another way (the disk cache's prebuild, a
+    /// translation) whose key the kept index holds: its record looked up at its first variant
+    /// request (PipelineCache::LookUpKeptParent; the reads on the occlusion lane), the record's
+    /// infos kept here (a KeptParentLookup, vk_pipeline_cache.cpp). kept_lookup_state: 0 not
+    /// looked up, 1 reading, 2 done (bound to a record, or none fits). kept_path: how this
+    /// pipeline was built, for the prepared variants' counter (0 other, 1 fast path, 2 disk cache).
+    std::shared_ptr<void> kept_lookup;
+    u8 kept_lookup_state{};
+    u8 kept_path{};
     /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): this pipeline's flag variant (the same key with
     /// the host flag pixel program), owned here and never in the cache; on a flag variant, the
     /// pipeline it was made from. occl_flag_state: 0 not tried, 1 made, 2 refused for good.

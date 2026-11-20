@@ -469,6 +469,12 @@ private:
     /// this frame's budget is spent (`later`).
     std::unique_ptr<GraphicsPipeline> MakeKeptOcclVariant(GraphicsPipeline& full, u8 kind,
                                                           bool& later);
+    /// FRITCHII_PREP_OCCL_VARIANTS: binds `full`, built by a path other than the fast path, to
+    /// its record in the kept index (one whose infos describe full's descriptors exactly, with
+    /// full's descriptor signature), so its prepared variants are found as a fast path
+    /// pipeline's. The record infos are read on the occlusion lane, never here. 0: none (or no
+    /// index yet), 1: reading (no variant this draw), 2: bound.
+    u8 LookUpKeptParent(GraphicsPipeline& full);
     /// Kept variants tried a frame (fitting or not), and this frame's count.
     static constexpr u32 OcclKeptPerFrame = 16;
     u64 occl_kept_frame{~u64{0}};

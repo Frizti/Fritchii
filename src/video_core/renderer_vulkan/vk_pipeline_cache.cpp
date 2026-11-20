@@ -4365,12 +4365,12 @@ bool OcclVariantFitsParent(const GraphicsPipeline& variant, const GraphicsPipeli
 /// types read). A variant recorded with a parent is attached to a parent of the same signature
 /// only (a parent built from another record, or the variant from another state, does not fit);
 /// the refusal memo is keyed by it too. Never 0.
-u64 OcclDescriptorSignature(const GraphicsPipeline& pipeline) {
+u64 OcclDescriptorSignature(std::span<const Shader::Info> infos) {
     u64 hash = 0xcbf29ce484222325ULL;
     const auto mix = [&hash](u64 value) {
         hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
     };
-    for (const Shader::Info& info : pipeline.StageInfos()) {
+    for (const Shader::Info& info : infos) {
         mix(info.constant_buffer_descriptors.size());
         for (const auto& d : info.constant_buffer_descriptors) {
             mix((u64{d.index} << 32) | d.count);
@@ -4412,6 +4412,10 @@ u64 OcclDescriptorSignature(const GraphicsPipeline& pipeline) {
         mix((u64{info.uses_rescaling_uniform} << 1) | u64{info.uses_render_area});
     }
     return hash | 1;
+}
+
+u64 OcclDescriptorSignature(const GraphicsPipeline& pipeline) {
+    return OcclDescriptorSignature(pipeline.StageInfos());
 }
 
 /// OcclDescriptorSignature, computed once per pipeline (GPU thread).
@@ -4861,6 +4865,160 @@ u8& PipelineCache::OcclFlagStateOf(GraphicsPipeline& full, u8 kind) {
     }
 }
 
+namespace {
+/// FRITCHII_PREP_OCCL_VARIANTS: a parent built by a path other than the fast path, looked up in
+/// the kept index (PipelineCache::LookUpKeptParent). The occlusion lane reads the infos of the
+/// key's records (candidates) and of their prepared variants' own stages; the GPU thread then
+/// binds the parent to the candidate that describes its descriptors exactly and keeps that
+/// record's infos here, so its variants (MakeKeptOcclVariant) take the infos their SPIR-V was
+/// translated with and read nothing on the GPU thread.
+struct KeptParentLookup {
+    struct Candidate {
+        const PrecompiledKept::Record* record{};
+        std::array<Shader::Info, Maxwell::MaxShaderStage> infos{};
+    };
+    std::shared_ptr<const PrecompiledKept::Index> index;
+    std::atomic<bool> ready{};
+    std::vector<Candidate> candidates;
+    /// The bound record's infos, by stage.
+    std::array<Shader::Info, Maxwell::MaxShaderStage> parent_infos{};
+    /// Infos of the variant records' stages that are not their parent record's, by blob id.
+    std::vector<std::pair<u32, Shader::Info>> variant_infos;
+
+    [[nodiscard]] const Shader::Info* VariantInfo(u32 blob) const {
+        for (const auto& [id, info] : variant_infos) {
+            if (id == blob) {
+                return &info;
+            }
+        }
+        return nullptr;
+    }
+};
+} // Anonymous namespace
+
+u8 PipelineCache::LookUpKeptParent(GraphicsPipeline& full) {
+    using PrecompiledKept::NoBlob;
+    if (full.kept_index) {
+        return 2;
+    }
+    if (full.kept_lookup_state == 2 || PrepOcclVariantsMode() == 0) {
+        return 0;
+    }
+    if (full.kept_lookup_state == 0) {
+        // Not loaded (yet): looked up again at a later request.
+        if (!kept_available.load(std::memory_order_acquire)) {
+            return 0;
+        }
+        auto index = KeptIndex();
+        if (!index) {
+            return 0;
+        }
+        const GraphicsPipelineCacheKey& key = full.Key();
+        // A vertex A program is merged into vertex B: never prepared (as the fast path).
+        if (key.unique_hashes[0] != 0 || index->Graphics(key.Hash()).empty()) {
+            full.kept_lookup_state = 2;
+            return 0;
+        }
+        std::array<bool, Maxwell::MaxShaderStage> present{};
+        for (size_t stage = 0; stage < present.size(); ++stage) {
+            present[stage] = key.unique_hashes[stage + 1] != 0;
+        }
+        auto lookup = std::make_shared<KeptParentLookup>();
+        lookup->index = std::move(index);
+        full.kept_lookup = lookup;
+        full.kept_lookup_state = 1;
+        Common::ThreadWorker* const lane =
+            OcclCompileLane() != nullptr ? OcclCompileLane() : &workers;
+        lane->QueueWork([lookup, hash = key.Hash(), present,
+                         mesh = device.IsExtMeshShaderSupported()] {
+            try {
+                const PrecompiledKept::Index& kept = *lookup->index;
+                for (const PrecompiledKept::Record& record : kept.Graphics(hash)) {
+                    size_t programs = 0;
+                    bool usable = true;
+                    for (size_t stage = 0; stage < present.size() && usable; ++stage) {
+                        programs += present[stage] ? 1 : 0;
+                        usable = present[stage] == (record.infos[stage] != NoBlob) &&
+                                 present[stage] == (record.spirv[stage] != NoBlob);
+                    }
+                    if (!usable || programs != record.env_count) {
+                        continue;
+                    }
+                    KeptParentLookup::Candidate candidate{.record = &record};
+                    for (size_t stage = 0; stage < present.size() && usable; ++stage) {
+                        if (record.infos[stage] == NoBlob) {
+                            continue;
+                        }
+                        Shader::Info& info = candidate.infos[stage];
+                        // As the fast path: no layer emulation, no mesh fallback.
+                        usable = kept.ReadInfo(record.infos[stage], info) &&
+                                 !info.requires_layer_emulation &&
+                                 (mesh || !(info.is_mesh || info.is_task));
+                    }
+                    if (usable) {
+                        lookup->candidates.push_back(std::move(candidate));
+                    }
+                }
+                for (const PrecompiledKept::Record& variant : kept.Variants(hash)) {
+                    const auto parent = std::ranges::find_if(
+                        lookup->candidates, [&variant](const KeptParentLookup::Candidate& c) {
+                            return c.record->env_count == variant.env_count &&
+                                   std::equal(variant.envs.begin(),
+                                              variant.envs.begin() + variant.env_count,
+                                              c.record->envs.begin());
+                        });
+                    if (parent == lookup->candidates.end()) {
+                        continue;
+                    }
+                    for (size_t stage = 0; stage < present.size(); ++stage) {
+                        const u32 blob = variant.infos[stage];
+                        if (blob == NoBlob || blob == parent->record->infos[stage] ||
+                            lookup->VariantInfo(blob) != nullptr) {
+                            continue;
+                        }
+                        Shader::Info info;
+                        if (kept.ReadInfo(blob, info)) {
+                            lookup->variant_infos.emplace_back(blob, std::move(info));
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                LOG_WARNING(Render_Vulkan, "Prepared occlusion variants: kept record lookup: {}",
+                            e.what());
+                lookup->candidates.clear();
+            }
+            lookup->ready.store(true, std::memory_order_release);
+        });
+        return 1;
+    }
+    // Reading (state 1): bound once read, to the record whose infos describe exactly full's
+    // descriptors (OcclVariantFitsParent over every stage) with full's descriptor signature, the
+    // checks a variant recorded with another parent passes (FRITCHII_OCCL_FLAG_PERSIST).
+    auto* const lookup = static_cast<KeptParentLookup*>(full.kept_lookup.get());
+    if (lookup == nullptr) {
+        full.kept_lookup_state = 2;
+        return 0;
+    }
+    if (!lookup->ready.load(std::memory_order_acquire)) {
+        return 1;
+    }
+    full.kept_lookup_state = 2;
+    const u64 signature = OcclSignatureOf(full);
+    for (KeptParentLookup::Candidate& candidate : lookup->candidates) {
+        if (OcclVariantFitsParent(candidate.infos, full.StageInfos(), OCCL_FLAG_BUILD_COLOUR) &&
+            OcclDescriptorSignature(candidate.infos) == signature) {
+            full.kept_index = lookup->index;
+            full.kept_record = candidate.record;
+            lookup->parent_infos = std::move(candidate.infos);
+            lookup->candidates.clear();
+            lookup->candidates.shrink_to_fit();
+            return 2;
+        }
+    }
+    full.kept_lookup.reset();
+    return 0;
+}
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPipeline& full,
                                                                      u8 kind, bool& later) {
     namespace OcclFlag = VideoCommon::OcclFlag;
@@ -4909,6 +5067,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPip
     // info as it is: no read, and it fits by identity. Only a differing stage (a prepared kind's
     // pixel stage, as a rule) is read and checked, as AttachOcclFlag and the occlusion file's
     // checks do: the variant must read memory and textures as its parent does.
+    // A parent bound by LookUpKeptParent (built another way): its record's infos, which its
+    // check found to describe full's descriptors exactly, stand for full's (the infos the kept
+    // SPIR-V was translated with), and the variant's own stages were read on the occlusion lane.
+    const auto* const lookup = static_cast<const KeptParentLookup*>(full.kept_lookup.get());
     const auto& parent_infos = full.StageInfos();
     std::unique_ptr<std::array<Shader::Info, Maxwell::MaxShaderStage>> read;
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> info_ptrs{};
@@ -4923,16 +5085,21 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPip
             continue;
         }
         if (blob == parent.infos[stage]) {
-            info_ptrs[stage] = &parent_infos[stage];
+            info_ptrs[stage] = lookup != nullptr ? &lookup->parent_infos[stage]
+                                                 : &parent_infos[stage];
             continue;
         }
-        if (!read) {
-            read = std::make_unique<std::array<Shader::Info, Maxwell::MaxShaderStage>>();
+        const Shader::Info* preread = lookup != nullptr ? lookup->VariantInfo(blob) : nullptr;
+        if (preread == nullptr) {
+            if (!read) {
+                read = std::make_unique<std::array<Shader::Info, Maxwell::MaxShaderStage>>();
+            }
+            if (!index->ReadInfo(blob, (*read)[stage])) {
+                return nullptr;
+            }
+            preread = &(*read)[stage];
         }
-        Shader::Info& info = (*read)[stage];
-        if (!index->ReadInfo(blob, info)) {
-            return nullptr;
-        }
+        const Shader::Info& info = *preread;
         info_ptrs[stage] = &info;
         // Per stage: the pixel stage of a host kind is not the guest's (no fit to check).
         const std::span<const Shader::Info> x{&info, 1};
@@ -4995,12 +5162,26 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
     // (full came from the kept file): from its SPIR-V, no snapshot or translation, not recorded
     // in the occlusion file (nothing to record), before the memo (it fits full by construction).
     // None, or not fitting: as before.
+    // A full built another way (the disk cache's prebuild, a translation) whose key the kept
+    // index holds is first bound to its record there (LookUpKeptParent: read on the occlusion
+    // lane; no variant while it reads, the draw takes a host query as for a queued one).
+    if (!full.kept_index && full.kept_lookup_state != 2 && PrepOcclVariantsMode() != 0 &&
+        OcclFlagStateOf(full, kind) != OCCL_FLAG_STATE_QUEUED && LookUpKeptParent(full) == 1) {
+        return nullptr;
+    }
     if (full.kept_index && (full.kept_occl_tried & (1U << kind)) == 0 &&
         OcclFlagStateOf(full, kind) != OCCL_FLAG_STATE_QUEUED) {
         bool later = false;
         if (auto made = MakeKeptOcclVariant(full, kind, later)) {
             // Its descriptors were checked against full's (MakeKeptOcclVariant).
-            return AttachOcclFlag(full, kind, std::move(made), nullptr, nullptr, true);
+            GraphicsPipeline* const attached =
+                AttachOcclFlag(full, kind, std::move(made), nullptr, nullptr, true);
+            if (attached != nullptr) {
+                OcclFlag::Add(full.kept_path == 1   ? OcclFlag::g_stats.prepared_attached_fast
+                              : full.kept_path == 2 ? OcclFlag::g_stats.prepared_attached_disk
+                                                    : OcclFlag::g_stats.prepared_attached_other);
+            }
+            return attached;
         }
         if (later) {
             return nullptr;
@@ -8803,6 +8984,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         pipeline->kept_index = index;
         pipeline->kept_record = matched;
     }
+    pipeline->kept_path = 1;
     precompiled_pending.push_back(graphics_key);
     ++precompiled_stats.graphics;
     // The GPU thread's own time: the check and the creation, not the audit.
@@ -10313,6 +10495,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateCachedGraphicsPipeline(
             env_ptrs.push_back(&env);
         }
         if (auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), statistics, false)}) {
+            pipeline->kept_path = 2; // FRITCHII_PREP_OCCL_VARIANTS: its counter's "disk"
             return pipeline;
         }
     }
