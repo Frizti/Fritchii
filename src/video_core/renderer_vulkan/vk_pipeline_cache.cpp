@@ -1341,14 +1341,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         // FRITCHII_OCCL_FLAG_ASYNC=0 alone is v6.2: the lane defaults to none then.
         const bool occl_async = OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC", 1, 0, 1) != 0;
         // Defaults scale with the logical processors, (n - 1) * 2 / 7 held to 1-4 (16: 4,
-        // 12: 3, 8: 2, 6 or fewer: 1); the compile lane also within the legacy AMD cap
-        // (CapLegacyAmdBuildThreads). An explicit value wins.
+        // 12: 3, 8: 2, 6 or fewer: 1) for the translate threads. An explicit value wins.
         const unsigned cores = std::max(1U, Common::LowEndSim::LogicalProcessors());
         const int scaled = std::clamp((static_cast<int>(cores) - 1) * 2 / 7, 1, 4);
-        const int compile_default =
-            occl_async ? static_cast<int>(CapLegacyAmdBuildThreads(
-                             device, static_cast<size_t>(scaled)))
-                       : 0;
+        // The compile lane is one thread by default: with 4 lowest-priority compile threads a draw
+        // waited 4.3 s for a pipeline the shared builders compiled behind them in AMD's driver
+        // (user play, area load); one thread removed the freeze (worst hitch 0.99 s) and the lane's
+        // share of hitch time (11.6 s -> 0.16 s). The translate threads keep the scaled count.
+        const int compile_default = occl_async ? 1 : 0;
         occl_lane_compile_threads =
             OcclAsyncSwitch("FRITCHII_OCCL_FLAG_COMPILE_THREADS", compile_default, 0, 8);
         if (occl_async) {

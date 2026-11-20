@@ -8527,3 +8527,7 @@ their own. 1 = strict with guards, 3 = strict without, 0 = off. Check the `CPU p
   FRITCHII_COLD_SWEEP_KEEP_RESAMPLED keeps, whatever the texture cache's size. In play the cache went past its critical
   line (9.7 GiB on a 16 GiB card) and a memory line released 1,515 of 1,642 kept targets; a fixed budget bounds the
   extra memory instead, and the collector stays the backstop. The "Cold sweep keep" line reports the budget in use.
+
+- FRITCHII_OCCL_FLAG_COMPILE_THREADS now defaults to 1 (was core-scaled 1-4): with 4 lowest-priority compile threads a
+  draw waited 4.3 s behind them inside AMD's driver during an area load; 1 thread removed the freeze in play (worst
+  hitch 4.3 s -> 0.99 s, the lane's share of hitch time 11.6 s -> 0.16 s). Explicit values still win.
