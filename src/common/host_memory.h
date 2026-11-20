@@ -23,7 +23,7 @@ enum class MemoryPermission : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
 
-/// FRITCHII_PROTECT_UNLOCKED (live, default 0; -1 = not read yet): Windows Protect first tries
+/// FRITCHII_PROTECT_UNLOCKED (live, default 1 = on, as the docs always said; -1 = not read yet): Windows Protect first tries
 /// VirtualProtect on the whole range without the placeholder lock (docs/fritchii/switches.md).
 inline std::atomic<int> g_protect_unlocked{-1};
 

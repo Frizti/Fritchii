@@ -443,7 +443,7 @@ public:
             const char* const env = std::getenv("FRITCHII_PROTECT_UNLOCKED");
             int unset = -1;
             g_protect_unlocked.compare_exchange_strong(
-                unset, env != nullptr ? std::atoi(env) : 0, std::memory_order_relaxed);
+                unset, env != nullptr ? std::atoi(env) : 1, std::memory_order_relaxed);
             value = g_protect_unlocked.load(std::memory_order_relaxed);
         }
         return value > 0;

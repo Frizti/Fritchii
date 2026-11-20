@@ -8540,3 +8540,11 @@ their own. 1 = strict with guards, 3 = strict without, 0 = off. Check the `CPU p
 - FRITCHII_OCCL_FLAG_COMPILE_THREADS now defaults to 1 (was core-scaled 1-4): with 4 lowest-priority compile threads a
   draw waited 4.3 s behind them inside AMD's driver during an area load; 1 thread removed the freeze in play (worst
   hitch 4.3 s -> 0.99 s, the lane's share of hitch time 11.6 s -> 0.16 s). Explicit values still win.
+
+- FRITCHII_PROTECT_UNLOCKED: the code default is now 1 (the docs said "on by default since 2026-11-18", but the code
+  still defaulted to 0). Market A/B (RX 9070 XT): 99.9% of Protect calls skip the placeholder lock (about 2 million
+  vs 1,400 a run), no change in load or spin frame times, no device loss. In play, area changes queued the GPU back
+  thread's Protect calls behind guest Map/Unmap for up to 80-90 ms; this is the switch for that. FRITCHII_PROTECT_UNLOCKED=0
+  restores the locked path.
+- FRITCHII_COLD_SWEEP_KEEP_RESAMPLED=3 (range keep) measured: 10,070 targets kept (8,955 by range) for no fewer losses;
+  the default stays 1.
