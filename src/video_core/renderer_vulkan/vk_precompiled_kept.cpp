@@ -4,6 +4,7 @@
 #include "video_core/renderer_vulkan/vk_precompiled_kept.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <istream>
 #include <streambuf>
@@ -17,6 +18,8 @@
 #endif
 
 #include "common/cityhash.h"
+#include "common/logging.h"
+#include "common/thread.h"
 #include "common/zstd_compression.h"
 #include "shader_recompiler/info_serialize.h"
 #include "shader_recompiler/shader_info.h"
@@ -117,6 +120,121 @@ std::atomic<u64>& BytesRead() {
     return bytes;
 }
 
+u64& ThreadReadNanoseconds() {
+    thread_local u64 nanoseconds{};
+    return nanoseconds;
+}
+
+namespace {
+/// Physical memory free now (Windows: available, standby pages included), 0 where unknown.
+u64 FreePhysicalMemory() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? status.ullAvailPhys : 0;
+#elif defined(_SC_AVPHYS_PAGES)
+    const long pages = sysconf(_SC_AVPHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page_size > 0 ? static_cast<u64>(pages) * static_cast<u64>(page_size) : 0;
+#else
+    return 0;
+#endif
+}
+} // Anonymous namespace
+
+PageCacheWarmer::PageCacheWarmer(std::vector<std::filesystem::path> files)
+    : thread{[this, files = std::move(files)]() mutable { Run(std::move(files)); }} {}
+
+PageCacheWarmer::~PageCacheWarmer() {
+    stop.store(true, std::memory_order_relaxed);
+    if (!thread.joinable()) {
+        return;
+    }
+#if defined(_WIN32) && defined(_MSC_VER)
+    // A chunk read at very low I/O priority can wait behind the game's own I/O: cancelled.
+    CancelSynchronousIo(static_cast<HANDLE>(thread.native_handle()));
+#endif
+    thread.join();
+}
+
+void PageCacheWarmer::Run(std::vector<std::filesystem::path> files) {
+    Common::SetCurrentThreadName("PrepFileWarm");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+#ifdef _WIN32
+    // Background mode: idle CPU and very low I/O priority. It lowers the memory priority of the
+    // pages it reads too, which are what the fast path wants kept: put back to normal.
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    MEMORY_PRIORITY_INFORMATION memory_priority{};
+    memory_priority.MemoryPriority = MEMORY_PRIORITY_NORMAL;
+    SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &memory_priority,
+                         sizeof(memory_priority));
+#endif
+    const auto begin = std::chrono::steady_clock::now();
+    const u64 free_bytes = FreePhysicalMemory();
+    std::vector<std::pair<std::filesystem::path, u64>> wanted;
+    u64 planned = 0;
+    for (const auto& path : files) {
+        std::error_code error;
+        const u64 size = std::filesystem::file_size(path, error);
+        if (error || size == 0) {
+            continue;
+        }
+        if ((planned + size) * 2 > free_bytes) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled fast path I/O: {} ({} MiB) not read ahead: {} MiB of RAM free, "
+                     "under twice the {} MiB it would make",
+                     path.filename().string(), size >> 20, free_bytes >> 20,
+                     (planned + size) >> 20);
+            continue;
+        }
+        planned += size;
+        wanted.emplace_back(path, size);
+    }
+    if (wanted.empty()) {
+        return;
+    }
+    std::string names;
+    for (const auto& [path, size] : wanted) {
+        names += fmt::format("{}{} ({} MiB)", names.empty() ? "" : ", ", path.filename().string(),
+                             size >> 20);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Precompiled fast path I/O: reading {} into the OS file cache on an idle thread "
+             "({} MiB of RAM free)",
+             names, free_bytes >> 20);
+    constexpr size_t Chunk = size_t{4} << 20;
+    std::vector<u8> buffer(Chunk);
+    u64 done = 0;
+    bool failed = false;
+    for (const auto& [path, size] : wanted) {
+        const PositionalFile file{path};
+        if (!file.IsOpen()) {
+            failed = true;
+            continue;
+        }
+        for (u64 offset = 0; offset < size && !stop.load(std::memory_order_relaxed);) {
+            const size_t bytes = static_cast<size_t>((std::min<u64>)(Chunk, size - offset));
+            if (!file.ReadAt(offset, std::span(buffer.data(), bytes))) {
+                failed = !stop.load(std::memory_order_relaxed);
+                break;
+            }
+            offset += bytes;
+            done += bytes;
+        }
+        if (stop.load(std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    LOG_INFO(Render_Vulkan, "Precompiled fast path I/O: {} MiB of {} MiB read into the OS file "
+                            "cache in {:.1f} s{}",
+             done >> 20, planned >> 20, seconds,
+             stop.load(std::memory_order_relaxed) ? " (stopped)"
+             : failed                             ? " (a read failed)"
+                                                  : "");
+}
+
 u64 SampleSeed() {
     std::filesystem::path exe;
 #ifdef _WIN32
@@ -196,6 +314,14 @@ bool PositionalFile::ReadAt(u64 offset, std::span<u8> out) const {
     if (!IsOpen()) {
         return false;
     }
+    const auto begin = std::chrono::steady_clock::now();
+    // Read I/O time of this thread, whatever the outcome (ThreadReadNanoseconds).
+    const auto note_time = [begin] {
+        ThreadReadNanoseconds() += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin)
+                .count());
+    };
     while (!out.empty()) {
 #ifdef _WIN32
         OVERLAPPED position{};
@@ -204,17 +330,20 @@ bool PositionalFile::ReadAt(u64 offset, std::span<u8> out) const {
         const DWORD wanted = static_cast<DWORD>((std::min<size_t>)(out.size(), 1u << 30));
         DWORD read = 0;
         if (!ReadFile(handle, out.data(), wanted, &read, &position) || read == 0) {
+            note_time();
             return false;
         }
 #else
         const ssize_t read = pread(fd, out.data(), out.size(), static_cast<off_t>(offset));
         if (read <= 0) {
+            note_time();
             return false;
         }
 #endif
         offset += static_cast<u64>(read);
         out = out.subspan(static_cast<size_t>(read));
     }
+    note_time();
     return true;
 }
 

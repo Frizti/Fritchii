@@ -656,6 +656,35 @@ Shaders Now): neither stamp changed. The Preparing-shaders stamp is unchanged. L
 (FRITCHII_ONEF_OCCL=...) | occlusion speed-up off (N))", then "... hints from ..." or "...: no
 hints (<why>), no variant is prepared (play translates them as before)".
 
+### FRITCHII_PREP_FASTPATH_IO
+
+Boot, default 1 (0 = as before: the files are read on demand only). Vendor neutral. Why: the
+precompiled fast path (EDEN_NX2_PRECOMPILED_FAST) reads each new key's kept infos and recorded
+environments with positional reads on the GPU thread. With a cold OS file cache on the kept file
+(`precompiled_infos.fork-v<N>.bin`, ~0.8 GB) and the precompiled file (~1.5 GB) those reads go to the
+disk: 115-125 ms the worst per 10 s in play, ~250 ms per Market load, none of it in the worst frame
+line.
+
+- 1: once the kept index is published (boot, or the end of a preparation), one thread at idle CPU and
+  very low I/O priority (Windows background mode, page memory priority put back to normal) reads the
+  kept file, then the precompiled file, front to back in 4 MiB chunks, once, so later random reads hit
+  RAM. A file is taken only while twice the running total fits in the free physical memory (OoT:
+  ~4.6 GB free for both); the rest is skipped and logged. Shutdown stops it at once (a read in
+  progress is cancelled). Costs disk bandwidth at the lowest priority and standby (cache) memory only.
+- Logs: "FRITCHII_PREP_FASTPATH_IO=1: ...", "Precompiled fast path I/O: reading <kept> (N MiB),
+  <precompiled> (N MiB) into the OS file cache on an idle thread (F MiB of RAM free)" or "<file> (N
+  MiB) not read ahead: F MiB of RAM free, under twice the T MiB it would make", then "Precompiled fast
+  path I/O: D MiB of T MiB read into the OS file cache in S s" (" (stopped)" when cut short).
+- Attribution (both settings, logging only): the worst frame line ends with "..., K precompiled fast
+  path checks in X ms (Y ms file reads)" (hits and misses on the GPU thread in that frame), and every
+  10 s with fast path activity: "Precompiled fast path GPU thread time in the last 10 s: created X ms =
+  R ms file reads + C ms checks + P ms pipeline objects; sent back M ms (Q ms file reads)". "checks" is
+  the live environments, the infos decoded and the recorded answers compared (AnswersHoldFor); "sent
+  back" is keys whose checks failed (not in the "X ms on the GPU thread" of the line before).
+- With 1 the file reads in both lines should fall to near 0 once the read-ahead has finished.
+- Not done: moving the record reads and checks of skippable draws to the translation threads (it
+  needs a precompiled job type in the translate queue and its adoption; left out as invasive).
+
 ### FRITCHII_PREP_COMPUTE_FIRST, FRITCHII_PREP_COMPUTE_CHECK
 
 Why: a compute dispatch can't be skipped while its pipeline compiles, so a compute pipeline the

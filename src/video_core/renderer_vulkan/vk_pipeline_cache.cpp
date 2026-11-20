@@ -569,6 +569,12 @@ struct FrameTally {
     /// EDEN_NX2_ASYNC_TRANSLATE: translations queued (their environments and snapshots).
     std::chrono::steady_clock::duration queued_time{};
     u32 queued{};
+    /// EDEN_NX2_PRECOMPILED_FAST: the fast path's checks and creations, misses included (its
+    /// file reads and checks run on the GPU thread, outside the builds above), and of that the
+    /// positional reads of the kept and precompiled files.
+    std::chrono::steady_clock::duration fast_path{};
+    std::chrono::steady_clock::duration fast_path_read{};
+    u32 fast_path_count{};
 };
 FrameTally frame_tally;
 /// Pipeline lookups skipped for unbuilt pipelines this session (BuiltPipeline), and for
@@ -1594,6 +1600,22 @@ int PrecompiledFastMode() {
     return mode;
 }
 
+/// FRITCHII_PREP_FASTPATH_IO (boot, default 1): once the kept index is published (LoadKept), an
+/// idle priority thread reads the kept and precompiled files once (PageCacheWarmer), so the fast
+/// path's positional reads on the GPU thread hit the OS file cache instead of a cold disk. 0: not
+/// read ahead (v6.2).
+int FastpathIoMode() {
+    static const int mode = [] {
+        const char* value = std::getenv("FRITCHII_PREP_FASTPATH_IO");
+        const int parsed = value != nullptr && value[0] == '0' ? 0 : 1;
+        LOG_INFO(Render_Vulkan, "FRITCHII_PREP_FASTPATH_IO={}: kept and precompiled files {}",
+                 parsed, parsed != 0 ? "read into the OS file cache in the background"
+                                     : "read on demand only");
+        return parsed;
+    }();
+    return mode;
+}
+
 /// The canonical form of a native key's state (EDEN_NX2_CANONICAL_KEYS=1). The attribute types
 /// are left as they are: draws and the loader already keep only those the programs read
 /// (VideoCommon::KeyedAttributeTypes, the rule the ported mask follows). Idempotent.
@@ -2063,7 +2085,7 @@ int PrepOcclVariantsMode() {
 // translated or what it means (t_occl_flag_build -> occl_flag_store / occl_flag_store_at_end,
 // the host pixel replacement, the kinds OcclPrepKinds chooses, how MakeKeptOcclVariant builds
 // them): none of that is in NX2_SHADER_STAMP, and the boot sample checks only a few variants.
-constexpr u32 OcclVariantTranslationVersion = 1;
+constexpr u32 OcclVariantTranslationVersion = 2;
 
 // FRITCHII_PREP_OCCL_VARIANTS: the occlusion variant hints (docs/fritchii/recipe-merge.md, "What
 // the preparer reads") of the recipe the precompiled file was assembled from: one kind mask per
@@ -2794,6 +2816,14 @@ PipelineCache::~PipelineCache() {
     // stop callback goes first, as it writes the flags below.
     warm_stop_callback.reset();
     warm_cancel = true;
+    {
+        // FRITCHII_PREP_FASTPATH_IO: its reading stops (a read in progress is cancelled).
+        std::unique_ptr<PrecompiledKept::PageCacheWarmer> warmer;
+        {
+            std::scoped_lock lock{kept_mutex};
+            warmer = std::move(kept_warmer);
+        }
+    }
     background_stop.store(true, std::memory_order_relaxed);
     graphics_warm_threads.clear();
     compute_warm_threads.clear();
@@ -8105,6 +8135,20 @@ bool PipelineCache::LoadKept(const std::filesystem::path& kept, const std::files
         kept_index = std::move(index);
         kept_available = true;
     }
+    if (FastpathIoMode() != 0 && PrecompiledFastMode() != 0) {
+        // One reader at a time: one already going (an earlier file) is stopped first, outside
+        // the lock (it joins its thread).
+        std::unique_ptr<PrecompiledKept::PageCacheWarmer> previous;
+        {
+            std::scoped_lock lock{kept_mutex};
+            previous = std::move(kept_warmer);
+        }
+        previous.reset();
+        auto warmer = std::make_unique<PrecompiledKept::PageCacheWarmer>(
+            std::vector<std::filesystem::path>{used, precompiled});
+        std::scoped_lock lock{kept_mutex};
+        kept_warmer = std::move(warmer);
+    }
     return true;
 }
 
@@ -8599,6 +8643,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         return nullptr;
     }
     const auto begin = std::chrono::steady_clock::now();
+    const u64 read_ns_begin = PrecompiledKept::ThreadReadNanoseconds();
+    bool timed = false;
+    SCOPE_EXIT {
+        if (!timed) {
+            NoteFastPathTime(std::chrono::steady_clock::now() - begin,
+                             PrecompiledKept::ThreadReadNanoseconds() - read_ns_begin, {}, false);
+        }
+    };
     // A vertex A program is merged into vertex B: never one of these.
     if (graphics_key.unique_hashes[0] != 0) {
         NotePrecompiledMiss("vertex A");
@@ -8694,6 +8746,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         return nullptr;
     }
     const auto checked = std::chrono::steady_clock::now();
+    const u64 read_ns_checked = PrecompiledKept::ThreadReadNanoseconds();
     if (mode == 2) {
         ++precompiled_stats.audited;
         if (!AuditPrecompiled(*index, *matched, live, false, nullptr)) {
@@ -8753,9 +8806,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
     precompiled_pending.push_back(graphics_key);
     ++precompiled_stats.graphics;
     // The GPU thread's own time: the check and the creation, not the audit.
-    const auto elapsed = (checked - begin) + (std::chrono::steady_clock::now() - audit_end);
-    precompiled_stats.gpu_time += elapsed;
-    precompiled_stats.gpu_worst = (std::max)(precompiled_stats.gpu_worst, elapsed);
+    timed = true;
+    NoteFastPathTime(checked - begin, read_ns_checked - read_ns_begin,
+                     std::chrono::steady_clock::now() - audit_end, true);
     // The live environments answered every recorded question (AnswersHoldFor), as a
     // translation of them would have: stored like a translated pipeline's.
     if (!pipeline_cache_filename.empty()) {
@@ -8785,6 +8838,14 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
         return {};
     }
     const auto begin = std::chrono::steady_clock::now();
+    const u64 read_ns_begin = PrecompiledKept::ThreadReadNanoseconds();
+    bool timed = false;
+    SCOPE_EXIT {
+        if (!timed) {
+            NoteFastPathTime(std::chrono::steady_clock::now() - begin,
+                             PrecompiledKept::ThreadReadNanoseconds() - read_ns_begin, {}, false);
+        }
+    };
     auto info = std::make_unique<Shader::Info>();
     const PrecompiledKept::Record* matched = nullptr;
     const char* reason = "stages";
@@ -8824,6 +8885,7 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
         return {};
     }
     const auto checked = std::chrono::steady_clock::now();
+    const u64 read_ns_checked = PrecompiledKept::ThreadReadNanoseconds();
     if (mode == 2) {
         ++precompiled_stats.audited;
         Shader::Environment* const env_ptr = &env;
@@ -8862,10 +8924,31 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
     };
     entry.pipeline->MarkPrecompiled();
     ++precompiled_stats.compute;
-    const auto elapsed = (checked - begin) + (std::chrono::steady_clock::now() - audit_end);
-    precompiled_stats.gpu_time += elapsed;
-    precompiled_stats.gpu_worst = (std::max)(precompiled_stats.gpu_worst, elapsed);
+    timed = true;
+    NoteFastPathTime(checked - begin, read_ns_checked - read_ns_begin,
+                     std::chrono::steady_clock::now() - audit_end, true);
     return entry;
+}
+
+void PipelineCache::NoteFastPathTime(std::chrono::steady_clock::duration checks, u64 read_ns,
+                                     std::chrono::steady_clock::duration create, bool created) {
+    const auto read = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::nanoseconds{read_ns});
+    auto& stats = precompiled_stats;
+    if (created) {
+        const auto elapsed = checks + create;
+        stats.gpu_time += elapsed;
+        stats.gpu_worst = (std::max)(stats.gpu_worst, elapsed);
+        stats.read_time += read;
+        stats.check_time += checks - read;
+        stats.create_time += create;
+    } else {
+        stats.miss_time += checks;
+        stats.miss_read_time += read;
+    }
+    frame_tally.fast_path += checks + create;
+    frame_tally.fast_path_read += read;
+    ++frame_tally.fast_path_count;
 }
 
 void PipelineCache::CheckPrecompiledBuilds() {
@@ -9032,6 +9115,12 @@ void PipelineCache::ReportPrecompiled() {
                  stats.failed, stats.not_precompiled, misses.empty() ? "none" : misses,
                  bytes / 1024,
                  index ? static_cast<double>(index->MemoryBytes()) / (1024.0 * 1024.0) : 0.0);
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled fast path GPU thread time in the last 10 s: created {:.1f} ms = "
+                 "{:.1f} ms file reads + {:.1f} ms checks + {:.1f} ms pipeline objects; sent "
+                 "back {:.1f} ms ({:.1f} ms file reads)",
+                 ms(stats.gpu_time), ms(stats.read_time), ms(stats.check_time),
+                 ms(stats.create_time), ms(stats.miss_time), ms(stats.miss_read_time));
         if (PrecompiledFastMode() == 2) {
             LOG_INFO(Render_Vulkan,
                      "Precompiled audit in the last 10 s (EDEN_NX2_PRECOMPILED_FAST=2): {} "
@@ -9043,6 +9132,8 @@ void PipelineCache::ReportPrecompiled() {
     stats.graphics = stats.compute = stats.failed = stats.not_precompiled = 0;
     stats.audited = stats.audit_differ = 0;
     stats.gpu_time = stats.gpu_worst = {};
+    stats.read_time = stats.check_time = stats.create_time = {};
+    stats.miss_time = stats.miss_read_time = {};
     stats.misses.clear();
     stats.bytes_at_window = bytes_total;
     stats.window = now;
@@ -9396,11 +9487,13 @@ void ReportWorstFrame() {
     const auto describe = [&](const Frame& frame) {
         return fmt::format("{} pipelines built on the GPU thread in {:.1f} ms ({:.1f} ms "
                            "environments, {:.1f} ms translation), {:.1f} ms of draws held, {} "
-                           "lookups skipped, {} translations queued in {:.1f} ms",
+                           "lookups skipped, {} translations queued in {:.1f} ms, {} precompiled "
+                           "fast path checks in {:.1f} ms ({:.1f} ms file reads)",
                            frame.tally.count, ms(frame.tally.builds),
                            ms(frame.tally.split.environments), ms(frame.tally.split.translation),
                            ms(frame.held), frame.skipped, frame.tally.queued,
-                           ms(frame.tally.queued_time));
+                           ms(frame.tally.queued_time), frame.tally.fast_path_count,
+                           ms(frame.tally.fast_path), ms(frame.tally.fast_path_read));
     };
     const auto now = std::chrono::steady_clock::now();
     const auto held_total = GraphicsPipeline::HoldTimeTotal();
