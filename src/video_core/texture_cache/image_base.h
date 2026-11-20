@@ -180,10 +180,15 @@ struct ImageBase {
     u8 lost_drop_why = 0;
     /// FRITCHII_COLD_SWEEP_KEEP_RESAMPLED: the re-sampled set's generation this image was last
     /// looked up at (0 = never) and the answer (bit 0), whether it was counted as newly kept
-    /// (bit 1), and the frame it was last counted in the kept-now total.
+    /// (bit 1), whether covered retire kept it (bit 2: looked at again every frame until it goes
+    /// or is used again), and the frame it was last counted in the kept-now total.
+    /// cold_keep_charge: the device memory it holds of the keep budget (0 = none), counted in
+    /// TextureCache::cold_keep_resident until it is deleted, released, relocated or leaves
+    /// cold_watch (TextureCache::ColdKeepUncharge).
     u32 cold_keep_gen = 0;
     u32 cold_keep_frame = 0;
     u8 cold_keep = 0;
+    u64 cold_keep_charge = 0;
 
     /// Unmapped images (TextureCache::UnmapGPUMemory): the frame + 1 at which an unmap of its GPU
     /// memory flagged it Remapped (0 = none did, or it was found again since) and its device

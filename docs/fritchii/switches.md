@@ -6566,13 +6566,21 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   the regular sweep and by covered retire (FRITCHII_COVERED_RETIRE), only where the sweep would
   delete it (after covered retire's coverage test and after the GpuModified guards: guarded or
   uncovered images use no budget), within FRITCHII_COLD_SWEEP_KEEP_MIB of real device memory (each
-  kept image counts its own size plus its scaled copy when rescaled). A pressure gate releases
+  kept image counts its own size plus its scaled copy when rescaled). The budget is resident: a
+  kept image holds its share from its first keep until it is deleted, released, relocated or
+  leaves the sweep's watch list, so an overrun turns away new candidates instead of evicting
+  earlier keeps; a target kept by covered retire is looked at again every frame while it stays
+  cold, so the budget and the gate can release it. A pressure gate releases
   them (the sweep deletes as before and the collector's rules apply): while the driver's budget
   binds (budget_pressure), for 600 frames after an image failed to allocate, or while the cache is
-  over the critical line plus max(1 GiB, critical / 4). The plain critical line released 1,515 of
-  1,642 kept targets in 9070 XT play (cache 6.8-9.7 GiB, critical 7.68 GiB), so the margin keeps
-  the rule useful there, while small cards release through the budget-pressure and failure
-  signals and get a smaller budget. 2 also keeps from both any target sampled in a frame after its last GPU write
+  over the critical line plus min(max(1 GiB, critical / 4), (driver budget - critical) / 2), and
+  no margin when the device reports no budget (no VK_EXT_memory_budget, OpenGL). The plain
+  critical line released 1,515 of 1,642 kept targets in 9070 XT play (cache 6.8-9.7 GiB, critical
+  7.68 GiB), so the margin keeps the rule useful there (~1.9 GiB, line ~9.6 GiB); the second bound
+  keeps the line on smaller cards (~1.05 GiB of margin on 8 GB, ~0.5 GiB on 4 GB), where critical
+  + 1 GiB would pass the card's memory and only budget_pressure (absent with
+  FRITCHII_VRAM_BUDGET_MODE=0) or failed allocations (rare on Windows, where WDDM demotes) would
+  release. 2 also keeps from both any target sampled in a frame after its last GPU write
   (GuardSampled). 3 (test, not default) is 2 plus a range keep: a GPU-written target whose memory
   overlaps a recently lost read (the reader's range of a "Lost contents sampled" line, the
   FRITCHII_LOST_KEEP ring of 128 ranges, learned under 3 even with FRITCHII_LOST_KEEP=0) is kept
@@ -6592,8 +6600,8 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   size (+ keys learned), lost contents sampled in those frames (dropped by the cold sweep, each
   drop counted once; "in the set when deleted": the drop's key was in the set at the delete;
   "more images over a drop already counted": further images read over a drop already counted;
-  not recorded), device memory and the keep line, the keep budget and its use (real device memory),
-  and ", releasing: ..." with the gate's reason while it is shut. Each "Lost contents sampled" line ends with
+  not recorded), device memory and the keep line, the keep budget and its resident use (real
+  device memory, and how many images hold it), the release line, and ", releasing: ..." with the gate's reason while it is shut. Each "Lost contents sampled" line ends with
   ", key in set at drop" when the drop's key was in the set at the delete. The lost-contents attribution ring (StaleDropRing) is 4,096 drops now (was 1,024):
   covered retire alone records ~140 a second there, so drops read again 7+ s later were "not
   recorded" (9-11 a run) and could not be learned.
@@ -8556,14 +8564,21 @@ their own. 1 = strict with guards, 3 = strict without, 0 = off. Check the `CPU p
   the flush paths) and its own queue and counters. With 0 the path is as before; the covered retire line reports
   "({} written back first)" (0).
 
-- FRITCHII_COLD_SWEEP_KEEP_MIB (live, MiB; default min(256, device-local heap / 32), so 128 on a 4 GiB card and 256
-  from 8 GiB up; 0 = keep only below the critical line): the budget for targets FRITCHII_COLD_SWEEP_KEEP_RESAMPLED
-  keeps, in real device memory (each kept image's size plus its scaled copy when rescaled; it counted guest bytes
-  before, which at 2x let 256 MiB hold about 1.25 GiB). In play the cache went past its critical line (9.7 GiB on a 16
-  GiB card) and a memory line released 1,515 of 1,642 kept targets; a budget bounds the extra memory instead. The
-  pressure gate still applies in both modes: nothing is kept while budget_pressure is set, for 600 frames after an
-  image failed to allocate, or over critical + max(1 GiB, critical / 4); the collector stays the backstop. The "Cold
-  sweep keep" line reports the budget in use and the gate's reason while it is shut.
+- FRITCHII_COLD_SWEEP_KEEP_MIB (live, MiB; 0 = keep only below the critical line): the budget for targets
+  FRITCHII_COLD_SWEEP_KEEP_RESAMPLED keeps, in real device memory (each kept image's size plus its scaled copy when
+  rescaled; it counted guest bytes before, which at 2x let 256 MiB hold about 1.25 GiB), held as a resident total
+  (images already kept keep their share; new candidates are turned away when it is full). Default
+  min(256 MiB, GetDeviceLocalMemory() / 32), where GetDeviceLocalMemory is the driver budget less its reserve, capped
+  at 6 GiB + the resolution scale's GiB (not the heap size): ~96 MiB on a 4 GB card, ~200 MiB on 8 GB. With a driver
+  budget of 12 GiB or more the default is min(512 MiB, GetDeviceLocalMemory() / 16): 448 MiB at 1x and 512 MiB at 2x
+  on the 16 GB 9070 XT, since the measured kept set there (408 images, 115 MiB of guest bytes) is up to ~575 MiB real
+  when rescaled. That size is not measured yet: compare the line's "in use" with the budget. In play the cache went
+  past its critical line (9.7 GiB on a 16 GiB card) and a memory line released 1,515 of 1,642 kept targets; a budget
+  bounds the extra memory instead. The pressure gate still applies in both modes: nothing is kept while
+  budget_pressure is set, for 600 frames after an image failed to allocate, or over critical + min(max(1 GiB,
+  critical / 4), (driver budget - critical) / 2) (no margin without a reported budget); the collector stays the
+  backstop. The "Cold sweep keep" line reports the budget in use, the release line and the gate's reason while it is
+  shut.
 
 - FRITCHII_OCCL_FLAG_COMPILE_THREADS now defaults to 1 on AMD's proprietary driver only (elsewhere still core-scaled
   1-4 within the legacy AMD cap, as v6.2): with 4 lowest-priority compile threads a draw waited 4.3 s behind them

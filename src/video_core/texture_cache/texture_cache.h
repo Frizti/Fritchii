@@ -2690,34 +2690,56 @@ void TextureCache<P>::SweepColdImages() {
     // the expected line (6 GiB on a 16 GiB card), so that line kept nothing; the kept targets are
     // small (~40 mostly 1280x720 a run) and above critical the collector's rules apply as before.
     const u64 keep_limit = critical_memory;
-    // FRITCHII_COLD_SWEEP_KEEP_MIB (live, MiB, default 256; 0 = the critical line above instead):
-    // kept targets count against a fixed budget, whatever the cache's size. Play went past the
-    // critical line (9.7 GiB on a 16 GiB card), where the line released 1,515 of 1,642 kept
-    // targets; the budget bounds the extra memory and the collector stays the backstop.
-    // Unset, the default scales with the card: min(256 MiB, device-local heap / 32), so 128 MiB
-    // on a 4 GiB card and 256 MiB from 8 GiB up (the 16 GiB 9070 XT used up to 115 MiB of guest
-    // bytes in play).
+    // FRITCHII_COLD_SWEEP_KEEP_MIB (live, MiB; 0 = the critical line above instead): kept
+    // targets count against a budget of real device memory, whatever the cache's size. Play went
+    // past the critical line (9.7 GiB on a 16 GiB card), where the line released 1,515 of 1,642
+    // kept targets; the budget bounds the extra memory and the collector stays the backstop.
+    // The budget is resident (cold_keep_resident): an image keeps its share from its first keep
+    // until it is deleted, released, relocated or leaves cold_watch, so images kept earlier stay
+    // and an overrun turns away new candidates instead.
+    // Unset, the default is min(256 MiB, GetDeviceLocalMemory() / 32). GetDeviceLocalMemory is
+    // the driver's budget less a reserve, capped at 6 GiB + the resolution scale's GiB, not the
+    // heap: ~96 MiB on a 4 GB card, ~200 MiB on 8 GB. With a driver budget of 12 GiB or more it
+    // is min(512 MiB, GetDeviceLocalMemory() / 16): on the 16 GB 9070 XT 448 MiB at 1x and
+    // 512 MiB at 2x, as the measured peak there (408 images, 115 MiB of guest bytes) is up to
+    // ~575 MiB real when rescaled (guest + 4x scaled copy) and 256 MiB would cut it. Not yet
+    // measured at that size: the log's "in use" figure against the budget tells.
+    if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+        if (cold_keep_budget_frame == 0 || frame_tick - cold_keep_budget_frame >= 60) {
+            cold_keep_budget_frame = (std::max)(frame_tick, u64{1});
+            cold_keep_driver_budget = runtime.GetDeviceMemoryBudget();
+        }
+    }
     int keep_default_mib = 256;
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
         const u64 device_local = runtime.GetDeviceLocalMemory();
         if (device_local != 0) {
-            keep_default_mib = static_cast<int>(
-                (std::max)(u64{1}, (std::min)(u64{256}, (device_local / 32) >> 20)));
+            const bool large = cold_keep_driver_budget >= 12_GiB;
+            keep_default_mib = static_cast<int>((std::max)(
+                u64{1}, (std::min)(u64{large ? 512u : 256u},
+                                   (device_local / (large ? 16 : 32)) >> 20)));
         }
     }
     const int keep_mib = VideoCore::Nx2Debug::SwitchValue(
         VideoCore::Nx2Debug::g_cold_sweep_keep_mib, "FRITCHII_COLD_SWEEP_KEEP_MIB",
         keep_default_mib);
     const u64 keep_budget = keep_mib > 0 ? static_cast<u64>(keep_mib) << 20 : 0;
-    u64 keep_spent = 0;
-    // The pressure gate: nothing is kept (the sweep deletes as in v6.2) while the driver's budget
-    // binds (budget_pressure), for ColdKeepFailedFrames after an image could not be made (the
-    // collector's out-of-memory signal, runtime.FailedImages()), or while the cache is past the
-    // critical line by a margin of max(1 GiB, critical / 4). The plain critical line is too low:
-    // on the 9070 XT play ran the cache at 6.8-9.7 GiB with critical at 7.68 GiB, and that line
-    // released 1,515 of 1,642 kept targets. The margin puts the line at ~9.6 GiB there, while
-    // cards whose budget binds or whose allocations fail (4-6 GiB cards, iGPUs) release at once
-    // through the other two signals, and their budget is smaller (above).
+    // The pressure gate: nothing is kept (the sweep deletes as in v6.2, kept images included)
+    // while the driver's budget binds (budget_pressure), for ColdKeepFailedFrames after an image
+    // could not be made (the collector's out-of-memory signal, runtime.FailedImages()), or while
+    // the cache is past the critical line by a margin of min(max(1 GiB, critical / 4), (driver
+    // budget - critical) / 2). The plain critical line is too low: on the 9070 XT play ran the
+    // cache at 6.8-9.7 GiB with critical at 7.68 GiB, and that line released 1,515 of 1,642 kept
+    // targets; the margin puts the line at ~9.6 GiB there. The second bound keeps the line on
+    // the card where critical + 1 GiB would pass it: ~1.05 GiB of margin on an 8 GB card, ~0.5 GiB
+    // on 4 GB, so it holds without budget_pressure (FRITCHII_VRAM_BUDGET_MODE=0) or failures
+    // (WDDM demotes rather than fails). Without a reported budget (no VK_EXT_memory_budget,
+    // OpenGL) there is no margin: the plain critical line.
+    u64 keep_margin = 0;
+    if (cold_keep_driver_budget > critical_memory) {
+        keep_margin = (std::min)((std::max)(static_cast<u64>(1_GiB), critical_memory / 4),
+                                 (cold_keep_driver_budget - critical_memory) / 2);
+    }
     bool keep_failed = false;
     if constexpr (requires { runtime.FailedImages(); }) {
         // TickFrame records a failure after the sweep: one not yet recorded counts as well.
@@ -2725,25 +2747,34 @@ void TextureCache<P>::SweepColdImages() {
     }
     keep_failed = keep_failed || (cold_keep_failed_frame != 0 &&
                                   frame_tick - cold_keep_failed_frame < ColdKeepFailedFrames);
-    const u64 keep_pressure_line =
-        critical_memory + (std::max)(static_cast<u64>(1_GiB), critical_memory / 4);
+    const u64 keep_pressure_line = critical_memory + keep_margin;
     const bool keep_pressure =
         budget_pressure || keep_failed || total_used_memory > keep_pressure_line;
+    // Whether a kept image may stay; on false the caller deletes it (after ColdKeepUncharge).
     const auto keep_fits = [&](Image& image) {
         if (keep_pressure) {
             return false;
         }
         if (keep_budget == 0) {
+            const u8 covered_bit = image.cold_keep & 4;
+            ColdKeepUncharge(image); // the line holds it, not the budget
+            image.cold_keep |= covered_bit;
             return total_used_memory < keep_limit;
         }
         // Real device memory: the image plus its scaled copy when rescaled (Vulkan's ScaleUp
-        // keeps both), as total_used_memory counts it.
-        const u64 bytes =
-            ImageMemoryBytes(image) + (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
-        if (keep_spent + bytes > keep_budget) {
+        // keeps both), as total_used_memory counts it. Its own earlier share is not counted
+        // twice, so a kept image stays unless the budget shrank under what is kept.
+        const u64 bytes = (std::max)(
+            u64{1}, ImageMemoryBytes(image) +
+                        (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0));
+        const u64 others =
+            cold_keep_resident - (std::min)(cold_keep_resident, image.cold_keep_charge);
+        if (others + bytes > keep_budget) {
             return false;
         }
-        keep_spent += bytes;
+        cold_keep_resident_count += image.cold_keep_charge == 0 ? 1 : 0;
+        cold_keep_resident = others + bytes;
+        image.cold_keep_charge = bytes;
         return true;
     };
     const bool keep_room = total_used_memory < keep_limit;
@@ -2782,6 +2813,10 @@ void TextureCache<P>::SweepColdImages() {
         const ImageId image_id = cold_watch[index].first;
         const u64 watched_at = cold_watch[index].second;
         const auto drop = [&] {
+            // Out of cold_watch, the keep no longer holds it: its share of the budget goes back.
+            if (slot_images.contains(image_id)) {
+                ColdKeepUncharge(slot_images[image_id]);
+            }
             cold_watch_set.erase(image_id);
             cold_watch[index] = cold_watch.back();
             cold_watch.pop_back();
@@ -2796,15 +2831,27 @@ void TextureCache<P>::SweepColdImages() {
             drop();
             continue;
         }
-        if (covered_frames != 0 && True(image.flags & ImageFlagBits::GpuModified) &&
-            False(image.flags & ImageFlagBits::CollectPending) &&
-            image.covered_overlap_frame > image.covered_check_frame &&
-            frame_tick - lru_cache.Tick(image.lru_index) >= covered_frames) {
-            if (covered_checks >= MaxCoveredChecks || covered_deleted >= MaxCoveredDeletes) {
+        const bool covered_candidate = covered_frames != 0 &&
+                                       True(image.flags & ImageFlagBits::GpuModified) &&
+                                       False(image.flags & ImageFlagBits::CollectPending) &&
+                                       frame_tick - lru_cache.Tick(image.lru_index) >= covered_frames;
+        // Kept by covered retire (cold_keep bit 2): looked at again every frame without a new
+        // overlap (its memory was covered; coverage only grows), so the budget and the pressure
+        // gate release it; used again (or no longer a candidate), it is ordinary cache contents
+        // from here, its share of the budget kept while it stays in cold_watch.
+        bool covered_kept = (image.cold_keep & 4) != 0;
+        if (covered_kept && !covered_candidate) {
+            image.cold_keep &= static_cast<u8>(~4);
+            covered_kept = false;
+        }
+        if (covered_candidate &&
+            (covered_kept || image.covered_overlap_frame > image.covered_check_frame)) {
+            if ((!covered_kept && covered_checks >= MaxCoveredChecks) ||
+                covered_deleted >= MaxCoveredDeletes) {
                 covered_capped = true; // looked at in a later frame
             } else {
-                ++covered_checks;
-                if (CoveredByNewerWrites(image_id, image)) {
+                covered_checks += covered_kept ? 0 : 1;
+                if (covered_kept || CoveredByNewerWrites(image_id, image)) {
                     if (queued(image_id, uncommitted_downloads) ||
                         std::ranges::any_of(committed_downloads, [&](const auto& downloads) {
                             return queued(image_id, downloads);
@@ -2817,13 +2864,16 @@ void TextureCache<P>::SweepColdImages() {
                     }
                     // FRITCHII_COLD_SWEEP_KEEP_RESAMPLED: only here, where covered retire would
                     // delete it (covered retire was what lost them: 28 of 29 cold sweep losses
-                    // in a 3-minute market run). Kept, it is checked again on its next overlap.
+                    // in a 3-minute market run). Kept, it is looked at here every frame (bit 2).
                     const bool keep = keep_rule(image);
                     if (keep && keep_fits(image)) {
+                        image.cold_keep |= 4;
                         count_kept(image);
                         ++index;
                         continue;
                     }
+                    ColdKeepUncharge(image); // released (or the rule no longer holds)
+                    covered_kept = false;
                     // FRITCHII_COVERED_RETIRE_WRITEBACK (live, default 0 = off): written back to guest memory first, as
                     // the cold sweep does (LostWriteback), so a later sample of this target is not cleared to
                     // zero; deleted when the write-back lands, kept if used again first. Market A/B: cold sweep
@@ -2852,6 +2902,10 @@ void TextureCache<P>::SweepColdImages() {
                     continue;
                 }
             }
+        }
+        if (covered_kept) {
+            ++index; // kept by covered retire, its caps reached this frame: looked at next frame
+            continue;
         }
         if (False(image.flags & ImageFlagBits::BadOverlap)) {
             // The newest image of a chain has one overlap; the next drift makes it bad.
@@ -2945,6 +2999,7 @@ void TextureCache<P>::SweepColdImages() {
             ++index;
             continue;
         }
+        ColdKeepUncharge(image); // released (or the rule no longer holds)
         // FRITCHII_LOST_WRITEBACK (default 1): written back to guest memory first, and deleted
         // when that lands. Dropped, an image made there later (the dialogue box's text read
         // again after the UI was hidden: OoT draws it once) had no contents (#1310).
@@ -3019,13 +3074,14 @@ void TextureCache<P>::SweepColdImages() {
                  "re-sampled set {} entries (+{}); lost contents sampled {} ({} dropped by the "
                  "cold sweep, {} of those in the set when deleted; {} more images over a drop "
                  "already counted; not recorded {}); device memory {} MiB, keep line {} MiB{}; "
-                 "keep budget {} MiB (in use {} MiB, real device memory){}",
+                 "keep budget {} MiB (in use {} MiB by {} images, real device memory, resident), "
+                 "release line {} MiB{}",
                  keep_mode, k.kept_new, k.kept_sampled, k.kept_range, k.kept_now,
                  k.kept_now_bytes >> 20, k.released, cold_resampled.size(), k.learned, k.lost_all,
                  k.lost_cold, k.lost_cold_known, k.lost_cold_repeat, k.lost_not_recorded,
                  total_used_memory >> 20,
                  keep_limit >> 20, keep_room ? "" : " (over the line)", keep_budget >> 20,
-                 keep_spent >> 20,
+                 cold_keep_resident >> 20, cold_keep_resident_count, keep_pressure_line >> 20,
                  !keep_pressure     ? ""
                  : budget_pressure ? ", releasing: budget pressure"
                  : keep_failed     ? ", releasing: an image failed"
@@ -8369,6 +8425,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         CensusFinish(image_id, true);
     }
     ImageBase& image = slot_images[image_id];
+    ColdKeepUncharge(image); // whichever path deletes it (the collector included)
     if (True(image.flags & ImageFlagBits::CollectPending)) [[unlikely]] {
         // EXP121: deleted by another path before its queued download landed.
         for (size_t i = 0; i < collect_downloads.size(); ++i) {
@@ -8622,7 +8679,9 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
     image.gpu_addr = gpu_addr;
     image.cpu_addr = cpu_addr;
     image.cpu_addr_end = cpu_addr + image.guest_size_bytes;
-    // The cold sweep keep's cached answer was for the old address (ColdKeepResampled).
+    // The cold sweep keep's cached answer was for the old address (ColdKeepResampled), and its
+    // share of the keep budget goes back (the contents it was kept for are gone).
+    ColdKeepUncharge(image);
     image.cold_keep_gen = 0;
     image.cold_keep = 0;
     image.flags &= ~ImageFlagBits::GpuModified;

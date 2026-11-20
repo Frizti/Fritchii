@@ -1330,9 +1330,13 @@ private:
     /// own address and shape; the value is the frame last seen. At most ColdResampledMax, the
     /// least recently seen out. A target made again at such an address and shape is kept by the
     /// sweep (only where it would delete it) within FRITCHII_COLD_SWEEP_KEEP_MIB of real device
-    /// memory (the image plus its scaled copy; default min(256 MiB, device-local / 32)); under
-    /// pressure (budget_pressure, an image that failed in the last ColdKeepFailedFrames, or the
-    /// cache over critical_memory + max(1 GiB, critical / 4)) the sweep deletes it as before.
+    /// memory (the image plus its scaled copy) held as a resident total (cold_keep_resident):
+    /// images already kept keep their share, so an overrun turns away new candidates. The default
+    /// is min(256 MiB, GetDeviceLocalMemory() / 32), or min(512 MiB, GetDeviceLocalMemory() / 16)
+    /// with a driver budget of 12 GiB or more (SweepColdImages). Under pressure (budget_pressure,
+    /// an image that failed in the last ColdKeepFailedFrames, or the cache over critical_memory +
+    /// min(max(1 GiB, critical / 4), (driver budget - critical) / 2), no margin without a
+    /// reported budget) the sweep deletes kept images as before.
     /// 2 also keeps images sampled in a frame after their last GPU write (GuardSampled), from
     /// both. 3 also keeps GPU-written targets whose memory overlaps a recently lost read
     /// (lost_read_ranges, 128 ranges), under the same keep budget.
@@ -1342,6 +1346,21 @@ private:
     /// The frame an image last failed to allocate (0 = never): the keep's pressure gate.
     u64 cold_keep_failed_frame{};
     static constexpr u64 ColdKeepFailedFrames = 600;
+    /// The keep budget in use: the sum of every image's cold_keep_charge, and how many hold one.
+    u64 cold_keep_resident{};
+    u32 cold_keep_resident_count{};
+    /// GetDeviceMemoryBudget(), refreshed every 60 frames by the sweep (0 = not reported).
+    u64 cold_keep_driver_budget{};
+    u64 cold_keep_budget_frame{};
+    /// Gives back an image's share of the keep budget and clears its covered-kept bit.
+    void ColdKeepUncharge(ImageBase& image) noexcept {
+        image.cold_keep &= static_cast<u8>(~4);
+        if (image.cold_keep_charge != 0) {
+            cold_keep_resident -= (std::min)(cold_keep_resident, image.cold_keep_charge);
+            cold_keep_resident_count -= cold_keep_resident_count != 0 ? 1 : 0;
+            image.cold_keep_charge = 0;
+        }
+    }
     [[nodiscard]] static u64 ColdResampledKey(GPUVAddr gpu_addr, u64 shape_key) noexcept {
         return (gpu_addr * 0x9E3779B97F4A7C15ULL) ^ shape_key;
     }
