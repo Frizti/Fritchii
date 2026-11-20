@@ -454,6 +454,39 @@ private:
     /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
     u64 occl_made_frame{~u64{0}};
 
+    /// FRITCHII_OCCL_FLAG: hangs a made `kind` variant on `full` (its state 1), or sets the
+    /// state to 2 when `made` is null or (pre-pass kinds) its descriptors differ from full's;
+    /// a refused one is retired (RetireTranslatedPipeline), never destroyed on this thread. The
+    /// variant, or null. Shared by the synchronous and the asynchronous path.
+    GraphicsPipeline* AttachOcclFlag(GraphicsPipeline& full, u8 kind,
+                                     std::unique_ptr<GraphicsPipeline> made);
+    /// FRITCHII_OCCL_FLAG_ASYNC: queues `key`'s translation on occl_queue from snapshot
+    /// environments of the current draw (`kind` 1-5 a flag variant of `parent_key`, 0 a lean
+    /// sibling). Later when this frame's budget is spent or the queue is full (try again at a
+    /// later draw); Failed when the environments could not be read (as a failed translation).
+    enum class OcclEnqueue : u8 { Queued, Later, Failed };
+    OcclEnqueue EnqueueOcclJob(const GraphicsPipelineCacheKey& key, u8 kind,
+                               const GraphicsPipelineCacheKey& parent_key);
+    /// FRITCHII_OCCL_FLAG_ASYNC, between frames (TickFrame): attaches the translated variants
+    /// and siblings, retires the rest, sweeps wedged jobs.
+    void TickOcclVariants();
+    void AdoptOcclJob(std::unique_ptr<TranslationJob> job);
+    /// A finished lean sibling job: its pipeline when usable; `retry` when it is to be
+    /// translated again. Marks the parent Failed when it made none (or failed too often).
+    std::unique_ptr<GraphicsPipeline> AdoptOcclSibling(std::unique_ptr<TranslationJob> job,
+                                                       bool& retry);
+    /// A draw whose own key is a lean sibling still queued on occl_queue (its entry empty):
+    /// as AdoptTranslation (`pending`: skip the draw meanwhile).
+    std::unique_ptr<GraphicsPipeline> AdoptOcclSiblingForDraw(bool& pending);
+    /// FRITCHII_OCCL_FLAG_ASYNC: the parent's state for variant `kind` (1-5).
+    static u8& OcclFlagStateOf(GraphicsPipeline& full, u8 kind);
+    /// FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME: enqueues allowed a frame, and this frame's count.
+    u32 occl_async_per_frame{4};
+    u64 occl_enqueue_frame{~u64{0}};
+    u32 occl_enqueued_in_frame{};
+    /// Unusable translations per parent key and kind (0 sibling, 1-5 variants).
+    std::unordered_map<GraphicsPipelineCacheKey, std::array<u8, 6>> occl_failures;
+
     /// The pointer slots kept for the current key (evicted_pointer_slots), null when none
     [[nodiscard]] const VideoCommon::EvictedPointerSlots::Slots* KeptPointers() const;
     /// Answers the kept slots of each program as storage buffer pointers (KeepStoragePointers)
@@ -848,6 +881,9 @@ private:
     std::atomic_bool save_again{};
 
     Common::ThreadWorker workers;
+    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS (default 2; 0 none): the driver compiles of occlusion
+    /// flag variants and lean siblings, at the lowest priority, apart from the shared workers.
+    std::unique_ptr<Common::ThreadWorker> occl_compile_workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
 
@@ -875,6 +911,11 @@ private:
     /// EDEN_NX2_ASYNC_TRANSLATE=1/2: graphics pipelines translated off the GPU thread. Null with
     /// the switch off. Reset first in the destructor (its threads build with the members above).
     std::unique_ptr<TranslateQueue> translate_queue;
+    /// FRITCHII_OCCL_FLAG_ASYNC (default 1): occlusion flag variants and lean siblings
+    /// translated on threads of their own instead of on the lookup thread. Null with the switch
+    /// 0 (the synchronous path), or when neither feature can run this session. Reset first in
+    /// the destructor, with translate_queue.
+    std::unique_ptr<TranslateQueue> occl_queue;
     /// Keys whose translations kept failing their checks or were swept: built on the GPU thread.
     std::unordered_set<GraphicsPipelineCacheKey> translate_sync_only;
     /// Unusable translations per key (a stale texture descriptor, a guarded read that gave up).

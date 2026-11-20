@@ -217,6 +217,19 @@ struct Stats {
     std::atomic<u64> flag_slots{};     ///< slots opened as flag slots (no host query; mode 1)
     std::atomic<u64> query_slots{};    ///< slots opened with a host query
     std::atomic<u64> disagree_total{}; ///< since boot (q0_f1 + q1_f0)
+    /// prepass_refused in the window (prepass_refused itself counts since boot)
+    std::atomic<u64> prepass_refused_window{};
+    /// FRITCHII_OCCL_FLAG_ASYNC: variants (and FRITCHII_OCCL_LEAN siblings) queued for the
+    /// occlusion translation threads, attached once translated, translated again (a stale
+    /// texture descriptor or a guarded read that gave up), discarded unused (the parent gone, or
+    /// no longer waiting for it), not queued this frame (the per-frame budget or a full queue),
+    /// and the most in flight at once.
+    std::atomic<u64> async_queued{};
+    std::atomic<u64> async_adopted{};
+    std::atomic<u64> async_retried{};
+    std::atomic<u64> async_discarded{};
+    std::atomic<u64> async_deferred{};
+    std::atomic<u64> async_in_flight_max{};
     std::atomic<s64> window_start{};
 };
 inline Stats g_stats;
@@ -243,15 +256,28 @@ inline void MaybeLog() {
         return static_cast<double>(c.exchange(0, std::memory_order_relaxed)) / s;
     };
     auto& g = g_stats;
+    // Raw counts of the window (the rates below are these over its length).
+    const auto take_raw = [](std::atomic<u64>& c) { return c.exchange(0, std::memory_order_relaxed); };
+    const u64 made_raw = take_raw(g.made), colour_made_raw = take_raw(g.colour_made),
+              prepass_made_raw = take_raw(g.prepass_made),
+              prepass_refused_raw = take_raw(g.prepass_refused_window),
+              async_queued = take_raw(g.async_queued), async_adopted = take_raw(g.async_adopted),
+              async_retried = take_raw(g.async_retried),
+              async_discarded = take_raw(g.async_discarded),
+              async_deferred = take_raw(g.async_deferred),
+              async_in_flight_max = take_raw(g.async_in_flight_max);
+    const double made = static_cast<double>(made_raw) / s;
     const double flag_draws = take(g.flag_draws), other = take(g.other_counted),
                  not_lean = take(g.not_lean), refused = take(g.refused_regs),
-                 not_ready = take(g.not_ready), made = take(g.made), failed = take(g.failed),
+                 not_ready = take(g.not_ready), failed = take(g.failed),
                  no_slot = take(g.no_slot), compared = take(g.compared), agree = take(g.agree),
                  q0_f1 = take(g.q0_f1), q1_f0 = take(g.q1_f0), mixed = take(g.mixed),
                  no_flag = take(g.no_flag), reused = take(g.reused),
                  flag_slots = take(g.flag_slots), query_slots = take(g.query_slots),
-                 colour_flag_draws = take(g.colour_flag_draws), colour_made = take(g.colour_made),
-                 prepass_draws = take(g.prepass_draws), prepass_made = take(g.prepass_made),
+                 colour_flag_draws = take(g.colour_flag_draws),
+                 colour_made = static_cast<double>(colour_made_raw) / s,
+                 prepass_draws = take(g.prepass_draws),
+                 prepass_made = static_cast<double>(prepass_made_raw) / s,
                  prepass_fallback = take(g.prepass_fallback),
                  prepass_paused = take(g.prepass_paused),
                  prepass_skipped = take(g.prepass_skipped),
@@ -267,14 +293,19 @@ inline void MaybeLog() {
              "draws {:.0f}, colour flag pipelines made {:.0f}; pre-pass draws {:.0f} ({:.0f} "
              "between host queries, {:.0f} skipped: a host query open), made {:.0f}, refused at "
              "the draw {:.0f}, refused for their descriptors {} since boot, real draws lost {} "
-             "(must be 0); colour pre-pass draws {:.0f}; colour discard variant draws {:.0f}",
+             "(must be 0); colour pre-pass draws {:.0f}; colour discard variant draws {:.0f}; "
+             "in the window: made {}, colour made {}, pre-pass made {}, pre-pass refused {}; "
+             "async variants (FRITCHII_OCCL_FLAG_ASYNC): queued {}, adopted {}, stale/retried "
+             "{}, discarded {}, not queued (budget or full) {}, in flight at most {}",
              RawMode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
              mixed, no_flag, reused, flag_slots, query_slots, colour_flag_draws, colour_made,
              prepass_draws, prepass_paused, prepass_skipped, prepass_made, prepass_fallback,
              g.prepass_refused.load(std::memory_order_relaxed),
              g.prepass_lost.load(std::memory_order_relaxed), colour_prepass_draws,
-             discard_direct_draws);
+             discard_direct_draws, made_raw, colour_made_raw, prepass_made_raw,
+             prepass_refused_raw, async_queued, async_adopted, async_retried, async_discarded,
+             async_deferred, async_in_flight_max);
     std::string census;
     for (size_t i = 0; i < static_cast<size_t>(Census::Count); ++i) {
         census += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", CensusNames[i], take(g.census[i]));

@@ -9,9 +9,10 @@
 namespace Vulkan {
 
 TranslateQueue::TranslateQueue(size_t thread_count, size_t max_in_flight_, Translate translate_,
-                               Retire retire_)
+                               Retire retire_, std::string name,
+                               Common::ThreadPlacement placement)
     : max_in_flight{max_in_flight_}, translate{std::move(translate_)}, retire{std::move(retire_)},
-      threads{std::make_unique<Common::ThreadWorker>(thread_count, "VkTranslate")} {}
+      threads{new Common::ThreadWorker(thread_count, std::move(name), {}, placement)} {}
 
 TranslateQueue::~TranslateQueue() {
     // A translation in progress finishes and stores its job; the queued ones are dropped. At
@@ -23,7 +24,7 @@ TranslateQueue::~TranslateQueue() {
 }
 
 bool TranslateQueue::Enqueue(std::unique_ptr<TranslationJob> job) {
-    const GraphicsPipelineCacheKey key = job->key;
+    const TranslateQueueKey key{job->key, job->occl_kind};
     u64 id{};
     {
         std::scoped_lock lock{mutex};
@@ -34,13 +35,14 @@ bool TranslateQueue::Enqueue(std::unique_ptr<TranslationJob> job) {
         Entry& entry = entries[key];
         entry.id = id;
         entry.enqueued = job->enqueued;
+        entry.parent_key = job->parent_key;
         entry.job = std::move(job);
     }
     threads->QueueWork([this, key, id] { Run(key, id); });
     return true;
 }
 
-void TranslateQueue::Run(GraphicsPipelineCacheKey key, u64 id) {
+void TranslateQueue::Run(TranslateQueueKey key, u64 id) {
     std::unique_ptr<TranslationJob> job;
     {
         std::scoped_lock lock{mutex};
@@ -83,14 +85,15 @@ void TranslateQueue::Run(GraphicsPipelineCacheKey key, u64 id) {
     abandoned.push_back(std::move(job));
 }
 
-bool TranslateQueue::Contains(const GraphicsPipelineCacheKey& key) const {
+bool TranslateQueue::Contains(const GraphicsPipelineCacheKey& key, u8 kind) const {
     std::scoped_lock lock{mutex};
-    return entries.contains(key);
+    return entries.contains(TranslateQueueKey{key, kind});
 }
 
-std::unique_ptr<TranslationJob> TranslateQueue::Take(const GraphicsPipelineCacheKey& key) {
+std::unique_ptr<TranslationJob> TranslateQueue::Take(const GraphicsPipelineCacheKey& key,
+                                                     u8 kind) {
     std::scoped_lock lock{mutex};
-    const auto it = entries.find(key);
+    const auto it = entries.find(TranslateQueueKey{key, kind});
     if (it == entries.end() || !it->second.done) {
         return nullptr;
     }
@@ -100,16 +103,17 @@ std::unique_ptr<TranslationJob> TranslateQueue::Take(const GraphicsPipelineCache
 }
 
 std::unique_ptr<TranslationJob> TranslateQueue::Wait(const GraphicsPipelineCacheKey& key,
-                                                     std::chrono::milliseconds cap) {
+                                                     std::chrono::milliseconds cap, u8 kind) {
+    const TranslateQueueKey queue_key{key, kind};
     std::unique_lock lock{mutex};
     const bool finished = done_condition.wait_for(lock, cap, [&] {
-        const auto it = entries.find(key);
+        const auto it = entries.find(queue_key);
         return it == entries.end() || it->second.done;
     });
     if (!finished) {
         return nullptr;
     }
-    const auto it = entries.find(key);
+    const auto it = entries.find(queue_key);
     if (it == entries.end()) {
         return nullptr;
     }
@@ -118,11 +122,11 @@ std::unique_ptr<TranslationJob> TranslateQueue::Wait(const GraphicsPipelineCache
     return job;
 }
 
-void TranslateQueue::Abandon(const GraphicsPipelineCacheKey& key) {
+void TranslateQueue::Abandon(const GraphicsPipelineCacheKey& key, u8 kind) {
     std::unique_ptr<TranslationJob> job;
     {
         std::scoped_lock lock{mutex};
-        const auto it = entries.find(key);
+        const auto it = entries.find(TranslateQueueKey{key, kind});
         if (it == entries.end()) {
             return;
         }
@@ -137,20 +141,29 @@ void TranslateQueue::Abandon(const GraphicsPipelineCacheKey& key) {
 std::vector<GraphicsPipelineCacheKey> TranslateQueue::Sweep(
     std::chrono::steady_clock::duration age) {
     std::vector<GraphicsPipelineCacheKey> keys;
+    for (const Swept& swept : SweepJobs(age)) {
+        keys.push_back(swept.key);
+    }
+    return keys;
+}
+
+std::vector<TranslateQueue::Swept> TranslateQueue::SweepJobs(
+    std::chrono::steady_clock::duration age) {
+    std::vector<Swept> swept;
     const auto now = std::chrono::steady_clock::now();
     {
         std::scoped_lock lock{mutex};
         for (const auto& [key, entry] : entries) {
             // A finished job is only waiting for its draw to come back; it is not wedged.
             if (!entry.done && now - entry.enqueued > age) {
-                keys.push_back(key);
+                swept.push_back(Swept{key.key, key.kind, entry.parent_key});
             }
         }
     }
-    for (const auto& key : keys) {
-        Abandon(key);
+    for (const Swept& job : swept) {
+        Abandon(job.key, job.kind);
     }
-    return keys;
+    return swept;
 }
 
 std::vector<std::unique_ptr<TranslationJob>> TranslateQueue::TakeFinished() {

@@ -3243,7 +3243,42 @@ pre-passes, 0 disagreements, no real draws lost; host query slots ~36,000 -> ~14
 9 vs 3 (the package's =1 vs =3) frame time -0.6 to -1.0 ms. One GPU hang (device lost) under PCIe load in about 50
 loaded windows with the pre-passes, not reproduced since (22 min playtest and ~30 more windows
 clean); cause unknown. Flag variants are not in the disk cache: each session translates them again
-on the GPU thread (one a frame) and the driver compiles them on the workers.
+(see FRITCHII_OCCL_FLAG_ASYNC and FRITCHII_OCCL_FLAG_COMPILE_THREADS for where).
+
+### FRITCHII_OCCL_FLAG_ASYNC (occlusion variants off the lookup thread)
+
+FRITCHII_OCCL_FLAG_ASYNC (boot, default 1; 0 = v6.2: translated on the lookup thread, one a frame).
+Occlusion flag variants (FRITCHII_OCCL_FLAG, all five kinds) and lean siblings (FRITCHII_OCCL_LEAN)
+are translated on threads of their own ("VkOcclTranslate", below normal priority) from snapshot
+environments of the draw that asked, not on E (one follower) or the GPU thread: per build ~5 ms
+median, ~17 ms p90, up to ~41 ms on E before. The draw takes its parent with a host query until the
+variant is attached between frames (TickFrame), exactly as for a variant not built yet. A variant
+waits in state 3 (queued); a stale texture descriptor or a guarded read that gave up is queued again
+by a later draw, refused for good after two; one whose parent went (evicted) or that is no longer
+waited for is discarded; a pre-pass variant whose descriptors differ is retired (destroyed once
+built, never waited for on the lookup thread; also with the switch at 0). A lean sibling waits under
+an empty cache entry (a draw of its own key takes it, skips while it translates, or waits up to
+50 ms and builds it). Made only when FRITCHII_OCCL_FLAG was not 0 at boot or FRITCHII_OCCL_LEAN is
+set; independent of the asynchronous shaders.
+- FRITCHII_OCCL_FLAG_ASYNC_THREADS (boot, default 2, 1-8): its threads.
+- FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME (boot, default 4, 1-64): jobs queued a frame at most (each
+  copies the draw's environments on the lookup thread); at most 32 in flight. Over either, the
+  variant is asked again at a later draw.
+
+### FRITCHII_OCCL_FLAG_COMPILE_THREADS (occlusion variant compile lane)
+
+FRITCHII_OCCL_FLAG_COMPILE_THREADS (boot, default 2, 0-8; 0 = the shared pipeline workers, as v6.2).
+The driver compiles of occlusion flag variants and lean siblings run on threads of their own
+("VkOcclBuilder", lowest priority), so they never queue ahead of the game's own pipelines on the
+shared workers. No draw waits for a variant's compile: variants and siblings are drawn only once
+built (a sibling is also a cache entry; a draw of its very key waits as for any pipeline).
+
+Logs: "Runtime pipelines in the last 10 s" ends with "occlusion variants (flag variants and lean
+siblings): N on the GPU thread (X ms), M on workers (Y ms)". The "Occlusion flags" line ends with
+the window's raw counts: "made, colour made, pre-pass made, pre-pass refused; async variants
+(FRITCHII_OCCL_FLAG_ASYNC): queued, adopted, stale/retried, discarded, not queued (budget or full),
+in flight at most". The boot log says where variants are translated and compiled ("Occlusion
+variants: ...").
 
 ### EDEN_NX2_GPU_PROFILE=2: E's draw method zones (helper CP)
 

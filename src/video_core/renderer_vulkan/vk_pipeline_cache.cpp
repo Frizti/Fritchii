@@ -13,6 +13,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -594,6 +595,27 @@ size_t TranslateThreads() {
     const int threads = value != nullptr ? std::atoi(value) : 2;
     return static_cast<size_t>(std::clamp(threads, 1, 8));
 }
+
+/// An integer boot switch: `fallback` when unset or empty, else clamped to [low, high].
+int OcclAsyncSwitch(const char* name, int fallback, int low, int high) {
+    const char* const value = std::getenv(name);
+    const int parsed = value != nullptr && value[0] != '\0' ? std::atoi(value) : fallback;
+    return std::clamp(parsed, low, high);
+}
+
+/// FRITCHII_OCCL_FLAG_ASYNC (boot, default 1): occlusion flag variants and lean siblings are
+/// translated on occl_queue's threads (FRITCHII_OCCL_FLAG_ASYNC_THREADS, default 2) instead of
+/// on the lookup thread, at most FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME (default 4) queued a frame
+/// and MaxOcclJobsInFlight at once. 0: translated on the lookup thread, one a frame (v6.2).
+constexpr size_t MaxOcclJobsInFlight = 32;
+/// FRITCHII_OCCL_FLAG_ASYNC: a variant's state while its translation is queued (0 not tried,
+/// 1 made, 2 refused for good: vk_graphics_pipeline.h).
+constexpr u8 OCCL_FLAG_STATE_QUEUED = 3;
+
+/// FRITCHII_OCCL_FLAG / FRITCHII_OCCL_LEAN: variants and siblings built, on the lookup thread
+/// (0) and on occl_queue's threads (1): count and nanoseconds, for the runtime pipelines line.
+std::array<std::atomic<u64>, 2> occl_variant_builds{};
+std::array<std::atomic<u64>, 2> occl_variant_ns{};
 
 /// EDEN_NX2_SPIRV_SELFCHECK=1: throws (the pipeline is dropped, as one the translation rejects)
 /// when the emitted SPIR-V uses an id it never defines or its own result, before the driver gets
@@ -1289,6 +1311,60 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     } else if (VideoCommon::AsyncTranslateMode() == 3) {
         LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_TRANSLATE=3: GPU-thread translations use "
                                 "environment snapshots, checked against the live state");
+    }
+
+    // FRITCHII_OCCL_FLAG_ASYNC / FRITCHII_OCCL_FLAG_COMPILE_THREADS: only when occlusion flag
+    // variants (the device kept the flag area's buffer device address: FRITCHII_OCCL_FLAG was
+    // not 0 at boot) or lean siblings (FRITCHII_OCCL_LEAN) can be made this session. Neither
+    // depends on the asynchronous shaders: a variant not ready yet draws as its parent with a
+    // host query, exactly as one not built yet.
+    const bool occl_variants_possible =
+        device.IsOcclFlagDeviceAddressEnabled() || VideoCommon::OcclLean::Mode() != 0;
+    if (occl_variants_possible) {
+        const int compile_threads = OcclAsyncSwitch("FRITCHII_OCCL_FLAG_COMPILE_THREADS", 2, 0, 8);
+        if (compile_threads > 0) {
+            const auto count = static_cast<size_t>(compile_threads);
+            occl_compile_workers = std::unique_ptr<Common::ThreadWorker>(new Common::ThreadWorker(
+                count, "VkOcclBuilder", {}, Common::ThreadPlacement::Background));
+#ifdef _WIN32
+            // The lowest priority (ThreadPlacement::Background gives below normal): each thread
+            // takes one of these and holds until all have, so every thread gets one.
+            auto latch = std::make_shared<std::latch>(static_cast<std::ptrdiff_t>(count));
+            for (size_t i = 0; i < count; ++i) {
+                occl_compile_workers->QueueWork([latch] {
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                    latch->arrive_and_wait();
+                });
+            }
+#endif
+        }
+        if (OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC", 1, 0, 1) != 0) {
+            const auto threads =
+                static_cast<size_t>(OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_THREADS", 2, 1, 8));
+            occl_async_per_frame =
+                static_cast<u32>(OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME", 4, 1, 64));
+            occl_queue = std::make_unique<TranslateQueue>(
+                threads, MaxOcclJobsInFlight,
+                [this](TranslationJob& job) { TranslateOnWorker(job); },
+                [this](std::unique_ptr<GraphicsPipeline> pipeline) {
+                    RetireTranslatedPipeline(std::move(pipeline));
+                },
+                "VkOcclTranslate", Common::ThreadPlacement::Background);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion variants: translated {} (FRITCHII_OCCL_FLAG_ASYNC={}), driver "
+                 "compiles on {} (FRITCHII_OCCL_FLAG_COMPILE_THREADS)",
+                 occl_queue ? fmt::format("on {} threads of their own, at most {} queued a "
+                                          "frame",
+                                          OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_THREADS", 2,
+                                                          1, 8),
+                                          occl_async_per_frame)
+                            : std::string{"on the lookup thread, one a frame"},
+                 occl_queue ? 1 : 0,
+                 occl_compile_workers
+                     ? fmt::format("{} lowest-priority threads of their own",
+                                   OcclAsyncSwitch("FRITCHII_OCCL_FLAG_COMPILE_THREADS", 2, 0, 8))
+                     : std::string{"the shared pipeline workers"});
     }
 }
 
@@ -2579,9 +2655,14 @@ PipelineCache::~PipelineCache() {
     precompile_thread = {};
     // Its threads build with the members below (a translation in progress finishes).
     translate_queue.reset();
+    // FRITCHII_OCCL_FLAG_ASYNC: the same, before the workers and graphics_cache.
+    occl_queue.reset();
     StopBackgroundPipelines();
     Common::NoteShutdownProgress();
     workers.WaitForRequests();
+    if (occl_compile_workers) {
+        occl_compile_workers->WaitForRequests();
+    }
     serialization_thread.WaitForRequests();
     Common::NoteShutdownProgress();
     // The caches are written before anything slow is torn down, so a teardown cut short still
@@ -3745,6 +3826,9 @@ constexpr u8 OCCL_FLAG_BUILD_COLOUR = 2; ///< the guest pixel program with the f
 constexpr u8 OCCL_FLAG_BUILD_PREPASS = 3; ///< the guest pixel program, the store at its end
 constexpr u8 OCCL_FLAG_BUILD_NOCOLOUR = 4; ///< the host flag program, colour writes off (key)
 constexpr u8 OCCL_FLAG_BUILD_PREPASS_NOCOLOUR = 5; ///< the pre-pass, colour writes off (key)
+/// FRITCHII_OCCL_LEAN: set on the thread making a lean sibling (FindOrMakeOcclSibling, or
+/// occl_queue's job of kind 0), for FRITCHII_OCCL_FLAG_COMPILE_THREADS' lane and the counts.
+thread_local bool t_occl_sibling_build{};
 
 /// FRITCHII_OCCL_FLAG: why `pipeline`'s guest pixel program (Lean class: no discard, depth or
 /// sample mask writes, stores) cannot take the flag store with early fragment tests for a
@@ -4291,8 +4375,50 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
     return flag;
 }
 
+u8& PipelineCache::OcclFlagStateOf(GraphicsPipeline& full, u8 kind) {
+    switch (kind) {
+    case OCCL_FLAG_BUILD_COLOUR:
+        return full.occl_flag_colour_state;
+    case OCCL_FLAG_BUILD_PREPASS:
+        return full.occl_flag_prepass_state;
+    case OCCL_FLAG_BUILD_NOCOLOUR:
+        return full.occl_flag_nocolour_state;
+    case OCCL_FLAG_BUILD_PREPASS_NOCOLOUR:
+        return full.occl_flag_prepass_nocolour_state;
+    default:
+        return full.occl_flag_state;
+    }
+}
+
 GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 kind) {
     namespace OcclFlag = VideoCommon::OcclFlag;
+    if (occl_queue) {
+        // FRITCHII_OCCL_FLAG_ASYNC: queued (state 3) from snapshot environments of this draw,
+        // never translated here; null until TickOcclVariants attaches it (the draw takes its
+        // parent with a host query meanwhile). Only while the current key names full's programs
+        // (the environments come from this draw's registers).
+        u8& state = OcclFlagStateOf(full, kind);
+        if (state == OCCL_FLAG_STATE_QUEUED ||
+            graphics_key.unique_hashes != full.Key().unique_hashes) {
+            return nullptr;
+        }
+        GraphicsPipelineCacheKey key = full.Key();
+        if (kind == OCCL_FLAG_BUILD_NOCOLOUR || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
+            for (auto& attachment : key.state.attachments) {
+                attachment.raw = 0; // no colour writes, no blending
+            }
+        }
+        switch (EnqueueOcclJob(key, kind, full.Key())) {
+        case OcclEnqueue::Queued:
+            state = OCCL_FLAG_STATE_QUEUED;
+            break;
+        case OcclEnqueue::Later:
+            break; // state stays 0: a later draw queues it
+        case OcclEnqueue::Failed:
+            return AttachOcclFlag(full, kind, nullptr); // as a failed translation (state 2)
+        }
+        return nullptr;
+    }
     // The environments come from the registers of this draw: only while the current key names
     // full's programs. One translation a frame, shared with the lean siblings.
     if (graphics_key.unique_hashes != full.Key().unique_hashes || occl_made_frame == frame_count) {
@@ -4321,15 +4447,32 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
             made.reset();
         }
     }
-    u8& state = kind == OCCL_FLAG_BUILD_COLOUR     ? full.occl_flag_colour_state
-                : kind == OCCL_FLAG_BUILD_PREPASS  ? full.occl_flag_prepass_state
-                : kind == OCCL_FLAG_BUILD_NOCOLOUR ? full.occl_flag_nocolour_state
-                : kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR ? full.occl_flag_prepass_nocolour_state
-                                                   : full.occl_flag_state;
+    return AttachOcclFlag(full, kind, std::move(made));
+}
+
+GraphicsPipeline* PipelineCache::AttachOcclFlag(GraphicsPipeline& full, u8 kind,
+                                                std::unique_ptr<GraphicsPipeline> made) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    u8& state = OcclFlagStateOf(full, kind);
     if (!made) {
         OcclFlag::Add(OcclFlag::g_stats.failed);
         state = 2;
         return nullptr;
+    }
+    if (kind == OCCL_FLAG_BUILD_PREPASS || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
+        if (!OcclFlagSameDescriptors(*made, full)) {
+            state = 2; // the parent could not bind this variant's descriptors
+            OcclFlag::Add(OcclFlag::g_stats.prepass_refused);
+            OcclFlag::Add(OcclFlag::g_stats.prepass_refused_window);
+            LOG_INFO(Render_Vulkan,
+                     "Occlusion flag pre-pass: {}: its translation's descriptors differ from "
+                     "the pipeline's; no pre-pass for it",
+                     OcclShaders(full.Key()));
+            // Never bound; its driver compile may still be queued: destroyed by TickFrame once
+            // built, never here (the destructor would wait for that compile, or run it).
+            RetireTranslatedPipeline(std::move(made));
+            return nullptr;
+        }
     }
     made->occl_flag_parent = &full;
     made->occl_flag_kind = kind;
@@ -4340,15 +4483,6 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
         return full.occl_flag_colour.get();
     }
     if (kind == OCCL_FLAG_BUILD_PREPASS || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
-        if (!OcclFlagSameDescriptors(*made, full)) {
-            state = 2; // the parent could not bind this variant's descriptors
-            OcclFlag::Add(OcclFlag::g_stats.prepass_refused);
-            LOG_INFO(Render_Vulkan,
-                     "Occlusion flag pre-pass: {}: its translation's descriptors differ from "
-                     "the pipeline's; no pre-pass for it",
-                     OcclShaders(full.Key()));
-            return nullptr;
-        }
         OcclFlag::Add(OcclFlag::g_stats.prepass_made);
         if (kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
             full.occl_flag_prepass_nocolour = std::move(made);
@@ -4381,6 +4515,27 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
     }
     // The environments come from the registers of this draw (shader_infos from the lookup that
     // gave `full`): only while the current key names full's programs.
+    if (occl_queue) {
+        // FRITCHII_OCCL_FLAG_ASYNC: queued on occl_queue under an empty entry (as the translate
+        // queue's), filled by TickOcclVariants; a draw of this very key adopts or waits for it
+        // (AdoptOcclSiblingForDraw).
+        if (graphics_key.unique_hashes != full.Key().unique_hashes) {
+            return nullptr;
+        }
+        switch (EnqueueOcclJob(key, 0, full.Key())) {
+        case OcclEnqueue::Queued:
+            graphics_cache.emplace(key, nullptr);
+            break;
+        case OcclEnqueue::Later:
+            break;
+        case OcclEnqueue::Failed:
+            OcclLean::Add(stats.failed);
+            full.occl_class =
+                static_cast<u8>(static_cast<u8>(OcclLean::PipelineClass::Failed) + 1);
+            break;
+        }
+        return nullptr;
+    }
     if (graphics_key.unique_hashes != full.Key().unique_hashes || occl_made_frame == frame_count) {
         return nullptr;
     }
@@ -4390,8 +4545,10 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
     std::unique_ptr<GraphicsPipeline> made;
     {
         graphics_key = key;
+        t_occl_sibling_build = true;
         SCOPE_EXIT {
             graphics_key = saved;
+            t_occl_sibling_build = false;
         };
         try {
             made = CreateGraphicsPipeline(nullptr, false);
@@ -8241,6 +8398,13 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         if (pipeline && !precompiled && evicted_pointer_slots.Size() != 0) {
             evicted_pointer_slots.Forget(graphics_key.Hash());
         }
+    } else if (!pipeline && occl_queue && occl_queue->Contains(graphics_key, 0)) {
+        // FRITCHII_OCCL_FLAG_ASYNC: this key is a lean sibling still on occl_queue.
+        bool pending{};
+        pipeline = AdoptOcclSiblingForDraw(pending);
+        if (pending) {
+            return nullptr;
+        }
     } else if (!pipeline && translate_queue) {
         bool pending{};
         pipeline = AdoptTranslation(pending);
@@ -8406,6 +8570,9 @@ void PipelineCache::TickFrame() {
     }
     if (translate_queue) {
         TickTranslations();
+    }
+    if (occl_queue) {
+        TickOcclVariants();
     }
     if (frame_count % 60 == 0) {
         static std::chrono::steady_clock::time_point last_memory_log{};
@@ -9798,8 +9965,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             return stage_modules;
         };
     }
-    Common::ThreadWorker* const thread_worker{build_in_parallel && !libraries_only ? &workers
-                                                                                   : nullptr};
+    // FRITCHII_OCCL_FLAG_COMPILE_THREADS: an occlusion flag variant's or lean sibling's driver
+    // compile goes to its own lowest-priority lane, not the shared workers. Variants are only
+    // drawn once IsBuilt() (OcclFlagPipeline, OcclLeanPipeline), so no draw waits for one.
+    const bool occl_lane =
+        occl_compile_workers != nullptr && (t_occl_flag_build != 0 || t_occl_sibling_build);
+    Common::ThreadWorker* const thread_worker{
+        build_in_parallel && !libraries_only
+            ? (occl_lane ? occl_compile_workers.get() : &workers)
+            : nullptr};
     GraphicsPipeline::LibraryParams library_params{
         .library_cache = use_libraries ? &graphics_libraries : nullptr,
         .spirv_hashes = spirv_hashes,
@@ -9917,10 +10091,16 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
                  "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
                  "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
                  "{:.1f} ms of draws held for unbuilt pipelines; graphics on the GPU thread: "
-                 "{:.1f} ms environments, {:.1f} ms translation",
+                 "{:.1f} ms environments, {:.1f} ms translation; occlusion variants (flag "
+                 "variants and lean siblings): {} on the GPU thread ({:.1f} ms), {} on workers "
+                 "({:.1f} ms)",
                  count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
                  ms(GraphicsPipeline::TakeHoldTime()), ms(split_total.environments),
-                 ms(split_total.translation));
+                 ms(split_total.translation),
+                 occl_variant_builds[0].exchange(0, std::memory_order::relaxed),
+                 ms(take(occl_variant_ns[0])),
+                 occl_variant_builds[1].exchange(0, std::memory_order::relaxed),
+                 ms(take(occl_variant_ns[1])));
         total = {};
         split_total = {};
         count = 0;
@@ -10035,6 +10215,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     t_build_split = {};
     SCOPE_EXIT {
         t_runtime_build = false;
+        if (t_occl_flag_build != 0 || t_occl_sibling_build) {
+            // An occlusion flag variant or lean sibling built on the lookup thread
+            // (FRITCHII_OCCL_FLAG_ASYNC=0).
+            occl_variant_builds[0].fetch_add(1, std::memory_order::relaxed);
+            occl_variant_ns[0].fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - begin)
+                    .count(),
+                std::memory_order::relaxed);
+        }
         ReportRuntimePipeline("Graphics", begin, PipelineShaders(graphics_key), t_build_split);
     };
     GraphicsEnvironments environments;
@@ -10297,6 +10487,23 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptJob(std::unique_ptr<Transl
 }
 
 void PipelineCache::TranslateOnWorker(TranslationJob& job) {
+    // FRITCHII_OCCL_FLAG_ASYNC: an occlusion job is translated exactly as the synchronous path
+    // translates it (t_occl_flag_build set to its kind; a sibling marked for the compile lane),
+    // with no record, and never stored.
+    const auto occl_begin = std::chrono::steady_clock::now();
+    t_occl_flag_build = job.occl ? job.occl_kind : u8{0};
+    t_occl_sibling_build = job.occl && job.occl_kind == 0;
+    SCOPE_EXIT {
+        if (job.occl) {
+            occl_variant_builds[1].fetch_add(1, std::memory_order::relaxed);
+            occl_variant_ns[1].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - occl_begin)
+                                             .count(),
+                                         std::memory_order::relaxed);
+        }
+        t_occl_flag_build = 0;
+        t_occl_sibling_build = false;
+    };
     boost::container::static_vector<Shader::Environment*, Maxwell::MaxShaderProgram> env_ptrs;
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         if (job.key.unique_hashes[index] != 0) {
@@ -10432,6 +10639,221 @@ void PipelineCache::TickTranslations() {
     }
     stats = {};
     stats.window = now;
+}
+
+PipelineCache::OcclEnqueue PipelineCache::EnqueueOcclJob(
+    const GraphicsPipelineCacheKey& key, u8 kind, const GraphicsPipelineCacheKey& parent_key) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    OcclFlag::Stats& stats = OcclFlag::g_stats;
+    if (occl_enqueue_frame != frame_count) {
+        occl_enqueue_frame = frame_count;
+        occl_enqueued_in_frame = 0;
+    }
+    // The budget bounds this thread's snapshot copies a frame; a job of the same key and kind
+    // still in flight (its parent evicted and made again since) is waited out.
+    if (occl_enqueued_in_frame >= occl_async_per_frame ||
+        occl_queue->InFlight() >= MaxOcclJobsInFlight || occl_queue->Contains(key, kind)) {
+        OcclFlag::Add(stats.async_deferred);
+        return OcclEnqueue::Later;
+    }
+    ++occl_enqueued_in_frame;
+    auto job = std::make_unique<TranslationJob>();
+    job->key = key;
+    job->occl = true;
+    job->occl_kind = kind;
+    job->parent_key = parent_key;
+    job->native = maxwell3d->GetNativeMacroEngine().native_turing;
+    job->enqueued = std::chrono::steady_clock::now();
+    try {
+        GraphicsEnvironments environments;
+        GetGraphicsEnvironments(environments, key.unique_hashes, true);
+        // No kept pointer slots: the synchronous path translates with none either
+        // (CreateGraphicsPipeline(nullptr, false)).
+        KeepPointers(environments.envs, key, nullptr);
+        // A copy (environments declare a destructor, so they have no moves); the snapshot is
+        // shared.
+        job->envs = environments.envs;
+    } catch (const std::exception& exception) {
+        LOG_ERROR(Render_Vulkan, "Occlusion variants (FRITCHII_OCCL_FLAG_ASYNC): {}: {}",
+                  OcclShaders(key), exception.what());
+        return OcclEnqueue::Failed;
+    }
+    if (!occl_queue->Enqueue(std::move(job))) {
+        OcclFlag::Add(stats.async_deferred);
+        return OcclEnqueue::Later;
+    }
+    OcclFlag::Add(stats.async_queued);
+    const u64 in_flight = occl_queue->InFlight();
+    u64 seen = stats.async_in_flight_max.load(std::memory_order_relaxed);
+    while (in_flight > seen &&
+           !stats.async_in_flight_max.compare_exchange_weak(seen, in_flight,
+                                                            std::memory_order_relaxed)) {
+    }
+    return OcclEnqueue::Queued;
+}
+
+void PipelineCache::TickOcclVariants() {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    occl_queue->RetireAbandoned();
+    for (auto& job : occl_queue->TakeFinished()) {
+        AdoptOcclJob(std::move(job));
+    }
+    if (frame_count % 60 != 0) {
+        return;
+    }
+    for (const TranslateQueue::Swept& swept : occl_queue->SweepJobs(TranslateSweepAge)) {
+        // Wedged (a translation or driver that does not return): given up for good.
+        OcclFlag::Add(OcclFlag::g_stats.async_discarded);
+        const auto parent_it = graphics_cache.find(swept.parent_key);
+        GraphicsPipeline* const parent =
+            parent_it != graphics_cache.end() ? parent_it->second.get() : nullptr;
+        if (swept.kind == 0) {
+            if (const auto it = graphics_cache.find(swept.key);
+                it != graphics_cache.end() && !it->second) {
+                graphics_cache.erase(it);
+            }
+            if (parent != nullptr) {
+                parent->occl_class =
+                    static_cast<u8>(static_cast<u8>(VideoCommon::OcclLean::PipelineClass::Failed) + 1);
+            }
+        } else if (parent != nullptr &&
+                   OcclFlagStateOf(*parent, swept.kind) == OCCL_FLAG_STATE_QUEUED) {
+            OcclFlagStateOf(*parent, swept.kind) = 2;
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "Occlusion variants (FRITCHII_OCCL_FLAG_ASYNC): {} (kind {}) still "
+                    "translating after {} s; given up",
+                    OcclShaders(swept.key), swept.kind, TranslateSweepAge.count());
+    }
+}
+
+void PipelineCache::AdoptOcclJob(std::unique_ptr<TranslationJob> job) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    OcclFlag::Stats& stats = OcclFlag::g_stats;
+    const u8 kind = job->occl_kind;
+    if (kind == 0) {
+        // A lean sibling: into its empty entry, unless the entry went (swept) or a draw of the
+        // key filled it meanwhile.
+        const auto it = graphics_cache.find(job->key);
+        if (it == graphics_cache.end() || it->second) {
+            OcclFlag::Add(stats.async_discarded);
+            occl_queue->Discard(std::move(job));
+            return;
+        }
+        bool retry{};
+        if (auto pipeline = AdoptOcclSibling(std::move(job), retry)) {
+            it->second = std::move(pipeline);
+        } else {
+            // Translated again by a later lookup of its parent (retry), or never (Failed).
+            graphics_cache.erase(it);
+        }
+        return;
+    }
+    // Never a GraphicsPipeline* across threads: the parent is found again by its key. Gone
+    // (evicted), or no longer waiting for this job (made again since, or refused): discarded.
+    const GraphicsPipelineCacheKey parent_key = job->parent_key;
+    const auto parent_it = graphics_cache.find(parent_key);
+    GraphicsPipeline* const parent =
+        parent_it != graphics_cache.end() ? parent_it->second.get() : nullptr;
+    if (parent == nullptr || OcclFlagStateOf(*parent, kind) != OCCL_FLAG_STATE_QUEUED) {
+        OcclFlag::Add(stats.async_discarded);
+        occl_queue->Discard(std::move(job));
+        return;
+    }
+    u8& state = OcclFlagStateOf(*parent, kind);
+    switch (job->outcome) {
+    case TranslationJob::Outcome::Built:
+        if (std::ranges::all_of(job->envs, [](GraphicsEnvironment& env) {
+                return env.TextureReadsStillMatch();
+            })) {
+            OcclFlag::Add(stats.async_adopted);
+            // As the synchronous path: attached (state 1), or refused and retired (state 2).
+            AttachOcclFlag(*parent, kind, std::move(job->pipeline));
+            return;
+        }
+        break; // a stale texture descriptor: translated again
+    case TranslationJob::Outcome::Retry:
+    case TranslationJob::Outcome::Differs:
+        break;
+    case TranslationJob::Outcome::NoPipeline:
+    case TranslationJob::Outcome::Pending:
+        // The translation made none: as the synchronous path's failure (state 2). A pipeline
+        // made before a failure on its thread is retired, not destroyed here.
+        occl_queue->Discard(std::move(job));
+        AttachOcclFlag(*parent, kind, nullptr);
+        return;
+    }
+    OcclFlag::Add(stats.async_retried);
+    occl_queue->Discard(std::move(job));
+    u8& failures = occl_failures[parent_key][kind];
+    state = ++failures >= MaxTranslateFailures ? u8{2} : u8{0};
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptOcclSibling(
+    std::unique_ptr<TranslationJob> job, bool& retry) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    namespace OcclLean = VideoCommon::OcclLean;
+    retry = false;
+    const GraphicsPipelineCacheKey parent_key = job->parent_key;
+    const auto mark_parent_failed = [&] {
+        if (const auto it = graphics_cache.find(parent_key);
+            it != graphics_cache.end() && it->second) {
+            it->second->occl_class =
+                static_cast<u8>(static_cast<u8>(OcclLean::PipelineClass::Failed) + 1);
+        }
+    };
+    switch (job->outcome) {
+    case TranslationJob::Outcome::Built:
+        if (std::ranges::all_of(job->envs, [](GraphicsEnvironment& env) {
+                return env.TextureReadsStillMatch();
+            })) {
+            OcclFlag::Add(OcclFlag::g_stats.async_adopted);
+            OcclLean::Add(OcclLean::g_stats.made);
+            return std::move(job->pipeline);
+        }
+        break;
+    case TranslationJob::Outcome::Retry:
+    case TranslationJob::Outcome::Differs:
+        break;
+    case TranslationJob::Outcome::NoPipeline:
+    case TranslationJob::Outcome::Pending:
+        occl_queue->Discard(std::move(job));
+        OcclLean::Add(OcclLean::g_stats.failed);
+        mark_parent_failed();
+        return nullptr;
+    }
+    retry = true;
+    OcclFlag::Add(OcclFlag::g_stats.async_retried);
+    occl_queue->Discard(std::move(job));
+    if (++occl_failures[parent_key][0] >= MaxTranslateFailures) {
+        OcclLean::Add(OcclLean::g_stats.failed);
+        mark_parent_failed();
+    }
+    return nullptr;
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptOcclSiblingForDraw(bool& pending) {
+    pending = false;
+    auto job = occl_queue->Take(graphics_key, 0);
+    if (!job) {
+        if (DrawMayBeSkipped()) {
+            NoteSkippedLookup();
+            pending = true;
+            return nullptr;
+        }
+        // A draw that must not be skipped: wait a little, then build it here as any new key.
+        job = occl_queue->Wait(graphics_key, TranslateWaitCap, 0);
+        if (!job) {
+            occl_queue->Abandon(graphics_key, 0);
+            return CreateGraphicsPipeline(KeptPointers());
+        }
+    }
+    bool retry{};
+    auto pipeline = AdoptOcclSibling(std::move(job), retry);
+    if (pipeline || !retry) {
+        return pipeline; // null: it makes none, as this key's own translation would not either
+    }
+    return CreateGraphicsPipeline(KeptPointers());
 }
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipelineCacheKey& key,
