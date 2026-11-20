@@ -463,8 +463,11 @@ Zora's Domain facing King Zora, the view must follow the camera.
 
 ### FRITCHII_PROTECT_UNLOCKED
 
-On by default on every driver since 2026-11-18 (owner: a briefly late object beats a freeze; RTX 4080 market toggle 70.1 / 71.3 fps, no cost); first AMD/Intel only. (Helper AK, 2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live,
-FRITCHII_PROTECT_UNLOCKED=1 turns it on (Windows only). HostMemory's Protect (the write traps on
+On by default on every driver since 6862d0b (2026-11-20). Earlier docs said "since 2026-11-18", but
+the code still defaulted to 0 until that commit, so 6862d0b is its first default-on exposure (owner:
+a briefly late object beats a freeze; RTX 4080 market toggle 70.1 / 71.3 fps, no cost). (Helper AK,
+2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live, Windows only,
+FRITCHII_PROTECT_UNLOCKED=0 restores the locked path. HostMemory's Protect (the write traps on
 GPU-cached guest memory, 12,000-28,000 calls a second in OoT) took the placeholder lock before every
 VirtualProtect, and Map/Unmap hold that lock across their kernel calls, which slow from ~10 us to
 ~250 us while the game maps memory in bulk (zone changes): protections queued behind them and the
@@ -472,8 +475,13 @@ GPU thread stalled (their test: frames over 100 ms 37 -> 10 on one route). With 
 Protect first calls VirtualProtect on the whole range without the lock. It refuses a range that
 reaches a placeholder or a second view (a Map/Unmap under way, or a range across views); those take
 the lock and are protected view by view as before. Any interleaving ends as a Protect done wholly
-before or after the Map/Unmap. Log: "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): N
-without the lock, M took the lock". Measure with the "host protect" time and longest in the Hitch:
+before or after the Map/Unmap, but one: a partial Unmap that splits a view unmaps it whole and maps
+the kept parts again with PAGE_READWRITE, which would wipe a protection that landed on the old view.
+A split sequence counter (odd from before that unmap until after the last remap) guards it: an
+unlocked Protect that saw it odd or changed around its VirtualProtect is redone under the lock.
+Log: "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): N without the lock, M took the
+lock (placeholder or several views), R redone under the lock (a split Unmap ran alongside)".
+Measure with the "host protect" time and longest in the Hitch:
 lines around area loads.
 
 ### FRITCHII_ASYNC_REDRAWN
@@ -3363,10 +3371,14 @@ built yet. A variant waits in state 3 (queued).
 ### FRITCHII_OCCL_FLAG_COMPILE_THREADS (occlusion variant compile lane)
 
 FRITCHII_OCCL_FLAG_COMPILE_THREADS (boot, 0-8; 0 = the shared pipeline workers, as v6.2). Default
-with FRITCHII_OCCL_FLAG_ASYNC=1: clamp((logical processors - 1) * 2 / 7, 1, 4), as
-FRITCHII_OCCL_FLAG_ASYNC_THREADS (16 logical processors: 4), held within the legacy AMD cap (GCN4 or
-older on AMD's driver: 2, or EDEN_NX2_PIPELINE_WORKERS); 0 with FRITCHII_OCCL_FLAG_ASYNC=0. An
-explicit value wins (was 4 everywhere, before that 2). Made at boot or at the first variant request,
+with FRITCHII_OCCL_FLAG_ASYNC=1: 1 on AMD's proprietary driver (2026-11-20: with 4 lowest-priority
+compile threads a draw waited 4.3 s behind them inside AMD's driver during an area load; 1 removed
+the freeze, worst hitch 0.99 s); on every other driver clamp((logical processors - 1) * 2 / 7, 1, 4),
+as FRITCHII_OCCL_FLAG_ASYNC_THREADS (16 logical processors: 4), held within the legacy AMD cap
+(GCN4 or older on AMD's driver: 2, or EDEN_NX2_PIPELINE_WORKERS), as in v6.2 (1 thread was not
+measured there); 0 with FRITCHII_OCCL_FLAG_ASYNC=0. An explicit value wins (was 4 everywhere,
+before that 2). With FRITCHII_ONEF_LEAN=1 (a frontend default) the lane exists by default only on
+AMD's proprietary driver on a discrete GPU. Made at boot or at the first variant request,
 as FRITCHII_OCCL_FLAG_ASYNC's threads (above). The driver compiles of occlusion flag variants run
 on threads of their own ("VkOcclBuilder", lowest priority), so they never queue ahead of the game's
 own pipelines on the shared workers. No draw waits for one: flag variants are never cache entries
@@ -6551,10 +6563,16 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   contents sampled ... dropped by: cold sweep"), the dropped target's GPU address and shape (and
   the sampled image's own, when chain-shaped) go into a re-sampled set (at most 4,096 keys, the
   least recently seen out). A GPU-written target at such an address and shape is then skipped by
-  the regular sweep and by covered retire (FRITCHII_COVERED_RETIRE) while device memory is under
-  the collector's line (the "minimum" texture cache threshold, 1,536 MiB in the 9070 XT runs); over
-  it the sweep deletes it as before and the collector's rules apply, so the VRAM protection
-  stays. 2 also keeps from both any target sampled in a frame after its last GPU write
+  the regular sweep and by covered retire (FRITCHII_COVERED_RETIRE), only where the sweep would
+  delete it (after covered retire's coverage test and after the GpuModified guards: guarded or
+  uncovered images use no budget), within FRITCHII_COLD_SWEEP_KEEP_MIB of real device memory (each
+  kept image counts its own size plus its scaled copy when rescaled). A pressure gate releases
+  them (the sweep deletes as before and the collector's rules apply): while the driver's budget
+  binds (budget_pressure), for 600 frames after an image failed to allocate, or while the cache is
+  over the critical line plus max(1 GiB, critical / 4). The plain critical line released 1,515 of
+  1,642 kept targets in 9070 XT play (cache 6.8-9.7 GiB, critical 7.68 GiB), so the margin keeps
+  the rule useful there, while small cards release through the budget-pressure and failure
+  signals and get a smaller budget. 2 also keeps from both any target sampled in a frame after its last GPU write
   (GuardSampled). 3 (test, not default) is 2 plus a range keep: a GPU-written target whose memory
   overlaps a recently lost read (the reader's range of a "Lost contents sampled" line, the
   FRITCHII_LOST_KEEP ring of 128 ranges, learned under 3 even with FRITCHII_LOST_KEEP=0) is kept
@@ -6574,7 +6592,8 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   size (+ keys learned), lost contents sampled in those frames (dropped by the cold sweep, each
   drop counted once; "in the set when deleted": the drop's key was in the set at the delete;
   "more images over a drop already counted": further images read over a drop already counted;
-  not recorded), device memory and the keep line. Each "Lost contents sampled" line ends with
+  not recorded), device memory and the keep line, the keep budget and its use (real device memory),
+  and ", releasing: ..." with the gate's reason while it is shut. Each "Lost contents sampled" line ends with
   ", key in set at drop" when the drop's key was in the set at the delete. The lost-contents attribution ring (StaleDropRing) is 4,096 drops now (was 1,024):
   covered retire alone records ~140 a second there, so drops read again 7+ s later were "not
   recorded" (9-11 a run) and could not be learned.
@@ -8525,24 +8544,36 @@ held to the P-cores with CPU sets, released when they don't fit or after two 10 
 their own. 1 = strict with guards, 3 = strict without, 0 = off. Check the `CPU placement:` and
 `Hybrid placement in 10 s:` lines.
 
-- FRITCHII_COVERED_RETIRE_WRITEBACK (live, default 0 = off): covered retire (FRITCHII_COVERED_RETIRE) writes a
-  GPU-written target back to guest memory before deleting it, as the cold sweep does, so a later sample is not cleared
-  to zero ("Lost contents sampled ... cold sweep"). OoT Market A/B (RX 9070 XT): cold sweep losses 29 -> 12-15 a run and
-  "sampled again where one was deleted" 26 -> 10, pictures correct, but 11-14k write-backs a run for ~20 re-reads and a
-  slightly worse first camera spin in both runs. Off until a cheaper selection is measured. The covered retire line
-  reports "({} written back first)".
+- FRITCHII_COVERED_RETIRE_WRITEBACK (live, default 0 = off; experimental, not a validated option, do not enable or
+  suggest it): covered retire (FRITCHII_COVERED_RETIRE) writes a GPU-written target back to guest memory before
+  deleting it, as the cold sweep does, so a later sample is not cleared to zero ("Lost contents sampled ... cold
+  sweep"). OoT Market A/B (RX 9070 XT): cold sweep losses 29 -> 12-15 a run and "sampled again where one was deleted"
+  26 -> 10, but 11-14k write-backs a run for ~20 re-reads and a slightly worse first camera spin in both runs. Unsafe as
+  built: the covering images need not be GpuModified and the CPU-read flush paths record no write-back, so the landing
+  can write older bytes over newer covering data a CPU read already flushed; its landing can also clear stale marks
+  left by newer images; it crowds the shared write-back queue and ring and counts under the cold sweep's counters. A
+  future version needs a re-read gate, a covering-GpuModified check at queue time and at landing (or NoteWriteback on
+  the flush paths) and its own queue and counters. With 0 the path is as before; the covered retire line reports
+  "({} written back first)" (0).
 
-- FRITCHII_COLD_SWEEP_KEEP_MIB (live, MiB, default 256; 0 = keep only below the critical line): the budget for targets
-  FRITCHII_COLD_SWEEP_KEEP_RESAMPLED keeps, whatever the texture cache's size. In play the cache went past its critical
-  line (9.7 GiB on a 16 GiB card) and a memory line released 1,515 of 1,642 kept targets; a fixed budget bounds the
-  extra memory instead, and the collector stays the backstop. The "Cold sweep keep" line reports the budget in use.
+- FRITCHII_COLD_SWEEP_KEEP_MIB (live, MiB; default min(256, device-local heap / 32), so 128 on a 4 GiB card and 256
+  from 8 GiB up; 0 = keep only below the critical line): the budget for targets FRITCHII_COLD_SWEEP_KEEP_RESAMPLED
+  keeps, in real device memory (each kept image's size plus its scaled copy when rescaled; it counted guest bytes
+  before, which at 2x let 256 MiB hold about 1.25 GiB). In play the cache went past its critical line (9.7 GiB on a 16
+  GiB card) and a memory line released 1,515 of 1,642 kept targets; a budget bounds the extra memory instead. The
+  pressure gate still applies in both modes: nothing is kept while budget_pressure is set, for 600 frames after an
+  image failed to allocate, or over critical + max(1 GiB, critical / 4); the collector stays the backstop. The "Cold
+  sweep keep" line reports the budget in use and the gate's reason while it is shut.
 
-- FRITCHII_OCCL_FLAG_COMPILE_THREADS now defaults to 1 (was core-scaled 1-4): with 4 lowest-priority compile threads a
-  draw waited 4.3 s behind them inside AMD's driver during an area load; 1 thread removed the freeze in play (worst
-  hitch 4.3 s -> 0.99 s, the lane's share of hitch time 11.6 s -> 0.16 s). Explicit values still win.
+- FRITCHII_OCCL_FLAG_COMPILE_THREADS now defaults to 1 on AMD's proprietary driver only (elsewhere still core-scaled
+  1-4 within the legacy AMD cap, as v6.2): with 4 lowest-priority compile threads a draw waited 4.3 s behind them
+  inside AMD's driver during an area load; 1 thread removed the freeze in play (worst hitch 4.3 s -> 0.99 s, the
+  lane's share of hitch time 11.6 s -> 0.16 s). Not measured on other drivers. Explicit values still win.
 
-- FRITCHII_PROTECT_UNLOCKED: the code default is now 1 (the docs said "on by default since 2026-11-18", but the code
-  still defaulted to 0). Market A/B (RX 9070 XT): 99.9% of Protect calls skip the placeholder lock (about 2 million
+- FRITCHII_PROTECT_UNLOCKED: the code default is now 1, since 6862d0b (2026-11-20); the docs said "on by default
+  since 2026-11-18", but the code still defaulted to 0 until then, so this is its first default-on exposure. A split
+  sequence guard redoes under the lock an unlocked Protect that a partial (view-splitting) Unmap ran alongside, whose
+  PAGE_READWRITE remap would otherwise wipe it. Market A/B (RX 9070 XT): 99.9% of Protect calls skip the placeholder lock (about 2 million
   vs 1,400 a run), no change in load or spin frame times, no device loss. In play, area changes queued the GPU back
   thread's Protect calls behind guest Map/Unmap for up to 80-90 ms; this is the switch for that. FRITCHII_PROTECT_UNLOCKED=0
   restores the locked path.
