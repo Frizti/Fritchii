@@ -1329,13 +1329,19 @@ private:
     /// included) deleted and the game then sampled with lost contents, plus the sampled image's
     /// own address and shape; the value is the frame last seen. At most ColdResampledMax, the
     /// least recently seen out. A target made again at such an address and shape is kept by the
-    /// sweep while device memory is under the collector's line (minimum_memory); over it the
-    /// sweep deletes it as before. 2 also keeps images sampled in a frame after their last GPU
-    /// write (GuardSampled), from both. 3 also keeps GPU-written targets whose memory overlaps
-    /// a recently lost read (lost_read_ranges, 128 ranges), under the same keep budget.
+    /// sweep (only where it would delete it) within FRITCHII_COLD_SWEEP_KEEP_MIB of real device
+    /// memory (the image plus its scaled copy; default min(256 MiB, device-local / 32)); under
+    /// pressure (budget_pressure, an image that failed in the last ColdKeepFailedFrames, or the
+    /// cache over critical_memory + max(1 GiB, critical / 4)) the sweep deletes it as before.
+    /// 2 also keeps images sampled in a frame after their last GPU write (GuardSampled), from
+    /// both. 3 also keeps GPU-written targets whose memory overlaps a recently lost read
+    /// (lost_read_ranges, 128 ranges), under the same keep budget.
     static constexpr size_t ColdResampledMax = 4096;
     ::Common::unordered_map<u64, u64> cold_resampled;
     u32 cold_resampled_gen = 1; ///< Bumped by every change of the set (ImageBase::cold_keep_gen)
+    /// The frame an image last failed to allocate (0 = never): the keep's pressure gate.
+    u64 cold_keep_failed_frame{};
+    static constexpr u64 ColdKeepFailedFrames = 600;
     [[nodiscard]] static u64 ColdResampledKey(GPUVAddr gpu_addr, u64 shape_key) noexcept {
         return (gpu_addr * 0x9E3779B97F4A7C15ULL) ^ shape_key;
     }
