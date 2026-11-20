@@ -1312,6 +1312,7 @@ private:
     struct CoveredStats {
         u64 checked{};         ///< Coverage checks
         u64 sweep_deleted{};   ///< Deleted by the cold sweep
+        u64 written_back{};    ///< Of them, written back first (FRITCHII_COVERED_RETIRE_WRITEBACK)
         u64 collect_deleted{}; ///< Deleted by the collector without the download it would make
         u64 landing_deleted{}; ///< Queued collector downloads dropped as covered, image deleted
         u64 deleted_bytes{};   ///< Their device memory

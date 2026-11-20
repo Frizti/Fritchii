@@ -2734,6 +2734,24 @@ void TextureCache<P>::SweepColdImages() {
                         ++index;
                         continue;
                     }
+                    // FRITCHII_COVERED_RETIRE_WRITEBACK (live, default 1): written back to guest memory first, as
+                    // the cold sweep does (LostWriteback), so a later sample of this target is not cleared to
+                    // zero; deleted when the write-back lands, kept if used again first. 0 = deleted at once.
+                    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_covered_retire_writeback,
+                                                         "FRITCHII_COVERED_RETIRE_WRITEBACK", 1) != 0) {
+                        const LostWriteback wb = QueueLostWriteback(image_id, image, LostPathCold);
+                        if (wb == LostWriteback::Queued) {
+                            ++covered_deleted;
+                            ++covered_stats.sweep_deleted;
+                            ++covered_stats.written_back;
+                            drop();
+                            continue;
+                        }
+                        if (wb == LostWriteback::Keep) {
+                            ++index; // the queue is full: a later frame
+                            continue;
+                        }
+                    }
                     ++covered_deleted;
                     ++covered_stats.sweep_deleted;
                     cold_keep_stats.released += keep ? 1 : 0;
@@ -2870,12 +2888,12 @@ void TextureCache<P>::SweepColdImages() {
         if (covered_frames != 0 || c.checked != 0) {
             LOG_INFO(HW_GPU,
                      "Covered retire (FRITCHII_COVERED_RETIRE={}) last 600 frames: {} checked "
-                     "({:.2f} ms), deleted {} by the cold sweep, {} by the collector without a "
+                     "({:.2f} ms), deleted {} by the cold sweep ({} written back first), {} by the collector without a "
                      "download, {} queued downloads dropped as covered ({} MiB in all); {} kept "
                      "as busy, caps reached in {} frames; {} sampled again where one was "
                      "deleted (must stay near 0)",
                      covered_frames, c.checked, static_cast<double>(c.check_ns) / 1e6,
-                     c.sweep_deleted, c.collect_deleted, c.landing_deleted,
+                     c.sweep_deleted, c.written_back, c.collect_deleted, c.landing_deleted,
                      c.deleted_bytes >> 20, c.busy, c.capped_frames, c.sampled_after);
         }
         c = {};
