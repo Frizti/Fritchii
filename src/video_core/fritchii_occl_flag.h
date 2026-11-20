@@ -252,6 +252,10 @@ struct Stats {
     std::atomic<u64> persist_skip_dup{};
     std::atomic<u64> persist_skip_trap{};
     std::atomic<u64> persist_skip_unfit{};
+    /// FRITCHII_PREP_OCCL_VARIANTS: variants started from the kept SPIR-V the preparation made
+    /// for their parent (no snapshot, no translation), and kept ones that did not fit it.
+    std::atomic<u64> prepared_started{};
+    std::atomic<u64> prepared_unfit{};
     std::atomic<s64> window_start{};
 };
 inline Stats g_stats;
@@ -299,7 +303,9 @@ inline void MaybeLog() {
               persist_skip_envs = take_raw(g.persist_skip_envs),
               persist_skip_dup = take_raw(g.persist_skip_dup),
               persist_skip_trap = take_raw(g.persist_skip_trap),
-              persist_skip_unfit = take_raw(g.persist_skip_unfit);
+              persist_skip_unfit = take_raw(g.persist_skip_unfit),
+              prepared_started = take_raw(g.prepared_started),
+              prepared_unfit = take_raw(g.prepared_unfit);
     const double made = static_cast<double>(made_raw) / s;
     const double flag_draws = take(g.flag_draws), other = take(g.other_counted),
                  not_lean = take(g.not_lean), refused = take(g.refused_regs),
@@ -334,7 +340,8 @@ inline void MaybeLog() {
              "(FRITCHII_OCCL_FLAG_PERSIST): prebuilt queued {}, prebuilt adopted {}, prebuilt "
              "unused {}, memo refusals {}; recording: made {}, recorded {} ({} under their own "
              "shape), skipped: not recording {}, no environments {}, recorded already {}, trap "
-             "guard {}, sibling not fitting {}",
+             "guard {}, sibling not fitting {}; prepared (FRITCHII_PREP_OCCL_VARIANTS): started "
+             "{}, not fitting {}",
              RawMode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
              mixed, no_flag, reused, flag_slots, query_slots, colour_flag_draws, colour_made,
@@ -346,7 +353,7 @@ inline void MaybeLog() {
              async_deferred, async_in_flight_max, persist_queued, persist_adopted,
              persist_unused, persist_memo_refusals, persist_offered, persist_recorded,
              persist_recorded_own, persist_skip_off, persist_skip_envs, persist_skip_dup,
-             persist_skip_trap, persist_skip_unfit);
+             persist_skip_trap, persist_skip_unfit, prepared_started, prepared_unfit);
     std::string census;
     for (size_t i = 0; i < static_cast<size_t>(Census::Count); ++i) {
         census += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", CensusNames[i], take(g.census[i]));

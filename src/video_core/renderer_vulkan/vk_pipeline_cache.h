@@ -454,6 +454,24 @@ private:
     /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
     u64 occl_made_frame{~u64{0}};
 
+    /// FRITCHII_PREP_OCCL_VARIANTS: the occlusion flag variant kinds (bit per kind 1-5) a
+    /// pipeline can need, from its key and programs' infos alone (no draw): what the preparation
+    /// builds and keeps for it. Only kinds OcclKindWanted allows.
+    [[nodiscard]] u8 OcclPrepKinds(const GraphicsPipelineCacheKey& key,
+                                   std::span<const Shader::Info> infos,
+                                   bool emulated_mesh) const;
+    /// The kinds 1-5 this configuration and device make at all (bit per kind; 0 none).
+    [[nodiscard]] u8 OcclPrepMask() const;
+    /// FRITCHII_PREP_OCCL_VARIANTS: `full`'s `kind` variant built from the kept infos and SPIR-V
+    /// the preparation made for it (full came from the kept file), on the occlusion lane; null
+    /// when there is none, it does not fit full, or this frame's budget is spent (`later`).
+    std::unique_ptr<GraphicsPipeline> MakeKeptOcclVariant(GraphicsPipeline& full, u8 kind,
+                                                          bool& later);
+    /// Kept variants started a frame, and this frame's count.
+    static constexpr u32 OcclKeptPerFrame = 16;
+    u64 occl_kept_frame{~u64{0}};
+    u32 occl_kept_in_frame{};
+
     /// FRITCHII_OCCL_FLAG: hangs a made `kind` variant on `full` (its state 1), or sets the
     /// state to 2 when `made` is null or (pre-pass kinds) its descriptors differ from full's;
     /// a refused one is retired (RetireTranslatedPipeline), never destroyed on this thread. The
