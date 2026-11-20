@@ -6555,7 +6555,13 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   the collector's line (the "minimum" texture cache threshold, 1,536 MiB in the 9070 XT runs); over
   it the sweep deletes it as before and the collector's rules apply, so the VRAM protection
   stays. 2 also keeps from both any target sampled in a frame after its last GPU write
-  (GuardSampled). Why: at the OoT market 27-30 targets a 3-minute run (mostly 1280x720, also
+  (GuardSampled). 3 (test, not default) is 2 plus a range keep: a GPU-written target whose memory
+  overlaps a recently lost read (the reader's range of a "Lost contents sampled" line, the
+  FRITCHII_LOST_KEEP ring of 128 ranges, learned under 3 even with FRITCHII_LOST_KEEP=0) is kept
+  too, whatever its address and shape, under the same FRITCHII_COLD_SWEEP_KEEP_MIB budget. Cost:
+  a scan of at most 128 ranges per GPU-written cold candidate the set did not keep, only while a
+  range is on record. Aim: a loss whose drop key was already in the set (or a new target at
+  another address or shape over the same memory) is not kept by the key match. Why: at the OoT market 27-30 targets a 3-minute run (mostly 1280x720, also
   240x135 / 480x270 / 192x192 / 384x384) were sampled after the sweep took them and showed
   zeros ("upload skipped as stale, cleared to zero"; an RTX 5090 user logged 717 in 87 min, a
   pause-menu background in blocks). 28 of 29 came from covered retire (built-in
@@ -6563,10 +6569,13 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   that is why K=60 did not help. Turning the sweep off filled the card (14.3 of 14.3 GB) and
   crashed. Cost: nothing while the set is empty; then one cached lookup per cold candidate (the
   answer is kept per image until the set changes). Line every 600 frames "Cold sweep keep
-  (FRITCHII_COLD_SWEEP_KEEP_RESAMPLED=N)": images newly kept, kept now and their MiB, deletes
-  let through over the line, set size (+ keys learned), lost contents sampled in those frames
-  (by the cold sweep, of those at a key already in the set, not recorded), device memory and the
-  keep line. The lost-contents attribution ring (StaleDropRing) is 4,096 drops now (was 1,024):
+  (FRITCHII_COLD_SWEEP_KEEP_RESAMPLED=N)": images newly kept (of them as sampled after their
+  write, and "by range" under 3), kept now and their MiB, deletes let through over the line, set
+  size (+ keys learned), lost contents sampled in those frames (dropped by the cold sweep, each
+  drop counted once; "in the set when deleted": the drop's key was in the set at the delete;
+  "more images over a drop already counted": further images read over a drop already counted;
+  not recorded), device memory and the keep line. Each "Lost contents sampled" line ends with
+  ", key in set at drop" when the drop's key was in the set at the delete. The lost-contents attribution ring (StaleDropRing) is 4,096 drops now (was 1,024):
   covered retire alone records ~140 a second there, so drops read again 7+ s later were "not
   recorded" (9-11 a run) and could not be learned.
 

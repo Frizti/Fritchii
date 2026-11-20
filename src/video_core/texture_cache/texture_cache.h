@@ -872,6 +872,7 @@ void TextureCache<P>::RecordStaleDrop(const ImageBase& image) {
             return;
         }
     }
+    const u64 shape_key = RelocationShapeKey(image.info);
     stale_drops[stale_drop_next] = StaleDrop{
         .cpu_addr = image.cpu_addr,
         .size = image.guest_size_bytes,
@@ -883,19 +884,23 @@ void TextureCache<P>::RecordStaleDrop(const ImageBase& image) {
         .reason = marking_relocation ? LostReasonRelocate : static_cast<u8>(delete_reason),
         .guard = image.relocation_guard_noted,
         .why = image.lost_drop_why,
-        .shape_key = RelocationShapeKey(image.info),
+        .shape_key = shape_key,
+        .known = static_cast<u8>(
+            !cold_resampled.empty() &&
+            cold_resampled.contains(ColdResampledKey(image.gpu_addr, shape_key))),
+        .counted = 0,
     };
     stale_drop_next = (stale_drop_next + 1) % StaleDropRing;
     stale_drop_count = (std::min)(stale_drop_count + 1, StaleDropRing);
 }
 
 template <class P>
-auto TextureCache<P>::FindStaleDrop(DAddr addr, size_t size) const -> const StaleDrop* {
+auto TextureCache<P>::FindStaleDrop(DAddr addr, size_t size) -> StaleDrop* {
     // A join copied its overlaps into the new image before deleting them: another drop there,
     // if any, is the one that lost data.
-    const StaleDrop* join = nullptr;
+    StaleDrop* join = nullptr;
     for (size_t i = 0; i < stale_drop_count; ++i) {
-        const StaleDrop& drop =
+        StaleDrop& drop =
             stale_drops[(stale_drop_next + StaleDropRing - 1 - i) % StaleDropRing];
         if (drop.cpu_addr < addr + size && addr < drop.cpu_addr + drop.size) {
             if (drop.reason != static_cast<u8>(DeleteReason::Join)) {
@@ -924,23 +929,28 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
     image.lost_contents = 0; // counted once
     ++((bits & LostDrawn) != 0 ? s.sampled_drawn : s.sampled_undrawn);
     s.sampled_bytes += image.guest_size_bytes;
-    const StaleDrop* const drop = FindStaleDrop(image.cpu_addr, image.guest_size_bytes);
+    StaleDrop* const drop = FindStaleDrop(image.cpu_addr, image.guest_size_bytes);
     const size_t reason = drop == nullptr                         ? 9
                           : drop->reason == LostReasonRelocate     ? 8
                           : (std::min<size_t>)(drop->reason, 7);
     ++s.sampled_by_reason[reason];
     // FRITCHII_COLD_SWEEP_KEEP_RESAMPLED: the game reads this memory again after the cold sweep
     // (covered retire included) dropped it: the dropped target's address and shape, and this
-    // image's, are kept by the sweep from now on (while memory allows).
+    // image's, are kept by the sweep from now on (while memory allows). Each drop counts once
+    // (later images over it are repeats); "known" is whether its key was in the set when deleted.
+    const int cold_keep_mode = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_cold_sweep_keep_resampled, "FRITCHII_COLD_SWEEP_KEEP_RESAMPLED", 1);
     ++cold_keep_stats.lost_all;
     cold_keep_stats.lost_not_recorded += drop == nullptr ? 1 : 0;
     if (drop != nullptr && drop->reason == static_cast<u8>(DeleteReason::ColdSweep)) {
-        ++cold_keep_stats.lost_cold;
-        if (cold_resampled.contains(ColdResampledKey(drop->gpu_addr, drop->shape_key))) {
-            ++cold_keep_stats.lost_cold_known;
+        if (drop->counted != 0) {
+            ++cold_keep_stats.lost_cold_repeat;
+        } else {
+            drop->counted = 1;
+            ++cold_keep_stats.lost_cold;
+            cold_keep_stats.lost_cold_known += drop->known;
         }
-        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cold_sweep_keep_resampled,
-                                             "FRITCHII_COLD_SWEEP_KEEP_RESAMPLED", 1) > 0) {
+        if (cold_keep_mode > 0) {
             LearnColdResampled(drop->gpu_addr, drop->shape_key);
             if (RelocationShaped(image.info)) {
                 LearnColdResampled(image.gpu_addr, RelocationShapeKey(image.info));
@@ -967,9 +977,11 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
                        : static_cast<u8>(LostWhyNone);
     ++s.sampled_by_why[why];
     // FRITCHII_LOST_KEEP: this memory is read after going cold; the next drop over it is written
-    // back whatever its size (relocation has its guards instead).
-    if (reason != 8 && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
-                                                        "FRITCHII_LOST_KEEP", 1) > 0) {
+    // back whatever its size (relocation has its guards instead). FRITCHII_COLD_SWEEP_KEEP_RESAMPLED=3
+    // keeps GPU-written targets over these ranges from the sweep, so it learns them too.
+    if (reason != 8 && (cold_keep_mode >= 3 ||
+                        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
+                                                         "FRITCHII_LOST_KEEP", 1) > 0)) {
         LearnLostRead(image.cpu_addr, image.guest_size_bytes);
     }
     // The first 40 of the session, then 2 per 10 s window (the flashes a tester reports come
@@ -986,7 +998,7 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
         LOG_WARNING(HW_GPU,
                     "Lost contents sampled: format {} {}x{} levels {} at {:#x} ({} KiB), {}{}{}; "
                     "the memory's GPU data was dropped by: {} (format {} {}x{} at {:#x}, {} "
-                    "frames ago, guard {:#x}, {})",
+                    "frames ago, guard {:#x}, {}{})",
                     static_cast<u32>(image.info.format), image.info.size.width,
                     image.info.size.height, image.info.resources.levels, image.gpu_addr,
                     image.guest_size_bytes >> 10,
@@ -995,7 +1007,8 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
                     (bits & LostDrawn) != 0 ? ", drawn into without a full clear" : ", not drawn into",
                     names[reason], drop ? drop->format : 0u, drop ? drop->width : 0u,
                     drop ? drop->height : 0u, drop ? drop->gpu_addr : GPUVAddr{0},
-                    drop ? frame_tick - drop->frame : 0, drop ? drop->guard : u8{0}, whys[why]);
+                    drop ? frame_tick - drop->frame : 0, drop ? drop->guard : u8{0}, whys[why],
+                    drop != nullptr && drop->known != 0 ? ", key in set at drop" : "");
     }
 }
 
@@ -2694,9 +2707,25 @@ void TextureCache<P>::SweepColdImages() {
         return true;
     };
     const bool keep_room = total_used_memory < keep_limit;
+    // 3 also keeps targets whose memory overlaps a recently lost read (lost_read_ranges: at most
+    // LostReadRing ranges, scanned only for GPU-written candidates the set did not keep).
     const auto keep_rule = [&](Image& image) {
-        return keep_mode > 0 && True(image.flags & ImageFlagBits::GpuModified) &&
-               ColdKeepResampled(image, keep_mode);
+        if (keep_mode <= 0 || False(image.flags & ImageFlagBits::GpuModified)) {
+            return false;
+        }
+        if (ColdKeepResampled(image, keep_mode)) {
+            return true;
+        }
+        if (keep_mode < 3 || lost_read_count == 0 ||
+            !OverlapsLostRead(image.cpu_addr, image.guest_size_bytes)) {
+            return false;
+        }
+        if ((image.cold_keep & 2) == 0) {
+            image.cold_keep |= 2;
+            ++cold_keep_stats.kept_new;
+            ++cold_keep_stats.kept_range;
+        }
+        return true;
     };
     const auto count_kept = [&](Image& image) {
         const u32 frame = static_cast<u32>(frame_tick);
@@ -2942,14 +2971,16 @@ void TextureCache<P>::SweepColdImages() {
         auto& k = cold_keep_stats;
         LOG_INFO(HW_GPU,
                  "Cold sweep keep (FRITCHII_COLD_SWEEP_KEEP_RESAMPLED={}) last 600 frames: {} "
-                 "images newly kept by the rule ({} as sampled after their write), {} kept now "
-                 "({} MiB), {} deleted all the same as memory was over the line; re-sampled set "
-                 "{} entries (+{}); lost contents sampled {} ({} dropped by the cold sweep, {} of "
-                 "those at an address and shape already in the set; not recorded {}); device "
-                 "memory {} MiB, keep line {} MiB{}; keep budget {} MiB (in use {} MiB)",
-                 keep_mode, k.kept_new, k.kept_sampled, k.kept_now, k.kept_now_bytes >> 20,
-                 k.released, cold_resampled.size(), k.learned, k.lost_all, k.lost_cold,
-                 k.lost_cold_known, k.lost_not_recorded, total_used_memory >> 20,
+                 "images newly kept by the rule ({} as sampled after their write, {} by range), "
+                 "{} kept now ({} MiB), {} deleted all the same as memory was over the line; "
+                 "re-sampled set {} entries (+{}); lost contents sampled {} ({} dropped by the "
+                 "cold sweep, {} of those in the set when deleted; {} more images over a drop "
+                 "already counted; not recorded {}); device memory {} MiB, keep line {} MiB{}; "
+                 "keep budget {} MiB (in use {} MiB)",
+                 keep_mode, k.kept_new, k.kept_sampled, k.kept_range, k.kept_now,
+                 k.kept_now_bytes >> 20, k.released, cold_resampled.size(), k.learned, k.lost_all,
+                 k.lost_cold, k.lost_cold_known, k.lost_cold_repeat, k.lost_not_recorded,
+                 total_used_memory >> 20,
                  keep_limit >> 20, keep_room ? "" : " (over the line)", keep_budget >> 20,
                  keep_spent >> 20);
         k = {};

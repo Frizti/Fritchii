@@ -1331,7 +1331,8 @@ private:
     /// least recently seen out. A target made again at such an address and shape is kept by the
     /// sweep while device memory is under the collector's line (minimum_memory); over it the
     /// sweep deletes it as before. 2 also keeps images sampled in a frame after their last GPU
-    /// write (GuardSampled), from both.
+    /// write (GuardSampled), from both. 3 also keeps GPU-written targets whose memory overlaps
+    /// a recently lost read (lost_read_ranges, 128 ranges), under the same keep budget.
     static constexpr size_t ColdResampledMax = 4096;
     ::Common::unordered_map<u64, u64> cold_resampled;
     u32 cold_resampled_gen = 1; ///< Bumped by every change of the set (ImageBase::cold_keep_gen)
@@ -1346,11 +1347,13 @@ private:
         u64 kept_now{};        ///< Images kept in the report's frame
         u64 kept_now_bytes{};  ///< Their device memory
         u64 kept_sampled{};    ///< Of kept_new: by the sampled-after-write rule (mode 2)
+        u64 kept_range{};      ///< Of kept_new: over a recently lost read's range (mode 3)
         u64 released{};        ///< Would be kept, deleted as memory was over the line
         u64 learned{};         ///< Keys added to the set
         u64 lost_all{};        ///< Lost contents sampled (any drop)
-        u64 lost_cold{};       ///< ... dropped by the cold sweep
-        u64 lost_cold_known{}; ///< ... whose drop's key was in the set already
+        u64 lost_cold{};       ///< ... dropped by the cold sweep (each drop once)
+        u64 lost_cold_known{}; ///< ... whose drop's key was in the set when deleted
+        u64 lost_cold_repeat{}; ///< More images sampled over a cold drop already counted
         u64 lost_not_recorded{}; ///< ... with no drop on record
     } cold_keep_stats{};
     std::vector<std::pair<DAddr, DAddr>> covered_ranges; ///< Scratch for CoveredByNewerWrites
@@ -1626,6 +1629,8 @@ private:
         u8 guard;    ///< The image's relocation_guard_noted
         u8 why;      ///< LostWhy: why no write-back saved it
         u64 shape_key; ///< RelocationShapeKey (a relocation's loss guards the shape)
+        u8 known;    ///< (gpu_addr, shape_key) was in cold_resampled when dropped
+        u8 counted;  ///< A cold-sweep loss over this drop was counted already
     };
     static constexpr u8 LostReasonRelocate = 0x40;
     // 4096 (was 1024): covered retire alone records ~140 drops a second at the OoT market, so a
@@ -1703,7 +1708,7 @@ private:
     /// Takes `bytes` of the budget; guarded (not learned) images leave half of it to learned ones.
     bool TakeLostKeepBudget(u64 bytes, bool learned, int keep);
     /// The drop that left [addr, addr + size) stale, newest first (nullptr: none recorded).
-    [[nodiscard]] const StaleDrop* FindStaleDrop(DAddr addr, size_t size) const;
+    [[nodiscard]] StaleDrop* FindStaleDrop(DAddr addr, size_t size);
     void RecordStaleDrop(const ImageBase& image);
     /// FRITCHII_STALE_ZERO: clears an image whose upload the stale skip dropped to zero (every
     /// level and layer) instead of leaving it undefined; false where it cannot (then undefined).
