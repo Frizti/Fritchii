@@ -2670,7 +2670,10 @@ void TextureCache<P>::SweepColdImages() {
         VideoCore::Nx2Debug::g_cold_sweep_keep_resampled, "FRITCHII_COLD_SWEEP_KEEP_RESAMPLED", 1);
     // The expected threshold: the collector starts deleting by age above minimum_memory (1.5 GiB),
     // which play exceeds at once on large cards, so that line kept nothing in practice.
-    const u64 keep_limit = expected_memory;
+    // The critical threshold: at the market the cache runs at 6.8-7.6 GiB during the sweep, above
+    // the expected line (6 GiB on a 16 GiB card), so that line kept nothing; the kept targets are
+    // small (~40 mostly 1280x720 a run) and above critical the collector's rules apply as before.
+    const u64 keep_limit = critical_memory;
     const bool keep_room = total_used_memory < keep_limit;
     const auto keep_rule = [&](Image& image) {
         return keep_mode > 0 && True(image.flags & ImageFlagBits::GpuModified) &&
