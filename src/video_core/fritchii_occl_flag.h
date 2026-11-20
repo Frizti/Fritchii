@@ -235,6 +235,9 @@ struct Stats {
     /// once because the file remembers their descriptors differing (no snapshot, no translation).
     std::atomic<u64> persist_queued{};
     std::atomic<u64> persist_adopted{};
+    /// Prebuilt ones not used: their record did not read back or build, or the variant no
+    /// longer fits this session's parent (left to the draws).
+    std::atomic<u64> persist_unused{};
     std::atomic<u64> persist_memo_refusals{};
     std::atomic<s64> window_start{};
 };
@@ -274,6 +277,7 @@ inline void MaybeLog() {
               async_in_flight_max = take_raw(g.async_in_flight_max),
               persist_queued = take_raw(g.persist_queued),
               persist_adopted = take_raw(g.persist_adopted),
+              persist_unused = take_raw(g.persist_unused),
               persist_memo_refusals = take_raw(g.persist_memo_refusals);
     const double made = static_cast<double>(made_raw) / s;
     const double flag_draws = take(g.flag_draws), other = take(g.other_counted),
@@ -306,8 +310,8 @@ inline void MaybeLog() {
              "in the window: made {}, colour made {}, pre-pass made {}, pre-pass refused {}; "
              "async variants (FRITCHII_OCCL_FLAG_ASYNC): queued {}, adopted {}, stale/retried "
              "{}, discarded {}, not queued (budget or full) {}, in flight at most {}; on disk "
-             "(FRITCHII_OCCL_FLAG_PERSIST): prebuilt queued {}, prebuilt adopted {}, memo "
-             "refusals {}",
+             "(FRITCHII_OCCL_FLAG_PERSIST): prebuilt queued {}, prebuilt adopted {}, prebuilt "
+             "unused {}, memo refusals {}",
              RawMode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
              mixed, no_flag, reused, flag_slots, query_slots, colour_flag_draws, colour_made,
@@ -317,7 +321,7 @@ inline void MaybeLog() {
              discard_direct_draws, made_raw, colour_made_raw, prepass_made_raw,
              prepass_refused_raw, async_queued, async_adopted, async_retried, async_discarded,
              async_deferred, async_in_flight_max, persist_queued, persist_adopted,
-             persist_memo_refusals);
+             persist_unused, persist_memo_refusals);
     std::string census;
     for (size_t i = 0; i < static_cast<size_t>(Census::Count); ++i) {
         census += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", CensusNames[i], take(g.census[i]));

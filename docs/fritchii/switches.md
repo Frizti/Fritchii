@@ -3277,14 +3277,16 @@ built yet. A variant waits in state 3 (queued).
 - Made only when FRITCHII_OCCL_FLAG was not 0 at boot or FRITCHII_OCCL_LEAN is set.
 - On Intel's driver (FRITCHII_INTEL_PCACHE_FETCH) the translations and both compile lanes are
   drained before the pipeline cache is fetched between programs.
-- FRITCHII_OCCL_FLAG_ASYNC_THREADS (boot, default 2, 1-8): its threads.
-- FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME (boot, default 4, 1-64): jobs queued a frame at most (each
-  copies the draw's environments on the lookup thread); at most 32 in flight. Over either, the
-  variant is asked again at a later draw.
+- FRITCHII_OCCL_FLAG_ASYNC_THREADS (boot, default 4, 1-8; was 2): its threads.
+- FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME (boot, default 8, 1-64; was 4): jobs queued a frame at most
+  (each copies the draw's environments on the lookup thread); at most 32 in flight. Over either,
+  the variant is asked again at a later draw.
+- The defaults of these two and of FRITCHII_OCCL_FLAG_COMPILE_THREADS (4/8/4, were 2/4/2) are
+  the arms that won the A/B runs at the Market fountain.
 
 ### FRITCHII_OCCL_FLAG_COMPILE_THREADS (occlusion variant compile lane)
 
-FRITCHII_OCCL_FLAG_COMPILE_THREADS (boot, default 2 with FRITCHII_OCCL_FLAG_ASYNC=1 and 0 with it at
+FRITCHII_OCCL_FLAG_COMPILE_THREADS (boot, default 4 (was 2) with FRITCHII_OCCL_FLAG_ASYNC=1 and 0 with it at
 0, 0-8; 0 = the shared pipeline workers, as v6.2). The driver compiles of occlusion flag variants run
 on threads of their own ("VkOcclBuilder", lowest priority), so they never queue ahead of the game's
 own pipelines on the shared workers. No draw waits for one: flag variants are never cache entries
@@ -3307,46 +3309,76 @@ it). Occlusion flag variants (all five kinds) and lean siblings are never in the
 every session translated them again: at the Market about 770 a session, 11-26 ms of worker time
 each, plus about 650 pre-pass variants translated only to be refused for their descriptors. With it
 they are kept in a file of their own beside the disk cache, vulkan-frizti-occl.fork-v<N>.bin (header
-"occl_v1", the cache version and the key size; the disk cache file, its used list and the prepared
-shader stamp are never touched).
+"occl_v2", the cache version and the key size; the disk cache file, its used list and the prepared
+shader stamp are never touched). A file of the first format ("occl_v1") is started again.
 - Recorded: each variant attached to its pipeline (state 1), from the asynchronous path
   (FRITCHII_OCCL_FLAG_ASYNC) or the synchronous one, and each lean sibling made: the kind (0 a
-  sibling, 1-5 the flag variants), the parent pipeline's key, the key it was built as (kinds 4 and
-  5: every attachment's writes off; a sibling: no pixel program) and the environments it was
+  sibling, 1-5 the flag variants), the parent pipeline's key and descriptor signature (a hash of
+  its stages' descriptor lists, texture and image types included), the key it was built as (kinds
+  4 and 5: every attachment's writes off; a sibling: no pixel program) and the environments it was
   translated from, serialized exactly as the disk cache serializes them (the same snapshot the
-  build used). Once per parent key and kind (the file's records count). Written on the
-  serialization thread; a failure is logged once and never affects rendering.
+  build used; the finished job is handed to the serialization thread, nothing is copied on the GPU
+  thread). Only a variant whose guest stages describe exactly its parent's descriptors is recorded
+  (every stage; all but the pixel one for kinds 1 and 4 and siblings), since only such a one may be
+  used from the file. Once per parent key and kind, again after its record was not usable. Written
+  on the serialization thread; a failure is logged once and never affects rendering.
 - Lean siblings go in this file (kind 0), not the disk cache: the disk cache builds at boot every
   key recent sessions used whatever the switches, while siblings are wanted only with
   FRITCHII_OCCL_LEAN (a live switch, default 0) on; and that file is also merged with and imported
   from other builds' caches.
-- Refusal memo: a pre-pass variant (kinds 3 and 5) refused because its descriptors differ from its
-  pipeline's is remembered (the parent key's hash without the driver fields, and the kind). Next
-  session such a variant is refused at once (state 2): no snapshot, no translation. Applies with
-  FRITCHII_OCCL_FLAG_ASYNC=0 too.
-- At boot, after the disk cache's boot builds, the file is read on the serialization thread. The
-  GPU thread then queues on occl_queue (FRITCHII_OCCL_FLAG_ASYNC=1 only) each record whose parent is
-  in the pipeline cache and built, whose kind the current FRITCHII_OCCL_FLAG level and one-follower
-  state can use (FRITCHII_ONEF_OCCL with one follower on; its pre-pass kinds only with
-  FRITCHII_ONEF_OCCL_PREPASS; siblings only with FRITCHII_OCCL_LEAN 1 or 2 and one follower) and
-  that no draw made, refused or queued yet: built from the recorded environments (as the disk
-  cache's prebuild builds from its records, not from guest memory), attached between frames as a
-  draw-asked variant (state 3 while queued; the compile on the occlusion lane). At most 8 a frame
-  and while fewer than 16 occlusion jobs are in flight, so the draws' own variants keep room; they
-  go on in the background after boot. Records whose parent is not built yet (built later by a draw
-  or the background prebuild) or whose kind is not wanted at the current level stay pending and are
-  looked at again every 60 frames. A prebuilt variant whose record does not build is left to the
-  draws (never refused for it). Records of another GPU driver are rekeyed to this one, as the disk
-  cache's.
+- Used only when it still fits (no wrong picture from another session's state): a variant built
+  from its record is attached only when this session's parent has the descriptor signature it was
+  recorded with (the parent built from environments of the same shape), when the variant's guest
+  stages describe exactly the parent's descriptors (same storage pointers, same texture types: a
+  colour variant is drawn in the parent's place) and, for a pre-pass, when the parent can bind its
+  descriptors. Otherwise (or when it does not read back or build) it is dropped, never refused for:
+  a draw makes the variant from its own state, and that one is recorded in place of the record (the
+  last record of a parent and kind is the one read).
+- Refusal memo: a pre-pass variant (kinds 3 and 5) made from a draw's state and refused because its
+  descriptors differ from its pipeline's is noted (one note a session per parent and kind), keyed by
+  the parent key's hash without the driver fields, the parent's descriptor signature and this
+  build (its revision and a memo version bumped when the pre-pass translation changes). Once two
+  sessions of this build refused it, such a variant is refused at once (state 2): no snapshot, no
+  translation. Applies with FRITCHII_OCCL_FLAG_ASYNC=0 too. A prebuilt one that does not fit is
+  never noted. Another build, or a parent built from other environments, starts afresh.
+- At boot, after the disk cache's boot builds, the file is read on the loader thread (it waits only
+  for this title's own record writes still queued, never for a VkPipelineCache save) and handed to
+  the GPU thread. Only each record's place in the file is kept in memory, not its contents: the
+  translation thread reads its environments back (and checks their CityHash64) when it builds it.
+  With FRITCHII_OCCL_FLAG_ASYNC=1 records are queued on occl_queue and built from the recorded
+  environments (as the disk cache's prebuild builds from its records, not from guest memory),
+  attached between frames as a draw-asked variant (state 3 while queued; the compile on the
+  occlusion lane):
+  - when a draw asks for a variant that has a record not queued yet, the record is queued in place
+    of a snapshot (none taken, no per-frame budget spent);
+  - in the background, records whose parent is in the pipeline cache and built, whose kind the
+    current FRITCHII_OCCL_FLAG level and one-follower state can use (FRITCHII_ONEF_OCCL with one
+    follower on; its pre-pass kinds only with FRITCHII_ONEF_OCCL_PREPASS; siblings only with
+    FRITCHII_OCCL_LEAN 1 or 2 and one follower) and that no draw made, refused or queued yet: at
+    most 8 a frame and only while fewer than FRITCHII_OCCL_FLAG_ASYNC_THREADS + 1 occlusion jobs are
+    in flight, so a draw's own variant waits behind one round of them at most. A walk looks at 512
+    pending records at most and resumes where it stopped: every frame while records wait for room,
+    else every 15 frames.
+  Records of another GPU driver are rekeyed to this one, as the disk cache's.
+- Kept small: at boot the file is compacted (rewritten beside it and renamed over it; on any
+  failure it is used as it is) once superseded records, refusal notes past two and records this
+  build cannot use free a quarter of it and at least 4 MiB; past 128 MiB the oldest records go
+  too, down to 96 MiB (a record still used is written again by its draw).
+- A later program or title (LoadDiskResources again) stops the recording into the previous file at
+  once; the new one's file is recorded into once its read is handed over (also when it was not read).
 - Robustness: a file of another version (or not this file) is ignored and started again; a
   truncated or corrupt record (each has its size and a CityHash64 of its contents) is cut off with
-  everything after it, the records before it kept. Logged once.
+  everything after it, the records before it kept. A record that changed since boot or does not
+  read back is left to the draws. Logged once.
+- Benchmarks: a cold arm must remove or restore this file together with the disk cache snapshot;
+  otherwise the variants of the previous run are prebuilt.
 
-Logs: at boot "Occlusion variants on disk: N records (M refused memo), P queued at boot, R later or
-never (...)" (P: records whose parent is built and kind wanted at the first frame; they are queued
-over the next frames). The "Occlusion flags" line adds "on disk (FRITCHII_OCCL_FLAG_PERSIST):
-prebuilt queued, prebuilt adopted, memo refusals" for the window. The boot line "Occlusion variants:
-..." ends with "kept on disk: yes/no".
+Logs: at boot "Occlusion variants on disk: N records (R refusals, P parents in the memo), B with
+their parent built at boot, L later or never (...)" (B: queued over the next frames), and a
+"compacted from X to Y MiB" line when it was. The "Occlusion flags" line adds "on disk
+(FRITCHII_OCCL_FLAG_PERSIST): prebuilt queued, prebuilt adopted, prebuilt unused, memo refusals" for
+the window (unused: built from a record but not attached because it no longer fits or did not
+build). The boot line "Occlusion variants: ..." ends with "kept on disk: yes/no".
 
 ### EDEN_NX2_GPU_PROFILE=2: E's draw method zones (helper CP)
 

@@ -537,6 +537,11 @@ public:
     /// On a flag variant: 1 its translation's descriptors equal its parent's (the parent can
     /// bind them for a real draw after a pre-pass), 2 they differ.
     u8 occl_same_descriptors{};
+    /// FRITCHII_OCCL_FLAG_PERSIST, as a parent (GPU thread, computed once; 0 not yet): the hash
+    /// of its descriptor lists (PipelineCache's OcclDescriptorSignature), and its refusal memo
+    /// hash (its key without the driver fields, that signature and this build).
+    u64 occl_persist_signature{};
+    u64 occl_persist_memo{};
     /// On a flag variant: its last Configure's rescaling words and render area, which the
     /// parent pushes again when it is bound for the real draw after a pre-pass
     /// (ConfigureAfterOcclPrepass).

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -78,12 +79,23 @@ struct TranslationJob {
     /// with FRITCHII_OCCL_FLAG_PERSIST a used one is recorded in the occlusion file.
     bool occl{};
     u8 occl_kind{};
-    /// FRITCHII_OCCL_FLAG_PERSIST: built from its record in the occlusion file (`file_envs`, the
-    /// recorded environments, as the disk cache's prebuild builds; `envs` unused), not from a
-    /// draw's snapshot. Its texture reads are not checked against the live state, a failure
-    /// leaves the variant to a later draw, and it is never recorded again.
+    /// FRITCHII_OCCL_FLAG_PERSIST: built from its record in the occlusion file (`occl_file`: the
+    /// translation thread reads the recorded environments back, as the disk cache's prebuild
+    /// builds; `envs` unused), not from a draw's snapshot. Its texture reads are not checked
+    /// against the live state: it is attached only to a parent whose descriptor signature is
+    /// `occl_parent_signature` (the parent's when it was recorded). A record that does not read
+    /// back or build, or does not fit, leaves the variant to a later draw (never refused for it).
     bool prebuilt{};
-    std::shared_ptr<std::vector<VideoCommon::FileEnvironment>> file_envs;
+    struct OcclFileRecord {
+        std::shared_ptr<const std::filesystem::path> path;
+        u64 offset{};      ///< Of the payload
+        u32 size{};        ///< Payload bytes
+        u64 hash{};        ///< CityHash64 of the payload
+        u32 envs_offset{}; ///< In the payload: where the environments start
+        u32 num_envs{};
+    };
+    OcclFileRecord occl_file;
+    u64 occl_parent_signature{};
     GraphicsPipelineCacheKey parent_key{};
 
     // Written by the translation thread.

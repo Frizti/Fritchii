@@ -606,8 +606,8 @@ int OcclAsyncSwitch(const char* name, int fallback, int low, int high) {
 }
 
 /// FRITCHII_OCCL_FLAG_ASYNC (boot, default 1): occlusion flag variants and lean siblings are
-/// translated on occl_queue's threads (FRITCHII_OCCL_FLAG_ASYNC_THREADS, default 2) instead of
-/// on the lookup thread, at most FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME (default 4) queued a frame
+/// translated on occl_queue's threads (FRITCHII_OCCL_FLAG_ASYNC_THREADS, default 4) instead of
+/// on the lookup thread, at most FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME (default 8) queued a frame
 /// and MaxOcclJobsInFlight at once. 0: translated on the lookup thread, one a frame (v6.2).
 constexpr size_t MaxOcclJobsInFlight = 32;
 /// FRITCHII_OCCL_FLAG_ASYNC: a variant's state while its translation is queued (0 not tried,
@@ -1327,7 +1327,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         // FRITCHII_OCCL_FLAG_ASYNC=0 alone is v6.2: the lane defaults to none then.
         const bool occl_async = OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC", 1, 0, 1) != 0;
         const int compile_threads =
-            OcclAsyncSwitch("FRITCHII_OCCL_FLAG_COMPILE_THREADS", occl_async ? 2 : 0, 0, 8);
+            OcclAsyncSwitch("FRITCHII_OCCL_FLAG_COMPILE_THREADS", occl_async ? 4 : 0, 0, 8);
         if (compile_threads > 0) {
             const auto count = static_cast<size_t>(compile_threads);
             occl_compile_workers = std::unique_ptr<Common::ThreadWorker>(new Common::ThreadWorker(
@@ -1346,9 +1346,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         }
         if (occl_async) {
             const auto threads =
-                static_cast<size_t>(OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_THREADS", 2, 1, 8));
+                static_cast<size_t>(OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_THREADS", 4, 1, 8));
             occl_async_per_frame =
-                static_cast<u32>(OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME", 4, 1, 64));
+                static_cast<u32>(OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME", 8, 1, 64));
+            occl_queue_threads = threads;
             occl_queue = std::make_unique<TranslateQueue>(
                 threads, MaxOcclJobsInFlight,
                 [this](TranslationJob& job) { TranslateOnWorker(job); },
@@ -1366,8 +1367,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                  "(FRITCHII_OCCL_FLAG_PERSIST)",
                  occl_queue ? fmt::format("on {} threads of their own, at most {} queued a "
                                           "frame",
-                                          OcclAsyncSwitch("FRITCHII_OCCL_FLAG_ASYNC_THREADS", 2,
-                                                          1, 8),
+                                          occl_queue_threads,
                                           occl_async_per_frame)
                             : std::string{"on the lookup thread, one a frame"},
                  occl_queue ? 1 : 0,
@@ -4052,6 +4052,99 @@ bool OcclFlagSameDescriptors(const GraphicsPipeline& a, const GraphicsPipeline& 
     return true;
 }
 
+/// FRITCHII_OCCL_FLAG_PERSIST: whether flag variant `kind` (0 a lean sibling) describes the
+/// descriptors of the stages it takes from the guest's programs exactly as `parent` does: every
+/// stage, but the pixel one for the host flag kinds (1 and 4 replace the pixel program) and a
+/// sibling (it has none). Equal lists mean the
+/// variant was translated from environments of the parent's shape (the same storage pointers
+/// found, the same texture types read), so it reads memory and textures as the parent does. A
+/// variant built from its record (another session's state) is attached only when it fits, and
+/// only one that fits is recorded (one that does not would never be used from the file).
+bool OcclVariantFitsParent(const GraphicsPipeline& variant, const GraphicsPipeline& parent,
+                           u8 kind) {
+    const auto& x = variant.StageInfos();
+    const auto& y = parent.StageInfos();
+    const bool host_pixel =
+        kind == 0 || kind == OCCL_FLAG_BUILD_HOST || kind == OCCL_FLAG_BUILD_NOCOLOUR;
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (host_pixel && i + 1 == x.size()) {
+            continue;
+        }
+        if (x[i].constant_buffer_descriptors != y[i].constant_buffer_descriptors ||
+            x[i].storage_buffers_descriptors != y[i].storage_buffers_descriptors ||
+            x[i].texture_buffer_descriptors != y[i].texture_buffer_descriptors ||
+            x[i].image_buffer_descriptors != y[i].image_buffer_descriptors ||
+            x[i].texture_descriptors != y[i].texture_descriptors ||
+            x[i].image_descriptors != y[i].image_descriptors) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// FRITCHII_OCCL_FLAG_PERSIST: a hash of what OcclFlagSameDescriptors compares of a pipeline
+/// (each stage's descriptor lists, texture and image types included, and its push words), which
+/// the environments it was translated from decide (the storage pointers found, the texture
+/// types read). A variant recorded with a parent is attached to a parent of the same signature
+/// only (a parent built from another record, or the variant from another state, does not fit);
+/// the refusal memo is keyed by it too. Never 0.
+u64 OcclDescriptorSignature(const GraphicsPipeline& pipeline) {
+    u64 hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&hash](u64 value) {
+        hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+    };
+    for (const Shader::Info& info : pipeline.StageInfos()) {
+        mix(info.constant_buffer_descriptors.size());
+        for (const auto& d : info.constant_buffer_descriptors) {
+            mix((u64{d.index} << 32) | d.count);
+        }
+        mix(info.storage_buffers_descriptors.size());
+        for (const auto& d : info.storage_buffers_descriptors) {
+            mix((u64{d.cbuf_index} << 32) | d.cbuf_offset);
+            mix((u64{d.count} << 33) | (u64{d.is_written} << 32) | d.indirect_offset);
+        }
+        mix(info.texture_buffer_descriptors.size());
+        for (const auto& d : info.texture_buffer_descriptors) {
+            mix((u64{d.cbuf_index} << 32) | d.cbuf_offset);
+            mix((u64{d.count} << 33) | (u64{d.has_secondary} << 32) | d.handle_program);
+        }
+        mix(info.image_buffer_descriptors.size());
+        for (const auto& d : info.image_buffer_descriptors) {
+            mix((u64{d.cbuf_index} << 32) | d.cbuf_offset);
+            mix((u64{d.count} << 32) | (static_cast<u64>(d.format) << 3) |
+                (u64{d.is_written} << 2) | (u64{d.is_read} << 1) | u64{d.is_integer});
+        }
+        mix(info.texture_descriptors.size());
+        for (const auto& d : info.texture_descriptors) {
+            mix((u64{d.cbuf_index} << 32) | d.cbuf_offset);
+            mix((u64{d.count} << 32) | (static_cast<u64>(d.type) << 4) | (u64{d.is_depth} << 3) |
+                (u64{d.is_multisample} << 2) | (u64{d.is_integer} << 1) |
+                u64{d.has_secondary});
+            mix((u64{d.size_shift} << 32) | d.handle_program);
+            mix((u64{d.shift_left} << 32) | (u64{d.secondary_shift_left} << 1) |
+                u64{d.is_descriptor_array});
+            mix((u64{d.secondary_cbuf_index} << 32) | d.secondary_cbuf_offset);
+        }
+        mix(info.image_descriptors.size());
+        for (const auto& d : info.image_descriptors) {
+            mix((u64{d.cbuf_index} << 32) | d.cbuf_offset);
+            mix((u64{d.count} << 32) | (static_cast<u64>(d.type) << 16) |
+                (static_cast<u64>(d.format) << 4) | (u64{d.is_written} << 3) |
+                (u64{d.is_read} << 2) | (u64{d.is_integer} << 1) | u64{d.is_byte_addressed});
+        }
+        mix((u64{info.uses_rescaling_uniform} << 1) | u64{info.uses_render_area});
+    }
+    return hash | 1;
+}
+
+/// OcclDescriptorSignature, computed once per pipeline (GPU thread).
+u64 OcclSignatureOf(GraphicsPipeline& pipeline) {
+    if (pipeline.occl_persist_signature == 0) {
+        pipeline.occl_persist_signature = OcclDescriptorSignature(pipeline);
+    }
+    return pipeline.occl_persist_signature;
+}
+
 VideoCommon::OcclFlag::Census OcclFlagColourVerdict(const GraphicsPipeline& pipeline) {
     using VideoCommon::OcclFlag::Census;
     const auto& infos = pipeline.StageInfos();
@@ -4404,11 +4497,12 @@ u8& PipelineCache::OcclFlagStateOf(GraphicsPipeline& full, u8 kind) {
 
 GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 kind) {
     namespace OcclFlag = VideoCommon::OcclFlag;
-    // FRITCHII_OCCL_FLAG_PERSIST: a pre-pass variant of this parent key and kind was refused
-    // for its descriptors in an earlier session: refused now, with no snapshot or translation.
+    // FRITCHII_OCCL_FLAG_PERSIST: a pre-pass variant of this parent (key, descriptor signature)
+    // and kind was refused for its descriptors in two sessions of this build: refused now, with
+    // no snapshot or translation.
     if ((kind == OCCL_FLAG_BUILD_PREPASS || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) &&
         !occl_refused_memo.empty() && OcclFlagStateOf(full, kind) == 0 &&
-        OcclMemoRefused(full.Key(), kind)) {
+        OcclMemoRefused(full, kind)) {
         OcclFlagStateOf(full, kind) = 2;
         OcclFlag::Add(OcclFlag::g_stats.persist_memo_refusals);
         return nullptr;
@@ -4420,8 +4514,21 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
         // parent with a host query meanwhile). Only while the current key names full's programs
         // (the environments come from this draw's registers).
         u8& state = OcclFlagStateOf(full, kind);
-        if (state == OCCL_FLAG_STATE_QUEUED ||
-            graphics_key.unique_hashes != full.Key().unique_hashes) {
+        if (state == OCCL_FLAG_STATE_QUEUED) {
+            return nullptr;
+        }
+        // FRITCHII_OCCL_FLAG_PERSIST: its record in the occlusion file, when there is one not
+        // queued yet, in place of a snapshot (none taken, no per-frame budget spent).
+        if (!occl_disk_index.empty()) {
+            switch (EnqueueOcclRecordFor(full, kind)) {
+            case OcclEnqueue::Queued:
+            case OcclEnqueue::Later:
+                return nullptr;
+            case OcclEnqueue::Failed:
+                break; // no record: from this draw's state
+            }
+        }
+        if (graphics_key.unique_hashes != full.Key().unique_hashes) {
             return nullptr;
         }
         GraphicsPipelineCacheKey key = full.Key();
@@ -4450,9 +4557,9 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
     const GraphicsPipelineCacheKey saved = graphics_key;
     std::unique_ptr<GraphicsPipeline> made;
     // FRITCHII_OCCL_FLAG_PERSIST: the environments it is translated from, for its record.
-    std::unique_ptr<std::array<GraphicsEnvironment, Maxwell::MaxShaderProgram>> captured;
-    if (!occl_persist_path.empty()) {
-        captured = std::make_unique<std::array<GraphicsEnvironment, Maxwell::MaxShaderProgram>>();
+    std::shared_ptr<OcclEnvs> captured;
+    if (OcclPersistRecording()) {
+        captured = std::make_shared<OcclEnvs>();
     }
     GraphicsPipelineCacheKey built_key = full.Key();
     {
@@ -4479,13 +4586,13 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
         }
     }
     // CreateGraphicsPipeline filled `captured` when it made the pipeline.
-    return AttachOcclFlag(full, kind, std::move(made), captured.get(), &built_key);
+    return AttachOcclFlag(full, kind, std::move(made), std::move(captured), &built_key);
 }
 
-GraphicsPipeline* PipelineCache::AttachOcclFlag(
-    GraphicsPipeline& full, u8 kind, std::unique_ptr<GraphicsPipeline> made,
-    const std::array<GraphicsEnvironment, Maxwell::MaxShaderProgram>* envs,
-    const GraphicsPipelineCacheKey* built_key) {
+GraphicsPipeline* PipelineCache::AttachOcclFlag(GraphicsPipeline& full, u8 kind,
+                                                std::unique_ptr<GraphicsPipeline> made,
+                                                std::shared_ptr<const OcclEnvs> envs,
+                                                const GraphicsPipelineCacheKey* built_key) {
     namespace OcclFlag = VideoCommon::OcclFlag;
     u8& state = OcclFlagStateOf(full, kind);
     if (!made) {
@@ -4493,15 +4600,19 @@ GraphicsPipeline* PipelineCache::AttachOcclFlag(
         state = 2;
         return nullptr;
     }
-    // FRITCHII_OCCL_FLAG_PERSIST: recorded once attached (below), or its refusal remembered.
-    // Never anything that changes what is drawn.
+    // FRITCHII_OCCL_FLAG_PERSIST: one made from a draw's state (built_key given) is recorded
+    // once attached (below) when it fits its parent (OcclVariantFitsParent: what a prebuilt one
+    // must do to be used), or its refusal noted. A prebuilt one was checked by AdoptOcclJob and
+    // is neither. Never anything that changes what is drawn.
     const bool refused = (kind == OCCL_FLAG_BUILD_PREPASS ||
                           kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) &&
                          !OcclFlagSameDescriptors(*made, full);
-    if (refused) {
-        RecordOcclRefusal(full.Key(), kind);
-    } else if (envs != nullptr && built_key != nullptr) {
-        RecordOcclVariant(full.Key(), kind, *built_key, *envs);
+    if (built_key != nullptr) {
+        if (refused) {
+            RecordOcclRefusal(full, kind);
+        } else if (envs != nullptr && OcclVariantFitsParent(*made, full, kind)) {
+            RecordOcclVariant(full, kind, *built_key, std::move(envs));
+        }
     }
     if (kind == OCCL_FLAG_BUILD_PREPASS || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
         if (refused) {
@@ -4563,6 +4674,17 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
         // FRITCHII_OCCL_FLAG_ASYNC: queued on occl_queue under an empty entry (as the translate
         // queue's), filled by TickOcclVariants; a draw of this very key adopts it or builds it
         // (AdoptOcclSiblingForDraw). One that kept going stale is made below, as in v6.2.
+        // FRITCHII_OCCL_FLAG_PERSIST: its record in the occlusion file in place of a snapshot,
+        // when there is one not queued yet.
+        if (!occl_disk_index.empty()) {
+            switch (EnqueueOcclRecordFor(full, 0)) {
+            case OcclEnqueue::Queued:
+            case OcclEnqueue::Later:
+                return nullptr;
+            case OcclEnqueue::Failed:
+                break;
+            }
+        }
         if (graphics_key.unique_hashes != full.Key().unique_hashes) {
             return nullptr;
         }
@@ -4588,9 +4710,9 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
     const GraphicsPipelineCacheKey saved = graphics_key;
     std::unique_ptr<GraphicsPipeline> made;
     // FRITCHII_OCCL_FLAG_PERSIST: the environments it is translated from, for its record.
-    std::unique_ptr<std::array<GraphicsEnvironment, Maxwell::MaxShaderProgram>> captured;
-    if (!occl_persist_path.empty()) {
-        captured = std::make_unique<std::array<GraphicsEnvironment, Maxwell::MaxShaderProgram>>();
+    std::shared_ptr<OcclEnvs> captured;
+    if (OcclPersistRecording()) {
+        captured = std::make_shared<OcclEnvs>();
     }
     {
         graphics_key = key;
@@ -4617,8 +4739,8 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
         return nullptr;
     }
     OcclLean::Add(stats.made);
-    if (captured) {
-        RecordOcclVariant(full.Key(), 0, key, *captured);
+    if (captured && OcclVariantFitsParent(*made, full, 0)) {
+        RecordOcclVariant(full, 0, key, std::move(captured));
     }
     GraphicsPipeline* const pointer = made.get();
     graphics_cache.emplace(key, std::move(made));
@@ -4921,6 +5043,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     visual_workaround_title = title_id;
     if (title_id == 0) {
         return;
+    }
+    if (occl_persist) {
+        // FRITCHII_OCCL_FLAG_PERSIST: the GPU thread stops recording into the file an earlier
+        // load handed over (another title's or program's) until this load hands its own over.
+        occl_persist_generation.fetch_add(1);
     }
     g_disk_load_start = std::chrono::steady_clock::now();
     {
@@ -5443,25 +5570,33 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                          : std::string{"; records in memory"});
     boot_stream.reset();
 
-    // FRITCHII_OCCL_FLAG_PERSIST: the occlusion file, read now that the boot builds are in
-    // graphics_cache. Read (and repaired) on the serialization thread, so no record is appended
-    // while it is read; the GPU thread takes it over (TickOcclPersist) and queues the records
-    // whose parent is built, the rest as their parents get built.
+    // FRITCHII_OCCL_FLAG_PERSIST: the occlusion file, read here (loader thread) now that the boot
+    // builds are in graphics_cache; the GPU thread takes it over (TickOcclPersist) and queues
+    // the records whose parent is built, the rest as draws ask for them or their parents get
+    // built. Appends of an earlier load still queued are waited for, nothing else on the
+    // serialization thread (a VkPipelineCache save there is not waited for). Recording stopped
+    // when this load began (occl_persist_generation), so none is queued after this wait.
     if (occl_persist && !stop_loading.stop_requested()) {
         const auto occl_path =
             VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan-frizti-occl", CACHE_VERSION);
+        const u64 generation = occl_persist_generation.load();
+        while (occl_appends->load() != 0 && !stop_loading.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
         std::unique_ptr<OcclPersistLoad> occl_load;
-        serialization_thread.QueueWork(
-            [this, &occl_load, occl_path] {
-                try {
-                    occl_load = ReadOcclPersistFile(occl_path);
-                } catch (const std::exception& exception) {
-                    LOG_WARNING(Render_Vulkan, "Occlusion variants on disk: not read: {}",
-                                exception.what());
-                }
-            });
-        serialization_thread.WaitForRequests();
-        if (occl_load) {
+        if (!stop_loading.stop_requested()) {
+            try {
+                occl_load = ReadOcclPersistFile(occl_path);
+            } catch (const std::exception& exception) {
+                LOG_WARNING(Render_Vulkan, "Occlusion variants on disk: not read: {}",
+                            exception.what());
+            }
+            if (!occl_load) {
+                // Nothing read: recorded into anew all the same (this title's file).
+                occl_load = std::make_unique<OcclPersistLoad>();
+                occl_load->path = std::make_shared<const std::filesystem::path>(occl_path);
+            }
+            occl_load->generation = generation;
             std::scoped_lock occl_lock{occl_persist_mutex};
             occl_persist_incoming = std::move(occl_load);
             occl_persist_ready.store(true, std::memory_order_release);
@@ -10586,6 +10721,98 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptJob(std::unique_ptr<Transl
     return nullptr;
 }
 
+namespace {
+/// FRITCHII_OCCL_FLAG_PERSIST: the occlusion file, vulkan-frizti-occl.fork-v<N>.bin beside the
+/// disk cache. A header (OcclFileMagic, the cache version, the key size), then records back to
+/// back: a marker, the type, the payload's size and CityHash64, the payload.
+constexpr std::array<char, 8> OcclFileMagic{'o', 'c', 'c', 'l', '_', 'v', '2', '\0'};
+constexpr u32 OcclRecordMarker = 0x5243434F; // "OCCR"
+/// u8 kind, the parent's key, the key built (kinds 4/5: attachments zeroed; 0: no pixel
+/// program), u64 the parent's descriptor signature (OcclDescriptorSignature) when recorded,
+/// u32 count, the environments as the disk cache serializes them.
+constexpr u8 OcclRecordVariant = 1;
+/// u8 kind (a pre-pass kind), u64 the parent's memo hash (OcclMemoHashOf): refused for its
+/// descriptors in one session (two of them make the memo).
+constexpr u8 OcclRecordRefused = 2;
+constexpr u64 OcclFileHeaderSize = sizeof(OcclFileMagic) + 2 * sizeof(u32);
+constexpr u64 OcclRecordHeaderSize = sizeof(u32) + sizeof(u8) + sizeof(u32) + sizeof(u64);
+constexpr u64 OcclMaxPayload = u64{64} << 20;
+constexpr size_t OcclVariantFixedSize =
+    1 + 2 * sizeof(GraphicsPipelineCacheKey) + sizeof(u64) + sizeof(u32);
+/// Records queued in the background a frame at most (a draw's own record is queued when the
+/// draw asks for it, EnqueueOcclRecordFor), and only while fewer than occl_queue's threads + 1
+/// jobs are in flight: a draw's job waits behind one round of them at most.
+constexpr u32 OcclPrebuiltPerTick = 8;
+/// Pending records a background walk looks at a frame at most (it resumes from there).
+constexpr size_t OcclScanPerTick = 512;
+/// Compacted at boot (superseded records, refusals past two, records this build cannot use
+/// dropped) once that frees a quarter of the file and at least OcclCompactMin; past
+/// OcclFileCap the oldest records go too, down to three quarters of it.
+constexpr u64 OcclCompactMin = u64{4} << 20;
+constexpr u64 OcclFileCap = u64{128} << 20;
+/// Bump when the variants' translation changes which pre-pass descriptors differ from their
+/// parent's: the memo hash holds it and the build's revision, so another build's refusals are
+/// never used.
+constexpr u64 OcclMemoVersion = 1;
+
+/// FRITCHII_OCCL_FLAG_PERSIST: a prebuilt job's environments, read back from its record in the
+/// occlusion file on the translation thread. False when the record changed since boot or does
+/// not read back (logged once).
+bool ReadOcclRecordEnvs(const TranslationJob::OcclFileRecord& record,
+                        std::vector<FileEnvironment>& envs) {
+    static std::atomic<bool> logged{};
+    const auto fail = [](std::string_view why) {
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Occlusion variants on disk: a record does not read back ({}); such "
+                        "records are left to the draws",
+                        why);
+        }
+        return false;
+    };
+    if (!record.path || record.num_envs == 0 || record.envs_offset > record.size) {
+        return fail("malformed");
+    }
+    std::string payload(record.size, '\0');
+    try {
+        std::ifstream file(*record.path, std::ios::binary);
+        if (!file.is_open()) {
+            return fail("the file cannot be opened");
+        }
+        file.seekg(static_cast<std::streamoff>(record.offset));
+        file.read(payload.data(), static_cast<std::streamsize>(payload.size()));
+        if (!file) {
+            return fail("a short read");
+        }
+    } catch (const std::exception& exception) {
+        return fail(exception.what());
+    }
+    if (Common::CityHash64(payload.data(), payload.size()) != record.hash) {
+        return fail("it changed since boot");
+    }
+    MemoryStreamBuf memory{payload.data(), payload.size()};
+    std::istream stream{&memory};
+    stream.exceptions(std::ios_base::failbit | std::ios_base::badbit);
+    try {
+        stream.seekg(static_cast<std::streamoff>(record.envs_offset));
+        envs.resize(record.num_envs);
+        for (FileEnvironment& env : envs) {
+            const u64 left = payload.size() - static_cast<u64>(stream.tellg());
+            if (!FileEnvironment::RecordFits(stream, left)) {
+                return fail("an environment does not fit");
+            }
+            env.Deserialize(stream);
+        }
+        if (static_cast<u64>(stream.tellg()) != payload.size()) {
+            return fail("bytes left over");
+        }
+    } catch (const std::exception& exception) {
+        return fail(exception.what());
+    }
+    return true;
+}
+} // Anonymous namespace
+
 void PipelineCache::TranslateOnWorker(TranslationJob& job) {
     // FRITCHII_OCCL_FLAG_ASYNC: an occlusion job is translated exactly as the synchronous path
     // translates it (t_occl_flag_build set to its kind; a sibling marked for the counts), with
@@ -10605,10 +10832,16 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
         t_occl_sibling_build = false;
     };
     boost::container::static_vector<Shader::Environment*, Maxwell::MaxShaderProgram> env_ptrs;
-    if (job.file_envs) {
+    std::vector<FileEnvironment> file_envs;
+    if (job.prebuilt) {
         // FRITCHII_OCCL_FLAG_PERSIST: from the recorded environments (one per program the key
-        // uses, in order, as the disk cache's records).
-        for (FileEnvironment& env : *job.file_envs) {
+        // uses, in order, as the disk cache's records), read back here rather than on the GPU
+        // thread. One that does not read back made no pipeline: left to a later draw.
+        if (!ReadOcclRecordEnvs(job.occl_file, file_envs)) {
+            job.outcome = TranslationJob::Outcome::NoPipeline;
+            return;
+        }
+        for (FileEnvironment& env : file_envs) {
             env_ptrs.push_back(&env);
         }
     } else {
@@ -10678,7 +10911,6 @@ void PipelineCache::TranslateOnWorker(TranslationJob& job) {
     for (GraphicsEnvironment& env : job.envs) {
         env.ReleaseSnapshotBytes();
     }
-    job.file_envs.reset(); // a prebuilt job is never translated again (job.prebuilt stays)
 }
 
 void PipelineCache::TickTranslations() {
@@ -10941,30 +11173,51 @@ void PipelineCache::AdoptOcclJob(std::unique_ptr<TranslationJob> job) {
         return;
     }
     u8& state = OcclFlagStateOf(*parent, kind);
-    if (job->prebuilt && (job->outcome != TranslationJob::Outcome::Built || !job->pipeline)) {
-        // FRITCHII_OCCL_FLAG_PERSIST: its record did not build (this build translates it
-        // otherwise): never refused for that; a later draw makes it from its own state.
-        OcclFlag::Add(stats.async_discarded);
-        occl_queue->Discard(std::move(job));
-        state = 0;
+    if (job->prebuilt) {
+        // FRITCHII_OCCL_FLAG_PERSIST: built from its record (another session's environments),
+        // with no live state to check. Used only when the parent's descriptor signature is the
+        // one it was recorded with (the parent built from environments of the same shape:
+        // storage pointers, texture types), when the variant's guest stages describe exactly the
+        // parent's descriptors (OcclVariantFitsParent: it reads memory and textures as this
+        // session's parent does; a colour variant is drawn in its place) and, for a pre-pass,
+        // when the parent can bind its descriptors. Otherwise, or when it did not read back or
+        // build: never refused for it (no memo either); a later draw makes it from its own
+        // state, and that one is recorded in place of this record.
+        const bool usable =
+            job->outcome == TranslationJob::Outcome::Built && job->pipeline &&
+            job->occl_parent_signature == OcclSignatureOf(*parent) &&
+            OcclVariantFitsParent(*job->pipeline, *parent, kind) &&
+            ((kind != OCCL_FLAG_BUILD_PREPASS && kind != OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) ||
+             OcclFlagSameDescriptors(*job->pipeline, *parent));
+        if (!usable) {
+            OcclFlag::Add(stats.async_discarded);
+            OcclFlag::Add(stats.persist_unused);
+            occl_queue->Discard(std::move(job)); // its pipeline retired, never destroyed here
+            state = 0;
+            ForgetOcclRecord(parent_key, kind);
+            return;
+        }
+        OcclFlag::Add(stats.async_adopted);
+        OcclFlag::Add(stats.persist_adopted);
+        ClearOcclFailures(parent_key, *parent, kind);
+        AttachOcclFlag(*parent, kind, std::move(job->pipeline));
         return;
     }
     switch (job->outcome) {
     case TranslationJob::Outcome::Built:
-        // A prebuilt one was built from its record (no live state to check, as the disk cache's
-        // prebuild).
-        if (job->prebuilt || std::ranges::all_of(job->envs, [](GraphicsEnvironment& env) {
+        if (std::ranges::all_of(job->envs, [](GraphicsEnvironment& env) {
                 return env.TextureReadsStillMatch();
             })) {
             OcclFlag::Add(stats.async_adopted);
-            if (job->prebuilt) {
-                OcclFlag::Add(stats.persist_adopted);
-            }
             ClearOcclFailures(parent_key, *parent, kind);
             // As the synchronous path: attached (state 1), or refused and retired (state 2);
-            // recorded in the occlusion file with the snapshot it was translated from.
-            AttachOcclFlag(*parent, kind, std::move(job->pipeline),
-                           job->prebuilt ? nullptr : &job->envs, &job->key);
+            // recorded in the occlusion file with the snapshot it was translated from (the job,
+            // pipeline taken, goes with the record to the serialization thread: no copy here).
+            std::unique_ptr<GraphicsPipeline> pipeline = std::move(job->pipeline);
+            const GraphicsPipelineCacheKey built_key = job->key;
+            const std::shared_ptr<const TranslationJob> held{std::move(job)};
+            AttachOcclFlag(*parent, kind, std::move(pipeline),
+                           std::shared_ptr<const OcclEnvs>(held, &held->envs), &built_key);
             return;
         }
         break; // a stale texture descriptor: translated again
@@ -11000,29 +11253,49 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptOcclSibling(
     const auto parent_it = graphics_cache.find(parent_key);
     GraphicsPipeline* const parent =
         parent_it != graphics_cache.end() ? parent_it->second.get() : nullptr;
-    if (job->prebuilt && (job->outcome != TranslationJob::Outcome::Built || !job->pipeline)) {
-        // FRITCHII_OCCL_FLAG_PERSIST: its record did not build. The parent is not marked
-        // Failed for it; a later draw makes the sibling from its own state.
-        OcclFlag::Add(OcclFlag::g_stats.async_discarded);
-        occl_queue->Discard(std::move(job));
-        return nullptr;
+    if (job->prebuilt) {
+        // FRITCHII_OCCL_FLAG_PERSIST: built from its record. Used only with its parent built,
+        // of the descriptor signature it was recorded with, and with its vertex stages
+        // describing exactly the parent's descriptors (OcclVariantFitsParent; its vertex side is
+        // checked again at its first draw, OcclVertexSideSame). Otherwise, or when it did not
+        // read back or build, the parent is not marked Failed for it: a later draw makes the
+        // sibling from its own state, and that one is recorded in place of this record.
+        if (job->outcome != TranslationJob::Outcome::Built || !job->pipeline ||
+            parent == nullptr || job->occl_parent_signature != OcclSignatureOf(*parent) ||
+            !OcclVariantFitsParent(*job->pipeline, *parent, 0)) {
+            OcclFlag::Add(OcclFlag::g_stats.async_discarded);
+            OcclFlag::Add(OcclFlag::g_stats.persist_unused);
+            occl_queue->Discard(std::move(job));
+            ForgetOcclRecord(parent_key, 0);
+            return nullptr;
+        }
+        OcclFlag::Add(OcclFlag::g_stats.async_adopted);
+        OcclFlag::Add(OcclFlag::g_stats.persist_adopted);
+        OcclLean::Add(OcclLean::g_stats.made);
+        ClearOcclFailures(parent_key, *parent, 0);
+        return std::move(job->pipeline);
     }
     switch (job->outcome) {
     case TranslationJob::Outcome::Built:
-        if (job->prebuilt || std::ranges::all_of(job->envs, [](GraphicsEnvironment& env) {
+        if (std::ranges::all_of(job->envs, [](GraphicsEnvironment& env) {
                 return env.TextureReadsStillMatch();
             })) {
             OcclFlag::Add(OcclFlag::g_stats.async_adopted);
             OcclLean::Add(OcclLean::g_stats.made);
+            std::unique_ptr<GraphicsPipeline> pipeline = std::move(job->pipeline);
             if (parent != nullptr) {
                 ClearOcclFailures(parent_key, *parent, 0);
             }
-            if (job->prebuilt) {
-                OcclFlag::Add(OcclFlag::g_stats.persist_adopted);
-            } else {
-                RecordOcclVariant(parent_key, 0, job->key, job->envs);
+            if (parent != nullptr && pipeline && OcclVariantFitsParent(*pipeline, *parent, 0)) {
+                // Recorded with the snapshot it was translated from (the job goes with the
+                // record to the serialization thread: no copy here), when it fits its parent
+                // (what a prebuilt one must do to be used).
+                const GraphicsPipelineCacheKey built_key = job->key;
+                const std::shared_ptr<const TranslationJob> held{std::move(job)};
+                RecordOcclVariant(*parent, 0, built_key,
+                                  std::shared_ptr<const OcclEnvs>(held, &held->envs));
             }
-            return std::move(job->pipeline);
+            return pipeline;
         }
         break;
     case TranslationJob::Outcome::Retry:
@@ -11077,30 +11350,23 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptOcclSiblingForDraw(bool& p
 }
 
 namespace {
-/// FRITCHII_OCCL_FLAG_PERSIST: the occlusion file, vulkan-frizti-occl.fork-v<N>.bin beside the
-/// disk cache. A header (OcclFileMagic, the cache version, the key size), then records back to
-/// back: a marker, the type, the payload's size and CityHash64, the payload.
-constexpr std::array<char, 8> OcclFileMagic{'o', 'c', 'c', 'l', '_', 'v', '1', '\0'};
-constexpr u32 OcclRecordMarker = 0x5243434F; // "OCCR"
-/// u8 kind, the parent's key, the key built (kinds 4/5: attachments zeroed; 0: no pixel
-/// program), u32 count, the environments as the disk cache serializes them.
-constexpr u8 OcclRecordVariant = 1;
-/// u8 kind (a pre-pass kind), u64 OcclMemoHash of the parent's key: refused for its descriptors.
-constexpr u8 OcclRecordRefused = 2;
-constexpr u64 OcclFileHeaderSize = sizeof(OcclFileMagic) + 2 * sizeof(u32);
-constexpr u64 OcclRecordHeaderSize = sizeof(u32) + sizeof(u8) + sizeof(u32) + sizeof(u64);
-constexpr u64 OcclMaxPayload = u64{64} << 20;
-constexpr size_t OcclVariantFixedSize = 1 + 2 * sizeof(GraphicsPipelineCacheKey) + sizeof(u32);
-/// Records queued from the file a frame at most, and occl_queue's jobs in flight they stop at
-/// (the rest is left to the variants draws ask for).
-constexpr u32 OcclPrebuiltPerTick = 8;
-constexpr size_t OcclPrebuiltInFlight = MaxOcclJobsInFlight / 2;
-
-/// A parent key's hash without the driver fields (the memo outlives a driver update).
-u64 OcclMemoHash(GraphicsPipelineCacheKey key) {
-    key.state.driver_id = 0;
-    key.state.driver_version = 0;
-    return key.Hash();
+/// FRITCHII_OCCL_FLAG_PERSIST: the refusal memo's key for a parent, computed once per pipeline:
+/// its key without the driver fields (the memo outlives a driver update), its descriptor
+/// signature (a parent built from other environments is another entry) and this build (its
+/// revision and OcclMemoVersion: a later build's translation may no longer differ). Never 0.
+u64 OcclMemoHashOf(GraphicsPipeline& parent) {
+    if (parent.occl_persist_memo == 0) {
+        GraphicsPipelineCacheKey key = parent.Key();
+        key.state.driver_id = 0;
+        key.state.driver_version = 0;
+        static const u64 build =
+            Common::CityHash64(Common::g_scm_rev, std::strlen(Common::g_scm_rev)) ^
+            OcclMemoVersion;
+        const std::array<u64, 3> words{key.Hash(), OcclSignatureOf(parent), build};
+        parent.occl_persist_memo =
+            Common::CityHash64(reinterpret_cast<const char*>(words.data()), sizeof(words)) | 1;
+    }
+    return parent.occl_persist_memo;
 }
 
 /// The first failure to write the occlusion file is logged; recording never affects rendering.
@@ -11114,6 +11380,15 @@ void NoteOcclWriteFailure(const std::filesystem::path& path, std::string_view wh
     }
 }
 
+/// The file's header.
+void WriteOcclFileHeader(std::ostream& file) {
+    const u32 version = CACHE_VERSION;
+    const u32 key_size = sizeof(GraphicsPipelineCacheKey);
+    file.write(OcclFileMagic.data(), OcclFileMagic.size())
+        .write(reinterpret_cast<const char*>(&version), sizeof(version))
+        .write(reinterpret_cast<const char*>(&key_size), sizeof(key_size));
+}
+
 /// Appends one record (the header first into an empty file). Serialization thread.
 void AppendOcclRecord(const std::filesystem::path& path, u8 type, const std::string& payload) {
     try {
@@ -11123,11 +11398,7 @@ void AppendOcclRecord(const std::filesystem::path& path, u8 type, const std::str
             return;
         }
         if (file.tellp() == 0) {
-            const u32 version = CACHE_VERSION;
-            const u32 key_size = sizeof(GraphicsPipelineCacheKey);
-            file.write(OcclFileMagic.data(), OcclFileMagic.size())
-                .write(reinterpret_cast<const char*>(&version), sizeof(version))
-                .write(reinterpret_cast<const char*>(&key_size), sizeof(key_size));
+            WriteOcclFileHeader(file);
         }
         const u32 marker = OcclRecordMarker;
         const u32 size = static_cast<u32>(payload.size());
@@ -11191,37 +11462,57 @@ bool PipelineCache::OcclKindWanted(u8 kind) const {
     }
 }
 
-bool PipelineCache::OcclMemoRefused(const GraphicsPipelineCacheKey& parent_key, u8 kind) const {
-    const auto it = occl_refused_memo.find(OcclMemoHash(parent_key));
+bool PipelineCache::OcclPersistRecording() const {
+    return occl_persist_path != nullptr && occl_persist_generation.load() == occl_persist_taken;
+}
+
+bool PipelineCache::OcclMemoRefused(GraphicsPipeline& parent, u8 kind) {
+    const auto it = occl_refused_memo.find(OcclMemoHashOf(parent));
     return it != occl_refused_memo.end() && (it->second & (1U << kind)) != 0;
 }
 
-void PipelineCache::RecordOcclVariant(
-    const GraphicsPipelineCacheKey& parent_key, u8 kind, const GraphicsPipelineCacheKey& key,
-    const std::array<GraphicsEnvironment, Maxwell::MaxShaderProgram>& envs) {
-    if (occl_persist_path.empty() || kind > OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
+void PipelineCache::ForgetOcclRecord(const GraphicsPipelineCacheKey& parent_key, u8 kind) {
+    if (const auto it = occl_recorded.find(parent_key); it != occl_recorded.end()) {
+        it->second = static_cast<u8>(it->second & ~(1U << kind));
+    }
+}
+
+void PipelineCache::RecordOcclVariant(GraphicsPipeline& parent, u8 kind,
+                                      const GraphicsPipelineCacheKey& key,
+                                      std::shared_ptr<const OcclEnvs> envs) {
+    if (!envs || kind > OCCL_FLAG_BUILD_PREPASS_NOCOLOUR || !OcclPersistRecording()) {
         return;
     }
-    u8& recorded = occl_recorded[parent_key];
+    u8& recorded = occl_recorded[parent.Key()];
     const u8 bit = static_cast<u8>(1U << kind);
     if ((recorded & bit) != 0) {
-        return; // written once
+        return; // written once (again only after its record failed: ForgetOcclRecord)
     }
-    recorded = static_cast<u8>(recorded | bit);
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
-        if (key.unique_hashes[index] != 0 && !envs[index].CanBeSerialized()) {
+        if (key.unique_hashes[index] != 0 && !(*envs)[index].CanBeSerialized()) {
             return; // as the disk cache: a program with a trap guard is not stored
         }
     }
-    // A copy of the environments the variant was translated from, serialized on the
-    // serialization thread exactly as SerializePipeline serializes the disk cache's.
-    serialization_thread.QueueWork([path = occl_persist_path, parent_key, kind, key,
-                                    envs_ = envs] {
+    // Counted before the generation is checked again (a later load bumps it, then waits for
+    // the count): an append is never queued after a later load began reading the file.
+    occl_appends->fetch_add(1);
+    if (occl_persist_generation.load() != occl_persist_taken) {
+        occl_appends->fetch_sub(1);
+        return;
+    }
+    recorded = static_cast<u8>(recorded | bit);
+    // The environments the variant was translated from (shared, never copied here), serialized
+    // on the serialization thread exactly as SerializePipeline serializes the disk cache's.
+    serialization_thread.QueueWork([path = occl_persist_path, appends = occl_appends,
+                                    parent_key = parent.Key(), kind, key,
+                                    signature = OcclSignatureOf(parent),
+                                    envs = std::move(envs)] {
         try {
             std::ostringstream stream(std::ios::binary);
             stream.put(static_cast<char>(kind));
             stream.write(reinterpret_cast<const char*>(&parent_key), sizeof(parent_key));
             stream.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            stream.write(reinterpret_cast<const char*>(&signature), sizeof(signature));
             u32 count = 0;
             for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
                 count += key.unique_hashes[index] != 0 ? 1U : 0U;
@@ -11229,43 +11520,55 @@ void PipelineCache::RecordOcclVariant(
             stream.write(reinterpret_cast<const char*>(&count), sizeof(count));
             for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
                 if (key.unique_hashes[index] != 0) {
-                    envs_[index].Serialize(stream);
+                    (*envs)[index].Serialize(stream);
                 }
             }
             if (!stream) {
-                NoteOcclWriteFailure(path, "a record could not be serialized");
-                return;
+                NoteOcclWriteFailure(*path, "a record could not be serialized");
+            } else {
+                AppendOcclRecord(*path, OcclRecordVariant, stream.str());
             }
-            AppendOcclRecord(path, OcclRecordVariant, stream.str());
         } catch (const std::exception& exception) {
-            NoteOcclWriteFailure(path, exception.what());
+            NoteOcclWriteFailure(*path, exception.what());
         }
+        appends->fetch_sub(1);
     });
 }
 
-void PipelineCache::RecordOcclRefusal(const GraphicsPipelineCacheKey& parent_key, u8 kind) {
-    if (occl_persist_path.empty() || kind > OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
+void PipelineCache::RecordOcclRefusal(GraphicsPipeline& parent, u8 kind) {
+    if ((kind != OCCL_FLAG_BUILD_PREPASS && kind != OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) ||
+        !OcclPersistRecording()) {
         return;
     }
-    const u64 hash = OcclMemoHash(parent_key);
-    u8& bits = occl_refused_memo[hash];
+    const u64 hash = OcclMemoHashOf(parent);
     const u8 bit = static_cast<u8>(1U << kind);
-    if ((bits & bit) != 0) {
+    if (const auto it = occl_refused_memo.find(hash);
+        it != occl_refused_memo.end() && (it->second & bit) != 0) {
         return;
     }
-    bits = static_cast<u8>(bits | bit);
-    serialization_thread.QueueWork([path = occl_persist_path, hash, kind] {
+    u8& written = occl_refusals_written[hash];
+    if ((written & bit) != 0) {
+        return; // one a session: the memo takes two sessions' refusals
+    }
+    occl_appends->fetch_add(1);
+    if (occl_persist_generation.load() != occl_persist_taken) {
+        occl_appends->fetch_sub(1);
+        return;
+    }
+    written = static_cast<u8>(written | bit);
+    serialization_thread.QueueWork([path = occl_persist_path, appends = occl_appends, hash, kind] {
         std::string payload(1 + sizeof(hash), '\0');
         payload[0] = static_cast<char>(kind);
         std::memcpy(payload.data() + 1, &hash, sizeof(hash));
-        AppendOcclRecord(path, OcclRecordRefused, payload);
+        AppendOcclRecord(*path, OcclRecordRefused, payload);
+        appends->fetch_sub(1);
     });
 }
 
 std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFile(
     const std::filesystem::path& path) {
     auto load = std::make_unique<OcclPersistLoad>();
-    load->path = path;
+    load->path = std::make_shared<const std::filesystem::path>(path);
     std::error_code error;
     if (!std::filesystem::exists(path, error)) {
         return load;
@@ -11273,6 +11576,20 @@ std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFi
     const char* problem = nullptr;
     u64 keep = ~u64{0}; // bytes to keep after a bad record (0: the whole file goes)
     size_t skipped = 0;
+    /// Every good record in file order: where it starts and its length (header and payload).
+    struct Span {
+        u64 start{};
+        u64 length{};
+    };
+    std::vector<Span> spans;
+    std::vector<OcclDiskRecord> variants;
+    std::vector<size_t> variant_span;
+    struct MemoRead {
+        u64 hash{};
+        u8 kind{};
+        size_t span{};
+    };
+    std::vector<MemoRead> memos;
     try {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
@@ -11296,6 +11613,7 @@ std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFi
             keep = 0;
         }
         u64 offset = OcclFileHeaderSize;
+        std::string payload; // only to check each record: no payload is kept
         while (problem == nullptr && offset < size) {
             if (size - offset < OcclRecordHeaderSize) {
                 problem = "a truncated record";
@@ -11316,26 +11634,27 @@ std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFi
                 keep = offset;
                 break;
             }
-            auto payload = std::make_shared<std::string>(payload_size, '\0');
-            file.read(payload->data(), static_cast<std::streamsize>(payload_size));
-            if (!file || Common::CityHash64(payload->data(), payload->size()) != hash) {
+            payload.resize(payload_size);
+            file.read(payload.data(), static_cast<std::streamsize>(payload_size));
+            if (!file || Common::CityHash64(payload.data(), payload.size()) != hash) {
                 problem = "a corrupt record";
                 keep = offset;
                 break;
             }
+            const size_t span = spans.size();
+            spans.push_back({offset, OcclRecordHeaderSize + payload_size});
+            const u64 payload_offset = offset + OcclRecordHeaderSize;
             offset += OcclRecordHeaderSize + payload_size;
             if (type == OcclRecordRefused) {
-                const u8 kind = payload_size == 1 + sizeof(u64) ? static_cast<u8>((*payload)[0])
-                                                                : u8{0};
+                const u8 kind =
+                    payload_size == 1 + sizeof(u64) ? static_cast<u8>(payload[0]) : u8{0};
                 if (kind != OCCL_FLAG_BUILD_PREPASS && kind != OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
                     ++skipped;
                     continue;
                 }
                 u64 memo{};
-                std::memcpy(&memo, payload->data() + 1, sizeof(memo));
-                u8& bits = load->memo[memo];
-                bits = static_cast<u8>(bits | (1U << kind));
-                ++load->memo_records;
+                std::memcpy(&memo, payload.data() + 1, sizeof(memo));
+                memos.push_back({memo, kind, span});
                 continue;
             }
             if (type != OcclRecordVariant || payload_size < OcclVariantFixedSize) {
@@ -11343,12 +11662,16 @@ std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFi
                 continue;
             }
             OcclDiskRecord record;
-            record.kind = static_cast<u8>((*payload)[0]);
-            std::memcpy(&record.parent_key, payload->data() + 1, sizeof(record.parent_key));
-            std::memcpy(&record.key, payload->data() + 1 + sizeof(record.parent_key),
-                        sizeof(record.key));
-            std::memcpy(&record.num_envs, payload->data() + 1 + 2 * sizeof(record.key),
-                        sizeof(record.num_envs));
+            const char* at = payload.data();
+            record.kind = static_cast<u8>(*at);
+            at += 1;
+            std::memcpy(&record.parent_key, at, sizeof(record.parent_key));
+            at += sizeof(record.parent_key);
+            std::memcpy(&record.key, at, sizeof(record.key));
+            at += sizeof(record.key);
+            std::memcpy(&record.parent_signature, at, sizeof(record.parent_signature));
+            at += sizeof(record.parent_signature);
+            std::memcpy(&record.num_envs, at, sizeof(record.num_envs));
             // The key built must be what this build makes of the parent's for that kind.
             GraphicsPipelineCacheKey expected = record.parent_key;
             if (record.kind == 0) {
@@ -11375,17 +11698,20 @@ std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFi
                     rekeyed->state.driver_version = dynamic_features.driver_version;
                 }
             }
-            record.payload = std::move(payload);
-            record.envs_offset = OcclVariantFixedSize;
-            load->records.push_back(std::move(record));
+            record.offset = payload_offset;
+            record.size = payload_size;
+            record.hash = hash;
+            variants.push_back(record);
+            variant_span.push_back(span);
         }
     } catch (const std::exception& exception) {
         problem = "a read error";
         LOG_WARNING(Render_Vulkan, "Occlusion variants on disk: {}", exception.what());
         keep = 0;
-        load->records.clear();
-        load->memo.clear();
-        load->memo_records = 0;
+        spans.clear();
+        variants.clear();
+        variant_span.clear();
+        memos.clear();
     }
     if (problem != nullptr) {
         // Ignored from the bad part on, and rewritten: a bad header starts the file again, a
@@ -11399,9 +11725,130 @@ std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFi
                     "Occlusion variants on disk (FRITCHII_OCCL_FLAG_PERSIST): {} in {}; {}{}",
                     problem, Common::FS::PathToUTF8String(path),
                     keep == 0 ? "the file is ignored and started again"
-                              : fmt::format("cut there, {} records before it kept",
-                                            load->records.size() + load->memo_records),
+                              : fmt::format("cut there, {} records before it kept", spans.size()),
                     error ? fmt::format(" (failed: {})", error.message()) : std::string{});
+        if (keep == 0) {
+            return load;
+        }
+    }
+    // What stays: the last variant record of each parent key and kind (a later one, recorded
+    // after an earlier one failed or did not fit, replaces it), and two refusals of a parent and
+    // kind at most (two sessions make the memo).
+    std::vector<bool> kept(spans.size(), false);
+    {
+        std::unordered_map<GraphicsPipelineCacheKey, std::array<u32, 6>> last;
+        for (size_t i = 0; i < variants.size(); ++i) {
+            last[variants[i].parent_key][variants[i].kind] = static_cast<u32>(i + 1);
+        }
+        for (const auto& entry : last) {
+            for (const u32 slot : entry.second) {
+                if (slot != 0) {
+                    kept[variant_span[slot - 1]] = true;
+                }
+            }
+        }
+        std::unordered_map<u64, std::array<u8, 6>> refusals;
+        for (const MemoRead& memo : memos) {
+            u8& count = refusals[memo.hash][memo.kind];
+            if (count < 2) {
+                ++count;
+                kept[memo.span] = true;
+            }
+        }
+    }
+    u64 file_bytes = OcclFileHeaderSize;
+    u64 kept_bytes = OcclFileHeaderSize;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        file_bytes += spans[i].length;
+        kept_bytes += kept[i] ? spans[i].length : 0;
+    }
+    // Past the cap the oldest records go (a record still used is recorded again by its draw).
+    size_t capped = 0;
+    if (kept_bytes > OcclFileCap) {
+        for (size_t i = 0; i < spans.size() && kept_bytes > OcclFileCap / 4 * 3; ++i) {
+            if (kept[i]) {
+                kept[i] = false;
+                kept_bytes -= spans[i].length;
+                ++capped;
+            }
+        }
+    }
+    const u64 waste = file_bytes - kept_bytes;
+    std::vector<u64> moved_to;
+    if (capped != 0 || (waste >= OcclCompactMin && waste > file_bytes / 4)) {
+        // Rewritten beside it and renamed over it; on any failure the file stays as it was.
+        auto compact_path = path;
+        compact_path += ".compact";
+        std::vector<u64> starts(spans.size(), 0);
+        bool written = false;
+        try {
+            std::ifstream in(path, std::ios::binary);
+            std::ofstream out(compact_path, std::ios::binary | std::ios::trunc);
+            if (in.is_open() && out.is_open()) {
+                WriteOcclFileHeader(out);
+                u64 at = OcclFileHeaderSize;
+                std::string buffer;
+                for (size_t i = 0; i < spans.size(); ++i) {
+                    if (!kept[i]) {
+                        continue;
+                    }
+                    buffer.resize(spans[i].length);
+                    in.seekg(static_cast<std::streamoff>(spans[i].start));
+                    in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                    out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                    starts[i] = at;
+                    at += spans[i].length;
+                }
+                out.flush();
+                written = in.good() && out.good();
+            }
+        } catch (const std::exception&) {
+            written = false;
+        }
+        if (written) {
+            std::filesystem::rename(compact_path, path, error);
+            written = !error;
+        }
+        if (written) {
+            moved_to = std::move(starts);
+            LOG_INFO(Render_Vulkan,
+                     "Occlusion variants on disk: compacted from {:.1f} to {:.1f} MiB ({} "
+                     "records superseded, past two refusals or not for this build; {} oldest "
+                     "dropped past {} MiB)",
+                     static_cast<double>(file_bytes) / (1 << 20),
+                     static_cast<double>(kept_bytes) / (1 << 20),
+                     std::ranges::count(kept, false) - static_cast<std::ptrdiff_t>(capped),
+                     capped, OcclFileCap >> 20);
+        } else {
+            std::error_code ignored;
+            std::filesystem::remove(compact_path, ignored);
+            LOG_WARNING(Render_Vulkan,
+                        "Occlusion variants on disk: {} could not be compacted{}; used as it is",
+                        Common::FS::PathToUTF8String(path),
+                        error ? fmt::format(" ({})", error.message()) : std::string{});
+        }
+    }
+    for (size_t i = 0; i < variants.size(); ++i) {
+        const size_t span = variant_span[i];
+        if (!kept[span]) {
+            continue;
+        }
+        OcclDiskRecord& record = variants[i];
+        if (!moved_to.empty()) {
+            record.offset = moved_to[span] + OcclRecordHeaderSize;
+        }
+        load->records.push_back(record);
+    }
+    std::unordered_map<u64, std::array<u8, 6>> refusals;
+    for (const MemoRead& memo : memos) {
+        if (!kept[memo.span]) {
+            continue;
+        }
+        ++load->memo_records;
+        if (++refusals[memo.hash][memo.kind] == 2) {
+            u8& bits = load->memo[memo.hash];
+            bits = static_cast<u8>(bits | (1U << memo.kind));
+        }
     }
     if (skipped != 0) {
         LOG_INFO(Render_Vulkan,
@@ -11418,43 +11865,56 @@ void PipelineCache::TickOcclPersist() {
             load = std::move(occl_persist_incoming);
             occl_persist_ready.store(false, std::memory_order_relaxed);
         }
-        if (load) {
+        // A read of an earlier load (a later one began meanwhile) is dropped.
+        if (load && load->generation == occl_persist_generation.load()) {
             occl_persist_path = std::move(load->path);
+            occl_persist_taken = load->generation;
             occl_refused_memo = std::move(load->memo);
+            occl_refusals_written.clear();
+            occl_disk_records = std::move(load->records);
+            occl_disk_index.clear();
             occl_disk_pending.clear();
+            occl_disk_scan_next = 0;
             occl_recorded.clear();
-            // One record per parent key and kind (the first); each is written once.
-            for (OcclDiskRecord& record : load->records) {
+            for (u32 index = 0; index < occl_disk_records.size(); ++index) {
+                const OcclDiskRecord& record = occl_disk_records[index];
+                occl_disk_index[record.parent_key][record.kind] = index + 1;
                 u8& recorded = occl_recorded[record.parent_key];
-                const u8 bit = static_cast<u8>(1U << record.kind);
-                if ((recorded & bit) == 0) {
-                    recorded = static_cast<u8>(recorded | bit);
-                    occl_disk_pending.push_back(std::move(record));
-                }
+                recorded = static_cast<u8>(recorded | (1U << record.kind));
+                occl_disk_pending.push_back(index);
             }
-            const size_t records = occl_disk_pending.size();
+            const size_t records = occl_disk_records.size();
+            if (!occl_queue) {
+                // Only the memo and the recording are used.
+                occl_disk_records.clear();
+                occl_disk_index.clear();
+                occl_disk_pending.clear();
+            }
             const size_t ready = occl_queue ? ScanOcclDiskPending(false) : 0;
             LOG_INFO(Render_Vulkan,
-                     "Occlusion variants on disk: {} records ({} refused memo), {} queued at "
-                     "boot{} (FRITCHII_OCCL_FLAG_PERSIST, {})",
-                     records, load->memo_records, ready,
-                     occl_queue ? fmt::format(", {} later or never (parent not built yet, or "
-                                              "not wanted at this level)",
+                     "Occlusion variants on disk: {} records ({} refusals, {} parents in the "
+                     "memo), {} with their parent built at boot{} (FRITCHII_OCCL_FLAG_PERSIST, {})",
+                     records, load->memo_records, occl_refused_memo.size(), ready,
+                     occl_queue ? fmt::format(", {} later or never (when a draw asks, or their "
+                                              "parent is built; or not wanted at this level)",
                                               records - ready)
                                 : std::string{"; not prebuilt with FRITCHII_OCCL_FLAG_ASYNC=0"},
-                     Common::FS::PathToUTF8String(occl_persist_path));
-            if (!occl_queue) {
-                occl_disk_pending.clear(); // only the memo and the recording are used
-            }
+                     Common::FS::PathToUTF8String(*occl_persist_path));
             occl_disk_backlog = !occl_disk_pending.empty();
         }
     }
-    if (!occl_queue || occl_disk_pending.empty()) {
+    if (!occl_queue || occl_disk_records.empty()) {
         return;
     }
-    // Every frame while records wait for room; else every 60 frames (parents built since,
-    // or a level changed live).
-    if (!occl_disk_backlog && frame_count % 60 != 0) {
+    if (occl_disk_pending.empty()) {
+        // Every record queued or no longer wanted: nothing left for the draws to ask for.
+        occl_disk_records.clear();
+        occl_disk_index.clear();
+        return;
+    }
+    // Every frame while records wait for room; else every 15 frames (parents built since,
+    // or a level changed live), OcclScanPerTick records a walk.
+    if (!occl_disk_backlog && frame_count % 15 != 0) {
         return;
     }
     static_cast<void>(ScanOcclDiskPending(true));
@@ -11463,133 +11923,147 @@ void PipelineCache::TickOcclPersist() {
 size_t PipelineCache::ScanOcclDiskPending(bool enqueue) {
     namespace OcclFlag = VideoCommon::OcclFlag;
     namespace OcclLean = VideoCommon::OcclLean;
+    const size_t in_flight_cap = occl_queue_threads + 1;
+    if (enqueue && occl_queue->InFlight() >= in_flight_cap) {
+        occl_disk_backlog = true; // no room: no walk this frame
+        return 0;
+    }
     size_t ready = 0;
     u32 queued = 0;
     bool capped = false;
-    for (size_t index = 0; index < occl_disk_pending.size();) {
-        if (capped) {
-            break;
+    // A walk resumes where the last one stopped, and looks at OcclScanPerTick records a frame
+    // at most (a file of many areas costs the GPU thread a bounded walk, never the whole list).
+    size_t index = enqueue && occl_disk_scan_next < occl_disk_pending.size() ? occl_disk_scan_next
+                                                                             : 0;
+    const size_t total =
+        enqueue ? (std::min)(occl_disk_pending.size(), OcclScanPerTick) : occl_disk_pending.size();
+    for (size_t visited = 0; visited < total && !capped && !occl_disk_pending.empty();
+         ++visited) {
+        if (index >= occl_disk_pending.size()) {
+            index = 0;
         }
-        OcclDiskRecord& record = occl_disk_pending[index];
-        bool drop = false;
+        const u32 record_index = occl_disk_pending[index];
+        OcclDiskRecord& record = occl_disk_records[record_index];
+        bool remove = record.done; // queued by a draw's ask meanwhile
         GraphicsPipeline* parent = nullptr;
-        if (const auto it = graphics_cache.find(record.parent_key);
-            it != graphics_cache.end() && it->second && OcclKindWanted(record.kind)) {
-            parent = it->second.get();
-            if (record.kind == 0) {
-                // Made, found or queued already; or the parent is no Lean pipeline (the draw
-                // path makes siblings of those only).
-                if (parent->occl_class == 0) {
-                    parent->occl_class =
-                        static_cast<u8>(static_cast<u8>(ClassifyOcclPipeline(*parent)) + 1);
+        if (!remove) {
+            if (const auto it = graphics_cache.find(record.parent_key);
+                it != graphics_cache.end() && it->second && OcclKindWanted(record.kind)) {
+                parent = it->second.get();
+                if (record.parent_signature != OcclSignatureOf(*parent)) {
+                    // Built from other environments than when recorded: left to the draws,
+                    // whose variant is recorded in place of this one.
+                    remove = true;
+                    ForgetOcclRecord(record.parent_key, record.kind);
+                } else if (record.kind == 0) {
+                    // Made, found or queued already; or the parent is no Lean pipeline (the
+                    // draw path makes siblings of those only).
+                    if (parent->occl_class == 0) {
+                        parent->occl_class =
+                            static_cast<u8>(static_cast<u8>(ClassifyOcclPipeline(*parent)) + 1);
+                    }
+                    remove = graphics_cache.find(record.key) != graphics_cache.end() ||
+                             parent->occl_class !=
+                                 static_cast<u8>(static_cast<u8>(OcclLean::PipelineClass::Lean) +
+                                                 1) ||
+                             OcclSyncOnly(*parent, 0);
+                } else {
+                    // Made, refused or queued by a draw already; or refused by the memo.
+                    remove = OcclFlagStateOf(*parent, record.kind) != 0 ||
+                             ((record.kind == OCCL_FLAG_BUILD_PREPASS ||
+                               record.kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) &&
+                              OcclMemoRefused(*parent, record.kind));
                 }
-                drop = graphics_cache.find(record.key) != graphics_cache.end() ||
-                       parent->occl_class !=
-                           static_cast<u8>(static_cast<u8>(OcclLean::PipelineClass::Lean) + 1) ||
-                       OcclSyncOnly(*parent, 0);
-            } else {
-                // Made, refused or queued by a draw already; or remembered as refused.
-                drop = OcclFlagStateOf(*parent, record.kind) != 0 ||
-                       ((record.kind == OCCL_FLAG_BUILD_PREPASS ||
-                         record.kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) &&
-                        OcclMemoRefused(record.parent_key, record.kind));
             }
         }
-        bool remove = drop;
-        if (parent != nullptr && !drop) {
+        if (parent != nullptr && !remove) {
             ++ready;
             if (enqueue) {
-                if (queued >= OcclPrebuiltPerTick ||
-                    occl_queue->InFlight() >= OcclPrebuiltInFlight) {
+                if (queued >= OcclPrebuiltPerTick || occl_queue->InFlight() >= in_flight_cap) {
                     capped = true;
-                    break;
-                }
-                switch (EnqueueOcclPrebuilt(record, *parent)) {
-                case OcclEnqueue::Queued:
+                } else if (EnqueueOcclPrebuilt(record_index, *parent) == OcclEnqueue::Queued) {
                     ++queued;
                     OcclFlag::Add(OcclFlag::g_stats.persist_queued);
                     remove = true;
-                    break;
-                case OcclEnqueue::Later:
-                    capped = true;
-                    break;
-                case OcclEnqueue::Failed:
-                    remove = true; // its environments did not read back: left to the draws
-                    break;
+                } else {
+                    capped = true; // the queue is full
                 }
             }
         }
         if (remove) {
-            if (index + 1 != occl_disk_pending.size()) {
-                occl_disk_pending[index] = std::move(occl_disk_pending.back());
-            }
+            record.done = true;
+            occl_disk_pending[index] = occl_disk_pending.back();
             occl_disk_pending.pop_back();
-        } else {
+        } else if (!capped) {
             ++index;
         }
     }
     if (enqueue) {
         occl_disk_backlog = capped;
+        occl_disk_scan_next = index;
     }
     return ready;
 }
 
-PipelineCache::OcclEnqueue PipelineCache::EnqueueOcclPrebuilt(const OcclDiskRecord& record,
+PipelineCache::OcclEnqueue PipelineCache::EnqueueOcclPrebuilt(u32 index,
                                                               GraphicsPipeline& parent) {
+    OcclDiskRecord& record = occl_disk_records[index];
     if (occl_queue->Contains(record.key, record.kind)) {
         return OcclEnqueue::Later;
     }
-    // The recorded environments, read back as the disk cache's loader reads its records.
-    auto envs = std::make_shared<std::vector<FileEnvironment>>();
-    {
-        std::string& payload = const_cast<std::string&>(*record.payload);
-        MemoryStreamBuf memory{payload.data(), payload.size()};
-        std::istream stream{&memory};
-        stream.exceptions(std::ios_base::failbit | std::ios_base::badbit);
-        bool read = false;
-        try {
-            stream.seekg(static_cast<std::streamoff>(record.envs_offset));
-            envs->resize(record.num_envs);
-            read = true;
-            for (FileEnvironment& env : *envs) {
-                const u64 left = payload.size() - static_cast<u64>(stream.tellg());
-                if (!FileEnvironment::RecordFits(stream, left)) {
-                    read = false;
-                    break;
-                }
-                env.Deserialize(stream);
-            }
-            read = read && static_cast<u64>(stream.tellg()) == payload.size();
-        } catch (const std::exception&) {
-            read = false;
-        }
-        if (!read) {
-            static std::atomic<bool> logged{};
-            if (!logged.exchange(true, std::memory_order_relaxed)) {
-                LOG_WARNING(Render_Vulkan,
-                            "Occlusion variants on disk: a record of {} (kind {}) does not read "
-                            "back; such records are left to the draws",
-                            OcclShaders(record.parent_key), record.kind);
-            }
-            return OcclEnqueue::Failed;
-        }
-    }
+    // The translation thread reads the environments back from the file (ReadOcclRecordEnvs).
     auto job = std::make_unique<TranslationJob>();
     job->key = record.key;
     job->occl = true;
     job->occl_kind = record.kind;
     job->parent_key = record.parent_key;
     job->prebuilt = true;
-    job->file_envs = std::move(envs);
+    job->occl_file = TranslationJob::OcclFileRecord{
+        .path = occl_persist_path,
+        .offset = record.offset,
+        .size = record.size,
+        .hash = record.hash,
+        .envs_offset = static_cast<u32>(OcclVariantFixedSize),
+        .num_envs = record.num_envs,
+    };
+    job->occl_parent_signature = record.parent_signature;
     job->enqueued = std::chrono::steady_clock::now();
     if (!occl_queue->Enqueue(std::move(job))) {
         return OcclEnqueue::Later;
     }
+    record.done = true;
     if (record.kind == 0) {
         graphics_cache.emplace(record.key, nullptr); // filled by TickOcclVariants (as a draw's)
     } else {
         OcclFlagStateOf(parent, record.kind) = OCCL_FLAG_STATE_QUEUED;
     }
+    return OcclEnqueue::Queued;
+}
+
+PipelineCache::OcclEnqueue PipelineCache::EnqueueOcclRecordFor(GraphicsPipeline& parent,
+                                                               u8 kind) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    const auto it = occl_disk_index.find(parent.Key());
+    if (it == occl_disk_index.end() || kind > OCCL_FLAG_BUILD_PREPASS_NOCOLOUR ||
+        it->second[kind] == 0) {
+        return OcclEnqueue::Failed;
+    }
+    const u32 index = it->second[kind] - 1;
+    OcclDiskRecord& record = occl_disk_records[index];
+    if (record.done) {
+        return OcclEnqueue::Failed;
+    }
+    if (record.parent_signature != OcclSignatureOf(parent)) {
+        // Recorded with a parent built from other environments: from this draw's state, and
+        // that variant recorded in place of this record.
+        record.done = true;
+        ForgetOcclRecord(record.parent_key, kind);
+        return OcclEnqueue::Failed;
+    }
+    if (EnqueueOcclPrebuilt(index, parent) != OcclEnqueue::Queued) {
+        return OcclEnqueue::Later;
+    }
+    OcclFlag::Add(OcclFlag::g_stats.persist_queued);
     return OcclEnqueue::Queued;
 }
 
