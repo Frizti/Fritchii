@@ -104,8 +104,12 @@ nx2-precompile check    --file precompiled.fork-v<N>.nx2prep
 nx2-precompile recipe   --file precompiled.fork-v<N>.nx2prep --game GAME --out GAME.nx2recipe
 nx2-precompile assemble --recipe GAME.nx2recipe --game GAME --out precompiled.fork-v<N>.nx2prep
 nx2-precompile audit    --recipe GAME.nx2recipe --game GAME
+nx2-precompile merge    --recipe GAME.nx2recipe --game GAME --cache CACHE.bin [--cache ...] [--occl OCCL.bin ...] --out MERGED.nx2recipe
 nx2-precompile cache-version
 ```
+
+`merge` (Fritchii) adds what recorded play needed and the recipe lacks, and occlusion variant hints: see
+`docs/fritchii/recipe-merge.md`.
 
 ## Recipes
 

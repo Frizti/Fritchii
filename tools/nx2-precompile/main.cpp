@@ -1626,12 +1626,106 @@ int Assemble(const std::filesystem::path& recipe_path, const std::filesystem::pa
     const auto begin = std::chrono::steady_clock::now();
     const auto programs = ExtractGame(game, threads);
     VideoCommon::Nx2Recipe::Report report;
+    VideoCommon::Nx2Recipe::VariantHints hints;
     const auto file = VideoCommon::Nx2Recipe::Assemble(
-        recipe, programs, VideoCommon::VulkanPipelineCacheVersion, report, threads);
+        recipe, programs, VideoCommon::VulkanPipelineCacheVersion, report, threads, &hints);
     std::ofstream(out, std::ios::binary)
         .write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+    if (hints.sources != 0) {
+        const auto hinted =
+            std::ranges::count_if(hints.kinds, [](u8 mask) { return mask != 0; });
+        fmt::print("occlusion variant hints: {} of the file's {} records (from {} occlusion "
+                   "files)\n",
+                   hinted, hints.kinds.size(), hints.sources);
+    }
     PrintReport(report);
     fmt::print("precompiled file {} bytes in {:.1f} s\n", file.size(),
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    return 0;
+}
+
+// merge: the recipe with the pipelines the disk caches hold and it lacks, and the occlusion
+// variant kinds play used per record (docs/fritchii/recipe-merge.md).
+int Merge(const std::filesystem::path& recipe_path, const std::filesystem::path& game_path,
+          const std::vector<std::filesystem::path>& cache_paths,
+          const std::vector<std::filesystem::path>& occl_paths, const std::filesystem::path& out,
+          unsigned threads) {
+    namespace R = VideoCommon::Nx2Recipe;
+    const auto recipe = ReadFile(recipe_path);
+    const auto header = R::ReadHeader(recipe);
+    if (!header) {
+        throw std::runtime_error(recipe_path.string() + " is not a precompile recipe");
+    }
+    std::vector<std::vector<u8>> storage;
+    std::vector<R::MergeSource> caches, occlusion;
+    for (const auto& path : cache_paths) {
+        storage.push_back(ReadFile(path));
+    }
+    for (const auto& path : occl_paths) {
+        storage.push_back(ReadFile(path));
+    }
+    for (size_t i = 0; i < cache_paths.size(); ++i) {
+        caches.push_back({fmt::format("cache {}", i + 1), storage[i]});
+    }
+    for (size_t i = 0; i < occl_paths.size(); ++i) {
+        occlusion.push_back(
+            {fmt::format("occlusion file {}", i + 1), storage[cache_paths.size() + i]});
+    }
+    Game game;
+    auto spill = out;
+    spill += ".spill";
+    OpenGame(game, game_path, spill, "merged");
+    fmt::print("recipe for {:016X} v{} (cache version {}); game {:016X} v{}\n", header->title_id,
+               header->game_version, header->cache_version, game.title_id, game.version);
+    // A NUP holding only an update package names no base title: its version still decides.
+    if ((game.title_id != 0 && game.title_id != header->title_id) ||
+        game.version != header->game_version) {
+        throw std::runtime_error("the game is not the one the recipe is for");
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const auto programs = ExtractGame(game, threads);
+    R::MergeReport report;
+    const auto merged = R::Merge(recipe, programs, caches, occlusion, report, threads);
+    std::ofstream file(out, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(merged.data()),
+               static_cast<std::streamsize>(merged.size()));
+    file.close();
+    if (!file) {
+        throw std::runtime_error("cannot write " + out.string());
+    }
+    fmt::print("records {} -> {} (graphics +{}, compute +{}: {} with a key the recipe lacked, {} "
+               "with facts no record of their key answers)\n",
+               report.records_before, report.records_after, report.added_graphics,
+               report.added_compute, report.added_new_key, report.added_new_facts);
+    fmt::print("programs {} -> {}, fact sets {} -> {}, render states {} -> {}\n",
+               report.programs_before, report.programs_after, report.facts_before,
+               report.facts_after, report.states_before, report.states_after);
+    fmt::print("cache entries: {} graphics, {} compute; {} already in the recipe, {} answered by "
+               "a record of their key (texture handles aside), {} repeated across the caches, {} "
+               "not expressible (no program of the game, or withheld)\n",
+               report.cache_graphics, report.cache_compute, report.in_recipe, report.answered,
+               report.duplicates, report.not_expressible);
+    fmt::print("device form: {} states turned into the recipe's (logic op), {} left in their "
+               "device's form; recipe programs not in this game: {}\n",
+               report.converted_form, report.device_specific, report.recipe_programs_missing);
+    fmt::print("occlusion: {} variant records ({} refusals left out, {} parents without a "
+               "record); by kind:",
+               report.occl_variants, report.occl_refusals, report.occl_unmatched);
+    for (size_t kind = 0; kind < report.variants_by_kind.size(); ++kind) {
+        fmt::print(" {}={}", kind, report.variants_by_kind[kind]);
+    }
+    fmt::print("\nhinted records {}; records per kind:", report.hinted_records);
+    for (size_t kind = 0; kind < report.hinted_by_kind.size(); ++kind) {
+        fmt::print(" {}={}", kind, report.hinted_by_kind[kind]);
+    }
+    fmt::print("\n");
+    for (size_t i = 0; i < std::min<size_t>(report.errors.size(), 16); ++i) {
+        fmt::print("  {}\n", report.errors[i]);
+    }
+    if (report.errors.size() > 16) {
+        fmt::print("  ... {} more\n", report.errors.size() - 16);
+    }
+    fmt::print("recipe {} bytes (was {}) in {:.1f} s\n", merged.size(), recipe.size(),
                std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     return 0;
 }
@@ -1675,13 +1769,15 @@ int main(int argc, char** argv) {
             return 0;
         }
         std::filesystem::path pkg, cache, out, priors_path, check_file, game, recipe;
+        std::vector<std::filesystem::path> caches, occls; // merge: every --cache and --occl
         std::string packages = "merged";
         unsigned threads = std::max(1U, std::thread::hardware_concurrency() - 2);
         for (int i = 2; i + 1 < argc; i += 2) {
             const std::string arg = argv[i];
             const std::string value = argv[i + 1];
             if (arg == "--pkg") pkg = value;
-            else if (arg == "--cache") cache = value;
+            else if (arg == "--cache") { cache = value; caches.emplace_back(value); }
+            else if (arg == "--occl") occls.emplace_back(value);
             else if (arg == "--out") out = value;
             else if (arg == "--threads") threads = static_cast<unsigned>(std::stoul(value));
             else if (arg == "--priors") priors_path = value;
@@ -1700,6 +1796,14 @@ int main(int argc, char** argv) {
             if (recipe.empty() || game.empty() || out.empty())
                 throw std::runtime_error("assemble needs --recipe RECIPE --game GAME --out FILE");
             return Assemble(recipe, game, out, threads);
+        }
+        if (command == "merge") {
+            if (recipe.empty() || game.empty() || out.empty() || (caches.empty() && occls.empty()))
+                throw std::runtime_error("merge needs --recipe RECIPE --game GAME --out RECIPE and "
+                                         "--cache CACHE / --occl OCCL (each may repeat)");
+            if (out == recipe)
+                throw std::runtime_error("merge writes a new recipe: --out must not be --recipe");
+            return Merge(recipe, game, caches, occls, out, threads);
         }
         if (command == "audit") {
             if (recipe.empty() || game.empty())
