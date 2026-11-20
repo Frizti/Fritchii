@@ -3333,13 +3333,6 @@ std::optional<u32> Device::LinkHogFamily() const {
 bool Device::PrefersDescriptorSets() const {
     static const bool prefers = [this] {
         const char* const value = std::getenv("FRITCHII_DESCRIPTOR_SETS");
-        // Unset: sets from pools on AMD's proprietary driver on a discrete GPU (RX 9070 XT eGPU,
-        // OoT fountain with one follower: idle 16.45 -> 16.23 ms, under PCIe load 20.70 ->
-        // 19.04 ms, GPU busy -2 ms; the picture unchanged). 0 = as the driver's features allow
-        // (v6.2's default), 1 = always, 2 = v6.2's rule (AMD, discrete, no resizable BAR).
-        const bool amd_proprietary_discrete =
-            GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY && !IsIntegrated();
-        const int mode = value != nullptr ? std::atoi(value) : (amd_proprietary_discrete ? 1 : 0);
         VkDeviceSize window = 0;
         const auto memory = physical.GetMemoryProperties().memoryProperties;
         for (u32 type = 0; type < memory.memoryTypeCount; ++type) {
@@ -3353,13 +3346,22 @@ bool Device::PrefersDescriptorSets() const {
         // discrete card whose CPU-visible window is 7 GiB or less (no resizable BAR).
         const bool amd = GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY ||
                          GetDriverID() == VK_DRIVER_ID_AMD_OPEN_SOURCE;
-        const bool on = mode == 1 || (mode == 2 && amd && !IsIntegrated() &&
-                                      window <= VkDeviceSize{7} << 30);
+        const bool small_window = window <= VkDeviceSize{7} << 30;
+        // Unset: v6.2's =2 rule on AMD's proprietary driver (discrete, CPU-visible window 7 GiB or
+        // less). RX 9070 XT eGPU over OCuLink, 256 MiB window, OoT fountain with one follower at
+        // Full: idle 16.45 -> 16.23 ms, under PCIe load 20.70 -> 19.04 ms, GPU busy -2 ms, the
+        // picture unchanged. Cards with resizable BAR keep push descriptors (not measured there).
+        // 0 = as the driver's features allow (v6.2's default), 1 = always, 2 = v6.2's rule (both
+        // AMD drivers).
+        const bool amd_default =
+            GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY && !IsIntegrated() && small_window;
+        const int mode = value != nullptr ? std::atoi(value) : (amd_default ? 2 : 0);
+        const bool on = mode == 1 || (mode == 2 && amd && !IsIntegrated() && small_window);
         LOG_INFO(Render_Vulkan,
                  "Descriptors: {} (FRITCHII_DESCRIPTOR_SETS={}{}; push descriptors {}, descriptor "
                  "buffer {}; CPU-visible device memory {} MiB)",
                  on ? "sets from pools" : "as the driver's features allow", mode,
-                 value == nullptr ? (amd_proprietary_discrete ? ", the AMD discrete default" : ", unset")
+                 value == nullptr ? (amd_default ? ", the AMD small-window default" : ", unset")
                                   : "",
                  IsKhrPushDescriptorSupported() ? "supported" : "not supported",
                  IsExtDescriptorBufferSupported() ? "supported" : "off", window >> 20);

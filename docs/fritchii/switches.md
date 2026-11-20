@@ -6508,12 +6508,12 @@ thunderbolt) and --link, --link-load, --link-us, --hog, --hog-mode, --bar, --lin
   budget. Before a request spills to host staging because the ring looks busy, the GPU's progress
   is read again. FRITCHII_SMALL_BAR_STREAM_MIB=<transfers>,<buffers> (boot, 16 to 256 each) sets the
   sizes for tests and turns the rest on. Resizable BAR and integrated GPUs are not touched.
-- FRITCHII_DESCRIPTOR_SETS (boot; unset = on for AMD's proprietary driver on a discrete GPU, else
-  as the driver allows; 0 as the driver allows, 1 on, 2 AMD drivers on a discrete card with 7 GiB or
-  less of CPU-visible device memory). The AMD discrete default: RX 9070 XT eGPU with resizable BAR,
-  OoT fountain, one follower and Full occlusion: idle 16.45 -> 16.23 ms, under PCIe load 20.70 ->
-  19.04 ms (-8%), GPU busy about -2 ms, picture unchanged (2 runs each). Not yet measured on a
-  desktop x16 card. Draws and dispatches take descriptor sets from pools instead
+- FRITCHII_DESCRIPTOR_SETS (boot; unset = rule 2 on AMD's proprietary driver, else as the driver
+  allows; 0 as the driver allows, 1 on, 2 AMD drivers on a discrete card with 7 GiB or less of
+  CPU-visible device memory). The unset default: RX 9070 XT eGPU over OCuLink with a 256 MiB
+  CPU-visible window, OoT fountain, one follower and Full occlusion: idle 16.45 -> 16.23 ms, under
+  PCIe load 20.70 -> 19.04 ms (-8%), GPU busy about -2 ms, picture unchanged (2 runs). Cards with
+  resizable BAR (window over 7 GiB) keep push descriptors: not measured there. Draws and dispatches take descriptor sets from pools instead
   of push descriptors. In AMD's open driver source, push descriptors are command buffer embedded
   data, kept with the command buffers in host memory unless the CPU-visible window is over 7 GiB;
   descriptor pools try device memory first. So without resizable BAR each draw's shaders would fetch
