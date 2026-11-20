@@ -4498,7 +4498,8 @@ u8& PipelineCache::OcclFlagStateOf(GraphicsPipeline& full, u8 kind) {
 GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 kind) {
     namespace OcclFlag = VideoCommon::OcclFlag;
     // FRITCHII_OCCL_FLAG_PERSIST: a pre-pass variant of this parent (key, descriptor signature)
-    // and kind was refused for its descriptors in two sessions of this build: refused now, with
+    // and kind was refused for its descriptors in an earlier session of this build
+    // (OcclMemoSessions): refused now, with
     // no snapshot or translation.
     if ((kind == OCCL_FLAG_BUILD_PREPASS || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) &&
         !occl_refused_memo.empty() && OcclFlagStateOf(full, kind) == 0 &&
@@ -4600,19 +4601,19 @@ GraphicsPipeline* PipelineCache::AttachOcclFlag(GraphicsPipeline& full, u8 kind,
         state = 2;
         return nullptr;
     }
-    // FRITCHII_OCCL_FLAG_PERSIST: one made from a draw's state (built_key given) is recorded
-    // once attached (below) when it fits its parent (OcclVariantFitsParent: what a prebuilt one
-    // must do to be used), or its refusal noted. A prebuilt one was checked by AdoptOcclJob and
-    // is neither. Never anything that changes what is drawn.
+    // FRITCHII_OCCL_FLAG_PERSIST: one made from a draw's state (built_key given) is recorded,
+    // under the shape of parent it fits (RecordOcclVariant), and a refused pre-pass's refusal
+    // noted too (the memo is keyed by this parent's shape, the record by the variant's). A
+    // prebuilt one was checked by AdoptOcclJob and is neither. Never anything that changes what
+    // is drawn.
     const bool refused = (kind == OCCL_FLAG_BUILD_PREPASS ||
                           kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) &&
                          !OcclFlagSameDescriptors(*made, full);
     if (built_key != nullptr) {
         if (refused) {
             RecordOcclRefusal(full, kind);
-        } else if (envs != nullptr && OcclVariantFitsParent(*made, full, kind)) {
-            RecordOcclVariant(full, kind, *built_key, std::move(envs));
         }
+        RecordOcclVariant(full, kind, *made, *built_key, std::move(envs));
     }
     if (kind == OCCL_FLAG_BUILD_PREPASS || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
         if (refused) {
@@ -4739,9 +4740,7 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
         return nullptr;
     }
     OcclLean::Add(stats.made);
-    if (captured && OcclVariantFitsParent(*made, full, 0)) {
-        RecordOcclVariant(full, 0, key, std::move(captured));
-    }
+    RecordOcclVariant(full, 0, *made, key, std::move(captured));
     GraphicsPipeline* const pointer = made.get();
     graphics_cache.emplace(key, std::move(made));
     return pointer;
@@ -10732,8 +10731,13 @@ constexpr u32 OcclRecordMarker = 0x5243434F; // "OCCR"
 /// u32 count, the environments as the disk cache serializes them.
 constexpr u8 OcclRecordVariant = 1;
 /// u8 kind (a pre-pass kind), u64 the parent's memo hash (OcclMemoHashOf): refused for its
-/// descriptors in one session (two of them make the memo).
+/// descriptors in one session (OcclMemoSessions of them make the memo).
 constexpr u8 OcclRecordRefused = 2;
+/// Sessions whose refusal of a parent and kind make the memo. One: the memo hash holds this
+/// build, the parent's key and its descriptor signature, so a refusal is honoured by the next run
+/// of the same build for a parent of the same shape only (a parent built from other environments
+/// is another entry, and its pre-pass is tried).
+constexpr u8 OcclMemoSessions = 1;
 constexpr u64 OcclFileHeaderSize = sizeof(OcclFileMagic) + 2 * sizeof(u32);
 constexpr u64 OcclRecordHeaderSize = sizeof(u32) + sizeof(u8) + sizeof(u32) + sizeof(u64);
 constexpr u64 OcclMaxPayload = u64{64} << 20;
@@ -11286,13 +11290,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::AdoptOcclSibling(
             if (parent != nullptr) {
                 ClearOcclFailures(parent_key, *parent, 0);
             }
-            if (parent != nullptr && pipeline && OcclVariantFitsParent(*pipeline, *parent, 0)) {
+            if (parent != nullptr && pipeline) {
                 // Recorded with the snapshot it was translated from (the job goes with the
                 // record to the serialization thread: no copy here), when it fits its parent
-                // (what a prebuilt one must do to be used).
+                // (what a prebuilt one must do to be used; RecordOcclVariant counts the rest).
                 const GraphicsPipelineCacheKey built_key = job->key;
                 const std::shared_ptr<const TranslationJob> held{std::move(job)};
-                RecordOcclVariant(*parent, 0, built_key,
+                RecordOcclVariant(*parent, 0, *pipeline, built_key,
                                   std::shared_ptr<const OcclEnvs>(held, &held->envs));
             }
             return pipeline;
@@ -11478,18 +11482,51 @@ void PipelineCache::ForgetOcclRecord(const GraphicsPipelineCacheKey& parent_key,
 }
 
 void PipelineCache::RecordOcclVariant(GraphicsPipeline& parent, u8 kind,
+                                      const GraphicsPipeline& made,
                                       const GraphicsPipelineCacheKey& key,
                                       std::shared_ptr<const OcclEnvs> envs) {
-    if (!envs || kind > OCCL_FLAG_BUILD_PREPASS_NOCOLOUR || !OcclPersistRecording()) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    OcclFlag::Stats& stats = OcclFlag::g_stats;
+    OcclFlag::Add(stats.persist_offered);
+    if (kind > OCCL_FLAG_BUILD_PREPASS_NOCOLOUR || !OcclPersistRecording()) {
+        OcclFlag::Add(stats.persist_skip_off);
+        return;
+    }
+    if (!envs) {
+        OcclFlag::Add(stats.persist_skip_envs);
+        return;
+    }
+    // The shape of parent this variant is used with next run (AdoptOcclJob, AdoptOcclSibling:
+    // the record's signature equal to the parent's, the variant fitting it and, for a pre-pass,
+    // the parent binding its descriptors). One that fits this session's parent goes under the
+    // parent's signature. One that does not (this session's parent translated from other
+    // environments than the draw's: a parent built at runtime, where next run's comes from the
+    // disk cache) goes under its own: the variant keeps every guest stage's infos, so a parent of
+    // that signature describes exactly its descriptors. A lean sibling has no pixel stage to
+    // take a parent's shape from: one that does not fit is not recorded.
+    const bool prepass =
+        kind == OCCL_FLAG_BUILD_PREPASS || kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR;
+    u64 signature = 0;
+    bool own_shape = false;
+    if (OcclVariantFitsParent(made, parent, kind) &&
+        (!prepass || OcclFlagSameDescriptors(made, parent))) {
+        signature = OcclSignatureOf(parent);
+    } else if (kind != 0) {
+        signature = OcclDescriptorSignature(made);
+        own_shape = true;
+    } else {
+        OcclFlag::Add(stats.persist_skip_unfit);
         return;
     }
     u8& recorded = occl_recorded[parent.Key()];
     const u8 bit = static_cast<u8>(1U << kind);
     if ((recorded & bit) != 0) {
+        OcclFlag::Add(stats.persist_skip_dup);
         return; // written once (again only after its record failed: ForgetOcclRecord)
     }
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         if (key.unique_hashes[index] != 0 && !(*envs)[index].CanBeSerialized()) {
+            OcclFlag::Add(stats.persist_skip_trap);
             return; // as the disk cache: a program with a trap guard is not stored
         }
     }
@@ -11498,14 +11535,18 @@ void PipelineCache::RecordOcclVariant(GraphicsPipeline& parent, u8 kind,
     occl_appends->fetch_add(1);
     if (occl_persist_generation.load() != occl_persist_taken) {
         occl_appends->fetch_sub(1);
+        OcclFlag::Add(stats.persist_skip_off);
         return;
     }
     recorded = static_cast<u8>(recorded | bit);
+    OcclFlag::Add(stats.persist_recorded);
+    if (own_shape) {
+        OcclFlag::Add(stats.persist_recorded_own);
+    }
     // The environments the variant was translated from (shared, never copied here), serialized
     // on the serialization thread exactly as SerializePipeline serializes the disk cache's.
     serialization_thread.QueueWork([path = occl_persist_path, appends = occl_appends,
-                                    parent_key = parent.Key(), kind, key,
-                                    signature = OcclSignatureOf(parent),
+                                    parent_key = parent.Key(), kind, key, signature,
                                     envs = std::move(envs)] {
         try {
             std::ostringstream stream(std::ios::binary);
@@ -11548,7 +11589,7 @@ void PipelineCache::RecordOcclRefusal(GraphicsPipeline& parent, u8 kind) {
     }
     u8& written = occl_refusals_written[hash];
     if ((written & bit) != 0) {
-        return; // one a session: the memo takes two sessions' refusals
+        return; // one a session (OcclMemoSessions sessions' refusals make the memo)
     }
     occl_appends->fetch_add(1);
     if (occl_persist_generation.load() != occl_persist_taken) {
@@ -11732,8 +11773,8 @@ std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFi
         }
     }
     // What stays: the last variant record of each parent key and kind (a later one, recorded
-    // after an earlier one failed or did not fit, replaces it), and two refusals of a parent and
-    // kind at most (two sessions make the memo).
+    // after an earlier one failed or did not fit, replaces it), and OcclMemoSessions refusals of
+    // a parent and kind at most (that many sessions make the memo).
     std::vector<bool> kept(spans.size(), false);
     {
         std::unordered_map<GraphicsPipelineCacheKey, std::array<u32, 6>> last;
@@ -11750,7 +11791,7 @@ std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFi
         std::unordered_map<u64, std::array<u8, 6>> refusals;
         for (const MemoRead& memo : memos) {
             u8& count = refusals[memo.hash][memo.kind];
-            if (count < 2) {
+            if (count < OcclMemoSessions) {
                 ++count;
                 kept[memo.span] = true;
             }
@@ -11813,7 +11854,7 @@ std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFi
             moved_to = std::move(starts);
             LOG_INFO(Render_Vulkan,
                      "Occlusion variants on disk: compacted from {:.1f} to {:.1f} MiB ({} "
-                     "records superseded, past two refusals or not for this build; {} oldest "
+                     "records superseded, refusals past the memo's or not for this build; {} oldest "
                      "dropped past {} MiB)",
                      static_cast<double>(file_bytes) / (1 << 20),
                      static_cast<double>(kept_bytes) / (1 << 20),
@@ -11845,7 +11886,7 @@ std::unique_ptr<PipelineCache::OcclPersistLoad> PipelineCache::ReadOcclPersistFi
             continue;
         }
         ++load->memo_records;
-        if (++refusals[memo.hash][memo.kind] == 2) {
+        if (++refusals[memo.hash][memo.kind] == OcclMemoSessions) {
             u8& bits = load->memo[memo.hash];
             bits = static_cast<u8>(bits | (1U << memo.kind));
         }

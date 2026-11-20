@@ -239,6 +239,19 @@ struct Stats {
     /// longer fits this session's parent (left to the draws).
     std::atomic<u64> persist_unused{};
     std::atomic<u64> persist_memo_refusals{};
+    /// Recording: variants (and lean siblings) made from a draw's state and offered for a
+    /// record; recorded (of them, under the variant's own descriptor shape: it does not fit this
+    /// session's parent); skipped: not recording (no file taken over yet, or a later load began),
+    /// no environments, recorded already (parent key and kind), a program with a trap guard (as
+    /// the disk cache), a lean sibling that does not fit its parent.
+    std::atomic<u64> persist_offered{};
+    std::atomic<u64> persist_recorded{};
+    std::atomic<u64> persist_recorded_own{};
+    std::atomic<u64> persist_skip_off{};
+    std::atomic<u64> persist_skip_envs{};
+    std::atomic<u64> persist_skip_dup{};
+    std::atomic<u64> persist_skip_trap{};
+    std::atomic<u64> persist_skip_unfit{};
     std::atomic<s64> window_start{};
 };
 inline Stats g_stats;
@@ -278,7 +291,15 @@ inline void MaybeLog() {
               persist_queued = take_raw(g.persist_queued),
               persist_adopted = take_raw(g.persist_adopted),
               persist_unused = take_raw(g.persist_unused),
-              persist_memo_refusals = take_raw(g.persist_memo_refusals);
+              persist_memo_refusals = take_raw(g.persist_memo_refusals),
+              persist_offered = take_raw(g.persist_offered),
+              persist_recorded = take_raw(g.persist_recorded),
+              persist_recorded_own = take_raw(g.persist_recorded_own),
+              persist_skip_off = take_raw(g.persist_skip_off),
+              persist_skip_envs = take_raw(g.persist_skip_envs),
+              persist_skip_dup = take_raw(g.persist_skip_dup),
+              persist_skip_trap = take_raw(g.persist_skip_trap),
+              persist_skip_unfit = take_raw(g.persist_skip_unfit);
     const double made = static_cast<double>(made_raw) / s;
     const double flag_draws = take(g.flag_draws), other = take(g.other_counted),
                  not_lean = take(g.not_lean), refused = take(g.refused_regs),
@@ -311,7 +332,9 @@ inline void MaybeLog() {
              "async variants (FRITCHII_OCCL_FLAG_ASYNC): queued {}, adopted {}, stale/retried "
              "{}, discarded {}, not queued (budget or full) {}, in flight at most {}; on disk "
              "(FRITCHII_OCCL_FLAG_PERSIST): prebuilt queued {}, prebuilt adopted {}, prebuilt "
-             "unused {}, memo refusals {}",
+             "unused {}, memo refusals {}; recording: made {}, recorded {} ({} under their own "
+             "shape), skipped: not recording {}, no environments {}, recorded already {}, trap "
+             "guard {}, sibling not fitting {}",
              RawMode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
              mixed, no_flag, reused, flag_slots, query_slots, colour_flag_draws, colour_made,
@@ -321,7 +344,9 @@ inline void MaybeLog() {
              discard_direct_draws, made_raw, colour_made_raw, prepass_made_raw,
              prepass_refused_raw, async_queued, async_adopted, async_retried, async_discarded,
              async_deferred, async_in_flight_max, persist_queued, persist_adopted,
-             persist_unused, persist_memo_refusals);
+             persist_unused, persist_memo_refusals, persist_offered, persist_recorded,
+             persist_recorded_own, persist_skip_off, persist_skip_envs, persist_skip_dup,
+             persist_skip_trap, persist_skip_unfit);
     std::string census;
     for (size_t i = 0; i < static_cast<size_t>(Census::Count); ++i) {
         census += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", CensusNames[i], take(g.census[i]));

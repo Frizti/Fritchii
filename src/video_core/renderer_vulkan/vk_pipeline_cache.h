@@ -547,7 +547,7 @@ private:
         u64 generation{}; ///< occl_persist_generation of the load that read it
         std::shared_ptr<const std::filesystem::path> path;
         std::vector<OcclDiskRecord> records;
-        /// Memo hash (OcclMemoHashOf) -> bit per pre-pass kind refused in two sessions
+        /// Memo hash (OcclMemoHashOf) -> bit per pre-pass kind refused (OcclMemoSessions)
         std::unordered_map<u64, u8> memo;
         size_t memo_records{};
     };
@@ -603,8 +603,12 @@ private:
     [[nodiscard]] bool OcclKindWanted(u8 kind) const;
     /// Whether records are written now (a file taken over by the current load).
     [[nodiscard]] bool OcclPersistRecording() const;
-    /// Appends a variant's record (once per parent key and kind) on the serialization thread.
-    void RecordOcclVariant(GraphicsPipeline& parent, u8 kind, const GraphicsPipelineCacheKey& key,
+    /// Appends the record of variant `made` (built as `key` from a draw's state; once per parent
+    /// key and kind) on the serialization thread: under the parent's descriptor signature when it
+    /// fits the parent, else (kinds 1-5) under its own (the shape of a parent it would fit next
+    /// run). Every outcome is counted for the 10 s Occlusion flags line.
+    void RecordOcclVariant(GraphicsPipeline& parent, u8 kind, const GraphicsPipeline& made,
+                           const GraphicsPipelineCacheKey& key,
                            std::shared_ptr<const OcclEnvs> envs);
     /// Notes a pre-pass variant refused for its descriptors (once per parent and kind a session).
     void RecordOcclRefusal(GraphicsPipeline& parent, u8 kind);
