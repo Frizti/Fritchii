@@ -74,9 +74,16 @@ struct TranslationJob {
     /// `parent_key`'s pipeline (occl_kind 1-5, PipelineCache's OCCL_FLAG_BUILD_*: the thread
     /// translates with t_occl_flag_build set to it), or with occl_kind 0 a FRITCHII_OCCL_LEAN
     /// sibling (`key` is the parent's without its pixel program). `key` is what is translated
-    /// (kinds 4 and 5: the parent's with every attachment's writes off). Never stored.
+    /// (kinds 4 and 5: the parent's with every attachment's writes off). Not in the disk cache;
+    /// with FRITCHII_OCCL_FLAG_PERSIST a used one is recorded in the occlusion file.
     bool occl{};
     u8 occl_kind{};
+    /// FRITCHII_OCCL_FLAG_PERSIST: built from its record in the occlusion file (`file_envs`, the
+    /// recorded environments, as the disk cache's prebuild builds; `envs` unused), not from a
+    /// draw's snapshot. Its texture reads are not checked against the live state, a failure
+    /// leaves the variant to a later draw, and it is never recorded again.
+    bool prebuilt{};
+    std::shared_ptr<std::vector<VideoCommon::FileEnvironment>> file_envs;
     GraphicsPipelineCacheKey parent_key{};
 
     // Written by the translation thread.

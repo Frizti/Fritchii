@@ -458,8 +458,15 @@ private:
     /// state to 2 when `made` is null or (pre-pass kinds) its descriptors differ from full's;
     /// a refused one is retired (RetireTranslatedPipeline), never destroyed on this thread. The
     /// variant, or null. Shared by the synchronous and the asynchronous path.
-    GraphicsPipeline* AttachOcclFlag(GraphicsPipeline& full, u8 kind,
-                                     std::unique_ptr<GraphicsPipeline> made);
+    /// FRITCHII_OCCL_FLAG_PERSIST: an attached variant is recorded in the occlusion file with
+    /// `envs` (what it was translated from) under `built_key` (the key it was built as), when
+    /// both are given (not for one prebuilt from the file); a pre-pass variant refused for its
+    /// descriptors is remembered there.
+    GraphicsPipeline* AttachOcclFlag(
+        GraphicsPipeline& full, u8 kind, std::unique_ptr<GraphicsPipeline> made,
+        const std::array<VideoCommon::GraphicsEnvironment, Maxwell::MaxShaderProgram>* envs =
+            nullptr,
+        const GraphicsPipelineCacheKey* built_key = nullptr);
     /// FRITCHII_OCCL_FLAG_ASYNC: queues `key`'s translation on occl_queue from snapshot
     /// environments of the current draw (`kind` 1-5 a flag variant of `parent_key`, 0 a lean
     /// sibling). Later when this frame's budget is spent or the queue is full (try again at a
@@ -508,6 +515,74 @@ private:
     /// FRITCHII_OCCL_FLAG_COMPILE_THREADS: whether the build on this thread is a flag variant
     /// whose driver compile goes to occl_compile_workers (never a cache entry, never waited on).
     [[nodiscard]] bool OcclLaneBuild() const;
+
+    /// FRITCHII_OCCL_FLAG_PERSIST (boot, default 1; 0 = no file read or written): occlusion
+    /// variants and lean siblings used in a session are recorded in vulkan-frizti-occl beside
+    /// the disk cache (kind, the parent's key, the key built, the environments serialized as the
+    /// disk cache serializes them), apart from the disk cache and its stamps. The next boot
+    /// queues them on occl_queue once their parent is in graphics_cache (built from the records,
+    /// as the disk cache's prebuild builds) and attaches them as a draw-asked variant. Pre-pass
+    /// variants refused for their descriptors are remembered by parent key and kind and refused
+    /// at once next time. Recording never affects rendering.
+    bool occl_persist{};
+    /// One record of the occlusion file still to queue: its payload, read again by
+    /// EnqueueOcclPrebuilt (the environments start at `envs_offset`).
+    struct OcclDiskRecord {
+        u8 kind{};
+        u32 num_envs{};
+        GraphicsPipelineCacheKey parent_key{};
+        GraphicsPipelineCacheKey key{};
+        std::shared_ptr<const std::string> payload;
+        size_t envs_offset{};
+    };
+    /// What LoadDiskResources read from the file, handed to the GPU thread (TickOcclPersist).
+    struct OcclPersistLoad {
+        std::filesystem::path path;
+        std::vector<OcclDiskRecord> records;
+        /// Memo hash (OcclMemoHash) of a parent -> bit per pre-pass kind refused
+        std::unordered_map<u64, u8> memo;
+        size_t memo_records{};
+    };
+    /// Reads (and repairs) the occlusion file; on the serialization thread, so no record is
+    /// appended while it reads.
+    std::unique_ptr<OcclPersistLoad> ReadOcclPersistFile(const std::filesystem::path& path);
+    std::mutex occl_persist_mutex;
+    std::unique_ptr<OcclPersistLoad> occl_persist_incoming; ///< Under occl_persist_mutex
+    std::atomic<bool> occl_persist_ready{};
+    // GPU thread (the lookup thread) from here on.
+    /// The file records go to; empty until the boot's read was handed over (nothing recorded
+    /// before, so a record is never appended to a file being read).
+    std::filesystem::path occl_persist_path;
+    /// Records whose parent is not built yet or whose kind is not wanted now (the level is
+    /// live): looked at again every 60 frames, every frame while some wait for room.
+    std::vector<OcclDiskRecord> occl_disk_pending;
+    bool occl_disk_backlog{};
+    /// (parent key, kind bit) recorded or read: each written once.
+    std::unordered_map<GraphicsPipelineCacheKey, u8> occl_recorded;
+    /// The refusal memo: OcclMemoHash of a parent -> bit per pre-pass kind refused for its
+    /// descriptors (read and recorded).
+    std::unordered_map<u64, u8> occl_refused_memo;
+    /// The synchronous path's environments of the variant it is making (CreateGraphicsPipeline
+    /// copies them here when set), for its record.
+    std::array<VideoCommon::GraphicsEnvironment, Maxwell::MaxShaderProgram>* occl_capture_envs{};
+    /// TickFrame: takes over a finished read and queues the records that can be built.
+    void TickOcclPersist();
+    /// The pending records that could be queued now (parent built, kind wanted, not made or
+    /// queued yet); with `enqueue` they are queued (up to the per-frame and in-flight caps) and
+    /// dropped from the list, as are those no longer needed.
+    size_t ScanOcclDiskPending(bool enqueue);
+    /// Queues one record on occl_queue (state 3, or a sibling's empty entry).
+    OcclEnqueue EnqueueOcclPrebuilt(const OcclDiskRecord& record, GraphicsPipeline& parent);
+    /// Whether variant `kind` (0 a lean sibling) can be wanted by a draw at the current
+    /// FRITCHII_OCCL_FLAG / FRITCHII_OCCL_LEAN level and one-follower state.
+    [[nodiscard]] bool OcclKindWanted(u8 kind) const;
+    /// Appends a variant's record (once per parent key and kind) on the serialization thread.
+    void RecordOcclVariant(
+        const GraphicsPipelineCacheKey& parent_key, u8 kind, const GraphicsPipelineCacheKey& key,
+        const std::array<VideoCommon::GraphicsEnvironment, Maxwell::MaxShaderProgram>& envs);
+    /// Remembers a pre-pass variant refused for its descriptors (once per parent and kind).
+    void RecordOcclRefusal(const GraphicsPipelineCacheKey& parent_key, u8 kind);
+    [[nodiscard]] bool OcclMemoRefused(const GraphicsPipelineCacheKey& parent_key, u8 kind) const;
 
     /// The pointer slots kept for the current key (evicted_pointer_slots), null when none
     [[nodiscard]] const VideoCommon::EvictedPointerSlots::Slots* KeptPointers() const;
