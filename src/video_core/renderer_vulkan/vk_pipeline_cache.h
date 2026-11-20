@@ -1057,8 +1057,9 @@ private:
     std::atomic_bool save_again{};
 
     Common::ThreadWorker workers;
-    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS (default clamp((logical processors - 1) * 2 / 7, 1, 4)
-    /// with FRITCHII_OCCL_FLAG_ASYNC=1, else 0; 0 none): the driver compiles of occlusion flag
+    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS (default with FRITCHII_OCCL_FLAG_ASYNC=1: 1 on AMD's
+    /// proprietary driver, elsewhere clamp((logical processors - 1) * 2 / 7, 1, 4) within
+    /// CapLegacyAmdBuildThreads; else 0; 0 none): the driver compiles of occlusion flag
     /// variants, at the lowest priority, apart from the shared workers. Lean siblings (cache
     /// entries draws may wait on) stay on those. Made by EnsureOcclLanes; read through
     /// OcclCompileLane (preparation threads read it too).
