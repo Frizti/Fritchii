@@ -2844,10 +2844,12 @@ void TextureCache<P>::SweepColdImages() {
         // Kept by covered retire (cold_keep bit 2): looked at again every frame without a new
         // overlap (its memory was covered; coverage only grows), so the budget and the pressure
         // gate release it; used again (or no longer a candidate), it is ordinary cache contents
-        // from here, its share of the budget kept while it stays in cold_watch.
+        // from here, and its share of the budget goes back (charged again if it is kept again):
+        // the budget covers only images that are cold now, or a long session fills it with
+        // targets that are alive anyway and turns new candidates away.
         bool covered_kept = (image.cold_keep & 4) != 0;
         if (covered_kept && !covered_candidate) {
-            image.cold_keep &= static_cast<u8>(~4);
+            ColdKeepUncharge(image); // clears bit 2 too
             covered_kept = false;
         }
         if (covered_candidate &&
@@ -2922,8 +2924,10 @@ void TextureCache<P>::SweepColdImages() {
             }
             continue;
         }
-        // Touched (prepared, bound, sampled) in the last K host frames.
+        // Touched (prepared, bound, sampled) in the last K host frames. A kept one is hot again:
+        // its share of the keep's budget goes back (charged again if it is kept again).
         if (frame_tick - lru_cache.Tick(image.lru_index) < cold_frames) {
+            ColdKeepUncharge(image);
             ++index;
             continue;
         }
