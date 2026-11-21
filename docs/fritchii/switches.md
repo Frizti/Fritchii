@@ -466,8 +466,11 @@ Zora's Domain facing King Zora, the view must follow the camera.
 On by default on every driver since 6862d0b (2026-11-20). Earlier docs said "since 2026-11-18", but
 the code still defaulted to 0 until that commit, so 6862d0b is its first default-on exposure (owner:
 a briefly late object beats a freeze; RTX 4080 market toggle 70.1 / 71.3 fps, no cost). (Helper AK,
-2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live, Windows only,
-FRITCHII_PROTECT_UNLOCKED=0 restores the locked path. HostMemory's Protect (the write traps on
+2026-11-15, port of zortos293/Lichii #1780 by Reiixan); Windows only,
+FRITCHII_PROTECT_UNLOCKED=0 restores the locked path. The environment (nx2_switches.txt) is read
+once, at the first Protect of the session, so changing it there needs a fresh launch. Live only
+through the debug server's set_switch (FindSwitch has it, so profile_toggle.py works), which
+writes the value Protect reads on every call. HostMemory's Protect (the write traps on
 GPU-cached guest memory, 12,000-28,000 calls a second in OoT) took the placeholder lock before every
 VirtualProtect, and Map/Unmap hold that lock across their kernel calls, which slow from ~10 us to
 ~250 us while the game maps memory in bulk (zone changes): protections queued behind them and the
