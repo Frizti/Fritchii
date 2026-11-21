@@ -6642,7 +6642,7 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   ", key in set at drop" when the drop's key was in the set at the delete. The lost-contents attribution ring (StaleDropRing) is 4,096 drops now (was 1,024):
   covered retire alone records ~140 a second there, so drops read again 7+ s later were "not
   recorded" (9-11 a run) and could not be learned.
-- FRITCHII_COLD_SWEEP_KEEP_COVERED (live, default 0; 6.5 review R3 should-fix 3): whether the keep
+- FRITCHII_COLD_SWEEP_KEEP_COVERED (live, default 1, the tested 6.5 behaviour; 6.5 review R3 should-fix 3): whether the keep
   above may hold targets that newer images of another shape cover (covered retire) or overlap
   since the target's last use (the superseded test, ColdSuperseded). Such a kept target is not
   synced with those images (they aren't aliases), so the next lookup that finds it samples its

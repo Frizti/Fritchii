@@ -2804,7 +2804,7 @@ void TextureCache<P>::SweepColdImages() {
         }
         return true;
     };
-    // FRITCHII_COLD_SWEEP_KEEP_COVERED (live, default 0): whether the keep may hold a target that
+    // FRITCHII_COLD_SWEEP_KEEP_COVERED (live, default 1): whether the keep may hold a target that
     // newer images of another shape cover (covered retire) or overlap since its last use
     // (ColdSuperseded). Such a target is not synced with them (they aren't aliases), so a lookup
     // that finds it again samples its pre-cover picture. Off, those go as in v6.2 (no keep, no
@@ -2814,7 +2814,7 @@ void TextureCache<P>::SweepColdImages() {
     // background was such a target).
     const bool keep_covered =
         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cold_sweep_keep_covered,
-                                         "FRITCHII_COLD_SWEEP_KEEP_COVERED", 0) > 0;
+                                         "FRITCHII_COLD_SWEEP_KEEP_COVERED", 1) > 0;
     // Whether a GPU-written target's address and shape are in the re-sampled set: what mode 1
     // keeps by (no side effects: the rule's own lookup marks the image kept and counts it).
     const auto key_known = [&](const Image& image) {
