@@ -7232,10 +7232,18 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // the kept file only (its NX2KEPT6 layout and the variant token in its stamp): the prepared
     // stamp never names them. The kinds are the device's (OcclPrepMask) that play will draw
     // this session (OcclPrepPlayMask: the occlusion level and one follower, decided here as
-    // play will decide them), and only with the recipe's hints (below); never in a stamp.
-    const bool prep_variants = keep && PrepOcclVariantsMode() != 0;
+    // play will decide them), and only with the recipe's hints; never in a stamp.
+    // The file holds variants (and its stamp says so) only where some would be prepared: kinds
+    // this device and play use, and hints naming at least one of them for some record. Else
+    // (NVIDIA, Intel and RADV with one follower's defaults, a recipe without hints) the switch
+    // changes nothing: the stamp and layout stay those of 0, so turning it on or off there never
+    // prepares again for no variant. The hints need only the file's header and its note, read
+    // here before the stamp.
     u8 occl_mask = 0;
-    if (prep_variants) {
+    // The recipe's variant hints for the file's records, by index in file order (the records'
+    // `index`, whatever order FRITCHII_PREP_ORDER takes them in).
+    std::optional<VideoCommon::Nx2Recipe::VariantHints> occl_hints;
+    if (keep && PrepOcclVariantsMode() != 0) {
         std::string play_why;
         const u8 device_mask = OcclPrepMask();
         const u8 play_mask = OcclPrepPlayMask(device, play_why);
@@ -7244,7 +7252,55 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                  "Precompiled occlusion variants (FRITCHII_PREP_OCCL_VARIANTS={}): kinds {:#x} "
                  "(device {:#x}, played {:#x}: {})",
                  PrepOcclVariantsMode(), occl_mask, device_mask, play_mask, play_why);
+        std::string hint_source;
+        if (occl_mask != 0) {
+            u32 record_count = 0;
+            {
+                std::ifstream header(path, std::ios::binary);
+                std::array<char, 8> magic{};
+                u32 version{}, env_count{};
+                header.read(magic.data(), magic.size())
+                    .read(reinterpret_cast<char*>(&version), sizeof(version))
+                    .read(reinterpret_cast<char*>(&env_count), sizeof(env_count))
+                    .read(reinterpret_cast<char*>(&record_count), sizeof(record_count));
+                if (!header || std::string_view{magic.data(), magic.size()} != "NX2PREP1" ||
+                    version != CACHE_VERSION) {
+                    record_count = 0; // reported below, by the full read
+                    hint_source = "the precompiled file's header did not read";
+                }
+            }
+            if (record_count != 0) {
+                occl_hints = PrepOcclHints(title_id, base_dir, path, record_count, hint_source);
+            }
+        }
+        const u8 mask = occl_mask;
+        const auto hinted = occl_hints ? std::ranges::count_if(occl_hints->kinds,
+                                                               [mask](u8 kinds) {
+                                                                   return (kinds & mask) != 0;
+                                                               })
+                                       : 0;
+        if (occl_mask != 0 && occl_hints && hinted != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled occlusion variants: hints from {} ({} occlusion files): {} of "
+                     "{} records had variants of these kinds built in play, only their kinds "
+                     "are prepared",
+                     hint_source, occl_hints->sources, hinted, occl_hints->kinds.size());
+        } else {
+            // Without hints nothing says which records' variants play builds: preparing every
+            // kind for every record cost the preparation's time and disk for variants mostly
+            // never drawn, so none is prepared (play translates them as before).
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled occlusion variants: none prepared ({}): the kept file and its "
+                     "stamp are as with FRITCHII_PREP_OCCL_VARIANTS=0",
+                     occl_mask == 0 ? std::string{"no kind this device and play use"}
+                     : occl_hints   ? std::string{"the hints name none of these kinds"}
+                     : hint_source.empty() ? std::string{"no hints: no title id"}
+                                           : fmt::format("no hints: {}", hint_source));
+            occl_mask = 0;
+            occl_hints.reset();
+        }
     }
+    const bool prep_variants = occl_mask != 0;
     const auto kept_path =
         base_dir / fmt::format("precompiled_infos.fork-v{}.bin", CACHE_VERSION);
     auto kept_part = kept_path;
@@ -7343,9 +7399,6 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     /// Which records are compute ones (the compute pass takes only those).
     std::vector<u8> record_compute;
     const auto used_keys = precompile_used_keys;
-    // FRITCHII_PREP_OCCL_VARIANTS: the recipe's variant hints for the file's records, by index in
-    // file order (the records' `index`, whatever order FRITCHII_PREP_ORDER takes them in).
-    std::optional<VideoCommon::Nx2Recipe::VariantHints> occl_hints;
     try {
         std::ifstream in(path, std::ios::binary);
         in.exceptions(std::ifstream::failbit);
@@ -7366,27 +7419,12 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged", path_text);
             return;
         }
-        if (occl_mask != 0 && !compute_only) {
-            std::string hint_source;
-            occl_hints = PrepOcclHints(title_id, base_dir, path, record_count, hint_source);
-            if (occl_hints) {
-                const auto hinted = std::ranges::count_if(
-                    occl_hints->kinds, [](u8 kinds) { return kinds != 0; });
-                LOG_INFO(Render_Vulkan,
-                         "Precompiled occlusion variants: hints from {} ({} occlusion files): "
-                         "{} of {} records had variants built in play, only their kinds are "
-                         "prepared",
-                         hint_source, occl_hints->sources, hinted, record_count);
-            } else {
-                // Without hints nothing says which records' variants play builds: preparing
-                // every kind for every record cost the preparation's time and disk for variants
-                // mostly never drawn, so none is prepared (play translates them as before).
-                occl_mask = 0;
-                LOG_INFO(Render_Vulkan,
-                         "Precompiled occlusion variants: no hints ({}), no variant is prepared "
-                         "(play translates them as before)",
-                         hint_source.empty() ? std::string{"no title id"} : hint_source);
-            }
+        // FRITCHII_PREP_OCCL_VARIANTS: the hints were read with the header before the stamp
+        // (occl_hints); a file whose record count changed since is another file (its size or
+        // time is in the stamp), and HintsForFile matched the count then.
+        if (occl_hints && occl_hints->kinds.size() != record_count) {
+            occl_mask = 0;
+            occl_hints.reset();
         }
         env_index.resize(env_count);
         in.read(reinterpret_cast<char*>(env_index.data()),
