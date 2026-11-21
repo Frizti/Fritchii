@@ -8549,9 +8549,17 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
     // FRITCHII_PREP_OCCL_VARIANTS: the prepared occlusion flag variants too, whose translation
     // is decided in this file (not an NX2_SHADER_STAMP input; OcclVariantTranslationVersion).
     constexpr size_t VariantSample = 16;
+    // ... and the host flag kinds 1 and 4 MakeKeptOcclVariant makes from a parent's own record
+    // when no prepared record of theirs exists (review R2 should-fix 4): a few parents translated
+    // as kind 1 must equal their record, or a change to that kind's translation would go unseen
+    // (no stamp names it, and no record of it is sampled). Kind 4 differs from kind 1 only in
+    // its colour attachments, which reach only the pixel stage, and that stage is replaced by
+    // the host flag program in both. Parents with libraries never take that shortcut.
+    constexpr size_t HostKindSample = 4;
     const auto begin = std::chrono::steady_clock::now();
     const u64 seed = PrecompiledKept::SampleSeed();
-    // 0 graphics, 1 compute, 2 occlusion variant; the position among them.
+    // 0 graphics, 1 compute, 2 occlusion variant, 3 a graphics parent as the host flag kind; the
+    // position among them.
     std::vector<std::pair<u8, size_t>> items;
     for (const size_t position :
          PrecompiledKept::SamplePositions(index.GraphicsCount(), GraphicsSample, seed)) {
@@ -8564,6 +8572,19 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
     for (const size_t position : PrecompiledKept::SamplePositions(
              index.VariantCount(), VariantSample, seed ^ 0x4F43434C56415249ULL)) {
         items.emplace_back(u8{2}, position);
+    }
+    if (PrepOcclVariantsMode() != 0) {
+        size_t host_items = 0;
+        for (const size_t position : PrecompiledKept::SamplePositions(
+                 index.GraphicsCount(), HostKindSample * 4, seed ^ 0x484F53544B494E44ULL)) {
+            if (host_items >= HostKindSample) {
+                break;
+            }
+            if ((index.AllGraphics()[position].flags & PrecompiledKept::FlagLibraries) == 0) {
+                items.emplace_back(u8{3}, position);
+                ++host_items;
+            }
+        }
     }
     // What differs in one sampled pipeline, empty when it is equal. Translated from the
     // precompiled file's key and environments as the preparation did, into pools of its own,
@@ -8664,15 +8685,17 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
                 TranslationRecord translated;
                 translated.translate_only = true;
                 translated.keep_infos = true;
-                // An occlusion flag variant as the preparation translated it (0: the pipeline).
+                // An occlusion flag variant as the preparation translated it (0: the pipeline;
+                // type 3: the parent's record as the host flag kind, MakeKeptOcclVariant).
+                const u8 occl_kind = type == 3 ? OCCL_FLAG_BUILD_HOST : record.occl_kind;
                 GraphicsPipelineCacheKey translated_key = record_key;
-                if (record.occl_kind == OCCL_FLAG_BUILD_NOCOLOUR ||
-                    record.occl_kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
+                if (occl_kind == OCCL_FLAG_BUILD_NOCOLOUR ||
+                    occl_kind == OCCL_FLAG_BUILD_PREPASS_NOCOLOUR) {
                     for (auto& attachment : translated_key.state.attachments) {
                         attachment.raw = 0; // no colour writes, no blending
                     }
                 }
-                t_occl_flag_build = record.occl_kind;
+                t_occl_flag_build = occl_kind;
                 SCOPE_EXIT {
                     t_occl_flag_build = 0;
                 };
@@ -8747,10 +8770,12 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
     if (differences.empty()) {
         LOG_INFO(Render_Vulkan,
                  "Kept precompiled pipelines checked: {} of {} equal, kept file valid ({} "
-                 "graphics of {}, {} compute of {} and {} occlusion variants of {} translated "
-                 "again by this build, {}, {:.0f} ms on {} threads)",
+                 "graphics of {}, {} compute of {}, {} occlusion variants of {} and {} parents "
+                 "as the host flag kind translated again by this build, {}, {:.0f} ms on {} "
+                 "threads)",
                  equal.load(), items.size(), items_of(0), index.GraphicsCount(), items_of(1),
-                 index.ComputeCount(), items_of(2), index.VariantCount(), file_name, ms, threads);
+                 index.ComputeCount(), items_of(2), index.VariantCount(), items_of(3), file_name,
+                 ms, threads);
         return true;
     }
     for (const Difference& difference : differences) {
@@ -8759,6 +8784,7 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
                     "this build's translation",
                     difference.type == 1   ? "compute"
                     : difference.type == 2 ? "occlusion variant of graphics"
+                    : difference.type == 3 ? "host flag kind (from its parent's record) of graphics"
                                            : "graphics",
                     difference.key_hash,
                     difference.stage, difference.what);
@@ -11031,6 +11057,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // pipelines, transform feedback, a static rasterizer discard, and stages whose texture or
     // image counts do not fit the split rescaling bits.
     const bool use_libraries = [&] {
+        // VARIANT TRANSLATION (each t_occl_flag_build branch in this function): a change to
+        // one changes a prepared variant kind's translation, which no shader stamp names. Bump
+        // OcclVariantTranslationVersion with it (FRITCHII_PREP_OCCL_VARIANTS, review R2 5).
         if (t_occl_flag_build) {
             return false; // FRITCHII_OCCL_FLAG: a whole pipeline (a flag variant)
         }
@@ -11089,6 +11118,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         infos[stage_index] = &program.info;
 
         auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        // VARIANT TRANSLATION (see use_libraries above): bump OcclVariantTranslationVersion.
         if (t_occl_flag_build == OCCL_FLAG_BUILD_COLOUR &&
             program.stage == Shader::Stage::Fragment) {
             runtime_info.occl_flag_store = true; // FRITCHII_OCCL_FLAG: the colour flag variant
@@ -11203,6 +11233,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // pixel program was translated for its infos, which the variant keeps).
     // A pipeline without a pixel program gets the host flag program as its pixel stage (no
     // discard: the flag is exactly "some sample passed").
+    // VARIANT TRANSLATION (see use_libraries above): bump OcclVariantTranslationVersion; the
+    // host kinds 1 and 4 are also made from a parent's own record (MakeKeptOcclVariant), which
+    // CheckKeptSample's host kind sample checks.
     const bool occl_flag_variant = t_occl_flag_build == OCCL_FLAG_BUILD_HOST ||
                                    t_occl_flag_build == OCCL_FLAG_BUILD_NOCOLOUR;
     if (occl_flag_variant && !emit_pools && !(record && record->translate_only)) {
