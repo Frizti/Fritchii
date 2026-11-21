@@ -2819,6 +2819,21 @@ void DestroyPipelinesWithProgress(Container& pipelines) {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    // The occlusion flag variants' queued work is given up first (occl_build_cancel): a compile
+    // not started finishes as failed without running, on the lane, on the shared workers or in
+    // a destructor below (which would otherwise build it right there, on this thread), and the
+    // queued translations and kept-record lookups return without work. Variants are never
+    // cache entries, so the saves below lose nothing. Before this, a lane backlog (one
+    // lowest-priority thread on AMD, hundreds queued by a boot prebuild) was drained before the
+    // pipeline cache and the used list were saved, and the frontend cuts a teardown short.
+    occl_build_cancel->cancelled.store(true, std::memory_order_release);
+    if (const u64 backlog = occl_build_cancel->queued.load(std::memory_order_relaxed);
+        backlog != 0 || occl_compile_workers) {
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion variants at exit: {} driver compiles queued and not started, given "
+                 "up (variants are never cache entries)",
+                 backlog);
+    }
     // Stop the warm-ups and background builds first: their builds use the members below. The
     // stop callback goes first, as it writes the flags below.
     warm_stop_callback.reset();
@@ -2841,11 +2856,22 @@ PipelineCache::~PipelineCache() {
     occl_lanes_state.store(OcclLanesNone, std::memory_order_release); // none made from now
     occl_queue_live.store(nullptr, std::memory_order_release);
     occl_queue.reset();
+    Common::NoteShutdownProgress();
     StopBackgroundPipelines();
     Common::NoteShutdownProgress();
     workers.WaitForRequests();
+    Common::NoteShutdownProgress();
     if (occl_compile_workers) {
+        // Only the compiles already running (one a lane thread) are waited for.
+        const auto lane_begin = std::chrono::steady_clock::now();
         occl_compile_workers->WaitForRequests();
+        Common::NoteShutdownProgress();
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion variants at exit: lane drained in {} ms, {} compiles given up",
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - lane_begin)
+                     .count(),
+                 occl_build_cancel->skipped.load(std::memory_order_relaxed));
     }
     serialization_thread.WaitForRequests();
     Common::NoteShutdownProgress();
@@ -4937,7 +4963,11 @@ u8 PipelineCache::LookUpKeptParent(GraphicsPipeline& full) {
         Common::ThreadWorker* const lane =
             OcclCompileLane() != nullptr ? OcclCompileLane() : &workers;
         lane->QueueWork([lookup, hash = key.Hash(), present,
-                         mesh = device.IsExtMeshShaderSupported()] {
+                         mesh = device.IsExtMeshShaderSupported(), cancel = occl_build_cancel] {
+            if (cancel->cancelled.load(std::memory_order_acquire)) {
+                lookup->ready.store(true, std::memory_order_release); // exit: no candidates
+                return;
+            }
             try {
                 const PrecompiledKept::Index& kept = *lookup->index;
                 for (const PrecompiledKept::Record& record : kept.Graphics(hash)) {
@@ -5151,6 +5181,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPip
     Common::ThreadWorker* const thread_worker =
         OcclCompileLane() != nullptr ? OcclCompileLane() : &workers;
     GraphicsPipeline::LibraryParams library_params{};
+    const PipelineBuild::CancelScope cancel_scope{occl_build_cancel}; // given up at exit
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, PlayPipelineCache(), &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, draw_templates,
@@ -11179,6 +11210,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         build_in_parallel && !libraries_only
             ? (occl_lane ? OcclCompileLane() : &workers)
             : nullptr};
+    // A play variant's queued compile is given up at exit (occl_build_cancel); the preparation's
+    // variants build on its own thread (no worker) and are never cancelled.
+    std::optional<PipelineBuild::CancelScope> cancel_scope;
+    if (thread_worker != nullptr && t_occl_flag_build != 0 && !t_precompile_build) {
+        cancel_scope.emplace(occl_build_cancel);
+    }
     GraphicsPipeline::LibraryParams library_params{
         .library_cache = use_libraries ? &graphics_libraries : nullptr,
         .spirv_hashes = spirv_hashes,
@@ -11798,6 +11835,12 @@ bool ReadOcclRecordEnvs(const TranslationJob::OcclFileRecord& record,
 } // Anonymous namespace
 
 void PipelineCache::TranslateOnWorker(TranslationJob& job) {
+    // The teardown started (occl_build_cancel): an occlusion job is never used now, and none is
+    // ever stored, so it makes no pipeline instead of a translation and a driver compile.
+    if (job.occl && occl_build_cancel->cancelled.load(std::memory_order_acquire)) {
+        job.outcome = TranslationJob::Outcome::NoPipeline;
+        return;
+    }
     // FRITCHII_OCCL_FLAG_ASYNC: an occlusion job is translated exactly as the synchronous path
     // translates it (t_occl_flag_build set to its kind; a sibling marked for the counts), with
     // no record, and never stored.
