@@ -177,6 +177,11 @@ void LimitRow(QWidget* row_widget) {
                     QObject::tr("Does nothing on this card: it already uses another fast path."));
 }
 
+bool Answered() {
+    const std::string& state = UISettings::values.fritchii_occl_offer.GetValue();
+    return !state.empty() && state != Pending;
+}
+
 bool NoteSession() {
     if (!VideoCommon::OcclFlag::g_full_could_help.exchange(false, std::memory_order_relaxed)) {
         return false;

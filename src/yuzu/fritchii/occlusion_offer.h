@@ -33,6 +33,10 @@ void NoteCards(const std::vector<VkDeviceInfo::Record>& records);
 /// one short line in the tooltip.
 void LimitRow(QWidget* row);
 
+/// Whether fritchii_occl_offer holds an answer: anything but empty or "pending" (the player's
+/// reply, "skipped (setting changed)", or the recommended settings' own mark).
+[[nodiscard]] bool Answered();
+
 /// After a game (MainWindow::OnEmulationStopped): marks the offer pending when that game could
 /// use Full. True when it changed the config (the caller saves it).
 bool NoteSession();

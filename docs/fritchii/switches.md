@@ -3166,8 +3166,13 @@ pre-pass variants. It is set only on a start that applied the tuned settings in 
 install, "Use recommended" in the settings prompt, Reset to defaults), and only while the setting
 is still Standard; never after "Keep my settings" (then one follower stays off on AMD, as in 6.2,
 and the one-time offer below may still ask). The offer's state then reads "set by the recommended
-settings", so it never asks over it. Log: "Recommended settings: occlusion speed-up Full on CARD
-(...)" or "... left at VALUE on CARD (not the default, the player's choice)". A FRITCHII_OCCL_FLAG
+settings", so it never asks over it. That mark, or any other answer in the offer's state, also
+counts as the player's answer on a start that applied the tuned set only because the config looked
+new (qt-config.ini's revision older than frizti.ini's, e.g. after an older build wrote it): Full is
+not set again over a Standard the player picked since; "Use recommended" and Reset to defaults
+still set it. Log: "Recommended settings: occlusion speed-up Full on CARD (...)", "... left at
+VALUE on CARD (not the default, the player's choice)" or "... left at Standard on CARD (the offer
+was answered before: STATE)". A FRITCHII_OCCL_FLAG
 switch still wins at boot. No shaderInt64 test (the frontend's card records have none; every AMD
 proprietary Windows driver has it, and the colour variants check it at the draw). Measured only
 over OCuLink x4 (Full against Standard: host query slots 37k -> 14.5k a second, GPU -0.4 to -1.3
