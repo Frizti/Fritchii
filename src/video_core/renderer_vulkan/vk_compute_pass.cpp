@@ -861,24 +861,8 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     // and the next flush submits them (in Finish mode too: the wait is pacing only). It acts only
     // inside a held packet. Unset: 1 on AMD's proprietary driver only (where the losses were), 0
     // elsewhere (v6.2's submit). An explicit value wins; the old FRITCHII_ASTC_HELD_FLUSH=1 is 0.
-    static const bool held_defer = [this] {
-        const char* const value = std::getenv("FRITCHII_ASTC_HELD_DEFER");
-        const char* const old_flush = std::getenv("FRITCHII_ASTC_HELD_FLUSH");
-        const bool set = value != nullptr && value[0] != '\0';
-        const bool amd = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
-        bool on = set ? value[0] != '0' : amd;
-        if (!set && old_flush != nullptr && old_flush[0] == '1') {
-            on = false;
-        }
-        LOG_INFO(Render_Vulkan,
-                 "ASTC GPU decode inside a held draw fill: {} (FRITCHII_ASTC_HELD_DEFER={})",
-                 on ? "submit left to the next flush" : "submitted at once",
-                 set ? std::string{value}
-                     : fmt::format("unset: {}{}", amd ? "AMD proprietary driver"
-                                                      : "not AMD's proprietary driver",
-                                   !on && amd ? ", FRITCHII_ASTC_HELD_FLUSH=1" : ""));
-        return on;
-    }();
+    static const bool held_defer =
+        AstcHeldDeferOn(device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY);
     if (held_defer && SeamHook::Holding()) [[unlikely]] {
         static std::atomic<u32> held_skips{};
         if (held_skips.fetch_add(1, std::memory_order_relaxed) == 0) {
@@ -909,6 +893,27 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         waited = {};
         window_start = end;
     }
+}
+
+bool AstcHeldDeferOn(bool amd) {
+    static const bool decided = [amd] {
+        const char* const value = std::getenv("FRITCHII_ASTC_HELD_DEFER");
+        const char* const old_flush = std::getenv("FRITCHII_ASTC_HELD_FLUSH");
+        const bool set = value != nullptr && value[0] != '\0';
+        bool on = set ? value[0] != '0' : amd;
+        if (!set && old_flush != nullptr && old_flush[0] == '1') {
+            on = false;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "ASTC GPU decode inside a held draw fill: {} (FRITCHII_ASTC_HELD_DEFER={})",
+                 on ? "submit left to the next flush" : "submitted at once",
+                 set ? std::string{value}
+                     : fmt::format("unset: {}{}", amd ? "AMD proprietary driver"
+                                                      : "not AMD's proprietary driver",
+                                   !on && amd ? ", FRITCHII_ASTC_HELD_FLUSH=1" : ""));
+        return on;
+    }();
+    return decided;
 }
 
 BcEncoderPass::BcEncoderPass(const Device& device_, Scheduler& scheduler_,

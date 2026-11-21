@@ -146,6 +146,7 @@ namespace {
 /// draw or dispatch configures again in the new command buffer (only when the tick moved, so
 /// the common path costs nothing); a played dispatch (one follower, R), which cannot configure
 /// again, records its bind with the dispatch and the scheduler forgets its descriptor buffer.
+/// A played or served draw never configures again either (NotePlayedSplit).
 /// 0: as before (counted only).
 bool SplitBindFix() {
     static const bool on = [] {
@@ -156,6 +157,33 @@ bool SplitBindFix() {
 }
 std::atomic<u64> g_split_draws{};
 std::atomic<u64> g_split_dispatches{};
+std::atomic<u64> g_split_played_kept{};
+std::atomic<u64> g_split_played_lost{};
+/// FRITCHII_SPLIT_BIND_FIX for a played draw (one follower's R) or a served one (a ring B packet,
+/// FRITCHII_MEMSTAGE_THREAD=2): it never configures again (its packet was played at the rest, so
+/// a second Configure takes the unheld path into a buffer cache this thread does not own while
+/// its owner runs: the 4080 pot room crash in BindHostStageBuffers, and a descriptor count
+/// mismatch that stopped step 4 for the session). `lost`: the submit came after the bind (the
+/// scheduler no longer has the pipeline bound), the draw is not recorded. Otherwise the submit
+/// came before the bind (the ASTC decode inside the texture work, the common case): the bind,
+/// the index and the vertex binds of the packet's geometry section are in the new command buffer.
+void NotePlayedSplit(bool lost, u64 shader_hash) {
+    const u64 count = (lost ? g_split_played_lost : g_split_played_kept)
+                          .fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 8 || (count & (count - 1)) == 0) {
+        if (lost) {
+            LOG_WARNING(Render_Vulkan,
+                        "Split bind on a played draw: the submit came after its bind, not drawn "
+                        "(shader {:016x}; {} so far)",
+                        shader_hash, count);
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "Split bind on a played draw: the submit came before its bind, nothing to "
+                     "bind again (shader {:016x}; {} so far)",
+                     shader_hash, count);
+        }
+    }
+}
 void NoteSplitBind(bool dispatch, u64 shader_hash) {
     const u64 count = (dispatch ? g_split_dispatches : g_split_draws)
                           .fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2915,6 +2943,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     bool configured{};
     const u64 configure_tick = scheduler.CurrentTick();
+    const u64 index_plays_before = mem_player.IndexPlays();
     {
         Profile::Scope scope{Profile::Zone::Configure};
         const MemStage::RestAtEnd rest{mem_stage};
@@ -3064,9 +3093,27 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::DrawRecord};
         // FRITCHII_SPLIT_BIND_FIX: Configure (or anything after it) submitted: bind again.
         if (scheduler.CurrentTick() != configure_tick) [[unlikely]] {
-            NoteSplitBind(false, pipeline->ShaderHashes()[5] != 0 ? pipeline->ShaderHashes()[5]
-                                                                   : pipeline->ShaderHashes()[1]);
-            if (SplitBindFix()) {
+            const u64 split_hash = pipeline->ShaderHashes()[5] != 0 ? pipeline->ShaderHashes()[5]
+                                                                    : pipeline->ShaderHashes()[1];
+            NoteSplitBind(false, split_hash);
+            if (SplitBindFix() && (onef_play != nullptr || ring_packet != nullptr)) {
+                // A played or served draw does not configure again (NotePlayedSplit).
+                if (scheduler.BoundGraphicsPipeline() != pipeline) {
+                    NotePlayedSplit(true, split_hash);
+                    if (onef_play != nullptr) {
+                        VideoCommon::OneFollower::Note(
+                            VideoCommon::OneFollower::Check::PlayedSplitBind,
+                            "a played draw's bind went with a submit before its record");
+                    }
+                    report_failure("bind lost to a submit");
+                    return;
+                }
+                NotePlayedSplit(false, split_hash);
+                // An index bind this draw played before the submit is in the old command buffer.
+                if (is_indexed && mem_player.IndexPlays() != index_plays_before) {
+                    mem_player.EnsureIndexBinding();
+                }
+            } else if (SplitBindFix()) {
                 const MemStage::RestAtEnd rest{mem_stage};
                 if (!pipeline->Configure(is_indexed, keep_last_draw)) {
                     report_failure("configure failed after a split");

@@ -273,6 +273,10 @@ enum class Check : u8 {
     /// image other than the one E recorded the range of (the descriptor R reads at its play
     /// differs from E's, or E had no image where R binds one). The switch stops.
     DispatchImageRange,
+    /// FRITCHII_SPLIT_BIND_FIX: a played draw whose bind went with a submit between its
+    /// Configure and its record (the scheduler no longer had its pipeline bound). R cannot
+    /// configure it again (E's buffer cache): the draw is not recorded.
+    PlayedSplitBind,
     Count,
 };
 
@@ -289,7 +293,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "semaphore order", "R read landing",
     "signal ahead of landing", "unlent reset", "view values", "bind seed view",
     "played dispatch indirect", "played dispatch image", "indirect grid over the limit",
-    "dispatch image range",
+    "dispatch image range", "played split bind",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------

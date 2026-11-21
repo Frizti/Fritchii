@@ -1424,6 +1424,9 @@ private:
     u32 last_index_count = 0;
 
     u32 enabled_vertex_buffers_mask = 0;
+    /// Streams that went from a binding to none since the last BindHostVertexBuffers: the host
+    /// side forgets the buffer it remembers for them there (runtime.ForgetVertexBinding).
+    u32 forget_vertex_buffers_mask = 0;
     u32 stale_vertex_buffers_mask = 0;
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};

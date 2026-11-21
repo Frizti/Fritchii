@@ -1061,6 +1061,13 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
     }
 }
 
+void BufferCacheRuntime::ForgetVertexBinding(u32 index) {
+    if (index >= device.GetMaxVertexInputBindings()) {
+        return;
+    }
+    mem_stage.PushVertex(MemStage::ForgetOnly, index, VK_NULL_HANDLE, 0, 0, 0);
+}
+
 void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bindings) {
     boost::container::static_vector<VkBuffer, VideoCommon::NUM_VERTEX_BUFFERS> buffer_handles(bindings.buffers.size());
     for (u32 i = 0; i < bindings.buffers.size(); ++i) {

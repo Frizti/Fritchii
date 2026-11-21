@@ -3147,6 +3147,20 @@ void MemPlayer::EnsureVertexBindings() {
     }
 }
 
+void MemPlayer::EnsureIndexBinding() {
+    const u64 epoch = scheduler.VertexEpoch();
+    if (!last_index_valid || last_index_buffer == VK_NULL_HANDLE ||
+        last_index_vertex_epoch == epoch) {
+        return;
+    }
+    last_index_vertex_epoch = epoch;
+    bound_index_valid = false; // the rebind skip starts again from the next play
+    scheduler.Record([buffer = last_index_buffer, offset = last_index_offset,
+                      type = last_index_type](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindIndexBuffer(buffer, offset, type);
+    });
+}
+
 // ---------------------------------------------------------------------------------------------
 // The read log (5.3)
 
@@ -4026,16 +4040,26 @@ void MemStage::TickFrame() {
     // follower off (there SEAM 3 is about 0.6 ms slower than 1 on AMD) or FRITCHII_SEAM_AMD=0;
     // FRITCHII_SEAM_AMD=1 keeps the asked level either way (tests).
     if (value >= 2 && VideoCommon::OneFollower::IsAmdProprietaryDriver()) [[unlikely]] {
+        // The unset keep also needs the ASTC held defer: it is what made SEAM 3 survive the title
+        // on AMD (FRITCHII_ASTC_HELD_DEFER=0 would bring the title loss back).
+        static const bool defer = AstcHeldDeferOn(true);
         static const bool keep = [] {
             const char* const v = std::getenv("FRITCHII_SEAM_AMD");
             if (v != nullptr && v[0] != '\0') {
                 return v[0] != '0';
             }
-            return VideoCommon::OneFollower::On();
+            return VideoCommon::OneFollower::On() && defer;
         }();
         static bool logged = false;
         if (!std::exchange(logged, true)) {
-            if (keep) {
+            if (!keep && VideoCommon::OneFollower::On() && !defer &&
+                std::getenv("FRITCHII_SEAM_AMD") == nullptr) {
+                LOG_WARNING(Render_Vulkan,
+                            "Memory seam: EXP123={} held to 1 on AMD's proprietary driver (one "
+                            "follower on, but FRITCHII_ASTC_HELD_DEFER is off: SEAM 3 lost the "
+                            "device at the title without it); FRITCHII_SEAM_AMD=1 keeps it",
+                            value);
+            } else if (keep) {
                 LOG_INFO(Render_Vulkan,
                          "Memory seam: EXP123={} kept on AMD's proprietary driver ({}); "
                          "FRITCHII_SEAM_AMD=0 holds it to 1",
@@ -4479,14 +4503,18 @@ void MemStage::LogStats() {
     }
     {
         static u64 reported_rebound = 0;
+        static u64 reported_forgotten = 0;
         const u64 rebound = player.vertex_runs_rebound.load(std::memory_order_relaxed);
-        if (rebound != reported_rebound) {
+        const u64 forgotten = player.vertex_forgotten.load(std::memory_order_relaxed);
+        if (rebound != reported_rebound || forgotten != reported_forgotten) {
             LOG_INFO(Render_Vulkan,
                      "  memory seam vertex bindings bound again in a new command buffer "
-                     "(EnsureVertexBindings): {:.0f}/s",
-                     rate(rebound - reported_rebound));
+                     "(EnsureVertexBindings): {:.0f}/s; forgotten (stream left without a "
+                     "binding, never bound again) {:.0f}/s",
+                     rate(rebound - reported_rebound), rate(forgotten - reported_forgotten));
         }
         reported_rebound = rebound;
+        reported_forgotten = forgotten;
     }
     reported_vertex_runs = vertex_runs;
     reported = current;
@@ -5084,6 +5112,7 @@ void MemPlayer::SetPasses(Uint8Pass* uint8, QuadIndexedPass* quad_indexed,
 
 void MemPlayer::ForgetBindings() noexcept {
     bound_index_valid = false;
+    last_index_valid = false;
     for (BoundVertexBuffer& bound : bound_vertex_buffers) {
         bound.epoch = ~u64{0};
     }
@@ -5327,6 +5356,13 @@ void MemPlayer::PlayCopy(MemStage::Cmd kind, u8 flags, VkBuffer src_buffer, VkBu
 void MemPlayer::PlayIndex(MemStage::Cmd kind, u8 flags, VkBuffer vk_buffer, VkDeviceSize vk_offset,
                           VkIndexType vk_index_type) {
     BeginPlay(flags);
+    ++index_plays;
+    // EnsureIndexBinding: bound (or still bound) in this command buffer from here on.
+    last_index_valid = (flags & MemStage::ForgetOnly) == 0;
+    last_index_buffer = vk_buffer;
+    last_index_offset = vk_offset;
+    last_index_type = vk_index_type;
+    last_index_vertex_epoch = scheduler.VertexEpoch();
     if (kind == MemStage::Cmd::BindIndexAlways) {
         bound_index_valid = false;
         if ((flags & MemStage::ForgetOnly) != 0) {
@@ -5365,6 +5401,7 @@ void MemPlayer::PlayVertex(u8 flags, u32 index, VkBuffer buffer, u32 offset, u32
         bound_vertex_buffers[index].epoch = ~u64{0};
     }
     if ((flags & MemStage::ForgetOnly) != 0) {
+        Bump(vertex_forgotten);
         return;
     }
     if ((flags & MemStage::DynamicState) != 0) {

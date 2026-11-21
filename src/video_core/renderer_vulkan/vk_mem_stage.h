@@ -1320,6 +1320,16 @@ public:
     /// read the old command buffer's vertex table. Once per command buffer; nothing otherwise.
     void EnsureVertexBindings();
 
+    /// Index binds played (recorded or found still bound); a draw compares it around its
+    /// Configure to know whether the last one is its own.
+    [[nodiscard]] u64 IndexPlays() const noexcept {
+        return index_plays;
+    }
+    /// FRITCHII_SPLIT_BIND_FIX, a played or served draw after a submit inside its Configure: the
+    /// index buffer its play bound is bound again when that was in an earlier command buffer
+    /// (VertexEpoch moved since). Only right after a play of this draw (IndexPlays moved).
+    void EnsureIndexBinding();
+
     /// The remembered index and vertex buffers are forgotten (SEAM changed).
     void ForgetBindings() noexcept;
 
@@ -1379,6 +1389,13 @@ private:
     VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
     u64 bound_index_epoch = 0;
     bool bound_index_valid = false;
+    /// The last index bind played (EnsureIndexBinding), whatever the rebind skip does.
+    VkBuffer last_index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize last_index_offset = 0;
+    VkIndexType last_index_type = VK_INDEX_TYPE_UINT32;
+    u64 last_index_vertex_epoch = 0; ///< VertexEpoch of the command buffer it is bound in
+    bool last_index_valid = false;
+    u64 index_plays = 0;
 
     struct BoundVertexBuffer {
         VkBuffer buffer = VK_NULL_HANDLE;
@@ -1394,6 +1411,7 @@ private:
     /// BindVertices entries recorded, and dropped as still bound (FRITCHII_MEMSTAGE_FULL_BINDS).
     std::atomic<u64> vertex_runs_recorded{};
     std::atomic<u64> vertex_runs_rebound{}; ///< EnsureVertexBindings: bindings bound again
+    std::atomic<u64> vertex_forgotten{};    ///< single-slot forgets (ForgetOnly) played
     std::atomic<u64> vertex_runs_dropped{};
 
     static constexpr u32 LIST_DRAW_SLOTS = 1024;

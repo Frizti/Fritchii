@@ -34,6 +34,11 @@ class Scheduler;
 class Image;
 struct StagingBufferRef;
 
+/// FRITCHII_ASTC_HELD_DEFER (boot), decided once and logged: the ASTC GPU decode's submit inside
+/// a held draw fill is left to the next flush. Unset: on with AMD's proprietary driver only. The
+/// memory stage's SEAM 3 on AMD needs it (MemStage::TickFrame).
+[[nodiscard]] bool AstcHeldDeferOn(bool amd_proprietary);
+
 /// One run of a buffer conversion pass: what its Prepare took from the staging pool and worked
 /// out, and what its Record needs (the memory stage's Convert entry).
 struct ComputePassRun {

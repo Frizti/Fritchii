@@ -28,10 +28,9 @@ struct Record {
     std::map<std::string, std::string> global;   ///< label -> value written to qt-config.ini
     std::map<std::string, std::string> per_game; ///< label -> "global" or Ocarina's override
     bool oot_folded = false; ///< Ocarina's per-game settings were moved to the main ones once
-    /// MainWindow::ApplyHardwareDefaults: the card the hardware defaults were decided for (its
-    /// device name), and label -> the value applied for it (only settings it set). A value the
-    /// player changed since is never set again; on a card change an untouched one goes back to
-    /// its default.
+    /// Written by 6.5 test builds' hardware defaults (the card they were decided for, and label
+    /// -> the value applied); kept through a rewrite, no longer read (ApplyHardwareDefaults now
+    /// follows the recommended settings).
     std::string hw_card;
     std::map<std::string, std::string> hw;
 };

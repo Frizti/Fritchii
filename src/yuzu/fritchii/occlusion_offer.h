@@ -13,9 +13,9 @@ class Record;
 
 // "OoT occlusion speed-up" (Settings::values.occlusion_speedup, video_core/fritchii_occl_flag.h):
 // Standard by default; Full adds more and is offered once to players whose game ran it where it
-// helps (AMD's Windows driver). On AMD's proprietary driver on a discrete GPU Full is set once by
-// MainWindow::ApplyHardwareDefaults instead (its mark in fritchii_occl_offer keeps the offer
-// away). The offer comes after a game ends, or at the next plain launch when the app was closed
+// helps (AMD's Windows driver). On AMD's proprietary driver on a discrete GPU Full is part of the
+// recommended settings (MainWindow::ApplyHardwareDefaults, on a start that applied them; its mark
+// in fritchii_occl_offer keeps the offer away). The offer comes after a game ends, or at the next plain launch when the app was closed
 // with the game; never while a game runs.
 // UISettings fritchii_occl_offer: empty, "pending" (a game could use Full), or the answer.
 //

@@ -921,6 +921,7 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
         }
     }
 
+    frizti_full_applied = full; // ApplyHardwareDefaults, once the cards are known
     auto changes = Frizti::ReconcileGlobal(tuned, record, full);
     for (auto& change : Frizti::FixDockedController(Settings::values)) {
         changes.push_back(std::move(change));
@@ -997,21 +998,22 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
     }
 }
 
-// Hardware-gated defaults (Settings that only some hardware should change), decided once the
-// cards are known: MigrateFriztiSettings runs before them. No Frizti::Revision bump, so no "Use
-// recommended?" prompt. config/frizti.ini keeps the card they were decided for (hw_card) and what
-// was set (hw.<label>):
-// - set only when nothing was decided for this card yet, the value is still the default and the
-//   player never answered the one-time AMD offer (UISettings fritchii_occl_offer: empty, or
-//   "pending" when a build without these defaults queued the offer and it was not shown yet);
-// - afterwards never set again: a value the player changed stays theirs;
-// - on a card change a value still as set goes back to its default, then the new card decides.
-// A FRITCHII_OCCL_FLAG switch still wins at boot (OcclFlag::ReadAtBoot).
+// Hardware-gated recommended settings, decided once the cards are known (MigrateFriztiSettings
+// runs before them). They belong to the tuned set: applied only when this start applied the tuned
+// set in full (frizti_full_applied: a fresh install, "Use recommended" in the settings prompt,
+// Reset to defaults), never after "Keep my settings", and never over a value the player chose
+// (the setting must still be its default). Today one: the occlusion speed-up's Full on AMD's
+// proprietary driver on a discrete GPU (Windows): one follower runs there at Full
+// (FRITCHII_ONEF_AMD), and its win over off comes from Full's pre-pass variants (RX 9070 XT eGPU:
+// Full against Standard -0.4 to -1.3 ms GPU, host queries 37k -> 14.5k a second; verify 234k
+// reports, 0 disagreements). A FRITCHII_OCCL_FLAG switch still wins at boot
+// (OcclFlag::ReadAtBoot).
 bool MainWindow::ApplyHardwareDefaults() {
+    [[maybe_unused]] const bool full = std::exchange(frizti_full_applied, false);
 #ifndef _WIN32
-    return false; // Full is a Windows AMD default, like the offer it replaces (NoteSession)
+    return false; // Full is a Windows AMD default, like the offer (NoteSession)
 #else
-    if (vk_device_records.empty()) {
+    if (!full || vk_device_records.empty()) {
         return false;
     }
     const size_t index = VkDeviceInfo::PickedIndex(
@@ -1021,77 +1023,25 @@ bool MainWindow::ApplyHardwareDefaults() {
         return false;
     }
     const VkDeviceInfo::Record& card = vk_device_records[index];
-    const std::string card_name = card.device_name.empty() ? card.name : card.device_name;
-    // The occlusion speed-up's Full (FRITCHII_OCCL_FLAG=9) on AMD's proprietary driver on a
-    // discrete GPU: one follower runs there at Full (FRITCHII_ONEF_AMD), and its win over off
-    // comes from Full's pre-pass variants (RX 9070 XT eGPU: Full against Standard -0.4 to -1.3 ms
-    // GPU, host queries 37k -> 14.5k a second; verify 234k reports, 0 disagreements). No
-    // shaderInt64 test: VkDeviceInfo::Record has no such field, and every AMD proprietary Windows
-    // driver exposes it (the colour variants also check it at the draw).
-    const bool amd_discrete =
-        card.amd_proprietary && card.device_type != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-    auto& setting = Settings::values.occlusion_speedup;
-    const std::string label = setting.GetLabel();
-    auto& offer = UISettings::values.fritchii_occl_offer;
-    // Our own mark in the offer's state: the offer never asks over a value set here.
-    static constexpr const char* OfferMark = "set by hardware defaults";
-    static constexpr const char* PlayerMark = "changed by the player after hardware defaults";
-    auto record = LoadFriztiRecord();
-    bool changed = false;
-    const auto recorded = record.hw.find(label);
-    const bool player_changed =
-        recorded != record.hw.end() && setting.ToStringGlobal() != recorded->second;
-    if (player_changed && offer.GetValue() == OfferMark) {
-        // The player moved off the value set here: theirs from now on, on any card.
-        offer.SetValue(PlayerMark);
-        changed = true;
-    }
-    if (record.hw_card == card_name) {
-        // Decided for this card: a value set then stays (re-applying it changes nothing), and a
-        // value the player chose stays theirs.
-        if (changed) {
-            config->SaveAllValues();
-        }
+    if (!card.amd_proprietary || card.device_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
         return false;
     }
-    if (!record.hw_card.empty()) {
-        // Another card: a value still as set goes back to its default.
-        if (recorded != record.hw.end() && !player_changed) {
-            setting.SetValue(Settings::OcclusionSpeedup::Standard);
-            changed = true;
-            LOG_INFO(Frontend, "Hardware defaults: {} back to its default (card changed from "
-                               "{} to {})",
-                     label, record.hw_card, card_name);
-            if (offer.GetValue() == OfferMark) {
-                offer.SetValue(std::string{});
-            }
-        }
-        record.hw.clear();
+    const std::string card_name = card.device_name.empty() ? card.name : card.device_name;
+    auto& setting = Settings::values.occlusion_speedup;
+    if (setting.GetValue() != Settings::OcclusionSpeedup::Standard) {
+        LOG_INFO(Frontend, "Recommended settings: occlusion speed-up left at {} on {} (not the "
+                           "default, the player's choice)",
+                 setting.ToStringGlobal(), card_name);
+        return false;
     }
-    record.hw_card = card_name;
-    if (amd_discrete) {
-        if (setting.GetValue() == Settings::OcclusionSpeedup::Standard &&
-            (offer.GetValue().empty() || offer.GetValue() == OfferMark ||
-             offer.GetValue() == "pending")) {
-            setting.SetValue(Settings::OcclusionSpeedup::Full);
-            record.hw.insert_or_assign(label, setting.ToStringGlobal());
-            offer.SetValue(OfferMark);
-            changed = true;
-            LOG_INFO(Frontend, "Hardware defaults: occlusion speed-up Full on {} (AMD's "
-                               "proprietary driver, discrete GPU)",
-                     card_name);
-        } else {
-            LOG_INFO(Frontend, "Hardware defaults: occlusion speed-up left as the player has it "
-                               "on {} (setting {}, offer answer '{}')",
-                     card_name, setting.ToStringGlobal(), offer.GetValue());
-        }
-    }
-    // The record first: the config save below rewrites frizti.ini from the file (RecordFriztiWrite).
-    SaveFriztiRecord(record);
-    if (changed) {
-        config->SaveAllValues();
-    }
-    return changed;
+    setting.SetValue(Settings::OcclusionSpeedup::Full);
+    // The one-time offer has nothing left to ask.
+    UISettings::values.fritchii_occl_offer.SetValue("set by the recommended settings");
+    config->SaveAllValues();
+    LOG_INFO(Frontend, "Recommended settings: occlusion speed-up Full on {} (AMD's proprietary "
+                       "driver, discrete GPU)",
+             card_name);
+    return true;
 #endif
 }
 
@@ -4389,6 +4339,9 @@ void MainWindow::OnConfigure() {
             // The tuned settings now, not at the next start (the revision went back to 0).
             Settings::values.players.GetValue(true) = old_players;
             MigrateFriztiSettings();
+            if (ApplyHardwareDefaults()) {
+                FritchiiOcclusionOffer::NoteCards(vk_device_records);
+            }
             config->SaveAllValues();
         } else if (fritchii) {
             // A restored set stays as it is, and the next start does not ask about it again.
