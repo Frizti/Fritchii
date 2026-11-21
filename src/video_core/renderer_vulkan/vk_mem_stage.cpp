@@ -4040,16 +4040,26 @@ void MemStage::TickFrame() {
     // follower off (there SEAM 3 is about 0.6 ms slower than 1 on AMD) or FRITCHII_SEAM_AMD=0;
     // FRITCHII_SEAM_AMD=1 keeps the asked level either way (tests).
     if (value >= 2 && VideoCommon::OneFollower::IsAmdProprietaryDriver()) [[unlikely]] {
+        // The unset keep also needs the ASTC held defer: it is what made SEAM 3 survive the title
+        // on AMD (FRITCHII_ASTC_HELD_DEFER=0 would bring the title loss back).
+        static const bool defer = AstcHeldDeferOn(true);
         static const bool keep = [] {
             const char* const v = std::getenv("FRITCHII_SEAM_AMD");
             if (v != nullptr && v[0] != '\0') {
                 return v[0] != '0';
             }
-            return VideoCommon::OneFollower::On();
+            return VideoCommon::OneFollower::On() && defer;
         }();
         static bool logged = false;
         if (!std::exchange(logged, true)) {
-            if (keep) {
+            if (!keep && VideoCommon::OneFollower::On() && !defer &&
+                std::getenv("FRITCHII_SEAM_AMD") == nullptr) {
+                LOG_WARNING(Render_Vulkan,
+                            "Memory seam: EXP123={} held to 1 on AMD's proprietary driver (one "
+                            "follower on, but FRITCHII_ASTC_HELD_DEFER is off: SEAM 3 lost the "
+                            "device at the title without it); FRITCHII_SEAM_AMD=1 keeps it",
+                            value);
+            } else if (keep) {
                 LOG_INFO(Render_Vulkan,
                          "Memory seam: EXP123={} kept on AMD's proprietary driver ({}); "
                          "FRITCHII_SEAM_AMD=0 holds it to 1",
