@@ -5113,8 +5113,14 @@ void MemPlayer::SetPasses(Uint8Pass* uint8, QuadIndexedPass* quad_indexed,
 void MemPlayer::ForgetBindings() noexcept {
     bound_index_valid = false;
     last_index_valid = false;
+    // Every vertex bind reaches this player whatever the SEAM (entries run at once call the
+    // same plays), so the remembered buffers are still the ones bound: only the "still bound"
+    // drop stops trusting them. Forgotten (~0), a stream the fill keeps as clean stayed unbound
+    // in the next command buffer R starts (review R1 should-fix 3).
     for (BoundVertexBuffer& bound : bound_vertex_buffers) {
-        bound.epoch = ~u64{0};
+        if (bound.epoch != ~u64{0}) {
+            bound.epoch = StaleEpoch;
+        }
     }
 }
 
@@ -5397,8 +5403,20 @@ void MemPlayer::PlayIndex(MemStage::Cmd kind, u8 flags, VkBuffer vk_buffer, VkDe
 void MemPlayer::PlayVertex(u8 flags, u32 index, VkBuffer buffer, u32 offset, u32 size,
                            u32 stride) {
     BeginPlay(flags);
+    // Remembered as bound (EnsureVertexBindings binds it again in a new command buffer); a
+    // forget, or a null binding, leaves nothing to bind again.
     if (index < VideoCommon::NUM_VERTEX_BUFFERS) {
-        bound_vertex_buffers[index].epoch = ~u64{0};
+        BoundVertexBuffer& bound = bound_vertex_buffers[index];
+        if ((flags & MemStage::ForgetOnly) != 0 || buffer == VK_NULL_HANDLE) {
+            bound.epoch = ~u64{0};
+        } else {
+            bound = {buffer,
+                     offset,
+                     size,
+                     stride,
+                     scheduler.VertexEpoch(),
+                     (flags & MemStage::DynamicState) != 0};
+        }
     }
     if ((flags & MemStage::ForgetOnly) != 0) {
         Bump(vertex_forgotten);
@@ -5424,9 +5442,11 @@ void MemPlayer::PlayVertices(u8 flags, u32 first, u32 binding_count, const VkBuf
     BeginPlay(flags);
     // The same buffers are still bound in this command buffer (as for index buffers): skip
     // the rebind. Draws re-resolve their vertex streams when the guest rewrites unchanged
-    // registers.
+    // registers. Verify never drops one, but still remembers what it binds: EnsureVertexBindings
+    // binds the memo again in a new command buffer, and a memo left from before Verify could
+    // name a buffer deleted since (review R1 should-fix 3).
+    const u64 epoch = scheduler.VertexEpoch();
     if (!VideoCommon::Nx2Perf::Verify()) {
-        const u64 epoch = scheduler.VertexEpoch();
         // A clean run (full vertex binds) only re-states what is bound: still bound at any size,
         // as before full binds (its size follows the draw, the binding did not change).
         const bool keep_size = (flags & MemStage::KeepSize) != 0;
@@ -5441,6 +5461,8 @@ void MemPlayer::PlayVertices(u8 flags, u32 first, u32 binding_count, const VkBuf
             Bump(vertex_runs_dropped);
             return;
         }
+    }
+    {
         const bool dynamic = (flags & MemStage::DynamicState) != 0;
         for (u32 i = 0; i < binding_count; ++i) {
             bound_vertex_buffers[first + i] = {handles[i], offsets[i], sizes[i], strides[i],
