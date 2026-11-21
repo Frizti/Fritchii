@@ -9866,6 +9866,9 @@ void PipelineCache::TickFrame() {
         price_frees ? Common::GetProcessMemoryUsage() : Common::ProcessMemoryUsage{};
     size_t freed_pipelines = 0;
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
+        if (GraphicsPipeline* const parent = evicted_pipelines.front().second.get()) {
+            RetireUnbuiltOcclVariants(*parent);
+        }
         evicted_pipelines.pop_front();
         ++freed_pipelines;
     }
@@ -9947,6 +9950,29 @@ PipelineCache::MemoryOwnerCounts PipelineCache::MemoryOwners() {
 void PipelineCache::RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline) {
     if (pipeline) {
         retired_translations.emplace_back(scheduler.CurrentTick(), std::move(pipeline));
+    }
+}
+
+void PipelineCache::RetireUnbuiltOcclVariants(GraphicsPipeline& parent) {
+    // A parent owns its occlusion flag variants. One whose driver compile still waits on the
+    // occlusion lane (one lowest-priority thread on AMD) would be compiled right here by its
+    // destructor (PipelineBuild's Wait(true)), on the GPU thread. Unbuilt ones go to the retired
+    // translations instead, destroyed once built (TickFrame). A variant is drawn only once built
+    // (OcclFlagPipeline), so an unbuilt one was never drawn; it is never drawn now either, and
+    // forgets its parent, which goes now. Built ones go with the parent, as before.
+    for (std::unique_ptr<GraphicsPipeline>* const variant :
+         {&parent.occl_flag, &parent.occl_flag_colour, &parent.occl_flag_prepass,
+          &parent.occl_flag_nocolour, &parent.occl_flag_prepass_nocolour}) {
+        if (*variant && !(*variant)->IsBuilt()) {
+            (*variant)->occl_flag_parent = nullptr;
+            RetireTranslatedPipeline(std::move(*variant));
+            if (++occl_variants_retired_unbuilt <= 4) {
+                LOG_INFO(Render_Vulkan,
+                         "Occlusion variants: evicted pipeline {:016x} had a variant still "
+                         "compiling, retired instead of compiled on this thread ({} so far)",
+                         parent.Key().Hash(), occl_variants_retired_unbuilt);
+            }
+        }
     }
 }
 

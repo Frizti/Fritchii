@@ -982,6 +982,10 @@ private:
     /// prebuild would hold the evictions behind it there, as that deque is freed from the front.
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> retired_translations; ///< (tick, pipeline)
     void RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
+    /// Before an evicted pipeline is destroyed: its occlusion flag variants not built yet go to
+    /// retired_translations, so their queued compiles never run on the GPU thread.
+    void RetireUnbuiltOcclVariants(GraphicsPipeline& parent);
+    u64 occl_variants_retired_unbuilt{}; ///< This session, GPU thread
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
     /// FRITCHII_RAM_PREBUILT_KEEP: key hashes of boot builds destroyed before any draw used them,
     /// and how many went that way / were asked for again (translated anew) this session.
