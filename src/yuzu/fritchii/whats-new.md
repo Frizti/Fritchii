@@ -1,10 +1,35 @@
-## ⬇️ Download this file: **`Fritchii-v6.2-Windows-x64.zip`**
+## ⬇️ Download this file: **`Fritchii-v6.5-Windows-x64.zip`**
 
-Linux: **`Fritchii-v6.2-Linux-x86_64.AppImage`** (or the `.tar.gz` of the same build).
+Linux: **`Fritchii-v6.5-Linux-x86_64.AppImage`** (or the `.tar.gz` of the same build).
 
-On Fritchii v4 to v6.1 you don't need to download anything: it offers this update when you open it. Otherwise unzip it anywhere and run `Fritchii-v6.2\fritchii.exe` (a small `lichii.exe` stays next to it, so old shortcuts keep working). Don't download "Source code (zip)" or "Source code (tar.gz)": they contain no emulator.
+On Fritchii v4 to v6.2 you don't need to download anything: it offers this update when you open it. Otherwise unzip it anywhere and run `Fritchii-v6.5\fritchii.exe` (a small `lichii.exe` stays next to it, so old shortcuts keep working). Don't download "Source code (zip)" or "Source code (tar.gz)": they contain no emulator.
 
 ---
+
+Fritchii v6.5: AMD gets its extra GPU thread back, and fewer stutters for everyone. Big thanks to Bakemono, who found the AMD crash and wrote most of this release.
+
+### Good to know
+- **First start asks once: "Use the recommended settings?"** Use recommended applies the settings tuned for OoT (on AMD Radeon cards that now includes the Full occlusion speed-up) and saves your old ones first. Keep my settings changes nothing.
+- No new shader preparation: v6.5 keeps v6.2's prepared shaders.
+
+### AMD
+- **The crash with Fritchii's extra GPU thread is fixed.** Bakemono tracked it down with Radeon GPU Detective: the GPU read a vertex buffer list that was out of date. With that fixed, AMD Radeon cards (Windows driver, discrete cards) get the extra GPU thread back, on by default.
+- **The OoT occlusion speed-up is Full by default on AMD Radeon cards.** You can still pick Standard in Graphics > Advanced and Fritchii keeps your choice.
+
+### Fewer stutters
+- **The occlusion speed-up's shader variants are built in the background** and kept on disk, so a new area no longer waits for them, and the next visit doesn't build them again.
+- Prepared shaders load faster on SSDs (read ahead in big chunks).
+
+### Graphics cards with 4 to 8 GB
+- Textures the game keeps sampling again are no longer thrown away when video memory runs short, so there's less re-uploading when you turn around.
+
+### Stability
+- A rare case where Fritchii stopped noticing the game's writes to some memory after it was freed in pieces is fixed (it could show old textures).
+- Fixes from upstream: a CPU rounding instruction, core timing, game list updates and a flood of log lines on some unmapped writes.
+
+---
+
+## What came in v6.2
 
 Fritchii v6.2: smaller graphics cards, slower PCs and above 60 fps.
 

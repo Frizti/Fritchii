@@ -16,7 +16,7 @@ namespace Settings::Frizti {
 
 // Bump when the tuned values change, so every player gets them once more.
 // 13: v6.0 (window filter Auto); 12: v5.8.4 (8: v5.8, own data folder, DLSS modes)
-inline constexpr u32 Revision = 14; // 14: Fritchii v6.2 (asked first: recommended settings prompt)
+inline constexpr u32 Revision = 15; // 15: Fritchii v6.5 (AMD Radeon: occlusion Full by default); 14: v6.2 (asked first: recommended settings prompt)
 inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
 
 // The tuned settings. Frizti's value is each setting's default in settings.h.
