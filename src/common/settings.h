@@ -378,7 +378,7 @@ struct Values {
                                                   true};
 
     SwitchableSetting<ScalingFilter> scaling_filter{linkage,
-                                                    ScalingFilter::Auto,
+                                                    ScalingFilter::Fsr,
                                                     "scaling_filter",
                                                     Category::Renderer,
                                                     Specialization::Default,
