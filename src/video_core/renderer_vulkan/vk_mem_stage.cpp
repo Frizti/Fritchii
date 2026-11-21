@@ -4493,14 +4493,18 @@ void MemStage::LogStats() {
     }
     {
         static u64 reported_rebound = 0;
+        static u64 reported_forgotten = 0;
         const u64 rebound = player.vertex_runs_rebound.load(std::memory_order_relaxed);
-        if (rebound != reported_rebound) {
+        const u64 forgotten = player.vertex_forgotten.load(std::memory_order_relaxed);
+        if (rebound != reported_rebound || forgotten != reported_forgotten) {
             LOG_INFO(Render_Vulkan,
                      "  memory seam vertex bindings bound again in a new command buffer "
-                     "(EnsureVertexBindings): {:.0f}/s",
-                     rate(rebound - reported_rebound));
+                     "(EnsureVertexBindings): {:.0f}/s; forgotten (stream left without a "
+                     "binding, never bound again) {:.0f}/s",
+                     rate(rebound - reported_rebound), rate(forgotten - reported_forgotten));
         }
         reported_rebound = rebound;
+        reported_forgotten = forgotten;
     }
     reported_vertex_runs = vertex_runs;
     reported = current;
@@ -5387,6 +5391,7 @@ void MemPlayer::PlayVertex(u8 flags, u32 index, VkBuffer buffer, u32 offset, u32
         bound_vertex_buffers[index].epoch = ~u64{0};
     }
     if ((flags & MemStage::ForgetOnly) != 0) {
+        Bump(vertex_forgotten);
         return;
     }
     if ((flags & MemStage::DynamicState) != 0) {

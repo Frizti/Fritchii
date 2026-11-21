@@ -1411,6 +1411,7 @@ private:
     /// BindVertices entries recorded, and dropped as still bound (FRITCHII_MEMSTAGE_FULL_BINDS).
     std::atomic<u64> vertex_runs_recorded{};
     std::atomic<u64> vertex_runs_rebound{}; ///< EnsureVertexBindings: bindings bound again
+    std::atomic<u64> vertex_forgotten{};    ///< single-slot forgets (ForgetOnly) played
     std::atomic<u64> vertex_runs_dropped{};
 
     static constexpr u32 LIST_DRAW_SLOTS = 1024;
