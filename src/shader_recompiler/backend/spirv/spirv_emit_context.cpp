@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "common/div_ceil.h"
+#include "common/settings.h"
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -478,7 +479,8 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
       requires_coherent_image_memory{program.info.requires_coherent_image_memory},
       stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index},
-      descriptor_set{bindings.descriptor_set} {
+      descriptor_set{bindings.descriptor_set},
+      render_area_offset{bindings.render_area_offset} {
     const bool is_unified{profile.unified_descriptor_binding};
     u32& uniform_binding{is_unified ? bindings.unified : bindings.uniform_buffer};
     u32& storage_binding{is_unified ? bindings.unified : bindings.storage_buffer};
@@ -503,6 +505,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineWriteStorageCasLoopFunction(program.info);
     DefineGlobalMemoryFunctions(program);
     DefineMeshEmulationOutput();
+    DefineLoopGuard(program);
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
     DefineMeshDrawBase();
@@ -1338,13 +1341,13 @@ void EmitContext::DefineRescalingInput(const Info& info) {
         return;
     }
     if (profile.unified_descriptor_binding) {
-        DefineRescalingInputPushConstant();
+        DefineRescalingInputPushConstant(info);
     } else {
         DefineRescalingInputUniformConstant();
     }
 }
 
-void EmitContext::DefineRescalingInputPushConstant() {
+void EmitContext::DefineRescalingInputPushConstant(const Info& info) {
     boost::container::static_vector<Id, 4> members{};
     u32 member_index{0};
 
@@ -1370,6 +1373,11 @@ void EmitContext::DefineRescalingInputPushConstant() {
     if (occl_flag) {
         members.push_back(TypeInt(64, false));
         occl_flag_member_index = member_index++;
+    }
+    const bool with_render_area{info.uses_render_area && render_area_offset != 0};
+    if (with_render_area) {
+        members.push_back(F32[4]);
+        render_are_member_index = member_index++;
     }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
@@ -1399,9 +1407,17 @@ void EmitContext::DefineRescalingInputPushConstant() {
                        static_cast<u32>(offsetof(RescalingLayout, down_factor)));
         MemberName(push_constant_struct, rescaling_downfactor_member_index, "down_factor");
     }
+    if (with_render_area) {
+        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset,
+                       render_area_offset);
+        MemberName(push_constant_struct, render_are_member_index, "render_area");
+    }
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
     Name(rescaling_push_constants, "rescaling_push_constants");
+    if (with_render_area) {
+        render_area_push_constant = rescaling_push_constants;
+    }
     if (UsesMeshDrawBase()) {
         mesh_draw_base_push_constant = rescaling_push_constants;
     }
@@ -1510,8 +1526,8 @@ void EmitContext::DefineOcclFlag() {
 }
 
 void EmitContext::DefineRenderArea(const Info& info) {
-    if (!info.uses_render_area) {
-        return;
+    if (!info.uses_render_area || Sirit::ValidId(render_area_push_constant)) {
+        return;   // (or a member of the rescaling block: DefineRescalingInputPushConstant)
     }
 
     if (profile.unified_descriptor_binding) {
@@ -1535,7 +1551,8 @@ void EmitContext::DefineRenderArea(const Info& info) {
             MemberName(push_constant_struct, occl_flag_member_index, "occl_flag_slot");
         }
 
-        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset, 0);
+        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset,
+                       render_area_offset);
         MemberName(push_constant_struct, render_are_member_index, "render_area");
 
         const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
@@ -2238,6 +2255,41 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     }
 }
 
+void EmitContext::DefineLoopGuard(const IR::Program& program) {
+    if (runtime_info.loop_guard_binding == ~0U || Settings::values.disable_shader_loop_safety_checks ||
+        std::ranges::none_of(program.syntax_list, [](const IR::AbstractSyntaxNode& node) {
+            return node.type == IR::AbstractSyntaxNode::Type::Repeat;
+        })) {
+        return;
+    }
+    // (Sirit shares identical types: the u32 storage buffer type of the program's own storage
+    // buffers is decorated already, as in DefineMeshEmulationOutput)
+    AddExtension("SPV_KHR_storage_buffer_storage_class");
+    Id struct_pointer{storage_types.U32.array};
+    if (!Sirit::ValidId(struct_pointer)) {
+        const Id array_type{TypeRuntimeArray(U32[1])};
+        Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+        const Id struct_type{TypeStruct(array_type)};
+        Decorate(struct_type, spv::Decoration::Block);
+        MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+        struct_pointer = TypePointer(spv::StorageClass::StorageBuffer, struct_type);
+    }
+    const Id buffer{AddGlobalVariable(struct_pointer, spv::StorageClass::StorageBuffer)};
+    Decorate(buffer, spv::Decoration::Binding, runtime_info.loop_guard_binding);
+    Decorate(buffer, spv::Decoration::DescriptorSet, 0U);
+    Name(buffer, "loop_guard");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(buffer);
+    }
+    loop_guard_buffer = buffer;
+    loop_guard_word_pointer = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+    loop_guard_flag = AddGlobalVariable(TypePointer(spv::StorageClass::Private, U32[1]),
+                                        spv::StorageClass::Private, u32_zero_value);
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(loop_guard_flag);
+    }
+}
+
 void EmitContext::DefineMeshEmulationOutput() {
     if ((stage != Stage::Mesh && stage != Stage::Task) || !runtime_info.mesh_as_compute) {
         return;
@@ -2340,7 +2392,8 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
                                      spv::BuiltIn::ViewportMaskNV);
     }
     for (size_t index = 0; index < IR::NUM_GENERICS; ++index) {
-        if (info.stores.Generic(index)) {
+        if (info.stores.Generic(index) ||
+            (runtime_info.declare_all_generic_outputs && stage == Stage::VertexB)) {
             DefineGenericOutput(*this, index, invocations);
         }
     }
