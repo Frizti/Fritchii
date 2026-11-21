@@ -249,8 +249,10 @@ json Screenshot(ToolState& state, const json& params) {
     const auto pixels = std::make_shared<std::vector<u8>>(size_t{layout.width} * layout.height * 4);
     const auto done = std::make_shared<std::promise<bool>>();
     auto future = done->get_future();
-    renderer.RequestScreenshot(
-        pixels->data(), [pixels, done](bool invert_y) { done->set_value(invert_y); }, layout);
+    if (!renderer.RequestScreenshot(
+            pixels->data(), [pixels, done](bool invert_y) { done->set_value(invert_y); }, layout)) {
+        throw std::runtime_error{"a screenshot is already pending: no frame was presented since"};
+    }
     const int timeout = Param<int>(params, "timeout_s", 5, 1, 30);
     if (!WaitReady(state, future, std::chrono::seconds{timeout})) {
         throw std::runtime_error{

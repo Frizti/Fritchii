@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -30,6 +32,10 @@
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/loader/loader.h"
+#include "core/nvn_hook.h"
+#ifdef LICHII_NVN_DIRECT
+#include "video_core/nvn_direct/nvn_direct.h"
+#endif
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/shader_warm/shader_archives.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
@@ -809,6 +815,178 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
              result.skipped, archive_errors, member_errors,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     return result;
+}
+
+
+std::optional<std::string> ForEachProgram(Core::System& system, const fs::path& game_path,
+                                          const std::function<void(const ShaderRecord&)>& on_record,
+                                          const std::function<void(const Progress&)>& progress,
+                                          std::stop_token stop) {
+    GameFiles game;
+    if (const auto error = OpenGame(system, game_path, game)) {
+        return error;
+    }
+    std::vector<ArchiveFile> archives;
+    std::vector<ArchiveFile> effects;
+    ZstdDictionaries dictionaries;
+    FileSys::VirtualFile dictionary_pack;
+    for (const auto& romfs : game.romfs) {
+        std::vector<ArchiveFile> files;
+        ListFiles(romfs, "", files);
+        std::sort(files.begin(), files.end(),
+                  [](const ArchiveFile& a, const ArchiveFile& b) { return a.path < b.path; });
+        for (auto& file : files) {
+            if (EndsWith(file.path, ".bfsha.zs") || EndsWith(file.path, ".sarc.zs")) {
+                archives.push_back(file);
+            } else if (file.path.starts_with("Effect/") &&
+                       file.path.find('/', 7) == std::string::npos &&
+                       EndsWith(file.path, ".vsetb.byml.zs")) {
+                effects.push_back(file);
+            } else if (file.path == "Pack/ZsDic.pack.zs") {
+                dictionary_pack = file.file;
+            }
+        }
+    }
+    archives.insert(archives.end(), effects.begin(), effects.end());
+    if (dictionary_pack) {
+        try {
+            dictionaries.Load(dictionary_pack->ReadAllBytes());
+        } catch (const ArchiveError& e) {
+            LOG_WARNING(Render_Vulkan, "Shader programs: zstd dictionary pack: {}", e.what());
+        }
+    }
+    if (archives.empty()) {
+        return "No shader archives found in the game files";
+    }
+    for (size_t i = 0; i < archives.size(); ++i) {
+        if (stop.stop_requested()) {
+            return "Stopped";
+        }
+        progress({"Extracting shaders", i, archives.size()});
+        const auto data = archives[i].file->ReadAllBytes();
+        const auto name = archives[i].path.substr(archives[i].path.rfind('/') + 1);
+        try {
+            WalkArchive(data, name, &dictionaries, on_record, [](const std::string&) {});
+        } catch (const ArchiveError& e) {
+            LOG_WARNING(Render_Vulkan, "Shader programs: {}: {}", archives[i].path, e.what());
+        }
+    }
+    progress({"Extracting shaders", archives.size(), archives.size()});
+    return std::nullopt;
+}
+
+
+#ifdef LICHII_NVN_DIRECT
+extern "C" int vka_prewarm_progress(unsigned* done, unsigned* total); // vka_pso.c
+namespace {
+/// The direct renderer's prewarm of earlier runs' pipelines, waited for with its progress shown.
+void WaitForNvnPrewarm(std::stop_token stop, const std::function<void(size_t, size_t)>& progress) {
+    unsigned done = 0, total = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (vka_prewarm_progress(&done, &total) && !stop.stop_requested()) {
+        progress(done, total);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    LOG_INFO(Render_Vulkan, "NVN direct: the loading screen waited {:.1f} s for the pipeline prewarm ({} keys)",
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), total);
+}
+} // namespace
+#endif
+
+void PrepareNvnDirect(Core::System& system, std::stop_token stop,
+                      const std::function<void(size_t, size_t)>& progress) {
+#ifdef LICHII_NVN_DIRECT
+    if (!Core::NvnHook::DirectMode()) {
+        return;
+    }
+    if (const char* off = std::getenv("FRITCHII_NVN_PREPARE"); off != nullptr && off[0] == '0') {
+        return;
+    }
+    const char* const temp = std::getenv("DM_TEMP");
+    const std::string& game_path = system.GetCurrentApplicationFilePath();
+    if (temp == nullptr || *temp == '\0' || game_path.empty()) {
+        return;
+    }
+    // The marker: the game file's size and time, rewritten after a preparation that ran to the
+    // end (the translation file starting again removes it: nvn_recompile.c disk_open).
+    const fs::path marker = fs::path{temp} / "prepared.done";
+    std::error_code ec;
+    const auto size = fs::file_size(game_path, ec);
+    const auto time = fs::last_write_time(game_path, ec).time_since_epoch().count();
+    const std::string expected = fmt::format("1 {} {}", size, time);
+    {
+        std::ifstream in(marker);
+        std::string have;
+        if (in && std::getline(in, have) && have == expected) {
+            LOG_INFO(Render_Vulkan, "NVN direct: the game's shaders were prepared by an earlier boot");
+            WaitForNvnPrewarm(stop, progress);
+            return;
+        }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Program {
+        std::vector<u8> control;
+        std::vector<u8> code;
+    };
+    std::vector<Program> programs;
+    std::unordered_set<u128, U128Hasher> seen;
+    const auto error = ForEachProgram(
+        system, game_path,
+        [&](const ShaderRecord& r) {
+            if (r.stage != ProgramStage::Vertex && r.stage != ProgramStage::Fragment &&
+                r.stage != ProgramStage::Compute) {
+                return;
+            }
+            u128 h = Hash128(r.code);
+            h[1] ^= Hash128(r.control)[0];
+            if (seen.insert(h).second) {
+                programs.push_back({{r.control.begin(), r.control.end()}, {r.code.begin(), r.code.end()}});
+            }
+        },
+        [&](const Progress& p) { progress(p.done, p.total * 10); }, stop);
+    if (error) {
+        LOG_WARNING(Render_Vulkan, "NVN direct: shaders not prepared: {}", *error);
+        return;
+    }
+    const size_t total = programs.size();
+    std::atomic<size_t> next{0}, done{0}, made{0}, known{0}, failed{0};
+    const size_t threads = std::max<size_t>(2, std::thread::hardware_concurrency() > 2
+                                                   ? std::thread::hardware_concurrency() - 2
+                                                   : 2);
+    std::vector<std::jthread> workers;
+    for (size_t t = 0; t < threads; ++t) {
+        workers.emplace_back([&] {
+            for (size_t i; !stop.stop_requested() && (i = next.fetch_add(1)) < total;) {
+                const auto& p = programs[i];
+                const int r = vka_rc_prepare(p.control.data(), p.control.size(), p.code.data(),
+                                             p.code.size());
+                (r > 0 ? made : r == 0 ? known : failed).fetch_add(1);
+                done.fetch_add(1);
+            }
+        });
+    }
+    while (done.load() < total && !stop.stop_requested()) {
+        progress(done.load(), total);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    workers.clear();
+    progress(total, total);
+    const auto seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    LOG_INFO(Render_Vulkan,
+             "NVN direct: {} programs from the game files in {:.1f} s on {} threads: {} prepared, "
+             "{} known already, {} not translated",
+             total, seconds, threads, made.load(), known.load(), failed.load());
+    if (!stop.stop_requested()) {
+        std::ofstream out(marker, std::ios::trunc);
+        out << expected << '\n';
+    }
+    WaitForNvnPrewarm(stop, progress);
+#else
+    (void)system;
+    (void)stop;
+    (void)progress;
+#endif
 }
 
 } // namespace VideoCommon::ShaderWarm

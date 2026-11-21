@@ -7,3 +7,6 @@ set_target_properties(lichii_forwarder PROPERTIES OUTPUT_NAME "lichii")
 target_compile_definitions(lichii_forwarder PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 # Built with the app, so a build of the app always refreshes it.
 add_dependencies(yuzu lichii_forwarder)
+if (MINGW)
+    target_link_options(lichii_forwarder PRIVATE -municode)   # (its entry point is wWinMain)
+endif()

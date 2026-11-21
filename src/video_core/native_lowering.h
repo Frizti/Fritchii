@@ -1,0 +1,59 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <memory>
+#include <span>
+#include <vector>
+
+#include "common/common_types.h"
+#include "video_core/shader_environment.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
+
+namespace Shader {
+struct ProgramHeader;
+}
+
+namespace Shader::Ampere {
+struct LoweredProgram;
+enum class TessellationStage;
+} // namespace Shader::Ampere
+
+namespace VideoCommon {
+
+/// What the lowering of a native program takes besides its instructions
+struct NativeLoweringInputs {
+    bool geometry{};
+    Shader::Ampere::TessellationStage tessellation_stage{};
+    /// Where the code is in guest memory. Only programs loading their own address read it (see
+    /// LoadsProgramCounter).
+    u64 native_code_address{};
+};
+
+/// Byte offsets of the trap instructions, whose guards the caller verifies before lowering
+[[nodiscard]] std::vector<u32> NativeTrapOffsets(
+    std::span<const Shader::Ampere::Instruction> native);
+
+/// Whether the lowering puts the address of the code into it: geometry programs loading the
+/// program counter
+[[nodiscard]] bool LoadsProgramCounter(std::span<const Shader::Ampere::Instruction> native,
+                                       bool geometry);
+
+/// Lowers a captured native program. It depends on its instructions, `inputs` and this build's
+/// lowering (see ShaderCacheV2::LoweringStamp) alone, so it can run again without guest memory.
+[[nodiscard]] Shader::Ampere::LoweredProgram LowerNativeProgram(
+    std::span<const Shader::Ampere::Instruction> native, const NativeLoweringInputs& inputs);
+
+/// Lays a successful lowering out as an environment's code: the shader header, the lowered
+/// instructions with a Maxwell scheduling word before every fourth word, one zero word, then the
+/// native address map. `verified_traps` are those the program was lowered with (NativeTrapOffsets).
+[[nodiscard]] std::shared_ptr<LoweredNativeCode> MakeLoweredNativeCode(
+    std::span<const Shader::Ampere::Instruction> native, const Shader::ProgramHeader& sph,
+    u32 header_size, std::span<const u32> verified_traps, Shader::Ampere::LoweredProgram& lowered);
+
+/// The shader hash of lowered native code (frame dump "shaders", pipeline cache keys), with a
+/// version tag that isolates this experimental ABI.
+[[nodiscard]] u64 NativeShaderHash(std::span<const u64> code);
+
+} // namespace VideoCommon

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <memory>
 
 #include "common/logging.h"
@@ -11,6 +12,7 @@
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
+#include "core/nvn_hook.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2_perf.h"
@@ -54,16 +56,25 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
     const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;
     const bool use_async = Settings::values.use_asynchronous_gpu_emulation.GetValue();
-    gpu.emplace(system, use_async, use_nvdec);
-    auto context = emu_window.CreateSharedContext();
-    auto scope = context->Acquire();
-    try {
-        auto renderer = CreateRenderer(system, emu_window, *gpu, std::move(context));
-        gpu->BindRenderer(std::move(renderer));
-    } catch (const std::runtime_error& exception) {
-        scope.Cancel();
-        LOG_ERROR(HW_GPU, "Failed to initialize GPU: {}", exception.what());
-        gpu.reset();
+    for (;;) {
+        gpu.emplace(system, use_async, use_nvdec);
+        auto context = emu_window.CreateSharedContext();
+        auto scope = context->Acquire();
+        try {
+            auto renderer = CreateRenderer(system, emu_window, *gpu, std::move(context));
+            gpu->BindRenderer(std::move(renderer));
+            return;
+        } catch (const std::runtime_error& exception) {
+            scope.Cancel();
+            gpu.reset();
+            if (!Core::NvnHook::DirectMode()) {
+                LOG_ERROR(HW_GPU, "Failed to initialize GPU: {}", exception.what());
+                return;
+            }
+            LOG_WARNING(HW_GPU, "Direct NVN Vulkan setup failed; retrying with GPU emulation: {}",
+                        exception.what());
+            Core::NvnHook::DirectFailed();
+        }
     }
 }
 

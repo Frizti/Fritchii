@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "video_core/shader_warm/shader_warm_builder.h"
 #include <qdebug.h>
 #include "core/core.h"
 #include "core/cpu_manager.h"
@@ -35,6 +36,11 @@ void EmuThread::run() {
                 emit LoadProgress(stage, value, total);
             });
     }
+    // NVN direct mode: the game files' shaders translated and their pipelines made before it runs
+    VideoCommon::ShaderWarm::PrepareNvnDirect(*QtCommon::system, stop_token,
+        [this](std::size_t value, std::size_t total) {
+            emit LoadProgress(VideoCore::LoadCallbackStage::Build, value, total);
+        });
     emit LoadProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
 
     gpu.ReleaseContext();
