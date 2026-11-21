@@ -8,6 +8,8 @@
 #include <functional>
 #include <chrono>
 #include <list>
+#include <thread>
+#include <vector>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -139,6 +141,31 @@ private:
     std::atomic<void*> guest_increment_context{};
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
+
+    /// FRITCHII_SYNCPT_UNLOCKED (default 1): actions run after `guard` is released. A due
+    /// action may run renderer work (the composite executer runs Composite, which with one
+    /// follower drains R on E): under `guard` that blocked every guest thread that registers
+    /// a wait, and deadlocked when R increments. As under the lock, one thread at a time runs
+    /// the increments' actions, in increment order: an increment whose actions come due while
+    /// another thread runs some queues them for that thread (the runner) and returns, so it
+    /// never waits for a running action. The waiters of a value with actions due wake after
+    /// those actions ran, as under the lock; a value with none due wakes its waiters at once.
+    /// Deregistering an action that is queued or running waits until it has run (nx2:syncpt
+    /// re-arms a slot right after its cancel: a late run would signal the new request), except
+    /// on the runner itself (from inside an action): a queued one is dropped then.
+    struct DueBatch {
+        std::list<RegisteredAction> actions;
+        std::condition_variable* wait_cv; ///< The waiters woken once `actions` ran
+    };
+    std::list<DueBatch> due_batches;      ///< Under `guard`: queued for the runner, in order
+    std::vector<u64> running_ids;         ///< Under `guard`: the batch the runner runs now
+    bool actions_running{};               ///< Under `guard`: a runner is active
+    std::thread::id actions_runner;       ///< Under `guard`
+    std::condition_variable running_cv;
+    /// The runner's loop (`lk` held, actions_running set): runs every queued batch unlocked.
+    void RunDueBatches(std::unique_lock<std::mutex>& lk);
+    /// Under `guard`: the action is queued or running.
+    [[nodiscard]] bool ActionDue(u64 id) const;
 };
 
 } // namespace Host1x

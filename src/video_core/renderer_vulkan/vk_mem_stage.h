@@ -74,6 +74,7 @@ public:
         Barrier = 2,
         DynamicState = 4,
         ForgetOnly = 8,
+        KeepSize = 0x10, ///< Full vertex binds: a clean run, dropped while still bound at any size
         Played = 0x80, ///< Played early by a sync inside a held fill (SEAM = 2)
     };
 
@@ -991,6 +992,15 @@ private:
     std::array<DiffSite, DIFF_SITES> diff_site_table{};
     bool claim_deferring{};
     bool pending{};
+    bool pending_engine{}; ///< `pending` counted in SeamHook::g_watch_engine (E's fill)
+    /// Uncounts `pending` from the word SetPending counted it in.
+    void ClearPendingWatch() noexcept {
+        if (std::exchange(pending_engine, false)) {
+            SeamHook::g_watch_engine.value.store(0, std::memory_order_relaxed);
+        } else {
+            SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
     /// The site of the bracket the first pending entry was recorded in (PostPendingOp).
     Site pending_site{Site::Count};
     u32 play_cursor{};
@@ -1303,7 +1313,26 @@ public:
 
     void AddDescriptors(const DescriptorUpdateEntry* entries, size_t count);
 
-    /// The remembered index and vertex buffers are forgotten (SEAM changed).
+    /// Before a draw is recorded (R, or the back): in a command buffer the remembered vertex
+    /// bindings were not bound in yet (VertexEpoch moved), they are bound again. The bindings
+    /// the fill leaves out as clean (their flags are E's under one follower, and R's new command
+    /// buffers do not raise them) are then still bound: the AMD device loss at the Market load
+    /// read the old command buffer's vertex table. Once per command buffer; nothing otherwise.
+    void EnsureVertexBindings();
+
+    /// Index binds played (recorded or found still bound); a draw compares it around its
+    /// Configure to know whether the last one is its own.
+    [[nodiscard]] u64 IndexPlays() const noexcept {
+        return index_plays;
+    }
+    /// FRITCHII_SPLIT_BIND_FIX, a played or served draw after a submit inside its Configure: the
+    /// index buffer its play bound is bound again when that was in an earlier command buffer
+    /// (VertexEpoch moved since). Only right after a play of this draw (IndexPlays moved).
+    void EnsureIndexBinding();
+
+    /// The remembered index buffer is forgotten and the vertex ones are no longer trusted as
+    /// bound (SEAM changed): each is recorded again at its next bind, and bound again in a new
+    /// command buffer (EnsureVertexBindings).
     void ForgetBindings() noexcept;
 
     /// The player is the back's: counts a use on GPUMem (vk_mem_stage.cpp).
@@ -1362,18 +1391,34 @@ private:
     VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
     u64 bound_index_epoch = 0;
     bool bound_index_valid = false;
+    /// The last index bind played (EnsureIndexBinding), whatever the rebind skip does.
+    VkBuffer last_index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize last_index_offset = 0;
+    VkIndexType last_index_type = VK_INDEX_TYPE_UINT32;
+    u64 last_index_vertex_epoch = 0; ///< VertexEpoch of the command buffer it is bound in
+    bool last_index_valid = false;
+    u64 index_plays = 0;
 
+    /// A vertex binding the player remembers. epoch: the VertexEpoch it was last bound at;
+    /// ~0 = forgotten (nothing to bind again: never bound, left without a buffer, or a repack
+    /// that failed); StaleEpoch = remembered but not known to be bound in this command buffer
+    /// (the next PlayVertices records it, EnsureVertexBindings binds it in a new one).
+    static constexpr u64 StaleEpoch = ~u64{0} - 1;
     struct BoundVertexBuffer {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
         VkDeviceSize size = 0;
         VkDeviceSize stride = 0;
         u64 epoch = ~u64{0};
+        bool dynamic = false; ///< bound with BindVertexBuffers2EXT (its size and stride)
     };
+    u64 ensured_vertex_epoch = ~u64{0};
     static constexpr size_t NUM_BOUND_VERTEX_BUFFERS = 32;
     std::array<BoundVertexBuffer, NUM_BOUND_VERTEX_BUFFERS> bound_vertex_buffers{};
     /// BindVertices entries recorded, and dropped as still bound (FRITCHII_MEMSTAGE_FULL_BINDS).
     std::atomic<u64> vertex_runs_recorded{};
+    std::atomic<u64> vertex_runs_rebound{}; ///< EnsureVertexBindings: bindings bound again
+    std::atomic<u64> vertex_forgotten{};    ///< single-slot forgets (ForgetOnly) played
     std::atomic<u64> vertex_runs_dropped{};
 
     static constexpr u32 LIST_DRAW_SLOTS = 1024;

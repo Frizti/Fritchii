@@ -4,6 +4,8 @@
 #include "video_core/renderer_vulkan/vk_precompiled_kept.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstring>
 #include <istream>
 #include <streambuf>
@@ -11,12 +13,20 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <winioctl.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+#ifdef __linux__
+#include <fstream>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#endif
 
 #include "common/cityhash.h"
+#include "common/logging.h"
+#include "common/thread.h"
 #include "common/zstd_compression.h"
 #include "shader_recompiler/info_serialize.h"
 #include "shader_recompiler/shader_info.h"
@@ -28,8 +38,12 @@ namespace {
 // A new layout, or a Shader::Info field the serializer learns (info_serialize.cpp), needs a new
 // magic: kept files written before are then prepared again. 2: the precompiled record offsets
 // (the boot check reads each sampled record's key from them). 4: Shader::Info's
-// storage_read_extents.
+// storage_read_extents. VariantMagic, 6: the layout with occlusion flag variant records
+// (Record::occl_kind, a fourth count in the index), written only by a preparation that keeps
+// variants (FRITCHII_PREP_OCCL_VARIANTS), so an older build never takes a variant for its parent
+// and a preparation without them writes (and reads) exactly the NX2KEPT4 layout as before.
 constexpr std::string_view Magic{"NX2KEPT4"};
+constexpr std::string_view VariantMagic{"NX2KEPT6"};
 constexpr std::string_view EndMagic{"NX2KEPTE"};
 constexpr u8 EntryInfo = 1;
 constexpr u8 EntrySpirv = 2;
@@ -75,7 +89,8 @@ bool Get(const PositionalFile& file, u64 offset, T& value) {
 }
 
 bool ValidRecord(const Record& record, size_t blob_count, size_t env_count) {
-    if (record.env_count == 0 || record.env_count > record.envs.size() || record.kind > 1) {
+    if (record.env_count == 0 || record.env_count > record.envs.size() || record.kind > 1 ||
+        record.occl_kind > MaxOcclKind || (record.occl_kind != 0 && record.kind != 0)) {
         return false;
     }
     for (size_t i = 0; i < record.env_count; ++i) {
@@ -110,6 +125,209 @@ std::span<const Record> EqualRange(const std::vector<Record>& records, u64 key_h
 std::atomic<u64>& BytesRead() {
     static std::atomic<u64> bytes{};
     return bytes;
+}
+
+u64& ThreadReadNanoseconds() {
+    thread_local u64 nanoseconds{};
+    return nanoseconds;
+}
+
+namespace {
+/// Physical memory free now (Windows: available, standby pages included), 0 where unknown.
+u64 FreePhysicalMemory() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? status.ullAvailPhys : 0;
+#elif defined(_SC_AVPHYS_PAGES)
+    const long pages = sysconf(_SC_AVPHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page_size > 0 ? static_cast<u64>(pages) * static_cast<u64>(page_size) : 0;
+#else
+    return 0;
+#endif
+}
+
+enum class DiskKind { Unknown, SolidState, Spinning };
+
+/// What kind of disk `path` is on. Windows: the volume's seek penalty (a hard disk has one), as
+/// the storage driver reports it (no administrator rights needed); a volume over several disks, a
+/// network share or a driver that does not answer: Unknown. Linux: the block device's
+/// queue/rotational in sysfs (the device's, or its parent disk's for a partition); a device
+/// sysfs does not list (btrfs, network and FUSE file systems, Android): Unknown.
+DiskKind DiskKindOf(const std::filesystem::path& path) {
+#ifdef _WIN32
+    std::array<wchar_t, MAX_PATH + 1> mount{};
+    std::array<wchar_t, 64> volume{};
+    if (!GetVolumePathNameW(path.c_str(), mount.data(), static_cast<DWORD>(mount.size())) ||
+        !GetVolumeNameForVolumeMountPointW(mount.data(), volume.data(),
+                                           static_cast<DWORD>(volume.size()))) {
+        return DiskKind::Unknown;
+    }
+    // "\\?\Volume{GUID}\": the volume device is the name without its last backslash.
+    std::wstring device{volume.data()};
+    if (!device.empty() && device.back() == L'\\') {
+        device.pop_back();
+    }
+    const HANDLE handle = CreateFileW(device.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      nullptr, OPEN_EXISTING, 0, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return DiskKind::Unknown;
+    }
+    STORAGE_PROPERTY_QUERY query{};
+    query.PropertyId = StorageDeviceSeekPenaltyProperty;
+    query.QueryType = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR penalty{};
+    DWORD returned = 0;
+    const BOOL ok = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                                    &penalty, sizeof(penalty), &returned, nullptr);
+    CloseHandle(handle);
+    if (!ok || returned < sizeof(penalty)) {
+        return DiskKind::Unknown;
+    }
+    return penalty.IncursSeekPenalty ? DiskKind::Spinning : DiskKind::SolidState;
+#elif defined(__linux__)
+    struct stat info{};
+    if (stat(path.c_str(), &info) != 0) {
+        return DiskKind::Unknown;
+    }
+    const auto device = fmt::format("/sys/dev/block/{}:{}/", major(info.st_dev), minor(info.st_dev));
+    for (const char* const queue : {"queue/rotational", "../queue/rotational"}) {
+        std::ifstream file(device + queue);
+        int rotational = -1;
+        if (file >> rotational && (rotational == 0 || rotational == 1)) {
+            return rotational == 1 ? DiskKind::Spinning : DiskKind::SolidState;
+        }
+    }
+    return DiskKind::Unknown;
+#else
+    return DiskKind::Unknown;
+#endif
+}
+
+const char* DiskKindName(DiskKind kind) {
+    switch (kind) {
+    case DiskKind::SolidState:
+        return "solid-state";
+    case DiskKind::Spinning:
+        return "hard disk";
+    default:
+        return "unknown disk";
+    }
+}
+} // Anonymous namespace
+
+PageCacheWarmer::PageCacheWarmer(std::vector<std::filesystem::path> files)
+    : thread{[this, files = std::move(files)]() mutable { Run(std::move(files)); }} {}
+
+PageCacheWarmer::~PageCacheWarmer() {
+    stop.store(true, std::memory_order_relaxed);
+    if (!thread.joinable()) {
+        return;
+    }
+#if defined(_WIN32) && defined(_MSC_VER)
+    // A chunk read at very low I/O priority can wait behind the game's own I/O: cancelled.
+    CancelSynchronousIo(static_cast<HANDLE>(thread.native_handle()));
+#endif
+    thread.join();
+}
+
+void PageCacheWarmer::Run(std::vector<std::filesystem::path> files) {
+    Common::SetCurrentThreadName("PrepFileWarm");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+#ifdef _WIN32
+    // Background mode: idle CPU and very low I/O priority. It lowers the memory priority of the
+    // pages it reads too, which are what the fast path wants kept: put back to normal.
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    MEMORY_PRIORITY_INFORMATION memory_priority{};
+    memory_priority.MemoryPriority = MEMORY_PRIORITY_NORMAL;
+    SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &memory_priority,
+                         sizeof(memory_priority));
+#endif
+    const auto begin = std::chrono::steady_clock::now();
+    const u64 free_bytes = FreePhysicalMemory();
+    // Per file: its path, size and read chunk.
+    struct Wanted {
+        std::filesystem::path path;
+        u64 size{};
+        size_t chunk{};
+        DiskKind disk{};
+    };
+    std::vector<Wanted> wanted;
+    u64 planned = 0;
+    for (const auto& path : files) {
+        std::error_code error;
+        const u64 size = std::filesystem::file_size(path, error);
+        if (error || size == 0) {
+            continue;
+        }
+        // On a hard disk one chunk in flight, even at very low I/O priority, puts a seek and a
+        // ~30 ms transfer in front of a fast-path read, at boot when the game's own reads peak:
+        // not read ahead there. A disk of unknown kind is read in 1 MiB chunks (a few ms each on
+        // a hard disk), a solid-state one in 4 MiB chunks as before.
+        const DiskKind disk = DiskKindOf(path);
+        if (disk == DiskKind::Spinning) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled fast path I/O: {} ({} MiB) not read ahead: it is on a hard "
+                     "disk (seek penalty)",
+                     path.filename().string(), size >> 20);
+            continue;
+        }
+        const size_t chunk = disk == DiskKind::SolidState ? size_t{4} << 20 : size_t{1} << 20;
+        if ((planned + size) * 2 > free_bytes) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled fast path I/O: {} ({} MiB) not read ahead: {} MiB of RAM free, "
+                     "under twice the {} MiB it would make",
+                     path.filename().string(), size >> 20, free_bytes >> 20,
+                     (planned + size) >> 20);
+            continue;
+        }
+        planned += size;
+        wanted.push_back({path, size, chunk, disk});
+    }
+    if (wanted.empty()) {
+        return;
+    }
+    std::string names;
+    for (const Wanted& file : wanted) {
+        names += fmt::format("{}{} ({} MiB, {}, {} MiB chunks)", names.empty() ? "" : ", ",
+                             file.path.filename().string(), file.size >> 20,
+                             DiskKindName(file.disk), file.chunk >> 20);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Precompiled fast path I/O: reading {} into the OS file cache on an idle thread "
+             "({} MiB of RAM free)",
+             names, free_bytes >> 20);
+    std::vector<u8> buffer(size_t{4} << 20);
+    u64 done = 0;
+    bool failed = false;
+    for (const auto& [path, size, chunk, disk] : wanted) {
+        const PositionalFile file{path};
+        if (!file.IsOpen()) {
+            failed = true;
+            continue;
+        }
+        for (u64 offset = 0; offset < size && !stop.load(std::memory_order_relaxed);) {
+            const size_t bytes = static_cast<size_t>((std::min<u64>)(chunk, size - offset));
+            if (!file.ReadAt(offset, std::span(buffer.data(), bytes))) {
+                failed = !stop.load(std::memory_order_relaxed);
+                break;
+            }
+            offset += bytes;
+            done += bytes;
+        }
+        if (stop.load(std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    LOG_INFO(Render_Vulkan, "Precompiled fast path I/O: {} MiB of {} MiB read into the OS file "
+                            "cache in {:.1f} s{}",
+             done >> 20, planned >> 20, seconds,
+             stop.load(std::memory_order_relaxed) ? " (stopped)"
+             : failed                             ? " (a read failed)"
+                                                  : "");
 }
 
 u64 SampleSeed() {
@@ -191,6 +409,14 @@ bool PositionalFile::ReadAt(u64 offset, std::span<u8> out) const {
     if (!IsOpen()) {
         return false;
     }
+    const auto begin = std::chrono::steady_clock::now();
+    // Read I/O time of this thread, whatever the outcome (ThreadReadNanoseconds).
+    const auto note_time = [begin] {
+        ThreadReadNanoseconds() += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin)
+                .count());
+    };
     while (!out.empty()) {
 #ifdef _WIN32
         OVERLAPPED position{};
@@ -199,17 +425,20 @@ bool PositionalFile::ReadAt(u64 offset, std::span<u8> out) const {
         const DWORD wanted = static_cast<DWORD>((std::min<size_t>)(out.size(), 1u << 30));
         DWORD read = 0;
         if (!ReadFile(handle, out.data(), wanted, &read, &position) || read == 0) {
+            note_time();
             return false;
         }
 #else
         const ssize_t read = pread(fd, out.data(), out.size(), static_cast<off_t>(offset));
         if (read <= 0) {
+            note_time();
             return false;
         }
 #endif
         offset += static_cast<u64>(read);
         out = out.subspan(static_cast<size_t>(read));
     }
+    note_time();
     return true;
 }
 
@@ -240,11 +469,18 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
     // Header and stamp.
     std::array<char, 8> magic{};
     u32 stamp_size{};
-    if (kept_size < 32 || !Get(file, 0, magic) || !Get(file, 8, stamp_size) ||
-        std::string_view{magic.data(), magic.size()} != Magic) {
+    if (kept_size < 32 || !Get(file, 0, magic) || !Get(file, 8, stamp_size)) {
         why = "another format";
         return nullptr;
     }
+    const std::string_view magic_view{magic.data(), magic.size()};
+    if (magic_view != Magic && magic_view != VariantMagic) {
+        why = "another format";
+        return nullptr;
+    }
+    // NX2KEPT6: a fourth count, the occlusion variants (its stamp names them as well).
+    const bool variant_layout = magic_view == VariantMagic;
+    const u64 counts_bytes = variant_layout ? 16 : 12;
     if (stamp_size != stamp.size()) {
         why = "made for another file, driver, release or settings";
         return nullptr;
@@ -264,27 +500,36 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
         why = "not finished";
         return nullptr;
     }
-    std::array<u32, 3> counts{};
-    if (!Get(file, index_offset, counts)) {
+    // Graphics, compute, blob and (NX2KEPT6) occlusion variant counts.
+    std::array<u32, 4> counts{};
+    if (index_offset > kept_size - 16 - counts_bytes ||
+        !file.ReadAt(index_offset, std::span(reinterpret_cast<u8*>(counts.data()),
+                                             static_cast<size_t>(counts_bytes)))) {
         why = "damaged";
         return nullptr;
     }
-    const u64 records_bytes = (u64{counts[0]} + counts[1]) * sizeof(Record);
+    const u64 base_records_bytes = (u64{counts[0]} + counts[1]) * sizeof(Record);
+    const u64 records_bytes = base_records_bytes + u64{counts[3]} * sizeof(Record);
     const u64 blobs_bytes = u64{counts[2]} * 16;
     const u64 offsets_bytes = (u64{counts[0]} + counts[1]) * sizeof(u64);
-    if (index_offset + 12 + records_bytes + blobs_bytes + offsets_bytes + 16 != kept_size) {
+    if (index_offset + counts_bytes + records_bytes + blobs_bytes + offsets_bytes + 16 !=
+        kept_size) {
         why = "damaged";
         return nullptr;
     }
     index->graphics.resize(counts[0]);
     index->compute.resize(counts[1]);
+    index->variants.resize(counts[3]);
     std::vector<std::array<u32, 4>> blob_entries(counts[2]);
-    u64 at = index_offset + 12;
+    u64 at = index_offset + counts_bytes;
     if (!file.ReadAt(at, std::span(reinterpret_cast<u8*>(index->graphics.data()),
                                    index->graphics.size() * sizeof(Record))) ||
         !file.ReadAt(at + counts[0] * sizeof(Record),
                      std::span(reinterpret_cast<u8*>(index->compute.data()),
                                index->compute.size() * sizeof(Record))) ||
+        !file.ReadAt(at + base_records_bytes,
+                     std::span(reinterpret_cast<u8*>(index->variants.data()),
+                               index->variants.size() * sizeof(Record))) ||
         !file.ReadAt(at + records_bytes, std::span(reinterpret_cast<u8*>(blob_entries.data()),
                                                    blob_entries.size() * 16))) {
         why = "damaged";
@@ -324,14 +569,15 @@ std::shared_ptr<const Index> Index::Load(const std::filesystem::path& kept,
             return nullptr;
         }
     }
-    const auto valid = [&](const std::vector<Record>& records, u8 kind) {
+    const auto valid = [&](const std::vector<Record>& records, u8 kind, bool variants) {
         return std::ranges::all_of(records, [&](const Record& record) {
-                   return record.kind == kind &&
+                   return record.kind == kind && (record.occl_kind != 0) == variants &&
                           ValidRecord(record, index->blobs.size(), index->environments.size());
                }) &&
                std::ranges::is_sorted(records, {}, &Record::key_hash);
     };
-    if (!valid(index->graphics, 0) || !valid(index->compute, 1)) {
+    if (!valid(index->graphics, 0, false) || !valid(index->compute, 1, false) ||
+        !valid(index->variants, 0, true)) {
         why = "damaged";
         return nullptr;
     }
@@ -346,8 +592,12 @@ std::span<const Record> Index::Compute(u64 key_hash) const {
     return EqualRange(compute, key_hash);
 }
 
+std::span<const Record> Index::Variants(u64 key_hash) const {
+    return EqualRange(variants, key_hash);
+}
+
 size_t Index::MemoryBytes() const noexcept {
-    return (graphics.capacity() + compute.capacity()) * sizeof(Record) +
+    return (graphics.capacity() + compute.capacity() + variants.capacity()) * sizeof(Record) +
            blobs.capacity() * sizeof(blobs[0]) + environments.capacity() * sizeof(environments[0]);
 }
 
@@ -449,7 +699,8 @@ bool Writer::Scan(const std::filesystem::path& part, const std::string& stamp, u
     std::array<char, 8> magic{};
     u32 stamp_size{};
     if (!Get(in, 0, magic) || !Get(in, 8, stamp_size) ||
-        std::string_view{magic.data(), magic.size()} != Magic || stamp_size != stamp.size()) {
+        std::string_view{magic.data(), magic.size()} != (variant_layout ? VariantMagic : Magic) ||
+        stamp_size != stamp.size()) {
         return false;
     }
     std::string file_stamp(stamp_size, '\0');
@@ -483,7 +734,10 @@ bool Writer::Scan(const std::filesystem::path& part, const std::string& stamp, u
             if (!Get(in, at + 1, index) || !Get(in, at + 5, record)) {
                 break;
             }
-            if (index < records.size() && ValidRecord(record, blobs.size(), ~size_t{0})) {
+            if (index < records.size() && record.occl_kind != 0 && variant_layout &&
+                ValidRecord(record, blobs.size(), ~size_t{0})) {
+                variant_records[u64{index} * 8 + record.occl_kind] = record;
+            } else if (index < records.size() && ValidRecord(record, blobs.size(), ~size_t{0})) {
                 records[index] = record;
                 if (!present[index]) {
                     present[index] = 1;
@@ -502,14 +756,16 @@ bool Writer::Scan(const std::filesystem::path& part, const std::string& stamp, u
 }
 
 bool Writer::Open(const std::filesystem::path& part, const std::string& stamp, bool resume,
-                  size_t total) {
+                  size_t total, bool variants) {
     std::scoped_lock lock{mutex};
+    variant_layout = variants;
     if (file.is_open()) {
         file.close();
     }
     file.clear();
     records.assign(total, Record{});
     present.assign(total, 0);
+    variant_records.clear();
     infos_by_hash.clear();
     spirv_by_hash.clear();
     blobs.clear();
@@ -530,6 +786,7 @@ bool Writer::Open(const std::filesystem::path& part, const std::string& stamp, b
     }
     records.assign(total, Record{});
     present.assign(total, 0);
+    variant_records.clear();
     infos_by_hash.clear();
     spirv_by_hash.clear();
     blobs.clear();
@@ -544,7 +801,8 @@ bool Writer::Open(const std::filesystem::path& part, const std::string& stamp, b
         failed = true;
         return false;
     }
-    file.write(Magic.data(), Magic.size());
+    const std::string_view magic = variant_layout ? VariantMagic : Magic;
+    file.write(magic.data(), static_cast<std::streamsize>(magic.size()));
     Put(file, static_cast<u32>(stamp.size()));
     file.write(stamp.data(), static_cast<std::streamsize>(stamp.size()));
     offset = 12 + stamp.size();
@@ -571,7 +829,7 @@ u32 Writer::KeepBlob(u8 type, u64 hash, std::span<const u8> bytes) {
 
 void Writer::Keep(size_t index, u8 kind, u8 flags, u64 key_hash, std::span<const u32> envs,
                   const std::array<std::vector<u8>, 5>& infos,
-                  const std::array<std::vector<u32>, 5>& spirv) {
+                  const std::array<std::vector<u32>, 5>& spirv, u8 occl_kind) {
     // Hashed and compressed before the lock: the workers keep in parallel.
     std::array<u64, 5> info_hash{};
     std::array<u64, 5> spirv_hash{};
@@ -592,7 +850,8 @@ void Writer::Keep(size_t index, u8 kind, u8 flags, u64 key_hash, std::span<const
     }
     std::scoped_lock lock{mutex};
     if (failed || !file.is_open() || index >= records.size() || envs.empty() ||
-        envs.size() > 5) {
+        envs.size() > 5 || occl_kind > MaxOcclKind || (occl_kind != 0 && kind != 0) ||
+        (occl_kind != 0 && !variant_layout)) {
         return;
     }
     Record record{};
@@ -604,6 +863,7 @@ void Writer::Keep(size_t index, u8 kind, u8 flags, u64 key_hash, std::span<const
     record.env_count = static_cast<u8>(envs.size());
     record.kind = kind;
     record.flags = flags;
+    record.occl_kind = occl_kind;
     for (size_t stage = 0; stage < infos.size(); ++stage) {
         if (compressed[stage].empty()) {
             continue;
@@ -615,6 +875,13 @@ void Writer::Keep(size_t index, u8 kind, u8 flags, u64 key_hash, std::span<const
     Put(file, static_cast<u32>(index));
     Put(file, record);
     offset += 5 + sizeof(Record);
+    if (!file) {
+        failed = true;
+    }
+    if (occl_kind != 0) {
+        variant_records[u64{index} * 8 + occl_kind] = record;
+        return;
+    }
     records[index] = record;
     if (!present[index]) {
         present[index] = 1;
@@ -633,7 +900,27 @@ void Writer::Flush() {
 }
 
 void Writer::SortedRecords(std::span<const u64> record_offsets, std::vector<Record>& graphics,
-                           std::vector<Record>& compute, std::vector<u64>& offsets) const {
+                           std::vector<Record>& compute, std::vector<u64>& offsets,
+                           std::vector<Record>& variants) const {
+    // Variants of records that were not kept themselves are dropped (never found from a draw).
+    std::vector<std::pair<u64, const Record*>> variant_order;
+    variant_order.reserve(variant_records.size());
+    for (const auto& [slot, record] : variant_records) {
+        const size_t index = static_cast<size_t>(slot / 8);
+        if (index < present.size() && present[index]) {
+            variant_order.emplace_back(slot, &record);
+        }
+    }
+    std::ranges::sort(variant_order, [](const auto& lhs, const auto& rhs) {
+        return lhs.second->key_hash != rhs.second->key_hash
+                   ? lhs.second->key_hash < rhs.second->key_hash
+                   : lhs.first < rhs.first;
+    });
+    variants.clear();
+    variants.reserve(variant_order.size());
+    for (const auto& entry : variant_order) {
+        variants.push_back(*entry.second);
+    }
     std::vector<size_t> graphics_order;
     std::vector<size_t> compute_order;
     for (size_t index = 0; index < records.size(); ++index) {
@@ -672,7 +959,8 @@ std::shared_ptr<const Index> Writer::PartIndex(
     std::vector<Record> graphics;
     std::vector<Record> compute;
     std::vector<u64> offsets;
-    SortedRecords(record_offsets, graphics, compute, offsets);
+    std::vector<Record> variants;
+    SortedRecords(record_offsets, graphics, compute, offsets, variants);
     index->blobs = blobs;
     index->environments.assign(environments.begin(), environments.end());
     // Records a damaged log could hold are left out of the check (the finished file's index is
@@ -689,6 +977,11 @@ std::shared_ptr<const Index> Writer::PartIndex(
     }
     index->record_offsets.insert(index->record_offsets.end(), compute_offsets.begin(),
                                  compute_offsets.end());
+    for (const Record& record : variants) {
+        if (ValidRecord(record, index->blobs.size(), index->environments.size())) {
+            index->variants.push_back(record);
+        }
+    }
     return index;
 }
 
@@ -704,14 +997,21 @@ bool Writer::Finish(std::span<const u64> record_offsets) {
     std::vector<Record> graphics;
     std::vector<Record> compute;
     std::vector<u64> offsets;
-    SortedRecords(record_offsets, graphics, compute, offsets);
+    std::vector<Record> variants;
+    SortedRecords(record_offsets, graphics, compute, offsets, variants);
     Put(file, static_cast<u32>(graphics.size()));
     Put(file, static_cast<u32>(compute.size()));
     Put(file, static_cast<u32>(blobs.size()));
+    if (variant_layout) {
+        Put(file, static_cast<u32>(variants.size()));
+    }
     for (const Record& record : graphics) {
         Put(file, record);
     }
     for (const Record& record : compute) {
+        Put(file, record);
+    }
+    for (const Record& record : variants) {
         Put(file, record);
     }
     for (const auto& [blob_offset, size] : blobs) {
@@ -724,8 +1024,9 @@ bool Writer::Finish(std::span<const u64> record_offsets) {
     }
     Put(file, index_offset);
     file.write(EndMagic.data(), EndMagic.size());
-    offset += 12 + (graphics.size() + compute.size()) * (sizeof(Record) + sizeof(u64)) +
-              blobs.size() * 16 + 16;
+    offset += (variant_layout ? 16 : 12) +
+              (graphics.size() + compute.size()) * (sizeof(Record) + sizeof(u64)) +
+              variants.size() * sizeof(Record) + blobs.size() * 16 + 16;
     file.flush();
     const bool ok = static_cast<bool>(file);
     file.close();
@@ -744,6 +1045,7 @@ Writer::Totals Writer::GetTotals() {
     std::scoped_lock lock{mutex};
     return Totals{
         .records = kept,
+        .variants = variant_records.size(),
         .infos = infos_by_hash.size(),
         .spirv = spirv_by_hash.size(),
         .spirv_bytes = spirv_bytes,

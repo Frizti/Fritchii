@@ -463,8 +463,14 @@ Zora's Domain facing King Zora, the view must follow the camera.
 
 ### FRITCHII_PROTECT_UNLOCKED
 
-On by default on every driver since 2026-11-18 (owner: a briefly late object beats a freeze; RTX 4080 market toggle 70.1 / 71.3 fps, no cost); first AMD/Intel only. (Helper AK, 2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live,
-FRITCHII_PROTECT_UNLOCKED=1 turns it on (Windows only). HostMemory's Protect (the write traps on
+On by default on every driver since 6862d0b (2026-11-20). Earlier docs said "since 2026-11-18", but
+the code still defaulted to 0 until that commit, so 6862d0b is its first default-on exposure (owner:
+a briefly late object beats a freeze; RTX 4080 market toggle 70.1 / 71.3 fps, no cost). (Helper AK,
+2026-11-15, port of zortos293/Lichii #1780 by Reiixan); Windows only,
+FRITCHII_PROTECT_UNLOCKED=0 restores the locked path. The environment (nx2_switches.txt) is read
+once, at the first Protect of the session, so changing it there needs a fresh launch. Live only
+through the debug server's set_switch (FindSwitch has it, so profile_toggle.py works), which
+writes the value Protect reads on every call. HostMemory's Protect (the write traps on
 GPU-cached guest memory, 12,000-28,000 calls a second in OoT) took the placeholder lock before every
 VirtualProtect, and Map/Unmap hold that lock across their kernel calls, which slow from ~10 us to
 ~250 us while the game maps memory in bulk (zone changes): protections queued behind them and the
@@ -472,8 +478,21 @@ GPU thread stalled (their test: frames over 100 ms 37 -> 10 on one route). With 
 Protect first calls VirtualProtect on the whole range without the lock. It refuses a range that
 reaches a placeholder or a second view (a Map/Unmap under way, or a range across views); those take
 the lock and are protected view by view as before. Any interleaving ends as a Protect done wholly
-before or after the Map/Unmap. Log: "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): N
-without the lock, M took the lock". Measure with the "host protect" time and longest in the Hitch:
+before or after the Map/Unmap, but one: a partial Unmap that splits a view unmaps it whole and maps
+the kept parts again with PAGE_READWRITE. Until 2026-11-21 that wiped every protection on the kept
+parts, with the switch on or off (the page table still said cached, so CPU writes there were
+missed). Now the Unmap reads the kept parts' protections (VirtualQuery) before it unmaps the view
+and puts them back (VirtualProtect) after both remaps (a ported approach, credited in the commit).
+A split sequence counter (odd from before that read until after the
+restore) guards the unlocked path: an unlocked Protect that saw it odd or changed around its
+VirtualProtect is redone under the lock, after the restore, so its newer flags win.
+Log: "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): N without the lock, M took the
+lock (placeholder or several views), R redone under the lock (a split Unmap ran alongside); this
+session S split Unmaps put P protected runs back on their kept parts" (that line only with the
+switch on, every 10 s at most, and at info level only when the window had a fallback, a redo or a
+new split Unmap that put protections back; a window of unlocked calls alone is a debug line). The first 3 splits that restored anything log "Split unmap: N protected runs of the
+kept parts restored after the remap" in either mode.
+Measure with the "host protect" time and longest in the Hitch:
 lines around area loads.
 
 ### FRITCHII_ASYNC_REDRAWN
@@ -629,6 +648,61 @@ its graphics records. The same builds on the same workers, only in another order
 all of them before the game starts either way, so a dispatch never waits for a program the disk cache
 recorded in an earlier session (runtime-translated compute programs are recorded, as are prepared
 ones the game used); this only makes the compute records end earlier within the boot.
+
+### FRITCHII_PREP_OCCL_VARIANTS
+
+Boot, default 0 (the kept file, its stamp and play as before). 1: "Preparing shaders" (with
+EDEN_NX2_PRECOMPILED_FAST) also builds and keeps occlusion flag variants (1 host, 2 colour, 3
+pre-pass, 4 host no-colour, 5 pre-pass no-colour) beside their pipelines in the kept file, from the
+recipe's variant hints (docs/fritchii/recipe-merge.md). The kinds prepared are the device's (the
+flag area's buffer device address for 1 and 4, 64-bit integers too for 2, 3 and 5) AND the kinds
+play will draw this session, decided before the preparation from the inputs play reads
+(2026-11-20, cross-vendor review): the occlusion level (FRITCHII_OCCL_FLAG, else the setting:
+Standard draws kind 1 only, Full all five; 4 needs the colour pre-pass, Full or 2) and one
+follower as OneFollower::ReadSwitches will decide it (FRITCHII_ONEF_LEAN=1 or FRITCHII_ONEF=1; on
+AMD's proprietary driver an explicit FRITCHII_ONEF_AMD, else a discrete GPU at Full). With one
+follower on only FRITCHII_ONEF_OCCL (unset: AMD's proprietary driver on a discrete GPU) plays flags,
+and its pre-pass kinds only with FRITCHII_ONEF_OCCL_PREPASS (default 1); so NVIDIA, Intel and RADV
+with one follower on prepare none. No hints for the file (no recipe note, another recipe, records
+dropped): no variant is prepared (was every kind). The host kinds 1 and 4 are prepared since
+2026-11-20 (before, only 2, 3 and 5): a kept parent can lend its own record for them, but then
+the driver compiles them in play, and a parent kept for libraries cannot lend it (translated in
+play); prepared, they are whole pipelines in the driver's cache. A file prepared before keeps
+working (kinds 1 and 4 from the parent's record); it gains them only when prepared again (Prepare
+Shaders Now): neither stamp changed. The Preparing-shaders stamp is unchanged. Logs:
+"Precompiled occlusion variants (FRITCHII_PREP_OCCL_VARIANTS=1): kinds 0x.. (device 0x3e, played
+0x..: occlusion level N, one follower on|off | one follower on without occlusion flags
+(FRITCHII_ONEF_OCCL=...) | occlusion speed-up off (N))", then "... hints from ..." or "...: no
+hints (<why>), no variant is prepared (play translates them as before)".
+
+### FRITCHII_PREP_FASTPATH_IO
+
+Boot, default 1 (0 = as before: the files are read on demand only). Vendor neutral. Why: the
+precompiled fast path (EDEN_NX2_PRECOMPILED_FAST) reads each new key's kept infos and recorded
+environments with positional reads on the GPU thread. With a cold OS file cache on the kept file
+(`precompiled_infos.fork-v<N>.bin`, ~0.8 GB) and the precompiled file (~1.5 GB) those reads go to the
+disk: 115-125 ms the worst per 10 s in play, ~250 ms per Market load, none of it in the worst frame
+line.
+
+- 1: once the kept index is published (boot, or the end of a preparation), one thread at idle CPU and
+  very low I/O priority (Windows background mode, page memory priority put back to normal) reads the
+  kept file, then the precompiled file, front to back in 4 MiB chunks, once, so later random reads hit
+  RAM. A file is taken only while twice the running total fits in the free physical memory (OoT:
+  ~4.6 GB free for both); the rest is skipped and logged. Shutdown stops it at once (a read in
+  progress is cancelled). Costs disk bandwidth at the lowest priority and standby (cache) memory only.
+- Logs: "FRITCHII_PREP_FASTPATH_IO=1: ...", "Precompiled fast path I/O: reading <kept> (N MiB),
+  <precompiled> (N MiB) into the OS file cache on an idle thread (F MiB of RAM free)" or "<file> (N
+  MiB) not read ahead: F MiB of RAM free, under twice the T MiB it would make", then "Precompiled fast
+  path I/O: D MiB of T MiB read into the OS file cache in S s" (" (stopped)" when cut short).
+- Attribution (both settings, logging only): the worst frame line ends with "..., K precompiled fast
+  path checks in X ms (Y ms file reads)" (hits and misses on the GPU thread in that frame), and every
+  10 s with fast path activity: "Precompiled fast path GPU thread time in the last 10 s: created X ms =
+  R ms file reads + C ms checks + P ms pipeline objects; sent back M ms (Q ms file reads)". "checks" is
+  the live environments, the infos decoded and the recorded answers compared (AnswersHoldFor); "sent
+  back" is keys whose checks failed (not in the "X ms on the GPU thread" of the line before).
+- With 1 the file reads in both lines should fall to near 0 once the read-ahead has finished.
+- Not done: moving the record reads and checks of skippable draws to the translation threads (it
+  needs a precompiled job type in the translate queue and its adoption; left out as invasive).
 
 ### FRITCHII_PREP_COMPUTE_FIRST, FRITCHII_PREP_COMPUTE_CHECK
 
@@ -1121,22 +1195,188 @@ for fps runs. Must be 0 bad; any line names the shader to clamp on the GPU next.
 
 ### FRITCHII_ONEF_AMD
 
-Boot, off by default (helper BJ, 2026-11-16). On AMD's proprietary Vulkan driver the one follower
-(FRITCHII_ONEF / FRITCHII_ONEF_LEAN) stays off: the desktop RX 7900 XT lost the device in game with
-it on and ran clean with every FRITCHII_ONEF_* line out. Log once: "One follower: off on AMD's
-proprietary driver ...". 1 = keep it on there (tests). RADV, NVIDIA and Intel unchanged.
+Boot (helper BJ, 2026-11-16; default inverted 2026-11-19). On AMD's proprietary Vulkan driver the
+one follower (FRITCHII_ONEF / FRITCHII_ONEF_LEAN) is on by default where it was measured: a
+discrete GPU with the occlusion speed-up at Full (9) in effect. Elsewhere on that driver it stays
+off as in 6.2: an integrated GPU (APUs, handhelds: never measured), or Full not in effect (the win
+over off comes from FRITCHII_ONEF_OCCL's pre-pass variants, which act only at Full; at Standard one
+follower on against off was never measured on AMD). 0 = off; 1 = on anyway (tests). Logs once:
+"One follower on AMD's proprietary driver (discrete GPU, occlusion speed-up Full |
+FRITCHII_ONEF_AMD=1); FRITCHII_ONEF_AMD=0 turns it off" or "One follower: off on AMD's proprietary
+driver (FRITCHII_ONEF_AMD=0 | an integrated GPU ... | the occlusion speed-up is not Full ...)".
+History: the desktop RX 7900 XT lost the device in game with it on (2026-11-16). Radeon GPU
+Detective traced the RX 9070 XT's loss at 0xbef011af0000 to AMD's vertex-buffer table in
+command-buffer embedded memory, read through a stale pointer after a draw without vertex buffers;
+fixed by MemPlayer::EnsureVertexBindings. Since then (with FRITCHII_ONEF_OCCL, FRITCHII_SEAM_AMD
+and FRITCHII_ASTC_HELD_DEFER on) about 30 launches and a 4-window soak had 0 losses, and one
+follower beat off at the fountain: 16.35-16.6 against 18.2 ms idle, 20.4-20.7 against 21.3 ms under
+PCIe load (RX 9070 XT over OCuLink x4, Core Ultra 7 255H). Only RDNA 4 tested: confirm on an RDNA 3
+desktop card. RADV, NVIDIA and Intel unchanged. The settings' Full row follows the same rule
+(fritchii/occlusion_offer.cpp).
+
+### FRITCHII_SEAM_AMD
+
+Boot (helper BJ, 2026-11-16; changed 2026-11-19). On AMD's proprietary driver EDEN_NX2_EXP123 (the
+memory seam, 3 built in) is kept at its value when one follower is on, and held to 1 when it is
+off (there SEAM 3 is about 0.6 ms slower than 1 on AMD). The original SEAM 3 loss at the title was
+the ASTC decoder's submit inside a held packet, skipped by FRITCHII_ASTC_HELD_DEFER (default 1 on AMD's proprietary driver). 0 =
+held to 1; 1 = kept either way (tests). Unset, the keep also needs FRITCHII_ASTC_HELD_DEFER on
+(2026-11-21): with the defer off SEAM 3 would bring the title loss back, so it is held to 1. Log
+once: "Memory seam: EXP123=N kept on AMD's proprietary driver (one follower on |
+FRITCHII_SEAM_AMD=1)", "... held to 1 ... (one follower off | FRITCHII_SEAM_AMD=0)", or "... held
+to 1 on AMD's proprietary driver (one follower on, but FRITCHII_ASTC_HELD_DEFER is off ...)".
+
+### FRITCHII_ONEF_OCCL
+
+Boot (2026-11-19). Occlusion flag variants (FRITCHII_OCCL_FLAG) with one follower on. An explicit
+value wins (0 off, anything else on); unset, it is on only on AMD's proprietary driver on a
+discrete GPU, where it was measured, and off on NVIDIA, Intel, RADV and AMD integrated GPUs until
+an A/B there. Log once at boot: "One follower: occlusion flags on|off (FRITCHII_ONEF_OCCL=V |
+unset: AMD proprietary driver, discrete GPU | not an AMD proprietary discrete GPU)".
+- Off: 6.2's rule, exactly: with one follower on no draw takes a flag variant, lent draws
+  included, and a played draw's pipeline from E falls back to its parent.
+- On: lent draws take their variants as with one follower off; E picks a played draw's in-place
+  variant at its own lookup (R only makes the flag area); with FRITCHII_ONEF_OCCL_PREPASS the
+  pre-pass variants too (not for list draws).
+Why: 6.2 turned the flags off with one follower after two AMD losses read a wild address at a lent
+load (0xbef0'xxaf'0000). Radeon GPU Detective put the fault at a DrawIndexed right after a draw
+without vertex buffers, an invalid read with no resource behind it: AMD's vertex-buffer table in
+command-buffer embedded memory read through a stale pointer, fixed by
+MemPlayer::EnsureVertexBindings. The flag program only stores. Without played-draw variants about
+16,000 draws a second at the fountain fall back to host queries (+1.2 ms eGPU a frame) and one
+follower is slower than off under PCIe load.
+
+FRITCHII_ONEF_OCCL_PREPASS (boot, default 1, so it follows FRITCHII_ONEF_OCCL; 0 keeps played
+draws to in-place variants): E also takes a played draw's pre-pass variant (colour, discard,
+colour-discard; only at Full, which allows pre-passes; never for list draws, whose arguments are
+consumed once; non-list indirect draws are always lent) and carries OcclFlag's pre-pass state in
+PacketHeader::reserved[1] (OcclPrepassBit). R restores it before the draw, only on a real flag
+variant, and records the pre-pass as the off path does (R's query state decides), or the parent
+with the same descriptors where that path falls back (draw counting, a frame dump's probe).
+Measured (RX 9070 XT eGPU, fountain, Full): host queries 19k -> 3.1k a second (off 3.0k); one
+follower 16.35-16.6 ms idle and 20.4-20.7 ms under PCIe load against off 18.2 / 21.3 ms; real
+draws lost 0, checks 0, picture unchanged.
 
 ### FRITCHII_ASTC_HELD_DEFER
 
-Boot, default 0 (helper BG's fix from 2026-11-16, ported by helper FJ). 1 = an ASTC GPU decode made
-while this thread holds a filled draw or dispatch packet (EXP123 >= 2) does not submit: the decode
-and its barrier stay in the current command buffer, ahead of the draw, and the next flush takes
-them. Why: that submit splits a held packet across two command buffers ("Memory seam (5.5) ...
-ASTCDecoderPass"), and both AMD cards lost the device 10-15 ms after one at the title. That loss
-is why EXP123 is held to 1 on AMD's driver (FRITCHII_SEAM_AMD), and with EXP123=1 the one follower
-posts nothing there ("lent: no ring", every draw a transient lend). Test on AMD with
-FRITCHII_SEAM_AMD=1: the 5.5 lines from ASTCDecoderPass must be gone, "ASTC GPU decode inside a
-held draw fill" shows once. Watch RADV for BC3 flashes (the submit once hid a race there).
+Boot (helper BG's fix from 2026-11-16, ported by helper FJ). Unset: 1 on AMD's proprietary driver
+(VK_DRIVER_ID_AMD_PROPRIETARY, where the losses were), 0 everywhere else (6.2's submit: RADV, NVIDIA,
+Intel and the rest; 2026-11-20, after a cross-vendor review, was 1 everywhere from 2026-11-19). An
+explicit value wins on any driver. An ASTC GPU decode made while this thread holds a filled draw or dispatch packet (EXP123 >= 2)
+does not submit: the decode and its barrier stay in the current command buffer, ahead of the draw,
+and the next flush takes them (Scheduler::DeferFlushUntilWanted: the back submits when it idles;
+in Finish mode, EDEN_NX2_ASTC_FLUSH=0, too, where the wait is pacing only). It acts only inside a
+held packet (SEAM 2/3), so it is inert elsewhere. Why: that submit splits a held packet across two
+command buffers ("Memory seam (5.5) ... ASTCDecoderPass"), and both AMD cards (RX 7900 XT, RX 9070
+XT) lost the device 10-15 ms after one at the title; with the skip, SEAM 3 on AMD passed the title
+and the fountain in every run since. 0, or the old FRITCHII_ASTC_HELD_FLUSH=1 of exp/onef-amd,
+submits as before (FRITCHII_ASTC_HELD_FLUSH=1 counts only while FRITCHII_ASTC_HELD_DEFER is unset).
+Logs once, at the first decode that would submit: "ASTC GPU decode inside a held draw fill: submit
+left to the next flush | submitted at once (FRITCHII_ASTC_HELD_DEFER=<value> | unset: AMD
+proprietary driver | unset: not AMD's proprietary driver)", then once "... submit left to the next
+flush (FRITCHII_ASTC_HELD_DEFER=1)" at the first skip. To try it on RADV (watch for BC3 flashes: the
+submit once hid a race there), NVIDIA or Intel, set it to 1.
+
+### FRITCHII_SPLIT_BIND_FIX
+
+Boot, default 1 (2026-11-19; reworked for 6.2). A submit between a draw's or dispatch's bind and
+its record puts the record into a new command buffer with nothing bound; AMD's driver then reads
+the descriptor table through a stale pointer into the old command buffer's recycled memory (a GPU
+page fault in the 0xbef0xxxxxxxx range). 1: when the tick moved between Configure and the record,
+the draw or dispatch configures again in the new command buffer (nothing on the common path). A
+played dispatch (one follower, R) cannot configure again (its packet was played): it records its
+bind with the dispatch and the scheduler forgets its descriptor buffer
+(Scheduler::ForgetDescriptorBuffer), so no compute bind leaves the tracker's chunk stale. A played
+draw (one follower, R) or a served one (a ring B packet, FRITCHII_MEMSTAGE_THREAD=2) never
+configures again either (2026-11-21): its packet was played at the rest, so a second Configure took
+the unheld path into E's (or GPUMem's) buffer cache while E ran (an RTX 4080 crash in
+BindHostStageBuffers on GPURender, and a descriptor count mismatch that stopped step 4 for the
+session: every draw lent, Castle Town 47 fps instead of 77). Instead: when the scheduler still has
+its pipeline bound, the submit came before the bind (the ASTC decode inside the texture work, the
+common case) and the bind, the index and the vertex binds are in the new command buffer already
+(an index bind this draw played before the submit is bound again, MemPlayer::EnsureIndexBinding);
+otherwise the bind went with the submit and the draw is not recorded (one follower check "played
+split bind", must be 0). Logs: "Split bind on a played draw: the submit came before its bind,
+nothing to bind again (shader S; N so far)" and "... the submit came after its bind, not drawn
+...". 0: as before. Either way the splits are counted and logged ("Split bind: a submit between the draw's |
+dispatch's bind and its record (shader S; N so far; FRITCHII_SPLIT_BIND_FIX=1)"). 0 were seen at
+the fountain: insurance.
+
+### FRITCHII_SYNCPT_UNLOCKED
+
+Boot, default 1 (2026-11-19; serialized 2026-11-21). Sync point actions run after the manager's
+lock is released. A due action may run renderer work (the composite executer runs Composite, which
+with one follower drains R on E): under the lock that blocked every guest thread registering a
+wait, and deadlocked when R increments. As under the lock, one thread at a time runs the
+increments' actions, in increment order: an increment whose actions come due while another thread
+runs some queues them for that thread and returns (it never waits for a running action). Waiters
+of a value with actions due wake after those actions ran (6.2's order); a value with none due
+wakes its waiters at once. Deregistering an action that is queued or running waits until it has
+run, except from inside an action on the running thread (a queued one is dropped then). 0 = under
+the lock, as before.
+
+### FRITCHII_ONEF_TICK_ON_E
+
+Boot, default 1 (2026-11-19). With one follower, a frame end R reaches outside a lent call (the
+composite executer of an increment R played) leaves TickFrame to E, which lends it at its next
+fence: TickFrame ticks E's staging pools, memory stage and caches, which R must not touch while E
+runs. 0 = R ticks there, as before.
+
+### FRITCHII_ONEF_OP_MARK
+
+Boot, default 1 (2026-11-19). With one follower, E's operation packets open their number under the
+close's lock with E's mark, as GPUMem's do: R closes ticks while E fills (posted fences), and an
+unmarked number could be published (its staging freed or reused) before R recorded the copy that
+reads it. 0 = as before.
+
+### FRITCHII_DESC_FRAME_GUARD
+
+Boot, default 1 (2026-11-19). The descriptor payload of a frame (UpdateDescriptorQueue, reused
+FRAMES_IN_FLIGHT frames later) is reused only once the scheduler's worker has recorded that frame:
+its Record lambdas read the entries when the worker runs them (push descriptors, descriptor
+buffers, and FRITCHII_DESCRIPTOR_SETS' UpdateDescriptorSet alike), and a worker that fell that far
+behind recorded overwritten descriptors (garbage view and buffer handles). 0 = as before.
+
+### FRITCHII_ONEF_MESH_EMU, FRITCHII_ONEF_MESH_EMU_ASYNC
+
+Boot (2026-11-19; default narrowed 2026-11-21). FRITCHII_ONEF_MESH_EMU: with one follower and E's
+pipeline lookup (FRITCHII_ONEF_E_PIPELINE), emulated mesh draws (no VK_EXT_mesh_shader, as on AMD's
+drivers with Mesh Shaders on Automatic) are posted like any draw: E fills the packet and R runs the
+emulation as for a lent one. Unset: on only on AMD's proprietary driver, where it was tested;
+elsewhere (NVIDIA Pascal and older, Intel iGPUs, RADV before RDNA2) lent as in 6.2, since R then
+uses the rasterizer's staging pool, which the query and texture caches also use on E. 1 / 0 =
+posted / lent everywhere. Indirect and list emulated draws stay lent. Log once: "One follower:
+emulated mesh draws posted | lent (FRITCHII_ONEF_MESH_EMU=...)".
+FRITCHII_ONEF_MESH_EMU_ASYNC: with FRITCHII_ESPLIT's async tail they take it too (fountain idle
+18.3 -> 18.2 ms, checks 0); 0 = lockstep tails for them.
+
+### FRITCHII_ESPLIT_WAKE_EACH, FRITCHII_ESPLIT_GUARD_HOLD
+
+Boot, test switches (2026-11-19, the E2 per-draw cuts). FRITCHII_ESPLIT_WAKE_EACH=1: E2's fenced
+wake check of E1 after every job, as before; by default E2's `done` is a release store and the
+fenced check runs after every draw tail, every 8th job and the last job it saw.
+FRITCHII_ESPLIT_GUARD_HOLD=1: E2's stream-write guard always takes the held path; by default it
+first tests the texture pages unheld and holds only on a possible hit.
+
+### FRITCHII_ONEF_POST_KINDS, FRITCHII_ONEF_POST_SYNCS, FRITCHII_ONEF_TRACE_LENDS
+
+Boot, bisect and trace tools (2026-11-19). FRITCHII_ONEF_POST_KINDS=<mask> (default all): which
+fence kinds one follower may post, the others lent: 1 sync points, 2 references, 4 forced
+releases, 8 SignalFence callbacks, 16 fence-flagged payload reports, 32 counter reports.
+FRITCHII_ONEF_POST_SYNCS=0 (default 1): every fence that owes query syncs is lent.
+FRITCHII_ONEF_TRACE_LENDS=1: the DKB frame trace lends every draw again (it made every
+one-follower measurement a fully lent one; by default it no longer does).
+
+### FRITCHII_SPIRV_DUMP, FRITCHII_SPIRV_DUMP_HASHES
+
+Test (2026-11-19). FRITCHII_SPIRV_DUMP=<folder> with FRITCHII_SPIRV_DUMP_HASHES=<hex,hex,...>: the
+listed programs' SPIR-V as <folder>/<hash>-<stage>.spv (for spirv-dis). Not
+FRITCHII_SPIRV_DUMP_DISCARD, which dumps the first discarding programs.
+
+### Samples query copies past their pool (no switch)
+
+2026-11-19: a samples query result copy whose range reaches past its pool is skipped and logged
+(must be 0): such a copy is invalid in Vulkan.
 
 ### FRITCHII_VA_REPORT
 
@@ -1156,6 +1396,27 @@ nearest ranges below and above within 256 MiB, nearest first. Two AMD losses rea
 region we never see. Costs a locked ring write per bind (allocations, not draws): for loss
 hunts, not fps runs. Boot lines: "GPU address report (FRITCHII_VA_REPORT=1): messenger on" and
 "the driver reports its GPU address binds", or why it is off.
+
+Fritchii's own ranges (2026-11-19): the driver reports memory binds only, so a multi-range sparse
+buffer's reserved addresses would show as "no holder". MultiRangeBufferCache notes them in the same
+ring when it takes an address and when it retires the buffer (VaReport::Note): they print as
+"multi-range sparse buffer (Fritchii's note: reserved addresses)" among the holders, before any
+"nearest ranges".
+
+Destroy report (2026-11-19, same switch): every vkDestroy* of an object whose memory the driver
+owns (buffers, buffer and image views, images, device memory, pipelines, samplers, pools, events,
+framebuffers, query pools) is kept in a 4,096-entry ring with the time, the thread id and name and
+8 return addresses as exe offsets. On a device loss the first reporter, right after it arms the
+end-process watch, logs the destroys of the last 60 s ("Destroy report: T H destroyed M ms ago on
+thread N "name"; stack exe+..."), up to 48 lines, and writes all of them to
+%APPDATA%/fritchii/log/destroy_report.txt at once (the log may not flush before the process ends).
+A GPU read of a freed driver-owned object faults in the driver's own range, which no binding
+report names. Off: one static bool per destroy.
+
+FRITCHII_RGD_WAIT_S (TEST, default 0, at most 600): after a device-loss report the process stays up
+that many more seconds before it ends ("Device loss: waiting N s for a GPU crash dump"), and the
+end-process watch waits that much longer, so a Radeon GPU Detective capture can finish writing its
+dump (v6.2 ends the process right after the report).
 
 ### FRITCHII_VRAM_REPORT
 
@@ -2857,7 +3118,7 @@ query count on the rasterized coverage and interpolated depth with no fragment s
   alpha test Always, no dual source blending, and a pixel program without demote, depth or
   sample mask writes, storage/image/global writes or atomics. The pixel-less pipeline
   ("sibling") is translated on E from the draw's own environments, at most one a frame, kept
-  out of the disk cache, and used only when built and its vertex side (stages 0-3: uniform masks
+  out of the disk cache (in the occlusion file instead: FRITCHII_OCCL_FLAG_PERSIST), and used only when built and its vertex side (stages 0-3: uniform masks
   and sizes, storage, texture, image and texel descriptors, handle programs, the vertex program)
   equals the full pipeline's. A difference refuses that pipeline for the session.
 - 2 = verify: as 1, but the full pipeline still draws (picture unchanged); the siblings are made
@@ -2899,6 +3160,26 @@ numbered "everything" 1, here it is 9); 2 verify (every flag store of 9, the hos
 decide; any game); 5 as 3 with the discard pre-pass and 8 as 9 without the colour pre-pass (A/B).
 Any other value is off.
 
+Full is part of the recommended settings on AMD's proprietary driver on a discrete GPU (Windows;
+2026-11-19, reworked 2026-11-21, MainWindow::ApplyHardwareDefaults, right after the cards are
+read): one follower runs there at Full (FRITCHII_ONEF_AMD) and its win over off comes from Full's
+pre-pass variants. It is set only on a start that applied the tuned settings in full (a fresh
+install, "Use recommended" in the settings prompt, Reset to defaults), and only while the setting
+is still Standard; never after "Keep my settings" (then one follower stays off on AMD, as in 6.2,
+and the one-time offer below may still ask). The offer's state then reads "set by the recommended
+settings", so it never asks over it. That mark, or any other answer in the offer's state, also
+counts as the player's answer on a start that applied the tuned set only because the config looked
+new (qt-config.ini's revision older than frizti.ini's, e.g. after an older build wrote it): Full is
+not set again over a Standard the player picked since; "Use recommended" and Reset to defaults
+still set it. Log: "Recommended settings: occlusion speed-up Full on CARD (...)", "... left at
+VALUE on CARD (not the default, the player's choice)" or "... left at Standard on CARD (the offer
+was answered before: STATE)". A FRITCHII_OCCL_FLAG
+switch still wins at boot. No shaderInt64 test (the frontend's card records have none; every AMD
+proprietary Windows driver has it, and the colour variants check it at the draw). Measured only
+over OCuLink x4 (Full against Standard: host query slots 37k -> 14.5k a second, GPU -0.4 to -1.3
+ms): confirm on a desktop x16 card before main dev takes it. (config/frizti.ini's hw_card and hw.
+keys from earlier 6.5 test builds are kept but no longer read.)
+
 Full is offered once to players it can help (fritchii/occlusion_offer.cpp): when a game ends in
 which the flags acted in OoT on AMD's Windows driver with shaderInt64 (the rasterizer sets
 OcclFlag::g_full_could_help), the setting is still Standard and no switch sets
@@ -2908,16 +3189,19 @@ mode for AMD / Can give more fps on AMD cards. / Change it any time in Graphics 
 [Not now] [Turn it on]". The answer is kept and logged ("Occlusion speed-up offer: ..."); it is
 never asked again. FRITCHII_OCCL_OFFER=0 never asks; =ask asks at every plain launch on any PC
 (screenshots). In the settings, Full is greyed out where it can't act (the picked card runs one
-follower: every card but AMD's Windows driver by default), with one tooltip line.
+follower without FRITCHII_ONEF_OCCL: by default NVIDIA, Intel and RADV), with one tooltip line.
 
 Preparing shaders: the extensions change files the stamp hashes, but no prepared pipeline (every
 new SPIR-V path runs only for a variant made during play, never stored on disk; any other module
 is byte-identical; vk_graphics_pipeline.cpp gained draw-time code only). Nx2ShaderStamp.cmake maps
 the new hashes to 6.1's stamp (SameAsReleased, with that reason), so nobody prepares again, with
-Full on or off. Vulkan 1.2 or later; one follower off (the draw path it hooks is the
-one-thread path, which is the path on AMD's Windows driver). With one follower on, no draw takes a
-flag variant, lent draws included (FRITCHII_ONEF_AMD=1 runs on AMD lent every draw and stored flags
-through them; a played draw's pipeline from E falls back to its parent too). Code: fritchii_occl_flag.h,
+Full on or off. Vulkan 1.2 or later. With one follower off the flags act on the one-thread draw
+path. With one follower on they act only where FRITCHII_ONEF_OCCL is on (by default AMD's
+proprietary driver on a discrete GPU): lent draws then take their variants as with one follower
+off, and E picks a played draw's variant at its own lookup. Elsewhere (FRITCHII_ONEF_OCCL off: by
+default NVIDIA, Intel, RADV and AMD integrated GPUs, where one follower is on by default) no draw
+takes a flag variant with one follower on, lent draws included, and a played draw's pipeline from E
+falls back to its parent, as in 6.2. Code: fritchii_occl_flag.h,
 vulkan_occl_flag.frag, PipelineCache::OcclFlagPipeline / FindOrMakeOcclFlag, SamplesStreamer.
 
 Why: OoT's occlusion tests run as host occlusion queries, about 1,100 begin/end pairs a frame at
@@ -2930,11 +3214,14 @@ pass" (census: all calls p0 = 0, one count of every pair 0), and writing sample 
 with the sun in view.
 
 What it does: a counted draw that writes no colour and whose pixel program can change nothing
-(FRITCHII_OCCL_LEAN's Lean class; not mesh) is drawn with its pipeline's flag variant: the same
+(FRITCHII_OCCL_LEAN's Lean class; at Full (9, and 2/8) also a mesh pipeline whose pixel program
+alone is Lean, whose variant replaces the draw, never a pre-pass, so the mesh emulation runs
+once, and a draw without a pixel program) is drawn with its pipeline's flag variant: the same
 key, a whole pipeline (no libraries) whose pixel stage is the host program
 vulkan_occl_flag.frag. With early fragment tests it runs only for fragments that passed depth
 and stencil and stores 4096 into the 64-bit slot of the open query window, at a buffer device
-address pushed at push constant offset 40 (bytes 40 to 47 are otherwise unused). The variant is
+address pushed at push constant offset 40 (bytes 40 to 47 are otherwise unused; pushed with
+the stages the pipeline's push range covers, the mesh and task stages too). The variant is
 owned by its pipeline (never in the cache or on disk), made one a frame (shared with the lean
 siblings' budget), and used once built; until then the draw keeps its pipeline and a real query.
 The flag area is device-local memory (not host visible when the device has such a type, so the
@@ -2992,7 +3279,7 @@ Risks and limits: a flag variant writes no colour by construction; a draw whose 
 fall outside the Lean class keeps its query. The GPU-side value of a window with several slots goes
 through the existing prefix scan, as windows split by a render pass already do; OoT's 0xe2c
 reads the CPU-written value. No flag area on Qualcomm, ARM or Turnip drivers. The flag area is in
-device-local memory (see above). Not tested on NVIDIA or Intel, nor with one follower on. Not with
+device-local memory (see above). Not tested on NVIDIA or Intel; with one follower on only on AMD (FRITCHII_ONEF_OCCL). Not with
 the memory-stage ring (facts are the parent's key, but not checked).
 
 #### Colour variants and pre-passes (2026-11-18; Full, =9, and verify, =2)
@@ -3020,17 +3307,35 @@ package called this value 1):
 - Both pre-passes only where the draw can be recorded twice and nothing in it can differ: not for
   indirect or list draws, the delta path or draw counting, frame dump probes; not with stencil
   writes, depth bounds, transform feedback, stores in any stage, mandated early Z (discard
-  pre-pass), EQUAL, or NOTEQUAL with depth writes; dynamic depth writes needed. A variant whose
+  pre-pass), or NOTEQUAL with depth writes; dynamic depth writes needed. EQUAL is allowed (the
+  variant's vertex programs are the same SPIR-V compiled in another pipeline, as the game's own
+  depth pre-pass and colour pass already are; verify compares it), except for pipelines built
+  from graphics pipeline libraries. A variant whose
   translation's descriptors differ from its pipeline's is refused. In mode 1 a host query
   already open in the window counts the real draw (no pre-pass); verify ends the open query
   around the pre-pass so it compares the pre-pass flag with the real draw's count.
+- Further Full-only variants (2026-11-19; 9, 8 and verify 2, never at Standard 3):
+  - a colour draw whose program discards and writes no depth or stencil draws the discard
+    variant in place of itself (early tests change nothing without those writes; not under an
+    open host query, where the draw's own pipeline draws; verify checks these draws through the
+    colour discard pre-pass);
+  - a colour draw whose program discards and writes depth takes the discard pre-pass with colour
+    writes off (the dynamic masks cleared, or a variant whose key has every attachment's writes
+    off: kind 5), then draws as it is;
+  - a colour-off draw without a pixel program takes the host flag variant (no discard, so the
+    flag is exactly "some sample passed");
+  - a mesh draw (native or emulated) whose pixel program is Lean takes the host flag variant
+    (colour off) or the colour flag variant (colour on), in place of the draw.
 - Test values (exact picture, for A/B): 3 colour-off flag variants only, 5 as 3 with the discard
   pre-pass, 8 as 9 without the colour pre-pass.
 
 Logs: the flag line adds "colour flag draws, colour flag pipelines made; pre-pass draws (between
 host queries, skipped: a host query open), made, refused at the draw, refused for their
-descriptors, real draws lost (must be 0); colour pre-pass draws". The census line adds the
-discarding draws' writes and the subgroup operations of colour Lean draws refused for them.
+descriptors, real draws lost (must be 0); colour pre-pass draws; colour discard variant draws".
+The census line adds the discarding draws' writes, the subgroup operations of colour Lean draws
+refused for them, "colour pre-pass candidates by outcome" (the first check that refused a
+subgroup or quad colour Lean draw) and "off other by class" (colour-off draws in "other" by
+pipeline class; mesh pipelines by pixel class as "mesh pixel N").
 
 Test switches (development): FRITCHII_OCCL_FLAG_DUMP=<folder> writes the first 64 colour or
 pre-pass flag pixel programs; FRITCHII_SPIRV_DUMP_DISCARD=<folder> the first 200 discarding
@@ -3043,7 +3348,166 @@ pre-passes, 0 disagreements, no real draws lost; host query slots ~36,000 -> ~14
 9 vs 3 (the package's =1 vs =3) frame time -0.6 to -1.0 ms. One GPU hang (device lost) under PCIe load in about 50
 loaded windows with the pre-passes, not reproduced since (22 min playtest and ~30 more windows
 clean); cause unknown. Flag variants are not in the disk cache: each session translates them again
-on the GPU thread (one a frame) and the driver compiles them on the workers.
+(see FRITCHII_OCCL_FLAG_ASYNC and FRITCHII_OCCL_FLAG_COMPILE_THREADS for where), unless the
+occlusion file has them (FRITCHII_OCCL_FLAG_PERSIST, then built from their records after boot).
+
+### FRITCHII_OCCL_FLAG_ASYNC (occlusion variants off the lookup thread)
+
+FRITCHII_OCCL_FLAG_ASYNC (boot, default 1; 0 = v6.2: translated on the lookup thread, one a frame,
+and FRITCHII_OCCL_FLAG_COMPILE_THREADS then defaults to 0 too, so =0 alone is the v6.2 baseline for
+an A/B; the only difference left is that a refused pre-pass variant is retired instead of destroyed
+at once). Occlusion flag variants (FRITCHII_OCCL_FLAG, all five kinds) and lean siblings
+(FRITCHII_OCCL_LEAN) are translated on threads of their own ("VkOcclTranslate", below normal
+priority) from snapshot environments of the draw that asked, not on E (one follower) or the GPU
+thread: per build ~5 ms median, ~17 ms p90, up to ~41 ms on E before. Their SPIR-V is emitted on
+those threads too (no reservation from the shared emission budget). The draw takes its parent with a
+host query until the variant is attached between frames (TickFrame), exactly as for a variant not
+built yet. A variant waits in state 3 (queued).
+- Unusable translations (a stale texture descriptor, a guarded read that gave up) are queued again
+  by a later draw; after two for the same parent and kind that variant (or sibling) is made on the
+  lookup thread from the draw's live state, as with the switch at 0. Never refused for it. The
+  counts belong to the parent object (a parent evicted and made again starts afresh) and are
+  cleared when a translation of that kind is used.
+- A translation still running 5 s after its thread took it (time spent queued does not count) is
+  abandoned; the variant is queued again by a later draw, and given up for good (state 2; a sibling:
+  its parent's lean class Failed) only the second time. A job that finished is never swept.
+- One whose parent went (evicted) or that is no longer waited for is discarded; one that made no
+  pipeline is refused (state 2), as the synchronous path's failure; a pre-pass variant whose
+  descriptors differ is retired (destroyed once built, never waited for on the lookup thread; also
+  with the switch at 0).
+- A lean sibling waits under an empty cache entry. A draw of its own key takes the finished job;
+  while it translates the draw is skipped only where an unbuilt pipeline's draw would be (the
+  asynchronous shaders on and a draw that may be skipped); otherwise the job is given up and the key
+  built at once from that draw, as any new key (also when the job made none or was unusable).
+- Planned only when FRITCHII_OCCL_FLAG was not 0 at boot or FRITCHII_OCCL_LEAN is set. The threads
+  (these and FRITCHII_OCCL_FLAG_COMPILE_THREADS') are made at boot only where variants will be made:
+  AMD's proprietary driver on a discrete GPU (one follower carries flags there; FRITCHII_ONEF_OCCL
+  unset), FRITCHII_ONEF_OCCL=1, one follower not asked for (FRITCHII_ONEF_LEAN and FRITCHII_ONEF not
+  1: flags with it off), or FRITCHII_OCCL_LEAN set at boot. Otherwise (NVIDIA, Intel, RADV, AMD
+  integrated by default: one follower on, FRITCHII_ONEF_OCCL off, so no variant is ever asked for)
+  they are made at the first flag variant or lean sibling request, or once a record of the occlusion
+  file is of a wanted kind (2026-11-20, cross-vendor review; were always made). Boot log:
+  "Occlusion variants: translated on N threads of their own (FRITCHII_OCCL_FLAG_ASYNC_THREADS), at
+  most 8 queued a frame (FRITCHII_OCCL_FLAG_ASYNC=1), flag variants' driver compiles on M
+  lowest-priority threads of their own (...), P logical processors; threads made now (<why>) | made
+  at the first variant request (one follower decides; none with it on and FRITCHII_ONEF_OCCL off);
+  kept on disk: ...", and when made later "Occlusion variants: threads made at the first request (a
+  flag variant | a lean sibling | records of the occlusion file): N translate, M compile".
+- On Intel's driver (FRITCHII_INTEL_PCACHE_FETCH) the translations and both compile lanes are
+  drained before the pipeline cache is fetched between programs.
+- FRITCHII_OCCL_FLAG_ASYNC_THREADS (boot, 1-8): its threads. Default clamp((logical processors -
+  1) * 2 / 7, 1, 4): 16 or more logical processors 4 (the measured arm), 12 3, 8 2, 6 or fewer 1
+  (2026-11-20; was 4 everywhere, before that 2). An explicit value wins.
+- FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME (boot, default 8, 1-64; was 4): jobs queued a frame at most
+  (each copies the draw's environments on the lookup thread); at most 32 in flight. Over either,
+  the variant is asked again at a later draw.
+- The defaults of these two and of FRITCHII_OCCL_FLAG_COMPILE_THREADS (4/8/4, were 2/4/2) are
+  the arms that won the A/B runs at the Market fountain (a 16-thread Core Ultra 7 255H); the thread
+  counts now scale down from there on smaller CPUs.
+
+### FRITCHII_OCCL_FLAG_COMPILE_THREADS (occlusion variant compile lane)
+
+FRITCHII_OCCL_FLAG_COMPILE_THREADS (boot, 0-8; 0 = the shared pipeline workers, as v6.2). Default
+with FRITCHII_OCCL_FLAG_ASYNC=1: 1 on AMD's proprietary driver (2026-11-20: with 4 lowest-priority
+compile threads a draw waited 4.3 s behind them inside AMD's driver during an area load; 1 removed
+the freeze, worst hitch 0.99 s); on every other driver clamp((logical processors - 1) * 2 / 7, 1, 4),
+as FRITCHII_OCCL_FLAG_ASYNC_THREADS (16 logical processors: 4), held within the legacy AMD cap
+(GCN4 or older on AMD's driver: 2, or EDEN_NX2_PIPELINE_WORKERS), as in v6.2 (1 thread was not
+measured there); 0 with FRITCHII_OCCL_FLAG_ASYNC=0. An explicit value wins (was 4 everywhere,
+before that 2). With FRITCHII_ONEF_LEAN=1 (a frontend default) the lane exists by default only on
+AMD's proprietary driver on a discrete GPU. Made at boot or at the first variant request,
+as FRITCHII_OCCL_FLAG_ASYNC's threads (above). The driver compiles of occlusion flag variants run
+on threads of their own ("VkOcclBuilder", lowest priority), so they never queue ahead of the game's
+own pipelines on the shared workers. No draw waits for one: flag variants are never cache entries
+and are drawn only once built. Such a build takes no emission-budget reservation (its SPIR-V is
+emitted where it is translated). Lean siblings are cache entries a draw of their key can wait on, so
+they compile on the shared workers.
+
+Logs: "Runtime pipelines in the last 10 s" ends with "occlusion variants (flag variants and lean
+siblings): N on the GPU thread (X ms), Q queued from the GPU thread (Z ms of snapshots), M on workers
+(Y ms)" (Z: what the lookup thread still pays per queued variant, the snapshot and its copy). The
+"Occlusion flags" line ends with the window's raw counts: "made, colour made, pre-pass made, pre-pass
+refused; async variants (FRITCHII_OCCL_FLAG_ASYNC): queued, adopted, stale/retried, discarded, not
+queued (budget or full), in flight at most". The boot log says where variants are translated and
+compiled ("Occlusion variants: ...").
+
+### FRITCHII_OCCL_FLAG_PERSIST (occlusion variants kept on disk)
+
+FRITCHII_OCCL_FLAG_PERSIST (boot, default 1; 0 = no file read or written, everything as without
+it). Occlusion flag variants (all five kinds) and lean siblings are never in the disk cache, so
+every session translated them again: at the Market about 770 a session, 11-26 ms of worker time
+each, plus about 650 pre-pass variants translated only to be refused for their descriptors. With it
+they are kept in a file of their own beside the disk cache, vulkan-frizti-occl.fork-v<N>.bin (header
+"occl_v2", the cache version and the key size; the disk cache file, its used list and the prepared
+shader stamp are never touched). A file of the first format ("occl_v1") is started again.
+- Recorded: each variant attached to its pipeline (state 1), from the asynchronous path
+  (FRITCHII_OCCL_FLAG_ASYNC) or the synchronous one, and each lean sibling made: the kind (0 a
+  sibling, 1-5 the flag variants), the parent pipeline's key and descriptor signature (a hash of
+  its stages' descriptor lists, texture and image types included), the key it was built as (kinds
+  4 and 5: every attachment's writes off; a sibling: no pixel program) and the environments it was
+  translated from, serialized exactly as the disk cache serializes them (the same snapshot the
+  build used; the finished job is handed to the serialization thread, nothing is copied on the GPU
+  thread). Only a variant whose guest stages describe exactly its parent's descriptors is recorded
+  (every stage; all but the pixel one for kinds 1 and 4 and siblings), since only such a one may be
+  used from the file. Once per parent key and kind, again after its record was not usable. Written
+  on the serialization thread; a failure is logged once and never affects rendering.
+- Lean siblings go in this file (kind 0), not the disk cache: the disk cache builds at boot every
+  key recent sessions used whatever the switches, while siblings are wanted only with
+  FRITCHII_OCCL_LEAN (a live switch, default 0) on; and that file is also merged with and imported
+  from other builds' caches.
+- Used only when it still fits (no wrong picture from another session's state): a variant built
+  from its record is attached only when this session's parent has the descriptor signature it was
+  recorded with (the parent built from environments of the same shape), when the variant's guest
+  stages describe exactly the parent's descriptors (same storage pointers, same texture types: a
+  colour variant is drawn in the parent's place) and, for a pre-pass, when the parent can bind its
+  descriptors. Otherwise (or when it does not read back or build) it is dropped, never refused for:
+  a draw makes the variant from its own state, and that one is recorded in place of the record (the
+  last record of a parent and kind is the one read).
+- Refusal memo: a pre-pass variant (kinds 3 and 5) made from a draw's state and refused because its
+  descriptors differ from its pipeline's is noted (one note a session per parent and kind), keyed by
+  the parent key's hash without the driver fields, the parent's descriptor signature and this
+  build (its revision and a memo version bumped when the pre-pass translation changes). Once two
+  sessions of this build refused it, such a variant is refused at once (state 2): no snapshot, no
+  translation. Applies with FRITCHII_OCCL_FLAG_ASYNC=0 too. A prebuilt one that does not fit is
+  never noted. Another build, or a parent built from other environments, starts afresh.
+- At boot, after the disk cache's boot builds, the file is read on the loader thread (it waits only
+  for this title's own record writes still queued, never for a VkPipelineCache save) and handed to
+  the GPU thread. Only each record's place in the file is kept in memory, not its contents: the
+  translation thread reads its environments back (and checks their CityHash64) when it builds it.
+  With FRITCHII_OCCL_FLAG_ASYNC=1 records are queued on occl_queue and built from the recorded
+  environments (as the disk cache's prebuild builds from its records, not from guest memory),
+  attached between frames as a draw-asked variant (state 3 while queued; the compile on the
+  occlusion lane):
+  - when a draw asks for a variant that has a record not queued yet, the record is queued in place
+    of a snapshot (none taken, no per-frame budget spent);
+  - in the background, records whose parent is in the pipeline cache and built, whose kind the
+    current FRITCHII_OCCL_FLAG level and one-follower state can use (FRITCHII_ONEF_OCCL with one
+    follower on; its pre-pass kinds only with FRITCHII_ONEF_OCCL_PREPASS; siblings only with
+    FRITCHII_OCCL_LEAN 1 or 2 and one follower) and that no draw made, refused or queued yet: at
+    most 8 a frame and only while fewer than FRITCHII_OCCL_FLAG_ASYNC_THREADS + 1 occlusion jobs are
+    in flight, so a draw's own variant waits behind one round of them at most. A walk looks at 512
+    pending records at most and resumes where it stopped: every frame while records wait for room,
+    else every 15 frames.
+  Records of another GPU driver are rekeyed to this one, as the disk cache's.
+- Kept small: at boot the file is compacted (rewritten beside it and renamed over it; on any
+  failure it is used as it is) once superseded records, refusal notes past two and records this
+  build cannot use free a quarter of it and at least 4 MiB; past 128 MiB the oldest records go
+  too, down to 96 MiB (a record still used is written again by its draw).
+- A later program or title (LoadDiskResources again) stops the recording into the previous file at
+  once; the new one's file is recorded into once its read is handed over (also when it was not read).
+- Robustness: a file of another version (or not this file) is ignored and started again; a
+  truncated or corrupt record (each has its size and a CityHash64 of its contents) is cut off with
+  everything after it, the records before it kept. A record that changed since boot or does not
+  read back is left to the draws. Logged once.
+- Benchmarks: a cold arm must remove or restore this file together with the disk cache snapshot;
+  otherwise the variants of the previous run are prebuilt.
+
+Logs: at boot "Occlusion variants on disk: N records (R refusals, P parents in the memo), B with
+their parent built at boot, L later or never (...)" (B: queued over the next frames), and a
+"compacted from X to Y MiB" line when it was. The "Occlusion flags" line adds "on disk
+(FRITCHII_OCCL_FLAG_PERSIST): prebuilt queued, prebuilt adopted, prebuilt unused, memo refusals" for
+the window (unused: built from a record but not attached because it no longer fits or did not
+build). The boot line "Occlusion variants: ..." ends with "kept on disk: yes/no".
 
 ### EDEN_NX2_GPU_PROFILE=2: E's draw method zones (helper CP)
 
@@ -5709,7 +6173,11 @@ command buffer, so the recorded commands stay the same; repacked bindings are le
 one again runs its conversion). It is what the stage will need instead of the scheduler's
 command buffer flags (step 6b). With EXP123 >= 1 the seam's stats line adds "memory seam full
 vertex bindings": vertex bind runs recorded and dropped as still bound a second. Independent of
-FRITCHII_MEMSTAGE_THREAD 0 and 1; THREAD = 2 turns it on by itself.
+FRITCHII_MEMSTAGE_THREAD 0 and 1; THREAD = 2 turns it on by itself. One follower does not need it
+(2026-11-19): R binds the remembered vertex bindings again once in each new command buffer
+(MemPlayer::EnsureVertexBindings; the AMD device loss at 0xbef011af0000 read the old command
+buffer's vertex table), and a vertex-binding epoch (Scheduler::VertexEpoch: new command buffers
+and passes that bind vertex buffers) drops a clean run still bound.
 
 ### FRITCHII_JIT_DISPATCH_BITS
 
@@ -6127,6 +6595,65 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   8 GB cards. The cold sweep (4 frames, on by default) and EXP64 already do that here, at most 16
   a frame; this raises the cap. Line every 600 frames "Cold sweep cap (...)" whenever the cap was
   reached (also with the switch at 0): frames that stopped at the cap, images watched.
+- FRITCHII_COLD_SWEEP_KEEP_RESAMPLED (live or boot, default 1; 0 = as before): the cold sweep
+  keeps render targets the game samples again. When a sampled image shows lost contents ("Lost
+  contents sampled ... dropped by: cold sweep"), the dropped target's GPU address and shape (and
+  the sampled image's own, when chain-shaped) go into a re-sampled set (at most 4,096 keys, the
+  least recently seen out). A GPU-written target at such an address and shape is then skipped by
+  the regular sweep and by covered retire (FRITCHII_COVERED_RETIRE), only where the sweep would
+  delete it (after covered retire's coverage test and after the GpuModified guards: guarded or
+  uncovered images use no budget), within FRITCHII_COLD_SWEEP_KEEP_MIB of real device memory (each
+  kept image counts its own size plus its scaled copy when rescaled). The budget is resident: a
+  kept image holds its share from its first keep until it is deleted, released, relocated or
+  leaves the sweep's watch list, so an overrun turns away new candidates instead of evicting
+  earlier keeps; a target kept by covered retire is looked at again every frame while it stays
+  cold, so the budget and the gate can release it. A pressure gate releases
+  them (the sweep deletes as before and the collector's rules apply): while the driver's budget
+  binds (budget_pressure), for 600 frames after an image failed to allocate, or while the cache is
+  over the critical line plus min(max(1 GiB, critical / 4), (driver budget - critical) / 2), and
+  no margin when the device reports no budget (no VK_EXT_memory_budget, OpenGL). The plain
+  critical line released 1,515 of 1,642 kept targets in 9070 XT play (cache 6.8-9.7 GiB, critical
+  7.68 GiB), so the margin keeps the rule useful there (~1.9 GiB, line ~9.6 GiB); the second bound
+  keeps the line on smaller cards (~1.05 GiB of margin on 8 GB, ~0.5 GiB on 4 GB), where critical
+  + 1 GiB would pass the card's memory and only budget_pressure (absent with
+  FRITCHII_VRAM_BUDGET_MODE=0) or failed allocations (rare on Windows, where WDDM demotes) would
+  release. 2 also keeps from both any target sampled in a frame after its last GPU write
+  (GuardSampled). 3 (test, not default) is 2 plus a range keep: a GPU-written target whose memory
+  overlaps a recently lost read (the reader's range of a "Lost contents sampled" line, the
+  FRITCHII_LOST_KEEP ring of 128 ranges, learned under 3 even with FRITCHII_LOST_KEEP=0) is kept
+  too, whatever its address and shape, under the same FRITCHII_COLD_SWEEP_KEEP_MIB budget. Cost:
+  a scan of at most 128 ranges per GPU-written cold candidate the set did not keep, only while a
+  range is on record. Aim: a loss whose drop key was already in the set (or a new target at
+  another address or shape over the same memory) is not kept by the key match. Why: at the OoT market 27-30 targets a 3-minute run (mostly 1280x720, also
+  240x135 / 480x270 / 192x192 / 384x384) were sampled after the sweep took them and showed
+  zeros ("upload skipped as stale, cleared to zero"; an RTX 5090 user logged 717 in 87 min, a
+  pause-menu background in blocks). 28 of 29 came from covered retire (built-in
+  FRITCHII_COVERED_RETIRE=4, "no write-back on that path"), which ignores EDEN_NX2_TC_COLD_FRAMES:
+  that is why K=60 did not help. Turning the sweep off filled the card (14.3 of 14.3 GB) and
+  crashed. Cost: nothing while the set is empty; then one cached lookup per cold candidate (the
+  answer is kept per image until the set changes). Line every 600 frames "Cold sweep keep
+  (FRITCHII_COLD_SWEEP_KEEP_RESAMPLED=N)": images newly kept (of them as sampled after their
+  write, and "by range" under 3), kept now and their MiB, deletes let through over the line, set
+  size (+ keys learned), lost contents sampled in those frames (dropped by the cold sweep, each
+  drop counted once; "in the set when deleted": the drop's key was in the set at the delete;
+  "more images over a drop already counted": further images read over a drop already counted;
+  not recorded), device memory and the keep line, the keep budget and its resident use (real
+  device memory, and how many images hold it), the release line, and ", releasing: ..." with the gate's reason while it is shut. Each "Lost contents sampled" line ends with
+  ", key in set at drop" when the drop's key was in the set at the delete. The lost-contents attribution ring (StaleDropRing) is 4,096 drops now (was 1,024):
+  covered retire alone records ~140 a second there, so drops read again 7+ s later were "not
+  recorded" (9-11 a run) and could not be learned.
+- FRITCHII_COLD_SWEEP_KEEP_COVERED (live, default 1, the tested 6.5 behaviour; 6.5 review R3 should-fix 3): whether the keep
+  above may hold targets that newer images of another shape cover (covered retire) or overlap
+  since the target's last use (the superseded test, ColdSuperseded). Such a kept target is not
+  synced with those images (they aren't aliases), so the next lookup that finds it samples its
+  pre-cover picture. At 0 they go as in v6.2 (deleted, no budget) and the keep holds only targets
+  no newer image of another shape touched since. 1 is the first 6.5 candidate's behaviour: it
+  keeps those too, which fixed the pause menu's blocky background (a 1280x720 target covered
+  retire took, 28 of 29 market losses came from covered retire), where the cover was the images'
+  ranges, not their real writes. The "Cold sweep keep" line counts "N with a learned key deleted
+  as newer images cover or overlap them (FRITCHII_COLD_SWEEP_KEEP_COVERED=V)": the targets 1
+  would have kept. Test it live: pause menu System tab and the market, 0 against 1; compare the
+  lost contents counts and the pictures.
 
 ### Pot room VRAM (helper CC)
 
@@ -6304,8 +6831,12 @@ thunderbolt) and --link, --link-load, --link-us, --hog, --hog-mode, --bar, --lin
   budget. Before a request spills to host staging because the ring looks busy, the GPU's progress
   is read again. FRITCHII_SMALL_BAR_STREAM_MIB=<transfers>,<buffers> (boot, 16 to 256 each) sets the
   sizes for tests and turns the rest on. Resizable BAR and integrated GPUs are not touched.
-- FRITCHII_DESCRIPTOR_SETS (boot, default 0; 1 on, 2 AMD drivers on a discrete card with 7 GiB or
-  less of CPU-visible device memory). Draws and dispatches take descriptor sets from pools instead
+- FRITCHII_DESCRIPTOR_SETS (boot; unset = rule 2 on AMD's proprietary driver, else as the driver
+  allows; 0 as the driver allows, 1 on, 2 AMD drivers on a discrete card with 7 GiB or less of
+  CPU-visible device memory). The unset default: RX 9070 XT eGPU over OCuLink with a 256 MiB
+  CPU-visible window, OoT fountain, one follower and Full occlusion: idle 16.45 -> 16.23 ms, under
+  PCIe load 20.70 -> 19.04 ms (-8%), GPU busy about -2 ms, picture unchanged (2 runs). Cards with
+  resizable BAR (window over 7 GiB) keep push descriptors: not measured there. Draws and dispatches take descriptor sets from pools instead
   of push descriptors. In AMD's open driver source, push descriptors are command buffer embedded
   data, kept with the command buffers in host memory unless the CPU-visible window is over 7 GiB;
   descriptor pools try device memory first. So without resizable BAR each draw's shaders would fetch
@@ -6436,7 +6967,7 @@ guest range made in the current command buffer, when the bytes still match
 EXP18 (buffer binding memos), bits: 1 = a constant buffer bind of the slot's current
 GPU range keeps its translation and resolved buffer (UBO_REBIND), 2 = storage bindings reuse
 their last FindBuffer result (STORAGE_MEMO), 4 = buffers touch the LRU once per frame
-(default 4: exact, see LoadExperiments). All while the mappings and the set of buffers are
+(default 6 since 2026-11-19, bits 4 and 2: exact, see LoadExperiments; 4 = the old default). All while the mappings and the set of buffers are
 unchanged (BufferCache::binding_epoch).
 
 ### EXP19
@@ -8069,3 +8600,46 @@ held to the P-cores with CPU sets, released when they don't fit or after two 10 
 50 late guest timers a second. It adds nothing where `Thread pinning:` already gave them cores of
 their own. 1 = strict with guards, 3 = strict without, 0 = off. Check the `CPU placement:` and
 `Hybrid placement in 10 s:` lines.
+
+- FRITCHII_COVERED_RETIRE_WRITEBACK (live, default 0 = off; experimental, not a validated option, do not enable or
+  suggest it): covered retire (FRITCHII_COVERED_RETIRE) writes a GPU-written target back to guest memory before
+  deleting it, as the cold sweep does, so a later sample is not cleared to zero ("Lost contents sampled ... cold
+  sweep"). OoT Market A/B (RX 9070 XT): cold sweep losses 29 -> 12-15 a run and "sampled again where one was deleted"
+  26 -> 10, but 11-14k write-backs a run for ~20 re-reads and a slightly worse first camera spin in both runs. Unsafe as
+  built: the covering images need not be GpuModified and the CPU-read flush paths record no write-back, so the landing
+  can write older bytes over newer covering data a CPU read already flushed; its landing can also clear stale marks
+  left by newer images; it crowds the shared write-back queue and ring and counts under the cold sweep's counters. A
+  future version needs a re-read gate, a covering-GpuModified check at queue time and at landing (or NoteWriteback on
+  the flush paths) and its own queue and counters. With 0 the path is as before; the covered retire line reports
+  "({} written back first)" (0).
+
+- FRITCHII_COLD_SWEEP_KEEP_MIB (live, MiB; 0 = keep only below the critical line): the budget for targets
+  FRITCHII_COLD_SWEEP_KEEP_RESAMPLED keeps, in real device memory (each kept image's size plus its scaled copy when
+  rescaled; it counted guest bytes before, which at 2x let 256 MiB hold about 1.25 GiB), held as a resident total
+  (images already kept keep their share; new candidates are turned away when it is full). Default
+  min(256 MiB, GetDeviceLocalMemory() / 32), where GetDeviceLocalMemory is the driver budget less its reserve, capped
+  at 6 GiB + the resolution scale's GiB (not the heap size): ~96 MiB on a 4 GB card, ~200 MiB on 8 GB. With a driver
+  budget of 12 GiB or more the default is min(512 MiB, GetDeviceLocalMemory() / 16): 448 MiB at 1x and 512 MiB at 2x
+  on the 16 GB 9070 XT, since the measured kept set there (408 images, 115 MiB of guest bytes) is up to ~575 MiB real
+  when rescaled. That size is not measured yet: compare the line's "in use" with the budget. In play the cache went
+  past its critical line (9.7 GiB on a 16 GiB card) and a memory line released 1,515 of 1,642 kept targets; a budget
+  bounds the extra memory instead. The pressure gate still applies in both modes: nothing is kept while
+  budget_pressure is set, for 600 frames after an image failed to allocate, or over critical + min(max(1 GiB,
+  critical / 4), (driver budget - critical) / 2) (no margin without a reported budget); the collector stays the
+  backstop. The "Cold sweep keep" line reports the budget in use, the release line and the gate's reason while it is
+  shut.
+
+- FRITCHII_OCCL_FLAG_COMPILE_THREADS now defaults to 1 on AMD's proprietary driver only (elsewhere still core-scaled
+  1-4 within the legacy AMD cap, as v6.2): with 4 lowest-priority compile threads a draw waited 4.3 s behind them
+  inside AMD's driver during an area load; 1 thread removed the freeze in play (worst hitch 4.3 s -> 0.99 s, the
+  lane's share of hitch time 11.6 s -> 0.16 s). Not measured on other drivers. Explicit values still win.
+
+- FRITCHII_PROTECT_UNLOCKED: the code default is now 1, since 6862d0b (2026-11-20); the docs said "on by default
+  since 2026-11-18", but the code still defaulted to 0 until then, so this is its first default-on exposure. A split
+  sequence guard redoes under the lock an unlocked Protect that a partial (view-splitting) Unmap ran alongside, whose
+  PAGE_READWRITE remap would otherwise wipe it. Market A/B (RX 9070 XT): 99.9% of Protect calls skip the placeholder lock (about 2 million
+  vs 1,400 a run), no change in load or spin frame times, no device loss. In play, area changes queued the GPU back
+  thread's Protect calls behind guest Map/Unmap for up to 80-90 ms; this is the switch for that. FRITCHII_PROTECT_UNLOCKED=0
+  restores the locked path.
+- FRITCHII_COLD_SWEEP_KEEP_RESAMPLED=3 (range keep) measured: 10,070 targets kept (8,955 by range) for no fewer losses;
+  the default stays 1.

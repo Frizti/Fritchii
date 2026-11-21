@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "common/fritchii_page_flags.h"
+#include "video_core/buffer_cache/nx2_bytes_equal.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_debug_control.h"
@@ -37,12 +39,20 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
 };
 
 /// EDEN_NX2_UBOREUSE=0 turns the reuse off (every small uniform buffer is copied, as before).
+/// The switch reads below are cached in plain atomics (-1: not read yet), not in function-local
+/// statics: a streamed bind made several of these calls, each a thread-safe-static guard check
+/// (a TLS epoch read) on the back's hottest path.
+inline std::atomic<int> g_uboreuse_switch{-1};
+inline std::atomic<int> g_ubo_inplace_switch{-1};
+
 [[nodiscard]] inline bool UniformStreamReuseEnabled() noexcept {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_UBOREUSE");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
+    int value = g_uboreuse_switch.load(std::memory_order_relaxed);
+    if (value < 0) [[unlikely]] {
+        const char* const env = std::getenv("EDEN_NX2_UBOREUSE");
+        value = (env == nullptr || env[0] != '0') ? 1 : 0;
+        g_uboreuse_switch.store(value, std::memory_order_relaxed);
+    }
+    return value != 0;
 }
 
 /// EDEN_NX2_UBO_INPLACE=1 (default off): BindSmallUniformReusing compares a buffer whose device
@@ -51,10 +61,13 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
 /// copied at all; changed ones are copied once into the slot and the stream copy is made from the
 /// slot, so the two never differ (as the scratch snapshot guaranteed before).
 [[nodiscard]] inline bool UniformInPlaceCompareEnabled() noexcept {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_UBO_INPLACE");
-        return value != nullptr && value[0] != '0';
-    }();
+    int value = g_ubo_inplace_switch.load(std::memory_order_relaxed);
+    if (value < 0) [[unlikely]] {
+        const char* const env = std::getenv("EDEN_NX2_UBO_INPLACE");
+        value = (env != nullptr && env[0] != '0') ? 1 : 0;
+        g_ubo_inplace_switch.store(value, std::memory_order_relaxed);
+    }
+    const bool enabled = value != 0;
     // EXP93 (live, 0 = as the env says, 1 = on): the same, switchable in one session. Both modes
     // compare against the slot's own bytes, so a change between two binds is safe.
     return enabled || VideoCore::Nx2Debug::Experiment(93) != 0;
@@ -114,7 +127,10 @@ public:
         u16 direct{}; ///< binds left that copy straight to the stream buffer (EXP115)
     };
 
-    UniformStreamReuse() : bytes{new u8[NumCopies * MaxBytes]} {}
+    /// Copies are MaxBytes plus one cache line apart: with a plain 16 KiB stride every copy's
+    /// first lines fell in the same L1 sets, so the compares of a draw's binds evicted each other.
+    static constexpr size_t Stride = MaxBytes + 64;
+    UniformStreamReuse() : bytes{new u8[NumCopies * Stride]} {}
 
     void Reset() noexcept {
         for (Copy& copy : copies) {
@@ -130,7 +146,7 @@ public:
     }
 
     [[nodiscard]] u8* Bytes(size_t copy) noexcept {
-        return bytes.get() + copy * MaxBytes;
+        return bytes.get() + copy * Stride;
     }
 
     static void NextSerial(Copy& copy) noexcept {
@@ -153,8 +169,23 @@ public:
 };
 
 template <class Ref>
-[[nodiscard]] inline UniformStreamReuse<Ref>& UniformStreamReuseState() noexcept {
+[[nodiscard]] inline UniformStreamReuse<Ref>& UniformStreamReuseStateSlow() noexcept {
     static UniformStreamReuse<Ref> state;
+    return state;
+}
+
+/// The state's address once made (no thread-safe-static guard on the bind path).
+template <class Ref>
+inline std::atomic<UniformStreamReuse<Ref>*> g_uniform_reuse_state{nullptr};
+
+template <class Ref>
+[[nodiscard]] inline UniformStreamReuse<Ref>& UniformStreamReuseState() noexcept {
+    if (UniformStreamReuse<Ref>* const state =
+            g_uniform_reuse_state<Ref>.load(std::memory_order_acquire)) [[likely]] {
+        return *state;
+    }
+    UniformStreamReuse<Ref>& state = UniformStreamReuseStateSlow<Ref>();
+    g_uniform_reuse_state<Ref>.store(&state, std::memory_order_release);
     return state;
 }
 
@@ -269,7 +300,7 @@ template <class Runtime, class DeviceMemory>
     const u64 tick = runtime.StreamEpoch();
     const auto same_bytes = [&](size_t copy_index) {
         return reuse.copies[copy_index].size == size &&
-               std::memcmp(reuse.Bytes(copy_index), guest, size) == 0;
+               Nx2BytesEqual(reuse.Bytes(copy_index), guest, size);
     };
     const auto rebind = [&](size_t copy_index) {
         const typename Reuse::Copy& copy = reuse.copies[copy_index];

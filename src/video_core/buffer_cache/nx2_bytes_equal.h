@@ -38,6 +38,15 @@ namespace VideoCommon {
             return false;
         }
     }
+    // 16 bytes a step for the rest (uniform sizes are multiples of 16): memcmp only for a tail
+    // under 16 bytes.
+    for (; offset + 16 <= size; offset += 16) {
+        const __m128i x = _mm_xor_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + offset)),
+                                        _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + offset)));
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(x, _mm_setzero_si128())) != 0xFFFF) {
+            return false;
+        }
+    }
     return offset == size || std::memcmp(a + offset, b + offset, size - offset) == 0;
 #else
     return std::memcmp(a, b, size) == 0;

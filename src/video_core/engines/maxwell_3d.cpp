@@ -884,6 +884,9 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
         // InvalidateGPUCache, then WaitForIdle (RasterizerInterface's default).
         return rasterizer->InvalidateTextureDataCache();
     case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
+        if (rasterizer->TiledCacheBarrierIsNoop()) {
+            return; // nothing to run (and with FRITCHII_ESPLIT, no E2 job for it)
+        }
         if (VideoCommon::ESplit::QueueRasterOp(VideoCommon::ESplit::RasterOp::TiledCacheBarrier,
                                                *rasterizer)) {
             return;

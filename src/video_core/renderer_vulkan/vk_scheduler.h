@@ -185,6 +185,12 @@ public:
     /// Returns true when the descriptor buffer chunk has to be bound into the command buffer.
     bool UpdateDescriptorBufferChunk(u32 descriptor_chunk);
 
+    /// FRITCHII_SPLIT_BIND_FIX: a bind recorded with a dispatch (a deferred compute bind) bound a
+    /// descriptor buffer without this tracker: the next user binds its own chunk again.
+    void ForgetDescriptorBuffer() noexcept {
+        state.descriptor_buffer_bound = false;
+    }
+
     /// Invalidates current command buffer state except for render passes
     void InvalidateState();
 
@@ -270,6 +276,17 @@ public:
     /// end of a render pass), so a binding recorded at the same epoch is still bound.
     [[nodiscard]] u64 RecordingEpoch() const noexcept {
         return recording_epoch;
+    }
+
+    /// Changes only when the vertex buffer bindings may be gone or replaced: a new command buffer
+    /// (SubmitExecution) or a pass that binds its own (DisturbVertexBindings). Not at a blit's
+    /// InvalidateState: blits bind no vertex buffers. Vulkan keeps them
+    /// across render passes, so a binding recorded at the same epoch is still bound.
+    [[nodiscard]] u64 VertexEpoch() const noexcept {
+        return vertex_epoch;
+    }
+    void DisturbVertexBindings() noexcept {
+        ++vertex_epoch;
     }
 
     /// Returns true when a tick has been triggered by the GPU.
@@ -599,6 +616,7 @@ private:
 
     State state;
     u64 recording_epoch = 0;
+    u64 vertex_epoch = 0;
     u64 render_pass_serial = 0; ///< BeginRenderPassImpl calls (delta draws)
 
     u32 num_renderpass_images = 0;

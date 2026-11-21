@@ -137,6 +137,65 @@
 
 namespace Vulkan {
 
+namespace {
+/// FRITCHII_SPLIT_BIND_FIX (boot, default 1): a submit between a draw's or dispatch's bind and
+/// its record put the record into a new command buffer with nothing bound (the pipeline, the
+/// descriptor sets, the dynamic state stay in the old one). AMD's driver then reads the
+/// descriptor table through the hardware's stale pointer into the old command buffer's
+/// recycled memory: a GPU page fault in the 32-bit descriptor range (0xbef0xxxxxxxx). 1: the
+/// draw or dispatch configures again in the new command buffer (only when the tick moved, so
+/// the common path costs nothing); a played dispatch (one follower, R), which cannot configure
+/// again, records its bind with the dispatch and the scheduler forgets its descriptor buffer.
+/// A played or served draw never configures again either (NotePlayedSplit).
+/// 0: as before (counted only).
+bool SplitBindFix() {
+    static const bool on = [] {
+        const char* value = std::getenv("FRITCHII_SPLIT_BIND_FIX");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+std::atomic<u64> g_split_draws{};
+std::atomic<u64> g_split_dispatches{};
+std::atomic<u64> g_split_played_kept{};
+std::atomic<u64> g_split_played_lost{};
+/// FRITCHII_SPLIT_BIND_FIX for a played draw (one follower's R) or a served one (a ring B packet,
+/// FRITCHII_MEMSTAGE_THREAD=2): it never configures again (its packet was played at the rest, so
+/// a second Configure takes the unheld path into a buffer cache this thread does not own while
+/// its owner runs: the 4080 pot room crash in BindHostStageBuffers, and a descriptor count
+/// mismatch that stopped step 4 for the session). `lost`: the submit came after the bind (the
+/// scheduler no longer has the pipeline bound), the draw is not recorded. Otherwise the submit
+/// came before the bind (the ASTC decode inside the texture work, the common case): the bind,
+/// the index and the vertex binds of the packet's geometry section are in the new command buffer.
+void NotePlayedSplit(bool lost, u64 shader_hash) {
+    const u64 count = (lost ? g_split_played_lost : g_split_played_kept)
+                          .fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 8 || (count & (count - 1)) == 0) {
+        if (lost) {
+            LOG_WARNING(Render_Vulkan,
+                        "Split bind on a played draw: the submit came after its bind, not drawn "
+                        "(shader {:016x}; {} so far)",
+                        shader_hash, count);
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "Split bind on a played draw: the submit came before its bind, nothing to "
+                     "bind again (shader {:016x}; {} so far)",
+                     shader_hash, count);
+        }
+    }
+}
+void NoteSplitBind(bool dispatch, u64 shader_hash) {
+    const u64 count = (dispatch ? g_split_dispatches : g_split_draws)
+                          .fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 8 || (count & (count - 1)) == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "Split bind: a submit between the {}'s bind and its record (shader {:016x}; "
+                    "{} so far; FRITCHII_SPLIT_BIND_FIX={})",
+                    dispatch ? "dispatch" : "draw", shader_hash, count, SplitBindFix() ? 1 : 0);
+    }
+}
+} // Anonymous namespace
+
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 using VideoCommon::ImageViewId;
 using VideoCommon::ImageViewType;
@@ -2390,15 +2449,29 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // may take its pipeline's flag variant; a kept flag variant is decided again.
     VideoCommon::OcclFlag::t_census = VideoCommon::OcclFlag::Census::Unknown;
     VideoCommon::OcclFlag::t_colour_prepass = false;
+    VideoCommon::OcclFlag::t_discard_direct = false;
+    VideoCommon::OcclFlag::t_colour_discard_prepass = false;
     const auto occl_flag = [&](GraphicsPipeline* chosen, bool allow_make) -> GraphicsPipeline* {
         if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
             chosen = chosen->occl_flag_parent; // a kept flag variant: decided again
         }
-        // Never with one follower on, lent draws included: the flag store dereferences a pushed
-        // GPU address, and the follower's lent paths were the one place flags ran with it (both
-        // AMD losses read a wild address at the same lent load, 2026-11-18/19).
-        if (onef_play != nullptr || VideoCommon::OneFollower::On() || chosen == nullptr ||
-            VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Off ||
+        // One follower with FRITCHII_ONEF_OCCL on (OneFollower::OcclWanted: unset = AMD's
+        // proprietary driver on a discrete GPU): a played draw's flag variant is E's choice (its
+        // lookup, the packet's pipeline); R only makes sure the flag area exists (made here, on
+        // R), and lent draws take their variants as with one follower off. With it off, v6.2's
+        // rule exactly: no flag variant with one follower on, lent draws included. (v6.2 made
+        // that rule after two AMD losses read a wild address at a lent load, 2026-11-18/19;
+        // RGD traced those to a stale vertex-buffer table, MemPlayer::EnsureVertexBindings,
+        // not the flag store, which only stores.)
+        const bool onef_occl = VideoCommon::OneFollower::OcclWanted();
+        if (onef_play != nullptr && onef_occl) {
+            if (VideoCommon::OcclFlag::Mode() != VideoCommon::OcclFlag::Off) {
+                static_cast<void>(query_cache_runtime.OcclFlagReady());
+            }
+            return chosen;
+        }
+        if (onef_play != nullptr || (VideoCommon::OneFollower::On() && !onef_occl) ||
+            chosen == nullptr || VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Off ||
             !query_cache_runtime.OcclFlagReady()) {
             return chosen;
         }
@@ -2408,14 +2481,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // consumes their arguments), the delta path and draw counting (they key on the bound
         // pipeline), or a frame dump's probe.
         const bool colour_prepass = VideoCommon::OcclFlag::t_colour_prepass;
-        if (flag != nullptr &&
-            (flag->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS || colour_prepass) &&
+        const bool discard_prepass = flag != nullptr && flag->IsOcclDiscardPrepass() &&
+                                     !VideoCommon::OcclFlag::t_discard_direct;
+        if (flag != nullptr && (discard_prepass || colour_prepass) &&
             (is_indirect || draw_tracking || frame_dump.CapturingSampled())) [[unlikely]] {
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_fallback);
             VideoCommon::OcclFlag::t_census =
                 colour_prepass ? VideoCommon::OcclFlag::t_colour_prepass_class
-                               : VideoCommon::OcclFlag::Census::OffDiscards;
+                : VideoCommon::OcclFlag::t_colour_discard_prepass
+                    ? VideoCommon::OcclFlag::Census::ColourDiscards
+                    : VideoCommon::OcclFlag::Census::OffDiscards;
             VideoCommon::OcclFlag::t_colour_prepass = false;
+            VideoCommon::OcclFlag::t_colour_discard_prepass = false;
             return chosen;
         }
         return flag;
@@ -2426,10 +2503,47 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
         if (onef_play != nullptr && onef_play->pipeline != nullptr) {
             // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looked this draw's pipeline up at its own
-            // position; R binds it and looks nothing up. Never a flag variant (one follower on).
+            // position; R binds it and looks nothing up. With FRITCHII_ONEF_OCCL off it is never a
+            // flag variant (v6.2: the parent). On, it may be the flag variant E picked
+            // (FillAndPush): an in-place one, or a pre-pass variant bringing E's pre-pass state
+            // (FRITCHII_ONEF_OCCL_PREPASS); R records the pre-pass as the off path does, or, where
+            // that path falls back (draw counting, a frame dump's probe), the parent with the same
+            // descriptors.
             auto* const played = const_cast<GraphicsPipeline*>(
                 static_cast<const GraphicsPipeline*>(onef_play->pipeline));
-            return played->occl_flag_parent != nullptr ? played->occl_flag_parent : played;
+            if (!VideoCommon::OneFollower::OcclWanted()) {
+                return played->occl_flag_parent != nullptr ? played->occl_flag_parent : played;
+            }
+            const u8 occl = played->occl_flag_parent != nullptr ? onef_play->reserved[1] : u8{0};
+            namespace OcclFlag = VideoCommon::OcclFlag;
+            OcclFlag::t_colour_prepass = (occl & VideoCommon::OneFollower::OcclColourPrepass) != 0;
+            OcclFlag::t_discard_direct = (occl & VideoCommon::OneFollower::OcclDiscardDirect) != 0;
+            OcclFlag::t_colour_discard_prepass =
+                (occl & VideoCommon::OneFollower::OcclColourDiscardPrepass) != 0;
+            const bool prepass = OcclFlag::t_colour_prepass ||
+                                 (played->IsOcclDiscardPrepass() && !OcclFlag::t_discard_direct);
+            if (prepass && played->occl_flag_parent == nullptr) [[unlikely]] {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_ERROR(Render_Vulkan,
+                              "One follower: a played draw's occlusion pre-pass bits {:#x} on a "
+                              "pipeline without a flag parent (kind {}, draw seq {}, flags {:#x})",
+                              occl, played->occl_flag_kind, onef_play->draw_seq,
+                              onef_play->flags);
+                }
+                OcclFlag::t_colour_prepass = false;
+                OcclFlag::t_discard_direct = false;
+                OcclFlag::t_colour_discard_prepass = false;
+            }
+            if (prepass && played->occl_flag_parent != nullptr &&
+                (draw_tracking || frame_dump.CapturingSampled())) [[unlikely]] {
+                OcclFlag::Add(OcclFlag::g_stats.prepass_fallback);
+                OcclFlag::t_colour_prepass = false;
+                OcclFlag::t_discard_direct = false;
+                OcclFlag::t_colour_discard_prepass = false;
+                return played->occl_flag_parent;
+            }
+            return played;
         }
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return occl_flag(pipeline_cache.CurrentGraphicsPipeline(), true);
@@ -2506,9 +2620,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         no_mesh = std::filesystem::exists(no_mesh_file);
     }
     const bool emulated_mesh{mesh_draw && pipeline->IsEmulatedMesh()};
-    // UNLEND's Mesh bit: E unlends native mesh draws only (the emulation takes the staging pool
-    // and the mesh arenas, which R does not own alone).
-    if (onef_play != nullptr && emulated_mesh) [[unlikely]] {
+    // UNLEND's Mesh bit: native mesh draws, and with FRITCHII_ONEF_MESH_EMU emulated ones too (the
+    // staging pool, the mesh arenas and the compute passes below run on R, played or lent; E
+    // raises the vertex buffer flags the emulation leaves). An indirect one is never posted.
+    if (onef_play != nullptr && emulated_mesh &&
+        (is_indirect || !VideoCommon::OneFollower::EmulatedMeshPostable())) [[unlikely]] {
         VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::PlayedNoPath,
                                        "a played draw on an emulated mesh pipeline");
         VideoCommon::OneFollower::DisableUnlend("a played draw needed mesh emulation");
@@ -2826,6 +2942,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         VideoCommon::MemStageShadow::BackDrawWindow(true);
     }
     bool configured{};
+    const u64 configure_tick = scheduler.CurrentTick();
+    const u64 index_plays_before = mem_player.IndexPlays();
     {
         Profile::Scope scope{Profile::Zone::Configure};
         const MemStage::RestAtEnd rest{mem_stage};
@@ -2949,12 +3067,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                           VideoCommon::OcclFlag::Census::Unknown);
         if (pipeline->occl_flag_parent != nullptr) {
             const u64 address = query_cache_runtime.OcclFlagAddress();
-            scheduler.Record([layout = pipeline->Layout(), address](vk::CommandBuffer cmdbuf) {
-                cmdbuf.PushConstants(layout, VK_SHADER_STAGE_ALL_GRAPHICS, 40, sizeof(address),
+            scheduler.Record([layout = pipeline->Layout(), stages = pipeline->PushStageFlags(),
+                              address](vk::CommandBuffer cmdbuf) {
+                cmdbuf.PushConstants(layout, stages, 40, sizeof(address),
                                      &address);
             });
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.flag_draws);
-            if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS) {
+            if (pipeline->IsOcclDiscardPrepass() && !VideoCommon::OcclFlag::t_discard_direct) {
                 VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_draws);
             }
 
@@ -2972,14 +3091,76 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         frame_dump.CapturingSampled() ? frame_dump.BeginProbe() : std::nullopt;
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
+        // FRITCHII_SPLIT_BIND_FIX: Configure (or anything after it) submitted: bind again.
+        if (scheduler.CurrentTick() != configure_tick) [[unlikely]] {
+            const u64 split_hash = pipeline->ShaderHashes()[5] != 0 ? pipeline->ShaderHashes()[5]
+                                                                    : pipeline->ShaderHashes()[1];
+            NoteSplitBind(false, split_hash);
+            if (SplitBindFix() && (onef_play != nullptr || ring_packet != nullptr)) {
+                // A played or served draw does not configure again (NotePlayedSplit).
+                if (scheduler.BoundGraphicsPipeline() != pipeline) {
+                    NotePlayedSplit(true, split_hash);
+                    if (onef_play != nullptr) {
+                        VideoCommon::OneFollower::Note(
+                            VideoCommon::OneFollower::Check::PlayedSplitBind,
+                            "a played draw's bind went with a submit before its record");
+                    }
+                    report_failure("bind lost to a submit");
+                    return;
+                }
+                NotePlayedSplit(false, split_hash);
+                // An index bind this draw played before the submit is in the old command buffer.
+                if (is_indexed && mem_player.IndexPlays() != index_plays_before) {
+                    mem_player.EnsureIndexBinding();
+                }
+            } else if (SplitBindFix()) {
+                const MemStage::RestAtEnd rest{mem_stage};
+                if (!pipeline->Configure(is_indexed, keep_last_draw)) {
+                    report_failure("configure failed after a split");
+                    return;
+                }
+                UpdateDynamicStates(pipeline);
+                query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                          maxwell3d->regs.zpass_pixel_count_enable);
+            }
+        }
+        // The vertex bindings the fill left out as clean, in a command buffer they are not
+        // bound in yet (one follower's R starts command buffers E cannot see).
+        mem_player.EnsureVertexBindings();
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
         if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
             VideoCommon::MemStageShadow::BackDrawWindow(false);
         }
         const bool colour_prepass = std::exchange(VideoCommon::OcclFlag::t_colour_prepass, false);
-        if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS ||
-            colour_prepass) [[unlikely]] {
+        const bool discard_direct = std::exchange(VideoCommon::OcclFlag::t_discard_direct, false);
+        const bool colour_discard_prepass =
+            std::exchange(VideoCommon::OcclFlag::t_colour_discard_prepass, false);
+        bool direct_by_parent = false;
+        if (discard_direct) {
+            // Early tests count the samples the variant's discards then kill: under an open host
+            // query (another counted draw opened it, or flag slots are not used) the draw's own
+            // pipeline draws instead (its descriptors equal the variant's).
+            if (query_cache_runtime.OcclQuerySlotOpen()) {
+                direct_by_parent = true;
+            } else {
+                VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.discard_direct_draws);
+            }
+        }
+        if (direct_by_parent) [[unlikely]] {
+            GraphicsPipeline& parent = *pipeline->occl_flag_parent;
+            if (parent.ConfigureAfterOcclPrepass(*pipeline)) [[likely]] {
+                trace_draw_hashes = {parent.ShaderHashes()[1], parent.ShaderHashes()[5]};
+                draw_func();
+            } else {
+                parent.occl_flag_prepass_state = 2;
+                VideoCommon::OcclFlag::g_stats.prepass_lost.fetch_add(1,
+                                                                      std::memory_order_relaxed);
+                LOG_ERROR(Render_Vulkan, "Occlusion flag discard variant: the draw could not be "
+                                         "configured with its own pipeline and was not recorded");
+            }
+        } else
+        if ((pipeline->IsOcclDiscardPrepass() && !discard_direct) || colour_prepass) [[unlikely]] {
             // FRITCHII_OCCL_FLAG pre-pass: the variant draws first with depth writes off (and,
             // for a colour pre-pass, colour writes off) and
             // stores the flag; a host query open in this slot (verify, or a window that opened
@@ -2995,7 +3176,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 }
                 scheduler.Record(
                     [](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthWriteEnableEXT(false); });
-                const bool clear_masks = colour_prepass && pipeline->occl_flag_kind == 1;
+                // A pre-pass for a colour draw: colour writes off (the dynamic masks cleared;
+                // without them the variant's key has every attachment's writes off).
+                const bool clear_masks =
+                    (colour_prepass || colour_discard_prepass) &&
+                    pipeline->Key().state.extended_dynamic_state_3_blend != 0;
                 if (colour_prepass) {
                     OcclFlag::Add(OcclFlag::g_stats.colour_prepass_draws);
                 }
@@ -3040,6 +3225,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             } else {
                 if (colour_prepass) {
                     pipeline->occl_same_descriptors = 2; // no more colour pre-passes with it
+                } else if (pipeline->occl_flag_kind ==
+                           GraphicsPipeline::OCCL_KIND_PREPASS_NOCOLOUR) {
+                    parent.occl_flag_prepass_nocolour_state = 2; // later draws: parent alone
                 } else {
                     parent.occl_flag_prepass_state = 2; // later draws take the parent alone
                 }
@@ -4092,6 +4280,19 @@ void RasterizerVulkan::OneFollowerMirrorDraw() {
     }
 }
 
+namespace {
+/// FRITCHII_ONEF_POST_KINDS (boot, default all; a bisect tool): which fence kinds may be posted
+/// (the others are lent): 1 sync points, 2 references, 4 forced releases, 8 SignalFence
+/// callbacks, 16 fence-flagged payload reports, 32 counter reports.
+bool OneFollowerPostKind(u32 bit) {
+    static const u32 mask = [] {
+        const char* value = std::getenv("FRITCHII_ONEF_POST_KINDS");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : ~0U;
+    }();
+    return (mask & bit) != 0;
+}
+} // Anonymous namespace
+
 bool RasterizerVulkan::OneFollowerFenceClean() {
     // fable_b 16.3 and 19.6: R's fence must not enter the buffer cache. Its three ways in: the
     // commit's buffer half (E runs it at the fence's place, R skips it), the query sync (none
@@ -4103,6 +4304,16 @@ bool RasterizerVulkan::OneFollowerFenceClean() {
         return false;
     }
     if (onef_sync_owed) {
+        OneF::CountFenceDecision(OneF::FenceDecision::SyncOwed);
+        return false;
+    }
+    // FRITCHII_ONEF_POST_SYNCS (boot, default 1; 0 = a bisect tool): 0 lends every fence that
+    // owes query syncs (16.2's posted sync targets off).
+    static const bool post_syncs = [] {
+        const char* value = std::getenv("FRITCHII_ONEF_POST_SYNCS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!post_syncs && (!onef_sync_samples.empty() || !onef_sync_payloads.empty())) {
         OneF::CountFenceDecision(OneF::FenceDecision::SyncOwed);
         return false;
     }
@@ -4590,7 +4801,12 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         return lend(blocker);
     }
     // Readers of the dispatch on R or of E's state on R, and the stage's own modes.
-    if (onef_draw->Diagnostic() || Common::DkbFrameTrace::Enabled() || InvalidateBeforeUse() ||
+    static const bool trace_lends = [] {
+        const char* value = std::getenv("FRITCHII_ONEF_TRACE_LENDS");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (onef_draw->Diagnostic() || (trace_lends && Common::DkbFrameTrace::Enabled()) ||
+        InvalidateBeforeUse() ||
         (MemStage::VerifyBits() & MemStage::VerifyHandles) != 0 ||
         VideoCommon::MemStageStats::Enabled() ||
         VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed) ||
@@ -5866,12 +6082,20 @@ void RasterizerVulkan::DispatchCompute() {
         mem_stage.FillDispatch(buffer_cache, pipeline->MemFacts());
     }
     bool configured{};
+    // FRITCHII_SPLIT_BIND_FIX: the tick Configure records the bind in (bind_again_after_split).
+    const u64 configure_tick = scheduler.CurrentTick();
+    // A played dispatch (one follower, R) cannot configure again after a split (its packet was
+    // played at the rest; R must not touch E's buffer cache): with the fix on, its bind is
+    // deferred and recorded with the dispatch, and the scheduler's tracker forgets the
+    // descriptor buffer afterwards (the deferred bind binds it behind the tracker's back).
+    const bool defer_split_bind = SplitBindFix() && onef_play != nullptr;
+    const bool defer_bind = can_replace || marking_effects || defer_split_bind;
     {
         const MemStage::RestAtEnd rest{mem_stage};
         configured = pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                                          texture_cache, texture_cache_runtime,
                                          byte_addressed_shadow,
-                                         can_replace || marking_effects ? &deferred_bind : nullptr);
+                                         defer_bind ? &deferred_bind : nullptr);
     }
     if (!configured) {
         if (onef_play != nullptr) [[unlikely]] {
@@ -5884,6 +6108,30 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
+    // FRITCHII_SPLIT_BIND_FIX, right before the dispatch's record: a submit since Configure
+    // (staging, the grid copy, an upscaler, ...) put the record into a new command buffer with
+    // nothing bound (the submit reset the scheduler's state). A deferred bind is recorded with
+    // the dispatch and needs nothing. Otherwise the dispatch configures again, as draws do: its
+    // bind lands in the new command buffer and the scheduler's state stays true (no compute bind
+    // bypasses Scheduler::UpdateDescriptorBufferChunk). Counted either way. False: that Configure
+    // failed (the dispatch is skipped).
+    const auto bind_again_after_split = [&]() -> bool {
+        if (scheduler.CurrentTick() == configure_tick) [[likely]] {
+            return true;
+        }
+        NoteSplitBind(true, pipeline->ShaderHash());
+        if (!SplitBindFix() || deferred_bind || onef_play != nullptr) {
+            return true;
+        }
+        if (byte_addressed_shadow) {
+            // The first bind's packed shadow: its view is in the submitted command buffer.
+            texture_cache_runtime.RetireByteAddressedShadow(*byte_addressed_shadow);
+        }
+        const MemStage::RestAtEnd rest{mem_stage};
+        return pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
+                                   texture_cache, texture_cache_runtime, byte_addressed_shadow,
+                                   nullptr);
+    };
     // FRITCHII_ASYNC_COMPUTE_SKIP: the written ranges' streaks (G2), for a dispatch recorded
     // here; a played one's came from E's fill (QueueWrites).
     const auto note_write_streaks = [&] {
@@ -6017,7 +6265,11 @@ void RasterizerVulkan::DispatchCompute() {
                 grid_copy = staging_pool.Request(16, MemoryUsage::Download, true);
             }
         }
-        scheduler.Record([this, pipeline, indirect_buffer = indirect_ref.buffer,
+        if (!bind_again_after_split()) [[unlikely]] {
+            return;
+        }
+        scheduler.Record([this, pipeline, bind = std::move(deferred_bind),
+                          indirect_buffer = indirect_ref.buffer,
                           indirect_offset = indirect_ref.offset,
                           grid_buffer = grid_copy ? grid_copy->buffer : VkBuffer{},
                           grid_offset = grid_copy ? grid_copy->offset : VkDeviceSize{}](
@@ -6047,6 +6299,10 @@ void RasterizerVulkan::DispatchCompute() {
                                        HOST_READS_COPY);
             }
             RecordDispatchBarrier(cmdbuf);
+            // The deferred bind (FRITCHII_SPLIT_BIND_FIX), in the dispatch's command buffer.
+            if (bind) {
+                bind(cmdbuf);
+            }
             if (!pipeline->IsBound()) {
                 return;
             }
@@ -6054,6 +6310,11 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
+        if (defer_split_bind) {
+            // FRITCHII_SPLIT_BIND_FIX: the played dispatch's bind, recorded with it, bound a
+            // descriptor buffer the scheduler did not track.
+            scheduler.ForgetDescriptorBuffer();
+        }
         if (grid_copy) {
             onef_grid_checks.push_back({*grid_copy, scheduler.CurrentTick(),
                                         pipeline->ShaderHash(), onef_play != nullptr,
@@ -6146,6 +6407,9 @@ void RasterizerVulkan::DispatchCompute() {
                      hash);
         }
     }
+    if (!bind_again_after_split()) [[unlikely]] {
+        return;
+    }
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
                       barrier_recorded = barrier_first, replacement](vk::CommandBuffer cmdbuf) {
         if (!barrier_recorded) {
@@ -6175,6 +6439,11 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }
     });
+    if (defer_split_bind) {
+        // FRITCHII_SPLIT_BIND_FIX: the played dispatch's bind, recorded with it, bound a
+        // descriptor buffer the scheduler did not track.
+        scheduler.ForgetDescriptorBuffer();
+    }
     // A played dispatch's probes and list page copies are E's (a lent tail after the post).
     if (onef_play == nullptr) {
         dispatch_kinds.extent_probes = mem_stage.Ref(MemStage::Site::DispatchAfter, [&] {
@@ -6193,6 +6462,9 @@ void RasterizerVulkan::DispatchCompute() {
             VideoCommon::OneFollower::StopPostDispatch("a played dispatch off the view");
         } else {
             scheduler.InvalidateState();
+            if (replacement) {
+                scheduler.DisturbVertexBindings(); // an upscaler's own recording
+            }
         }
     }
     compute_since_count_barrier = true;
@@ -6404,7 +6676,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             if (type == VideoCommon::QueryType::Payload && synced &&
                 VideoCore::Nx2Debug::Experiment(33) == 0 && OneF::SemOnE()) {
                 if (const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(gpu_addr);
-                    device && OneFollowerFenceClean()) {
+                    device && OneFollowerPostKind(16) && OneFollowerFenceClean()) {
                     const OneFollowerPayloadNote note{
                         *device, gpu_addr, payload, subreport,
                         True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)};
@@ -6424,7 +6696,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             if (type != VideoCommon::QueryType::Payload && OneF::PostFenceReportOn() &&
                 VideoCore::Nx2Debug::Experiment(33) == 0 && query_cache.ReportLandsLater(type)) {
                 if (const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(gpu_addr);
-                    device && OneFollowerFenceClean()) {
+                    device && OneFollowerPostKind(32) && OneFollowerFenceClean()) {
                     if (onef_report_pages == nullptr) [[unlikely]] {
                         onef_report_pages = std::make_unique<VideoCommon::PageFilter>();
                     }
@@ -8185,7 +8457,7 @@ void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
         // FRITCHII_ONEF_SIGNAL_ON_R: the callback writes game memory the guest acts on; it runs
         // on R at R's place, which (the callback may touch E's caches) means lent.
         if (VideoCommon::OneFollower::SemOnE() && !VideoCommon::OneFollower::SignalOnR() &&
-            OneFollowerFenceClean()) {
+            OneFollowerPostKind(8) && OneFollowerFenceClean()) {
             VideoCommon::OneFollower::NoteEngineSignal("a SignalFence callback");
             OneFollowerPostFence(4, 0, &func);
             return;
@@ -8216,10 +8488,18 @@ void RasterizerVulkan::SyncOperationKeepStamp(std::function<void()>&& func) {
     fence_manager.SyncOperationKeepStamp(std::move(func));
 }
 
+void RasterizerVulkan::OneFollowerDeferredTick() {
+    if (onef_frame_tick_deferred.load(std::memory_order_relaxed) &&
+        onef_frame_tick_deferred.exchange(false, std::memory_order_acq_rel)) [[unlikely]] {
+        TickFrame();
+    }
+}
+
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerDeferredTick();
         OneFollowerCountFence();
-        if (OneFollowerFenceClean()) {
+        if (OneFollowerPostKind(1) && OneFollowerFenceClean()) {
             // FRITCHII_ONEF_SEM_E (fable_b 20.3): the guest increment, then (after the buffer
             // half, as the fence's callback runs at once) the host increment, both at E's
             // place; R makes an empty fence. The game's wait on the sync point then ends when E
@@ -8246,8 +8526,9 @@ void RasterizerVulkan::SignalSyncPoint(u32 value) {
 
 void RasterizerVulkan::SignalReference() {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerDeferredTick();
         OneFollowerCountFence();
-        if (OneFollowerFenceClean()) {
+        if (OneFollowerPostKind(2) && OneFollowerFenceClean()) {
             OneFollowerPostFence(1, 0);
             return;
         }
@@ -8266,7 +8547,7 @@ void RasterizerVulkan::ReleaseFences(bool force) {
         return;
     }
     if (VideoCommon::OneFollower::ShouldLend() && force) [[unlikely]] {
-        if (OneFollowerFenceClean()) {
+        if (OneFollowerPostKind(4) && OneFollowerFenceClean()) {
             OneFollowerPostFence(2, 0);
             return;
         }
@@ -8496,7 +8777,7 @@ void RasterizerVulkan::WaitForIdle() {
         // E only stops waiting for the wait for idle itself); 2 also with R behind but no
         // posted fence with report landings unplayed (13.0), to test that dependency.
         namespace OneF = VideoCommon::OneFollower;
-        if (const int mode = OneF::PostIdleOn(); mode != 0) {
+        if (const int mode = OneFollowerPostKind(64) ? OneF::PostIdleOn() : 0; mode != 0) {
             if (onef_sync_owed) {
                 OneF::CountIdleDecision(OneF::IdleDecision::LentSyncOwed);
             } else if (OneF::RenderCaughtUp()) {
@@ -9859,6 +10140,18 @@ FrameEndTimes g_frame_end_times; ///< only TickFrame touches it (one thread at a
 
 void RasterizerVulkan::TickFrame() {
     ONEF_LEND(FrameEnd, TickFrame())
+    // FRITCHII_ONEF_TICK_ON_E: on R outside a lent call E runs meanwhile: E ticks it (lent).
+    if (VideoCommon::OneFollower::On() && VideoCommon::OneFollower::OnRenderThread() &&
+        !VideoCommon::OneFollower::RenderInLentCall()) [[unlikely]] {
+        static const bool tick_on_e = [] {
+            const char* value = std::getenv("FRITCHII_ONEF_TICK_ON_E");
+            return value == nullptr || std::string_view{value} != "0";
+        }();
+        if (tick_on_e) {
+            onef_frame_tick_deferred.store(true, std::memory_order_release);
+            return;
+        }
+    }
     async_compute_skip.TickFrame(); // FRITCHII_ASYNC_COMPUTE_SKIP's frame clock and 10 s line
     const bool frame_end_times = FrameEndTimes::On();
     if (frame_end_times) [[unlikely]] {
@@ -10026,8 +10319,8 @@ void RasterizerVulkan::TickFrame() {
     part_done(FrameEndTimes::Head);
     pipeline_cache.TickFrame();
     part_done(FrameEndTimes::Pipeline);
-    guest_descriptor_queue.TickFrame();
-    compute_pass_descriptor_queue.TickFrame();
+    guest_descriptor_queue.TickFrame(scheduler);
+    compute_pass_descriptor_queue.TickFrame(scheduler);
     descriptor_buffer_ring.TickFrame();
     part_done(FrameEndTimes::Queues);
     fence_manager.TickFrame();

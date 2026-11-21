@@ -6,6 +6,7 @@
 // One follower (one_follower.h), part (b): the engine side's write tracking, in a header of its
 // own so maxwell_3d.h can include it (one_follower.h includes maxwell_3d.h).
 
+#include <cstdlib>
 #include <array>
 #include <atomic>
 
@@ -26,6 +27,27 @@ inline bool g_track_writes_always{};
 /// it), E looks a draw's pipeline up before its fill and the packet carries it, R never looks
 /// one up outside a lent call. Set once by ReadSwitches.
 inline bool g_e_pipeline{};
+
+/// One follower (one_follower.cpp): the Vulkan device runs AMD's proprietary driver.
+[[nodiscard]] bool IsAmdProprietaryDriver() noexcept;
+
+/// FRITCHII_ONEF_MESH_EMU (boot): emulated mesh draws (no VK_EXT_mesh_shader, as on AMD's
+/// drivers in Automatic) are posted like any draw: E fills the packet from its own lookup
+/// (rule 3) and R runs the emulation in PrepareDraw/Configure as it does for a lent one. Unset:
+/// on only on AMD's proprietary driver, where it was tested; elsewhere (NVIDIA Pascal and older,
+/// Intel iGPUs, RADV before RDNA2) they stay lent as in v6.2, since the rasterizer's staging pool
+/// R then uses has other users on E. 1 / 0 = posted / lent everywhere. Indirect and list emulated
+/// draws stay lent. First asked at a draw or in ReadSwitches, after the device named its driver.
+[[nodiscard]] inline bool EmulatedMeshPostable() noexcept {
+    static const bool on = [] {
+        const char* const value = std::getenv("FRITCHII_ONEF_MESH_EMU");
+        if (value != nullptr && value[0] != '\0') {
+            return value[0] != '0';
+        }
+        return IsAmdProprietaryDriver();
+    }();
+    return on && g_e_pipeline;
+}
 
 /// Register word `index` of the engine was written on E (one_follower_view.cpp). Words written on
 /// another thread (the front's own copy) are not E's and are ignored there.

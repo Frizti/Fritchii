@@ -1061,6 +1061,13 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
     }
 }
 
+void BufferCacheRuntime::ForgetVertexBinding(u32 index) {
+    if (index >= device.GetMaxVertexInputBindings()) {
+        return;
+    }
+    mem_stage.PushVertex(MemStage::ForgetOnly, index, VK_NULL_HANDLE, 0, 0, 0);
+}
+
 void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bindings) {
     boost::container::static_vector<VkBuffer, VideoCommon::NUM_VERTEX_BUFFERS> buffer_handles(bindings.buffers.size());
     for (u32 i = 0; i < bindings.buffers.size(); ++i) {
@@ -1105,7 +1112,9 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     // min_binding is bindings.min_index here (binding_count is 0 otherwise). The player skips the
     // rebind when the same buffers are still bound in this command buffer.
     mem_stage.PushVertices(
-        device.IsExtExtendedDynamicStateSupported() ? MemStage::DynamicState : 0,
+        static_cast<u8>(
+            (device.IsExtExtendedDynamicStateSupported() ? MemStage::DynamicState : 0) |
+            (bindings.clean ? MemStage::KeepSize : 0)),
         bindings.min_index,
         std::span<const VkBuffer>{buffer_handles.data(), binding_count},
         std::span<const VkDeviceSize>{bindings.offsets.data(), binding_count},

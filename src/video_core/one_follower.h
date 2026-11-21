@@ -273,6 +273,10 @@ enum class Check : u8 {
     /// image other than the one E recorded the range of (the descriptor R reads at its play
     /// differs from E's, or E had no image where R binds one). The switch stops.
     DispatchImageRange,
+    /// FRITCHII_SPLIT_BIND_FIX: a played draw whose bind went with a submit between its
+    /// Configure and its record (the scheduler no longer had its pipeline bound). R cannot
+    /// configure it again (E's buffer cache): the draw is not recorded.
+    PlayedSplitBind,
     Count,
 };
 
@@ -289,7 +293,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "semaphore order", "R read landing",
     "signal ahead of landing", "unlent reset", "view values", "bind seed view",
     "played dispatch indirect", "played dispatch image", "indirect grid over the limit",
-    "dispatch image range",
+    "dispatch image range", "played split bind",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -441,6 +445,9 @@ struct PacketHeader {
     u8 flags;         ///< PacketFlag
     u8 reason;        ///< LentReason (a lent draw) or 0
     u8 op;            ///< LentOp (a lent packet)
+    /// reserved[0]: the draw's UnlendKind bit (TakeDrawKind). reserved[1], a draw packet with E's
+    /// flag variant: the occlusion flag pre-pass bits E's lookup gave (OcclPrepassBit), which R's
+    /// thread-local pre-pass state takes before the draw.
     u8 reserved[3];
     u32 delta_count;  ///< RegPair count (SpanDelta)
     u64 number;       ///< packets since R started, E's count (1 = the first)
@@ -485,10 +492,18 @@ enum class FlagOwner : u8 { E, R, Both };
 /// Reads the switches (GpuSplit::MaybeStart, before the back thread exists). Boot ones stick.
 void ReadSwitches();
 /// The Vulkan device names its driver (Device's constructor, before ReadSwitches): on AMD's
-/// proprietary driver the one follower stays off unless FRITCHII_ONEF_AMD=1.
-void NoteAmdProprietaryDriver() noexcept;
+/// proprietary driver the one follower stays off unless FRITCHII_ONEF_AMD=1. `integrated`: the
+/// device is an integrated GPU (an APU).
+void NoteAmdProprietaryDriver(bool integrated) noexcept;
 /// True once the Vulkan device said it runs AMD's proprietary driver (AMD safe defaults read it).
 [[nodiscard]] bool IsAmdProprietaryDriver() noexcept;
+/// AMD's proprietary driver on a discrete GPU (not an integrated one).
+[[nodiscard]] bool IsAmdProprietaryDiscrete() noexcept;
+/// FRITCHII_ONEF_OCCL (boot, read in ReadSwitches): occlusion flag variants with one follower on
+/// (lent draws through the off path's choice, played draws through E's). An explicit value wins;
+/// unset = on only on AMD's proprietary driver on a discrete GPU. False reproduces v6.2's rule
+/// (no flag variant with one follower on).
+[[nodiscard]] bool OcclWanted() noexcept;
 /// FRITCHII_ONEF=1 at boot (R exists).
 [[nodiscard]] bool On() noexcept;
 /// The effective step after nesting (StepLevel), refreshed at frame ends and lent packets.
@@ -609,7 +624,14 @@ void SetDrawPlayer(DrawPlayer* player) noexcept;
 /// index) and `flags` (PacketFlag), with the spans PackSpans gives; E goes on within
 /// FRITCHII_ONEF_AHEAD.
 void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags,
-              const void* pipeline = nullptr);
+              const void* pipeline = nullptr, u8 occl_prepass = 0);
+
+/// PacketHeader::reserved[1] of a draw packet: OcclFlag's pre-pass state for E's flag variant.
+enum OcclPrepassBit : u8 {
+    OcclColourPrepass = 1,        ///< OcclFlag::t_colour_prepass
+    OcclDiscardDirect = 2,        ///< OcclFlag::t_discard_direct
+    OcclColourDiscardPrepass = 4, ///< OcclFlag::t_colour_discard_prepass
+};
 
 /// E, at the end of Maxwell3D::ProcessQueryCondition when the host did not take the condition:
 /// from step 3, R computes the mode on its view at this place (in the lent call when one is

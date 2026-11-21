@@ -590,7 +590,17 @@ void MemStage::Fill::Open(Site site_, u32 index_) {
         }
         if (stage.ticks && IsOpSite(site)) {
             u64 number;
-            if (stage.ticks->PerThread() && Link::OnStageThread()) {
+            // FRITCHII_ONEF_OP_MARK (boot, default 1): with one follower, E's operation opens its
+            // number under the close's lock with E's mark, as GPUMem's does: R closes ticks while
+            // E fills (posted fences), and an unmarked number could be published (its staging
+            // freed or reused) before R recorded the copy that reads it (onef-audit finding 1).
+            static const bool op_mark = [] {
+                const char* value = std::getenv("FRITCHII_ONEF_OP_MARK");
+                return value == nullptr || value[0] != '0';
+            }();
+            const bool engine_mark = op_mark && VideoCommon::OneFollower::OnEngineThread() &&
+                                     FillSide() && TwoThreadRing();
+            if ((stage.ticks->PerThread() && Link::OnStageThread()) || engine_mark) {
                 // Step 7, stamps per thread: an operation on GPUMem (a served call) opens its
                 // number under the close's lock with GPUMem's mark, as a draw does, and its
                 // stamps carry it until the bracket ends.
@@ -699,7 +709,7 @@ MemStage::~MemStage() {
         SeamHook::g_tick_watch.store(false, std::memory_order_release);
     }
     if (pending) {
-        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        ClearPendingWatch();
     }
     if (held != HeldKind::None) {
         SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
@@ -734,9 +744,19 @@ void MemStage::SetPending() {
         if (ticks) {
             // The caller's packet (step 7, stamps per thread; `open` otherwise, as before).
             pending_from = ticks->Mine();
+            // FRITCHII_ONEF_OP_MARK: E's operation stamped its staging from its own number on;
+            // its pending entries keep that number (Mine() may be later once E's mark clears).
+            if (stage_op_from != 0 && stage_op_from < pending_from && FillSide()) {
+                pending_from = stage_op_from;
+            }
             UpdateUnplayed();
         }
-        SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
+        if (OneFollowerFill()) {
+            pending_engine = true;
+            SeamHook::g_watch_engine.value.store(1, std::memory_order_relaxed);
+        } else {
+            SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -799,7 +819,7 @@ void MemStage::PlayPending([[maybe_unused]] bool late) {
         UpdateUnplayed();
     }
     last_entry = ~0U;
-    SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    ClearPendingWatch();
 }
 
 void MemStage::Play() {
@@ -1250,7 +1270,7 @@ void MemStage::TakeHeld(HeldKind kind) {
     last_entry = ~0U;
     if (pending) {
         pending = false;
-        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        ClearPendingWatch();
     }
     held = kind;
     t_holding = true;
@@ -1934,7 +1954,7 @@ void MemStage::PushRingDraw() {
     last_entry = ~0U;
     if (pending) {
         pending = false;
-        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        ClearPendingWatch();
     }
     ring_pushed = true;
     t_holding = false;
@@ -2082,7 +2102,7 @@ bool MemStage::PostPendingOp() {
     play_cursor = end;
     pending = false;
     last_entry = ~0U;
-    SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    ClearPendingWatch();
     UpdateUnplayed();
     return true;
 }
@@ -2308,7 +2328,7 @@ void MemStage::PushRingDispatch(const std::vector<u32>& values, bool null_pointe
     last_entry = ~0U;
     if (pending) {
         pending = false;
-        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        ClearPendingWatch();
     }
     ring_pushed = true;
     t_holding = false;
@@ -3098,6 +3118,47 @@ void MemStage::NoteHeldFlush(SeamHook::Use use, const std::source_location& loca
                                              : dispatch.number,
                     location.file_name(), location.line(), location.function_name());
     }
+}
+
+void MemPlayer::EnsureVertexBindings() {
+    const u64 epoch = scheduler.VertexEpoch();
+    if (epoch == ensured_vertex_epoch) {
+        return;
+    }
+    ensured_vertex_epoch = epoch;
+    for (u32 index = 0; index < NUM_BOUND_VERTEX_BUFFERS; ++index) {
+        BoundVertexBuffer& bound = bound_vertex_buffers[index];
+        if (bound.buffer == VK_NULL_HANDLE || bound.epoch == epoch || bound.epoch == ~u64{0}) {
+            continue;
+        }
+        bound.epoch = epoch;
+        Bump(vertex_runs_rebound);
+        if (bound.dynamic) {
+            scheduler.Record([index, buffer = bound.buffer, offset = bound.offset,
+                              size = bound.size, stride = bound.stride](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers2EXT(index, 1, &buffer, &offset, &size, &stride);
+            });
+        } else {
+            scheduler.Record([index, buffer = bound.buffer,
+                              offset = bound.offset](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers(index, 1, &buffer, &offset);
+            });
+        }
+    }
+}
+
+void MemPlayer::EnsureIndexBinding() {
+    const u64 epoch = scheduler.VertexEpoch();
+    if (!last_index_valid || last_index_buffer == VK_NULL_HANDLE ||
+        last_index_vertex_epoch == epoch) {
+        return;
+    }
+    last_index_vertex_epoch = epoch;
+    bound_index_valid = false; // the rebind skip starts again from the next play
+    scheduler.Record([buffer = last_index_buffer, offset = last_index_offset,
+                      type = last_index_type](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindIndexBuffer(buffer, offset, type);
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3973,19 +4034,48 @@ void MemStage::TickFrame() {
     int value = VideoCore::Nx2Debug::Experiment(123);
     // AMD safe default (2026-11-16): SEAM 3 lost the device on an RX 7900 XT and an RX 9070 XT at
     // the title screen (the ASTC decoder's submit inside a held fill); SEAM 1 ran clean on both.
-    // Held to 1 on AMD's proprietary driver; FRITCHII_SEAM_AMD=1 keeps the asked level (tests).
+    // Since 2026-11-19 that submit is skipped by default (FRITCHII_ASTC_HELD_DEFER=1), and with
+    // one follower on SEAM 3 is what the AMD one-follower result and soak ran at: kept on AMD's
+    // proprietary driver when one follower is on (unset FRITCHII_SEAM_AMD). Held to 1 with one
+    // follower off (there SEAM 3 is about 0.6 ms slower than 1 on AMD) or FRITCHII_SEAM_AMD=0;
+    // FRITCHII_SEAM_AMD=1 keeps the asked level either way (tests).
     if (value >= 2 && VideoCommon::OneFollower::IsAmdProprietaryDriver()) [[unlikely]] {
+        // The unset keep also needs the ASTC held defer: it is what made SEAM 3 survive the title
+        // on AMD (FRITCHII_ASTC_HELD_DEFER=0 would bring the title loss back).
+        static const bool defer = AstcHeldDeferOn(true);
         static const bool keep = [] {
             const char* const v = std::getenv("FRITCHII_SEAM_AMD");
-            return v != nullptr && v[0] == '1';
-        }();
-        if (!keep) {
-            static bool logged = false;
-            if (!std::exchange(logged, true)) {
-                LOG_WARNING(Render_Vulkan, "Memory seam: EXP123={} held to 1 on AMD's proprietary "
-                                           "driver (device losses with 3); FRITCHII_SEAM_AMD=1 keeps it",
-                            value);
+            if (v != nullptr && v[0] != '\0') {
+                return v[0] != '0';
             }
+            return VideoCommon::OneFollower::On() && defer;
+        }();
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            if (!keep && VideoCommon::OneFollower::On() && !defer &&
+                std::getenv("FRITCHII_SEAM_AMD") == nullptr) {
+                LOG_WARNING(Render_Vulkan,
+                            "Memory seam: EXP123={} held to 1 on AMD's proprietary driver (one "
+                            "follower on, but FRITCHII_ASTC_HELD_DEFER is off: SEAM 3 lost the "
+                            "device at the title without it); FRITCHII_SEAM_AMD=1 keeps it",
+                            value);
+            } else if (keep) {
+                LOG_INFO(Render_Vulkan,
+                         "Memory seam: EXP123={} kept on AMD's proprietary driver ({}); "
+                         "FRITCHII_SEAM_AMD=0 holds it to 1",
+                         value,
+                         std::getenv("FRITCHII_SEAM_AMD") != nullptr ? "FRITCHII_SEAM_AMD=1"
+                                                                     : "one follower on");
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "Memory seam: EXP123={} held to 1 on AMD's proprietary driver ({}); "
+                            "FRITCHII_SEAM_AMD=1 keeps it",
+                            value,
+                            std::getenv("FRITCHII_SEAM_AMD") != nullptr ? "FRITCHII_SEAM_AMD=0"
+                                                                        : "one follower off");
+            }
+        }
+        if (!keep) {
             value = 1;
         }
     }
@@ -4171,6 +4261,13 @@ void MemStage::TickThread(int seam) {
     if (ticks) {
         ticks->SetPerThread(Link::RingActive() && Link::Ahead() != 0);
     }
+    // One follower: on unless FRITCHII_MEMSTAGE_FULL_BINDS=0. R starts command buffers E cannot
+    // see (posted fences, the E split), and the cmdbuf invalidation's vertex binding flags are
+    // E's (one_follower_view.cpp): the unchanged bindings were never bound in the new command
+    // buffer. AMD then reads the old command buffer's vertex table: a GPU page fault (Radeon GPU
+    // Detective, 2026-11-19). The player drops the bindings still bound (VertexEpoch).
+    // (With one follower the player now binds the remembered bindings again itself in a new
+    // command buffer, MemPlayer::EnsureVertexBindings: full binds stay opt-in.)
     const bool full =
         Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0 ||
         link.Mode() == 2;
@@ -4403,6 +4500,21 @@ void MemStage::LogStats() {
                  "runs recorded {:.0f}/s, dropped as still bound {:.0f}/s",
                  rate(vertex_runs[0] - reported_vertex_runs[0]),
                  rate(vertex_runs[1] - reported_vertex_runs[1]));
+    }
+    {
+        static u64 reported_rebound = 0;
+        static u64 reported_forgotten = 0;
+        const u64 rebound = player.vertex_runs_rebound.load(std::memory_order_relaxed);
+        const u64 forgotten = player.vertex_forgotten.load(std::memory_order_relaxed);
+        if (rebound != reported_rebound || forgotten != reported_forgotten) {
+            LOG_INFO(Render_Vulkan,
+                     "  memory seam vertex bindings bound again in a new command buffer "
+                     "(EnsureVertexBindings): {:.0f}/s; forgotten (stream left without a "
+                     "binding, never bound again) {:.0f}/s",
+                     rate(rebound - reported_rebound), rate(forgotten - reported_forgotten));
+        }
+        reported_rebound = rebound;
+        reported_forgotten = forgotten;
     }
     reported_vertex_runs = vertex_runs;
     reported = current;
@@ -5000,8 +5112,15 @@ void MemPlayer::SetPasses(Uint8Pass* uint8, QuadIndexedPass* quad_indexed,
 
 void MemPlayer::ForgetBindings() noexcept {
     bound_index_valid = false;
+    last_index_valid = false;
+    // Every vertex bind reaches this player whatever the SEAM (entries run at once call the
+    // same plays), so the remembered buffers are still the ones bound: only the "still bound"
+    // drop stops trusting them. Forgotten (~0), a stream the fill keeps as clean stayed unbound
+    // in the next command buffer R starts (review R1 should-fix 3).
     for (BoundVertexBuffer& bound : bound_vertex_buffers) {
-        bound.epoch = ~u64{0};
+        if (bound.epoch != ~u64{0}) {
+            bound.epoch = StaleEpoch;
+        }
     }
 }
 
@@ -5243,6 +5362,13 @@ void MemPlayer::PlayCopy(MemStage::Cmd kind, u8 flags, VkBuffer src_buffer, VkBu
 void MemPlayer::PlayIndex(MemStage::Cmd kind, u8 flags, VkBuffer vk_buffer, VkDeviceSize vk_offset,
                           VkIndexType vk_index_type) {
     BeginPlay(flags);
+    ++index_plays;
+    // EnsureIndexBinding: bound (or still bound) in this command buffer from here on.
+    last_index_valid = (flags & MemStage::ForgetOnly) == 0;
+    last_index_buffer = vk_buffer;
+    last_index_offset = vk_offset;
+    last_index_type = vk_index_type;
+    last_index_vertex_epoch = scheduler.VertexEpoch();
     if (kind == MemStage::Cmd::BindIndexAlways) {
         bound_index_valid = false;
         if ((flags & MemStage::ForgetOnly) != 0) {
@@ -5277,10 +5403,23 @@ void MemPlayer::PlayIndex(MemStage::Cmd kind, u8 flags, VkBuffer vk_buffer, VkDe
 void MemPlayer::PlayVertex(u8 flags, u32 index, VkBuffer buffer, u32 offset, u32 size,
                            u32 stride) {
     BeginPlay(flags);
+    // Remembered as bound (EnsureVertexBindings binds it again in a new command buffer); a
+    // forget, or a null binding, leaves nothing to bind again.
     if (index < VideoCommon::NUM_VERTEX_BUFFERS) {
-        bound_vertex_buffers[index].epoch = ~u64{0};
+        BoundVertexBuffer& bound = bound_vertex_buffers[index];
+        if ((flags & MemStage::ForgetOnly) != 0 || buffer == VK_NULL_HANDLE) {
+            bound.epoch = ~u64{0};
+        } else {
+            bound = {buffer,
+                     offset,
+                     size,
+                     stride,
+                     scheduler.VertexEpoch(),
+                     (flags & MemStage::DynamicState) != 0};
+        }
     }
     if ((flags & MemStage::ForgetOnly) != 0) {
+        Bump(vertex_forgotten);
         return;
     }
     if ((flags & MemStage::DynamicState) != 0) {
@@ -5303,23 +5442,31 @@ void MemPlayer::PlayVertices(u8 flags, u32 first, u32 binding_count, const VkBuf
     BeginPlay(flags);
     // The same buffers are still bound in this command buffer (as for index buffers): skip
     // the rebind. Draws re-resolve their vertex streams when the guest rewrites unchanged
-    // registers.
+    // registers. Verify never drops one, but still remembers what it binds: EnsureVertexBindings
+    // binds the memo again in a new command buffer, and a memo left from before Verify could
+    // name a buffer deleted since (review R1 should-fix 3).
+    const u64 epoch = scheduler.VertexEpoch();
     if (!VideoCommon::Nx2Perf::Verify()) {
-        const u64 epoch = scheduler.RecordingEpoch();
+        // A clean run (full vertex binds) only re-states what is bound: still bound at any size,
+        // as before full binds (its size follows the draw, the binding did not change).
+        const bool keep_size = (flags & MemStage::KeepSize) != 0;
         bool unchanged = true;
         for (u32 i = 0; unchanged && i < binding_count; ++i) {
             const BoundVertexBuffer& bound = bound_vertex_buffers[first + i];
             unchanged = bound.epoch == epoch && bound.buffer == handles[i] &&
-                        bound.offset == offsets[i] && bound.size == sizes[i] &&
+                        bound.offset == offsets[i] && (keep_size || bound.size == sizes[i]) &&
                         bound.stride == strides[i];
         }
         if (unchanged) {
             Bump(vertex_runs_dropped);
             return;
         }
+    }
+    {
+        const bool dynamic = (flags & MemStage::DynamicState) != 0;
         for (u32 i = 0; i < binding_count; ++i) {
             bound_vertex_buffers[first + i] = {handles[i], offsets[i], sizes[i], strides[i],
-                                               epoch};
+                                               epoch, dynamic};
         }
     }
     Bump(vertex_runs_recorded);

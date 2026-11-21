@@ -142,6 +142,8 @@ struct HostBindings {
     boost::container::static_vector<u64, NUM_VERTEX_BUFFERS> strides;
     u32 min_index{NUM_VERTEX_BUFFERS};
     u32 max_index{0};
+    /// Full vertex binds: a run of bindings that are not dirty (the player keeps the bound size).
+    bool clean{false};
 };
 
 class BufferCacheChannelInfo : public ChannelInfo {
@@ -1245,7 +1247,7 @@ private:
 
     void UpdateVertexBuffers();
 
-    void UpdateVertexBuffer(u32 index);
+    void UpdateVertexBuffer(u32 index, const CacheInputs& inputs);
 
     /// FRITCHII_FILL_UPDATE_KEEP (fable_b 25.2 cut f): resolve() (the translation and the buffer
     /// lookup UpdateIndexBuffer or UpdateVertexBuffer make), or the binding it gave last time for
@@ -1422,6 +1424,9 @@ private:
     u32 last_index_count = 0;
 
     u32 enabled_vertex_buffers_mask = 0;
+    /// Streams that went from a binding to none since the last BindHostVertexBuffers: the host
+    /// side forgets the buffer it remembers for them there (runtime.ForgetVertexBinding).
+    u32 forget_vertex_buffers_mask = 0;
     u32 stale_vertex_buffers_mask = 0;
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};

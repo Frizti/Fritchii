@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <stdexcept>
 #include <variant>
 #include <boost/container/static_vector.hpp>
@@ -11,6 +13,7 @@
 #include "common/assert.h"
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/descriptor_payload_growth.h"
+#include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -31,9 +34,28 @@ UpdateDescriptorQueue::UpdateDescriptorQueue(const Device& device_, size_t frame
 
 UpdateDescriptorQueue::~UpdateDescriptorQueue() = default;
 
-void UpdateDescriptorQueue::TickFrame() {
+void UpdateDescriptorQueue::TickFrame(Scheduler& scheduler) {
+    // The frame ending now: its entries are in chunks up to the tick being recorded.
+    frame_end_tick[frame_index] = scheduler.CurrentTick();
     if (++frame_index >= FRAMES_IN_FLIGHT) {
         frame_index = 0;
+    }
+    static const bool guard = [] {
+        const char* value = std::getenv("FRITCHII_DESC_FRAME_GUARD");
+        return value == nullptr || value[0] != '0';
+    }();
+    const u64 needed = frame_end_tick[frame_index];
+    if (guard && needed != 0 &&
+        scheduler.GetMasterSemaphore().QueueSubmittedTick() < needed) [[unlikely]] {
+        static std::atomic<u64> waits{};
+        const u64 n = waits.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "Descriptor payload frame reused before the worker recorded it (tick {} "
+                        "not submitted, {} submitted): waited for the worker ({} so far)",
+                        needed, scheduler.GetMasterSemaphore().QueueSubmittedTick(), n);
+        }
+        scheduler.WaitWorker();
     }
     payload_start = payload.get() + frame_index * frame_payload_size;
     payload_cursor = payload_start;

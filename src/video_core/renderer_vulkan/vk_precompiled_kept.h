@@ -12,12 +12,16 @@
 // 10 MB for 132k pipelines); every info, SPIR-V and recorded environment is read from disk with
 // a positional read when a pipeline needs it, never the whole file.
 //
-// Layout: "NX2KEPT4", u32 stamp size, the stamp, then entries: u8 1 (info) or 2 (SPIR-V, one
+// Layout: "NX2KEPT4" (no occlusion variants) or "NX2KEPT6", u32 stamp size, the stamp, then entries: u8 1 (info) or 2 (SPIR-V, one
 // zstd frame of its words), u64 content hash, u32 size, the bytes; u8 3 (record), u32 record
 // index in the precompiled file, then a Record (72 bytes); u8 4 ends the entries. Then the
-// index: u32 graphics count, u32 compute count, u32 blob count, the Records of each kind sorted
-// by key hash, per blob u64 offset, u32 size, u32 0, then per Record (graphics, then compute)
-// the u64 offset of its record in the precompiled file. Last, u64 index offset and "NX2KEPTE".
+// index: u32 graphics count, u32 compute count, u32 blob count, u32 variant count (NX2KEPT6
+// only), the Records
+// sorted by key hash (graphics, compute, then the occlusion variants), per blob u64 offset,
+// u32 size, u32 0, then per Record (graphics, then compute; not the variants) the u64 offset of
+// its record in the precompiled file. Last, u64 index offset and "NX2KEPTE".
+// NX2KEPT6: occlusion flag variants (FRITCHII_PREP_OCCL_VARIANTS), graphics Records whose
+// occl_kind is 1-5, kept under their parent's key hash and environments.
 // Blob ids number the info and SPIR-V blobs together, in the order they were written.
 //
 // Validity: the stamp holds what is cheap and decisive (the prepared stamp with the release
@@ -37,6 +41,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -68,13 +73,40 @@ struct Record {
     u8 env_count;
     u8 kind; ///< 0 graphics, 1 compute
     u8 flags;
-    u8 reserved;
+    /// 0 the pipeline as recorded; 1-5 an occlusion flag variant of the graphics pipeline with
+    /// the same key hash and environments (GraphicsPipeline::occl_flag_kind; its key's
+    /// attachments cleared for 4 and 5), prepared with it (FRITCHII_PREP_OCCL_VARIANTS).
+    u8 occl_kind;
 };
+constexpr u8 MaxOcclKind = 5;
 static_assert(sizeof(Record) == 72 && std::is_trivially_copyable_v<Record> &&
               std::has_unique_object_representations_v<Record>);
 
 /// Bytes read from kept files and recorded environments at run time (for the 10 s line).
 std::atomic<u64>& BytesRead();
+
+/// Nanoseconds the calling thread has spent in PositionalFile reads so far (the GPU thread's
+/// fast path splits its time into read I/O and the rest with it).
+u64& ThreadReadNanoseconds();
+
+/// FRITCHII_PREP_FASTPATH_IO: reads `files` once, front to back in 4 MiB chunks, on a thread of
+/// its own at idle CPU and very low I/O priority, so the fast path's later positional reads of
+/// them hit the OS file cache instead of the disk. Files are taken in order while twice their
+/// running total fits in the free physical memory; the rest are skipped (logged). Destroying it
+/// stops the reading promptly (a read in progress is cancelled on Windows) and joins the thread.
+class PageCacheWarmer {
+public:
+    explicit PageCacheWarmer(std::vector<std::filesystem::path> files);
+    ~PageCacheWarmer();
+    PageCacheWarmer(const PageCacheWarmer&) = delete;
+    PageCacheWarmer& operator=(const PageCacheWarmer&) = delete;
+
+private:
+    void Run(std::vector<std::filesystem::path> files);
+
+    std::atomic<bool> stop{};
+    std::thread thread;
+};
 
 /// The seed of the boot check's sample: the running exe's size and modification time, hashed.
 /// The same build checks the same pipelines on every boot; each new build checks others, so a
@@ -120,6 +152,11 @@ public:
     /// The records of a key (a compute key has one per storage pointer state it was prepared in).
     [[nodiscard]] std::span<const Record> Graphics(u64 key_hash) const;
     [[nodiscard]] std::span<const Record> Compute(u64 key_hash) const;
+    /// The occlusion flag variants prepared for a graphics key (occl_kind 1-5).
+    [[nodiscard]] std::span<const Record> Variants(u64 key_hash) const;
+    [[nodiscard]] size_t VariantCount() const noexcept {
+        return variants.size();
+    }
 
     [[nodiscard]] bool ReadInfoBytes(u32 blob, std::vector<u8>& bytes) const;
     [[nodiscard]] bool ReadInfo(u32 blob, Shader::Info& info) const;
@@ -134,6 +171,9 @@ public:
     }
     [[nodiscard]] std::span<const Record> AllCompute() const noexcept {
         return compute;
+    }
+    [[nodiscard]] std::span<const Record> AllVariants() const noexcept {
+        return variants;
     }
     /// Where the precompiled file's record of AllGraphics()[position] (compute: of
     /// AllCompute()[position]) starts.
@@ -157,6 +197,7 @@ private:
 
     std::vector<Record> graphics; ///< Sorted by key hash
     std::vector<Record> compute;  ///< Sorted by key hash
+    std::vector<Record> variants; ///< Occlusion flag variants, sorted by key hash
     std::vector<std::pair<u64, u32>> blobs;        ///< Offset, size
     std::vector<std::pair<u64, u64>> environments; ///< The precompiled file's: offset, size
     /// Where the precompiled record offsets start in the kept file (read per sampled record), or
@@ -173,17 +214,20 @@ public:
     /// Starts `part` for `stamp`, or with `resume` continues it when it was started for the same
     /// stamp (the entries up to the last complete one are kept). `total`: the precompiled
     /// file's record count. False when the file cannot be written.
+    /// `variants`: the NX2KEPT6 layout, which can hold occlusion flag variant records (a
+    /// preparation that keeps them); otherwise NX2KEPT4, as before them.
     bool Open(const std::filesystem::path& part, const std::string& stamp, bool resume,
-              size_t total);
+              size_t total, bool variants = false);
     /// Records kept from an earlier, interrupted preparation.
     [[nodiscard]] size_t Resumed() const noexcept {
         return resumed;
     }
 
     /// Keeps one built pipeline: per stage its serialized info and its SPIR-V (empty for none).
+    /// `occl_kind` 1-5: an occlusion flag variant of record `index` (Record::occl_kind).
     void Keep(size_t index, u8 kind, u8 flags, u64 key_hash, std::span<const u32> envs,
               const std::array<std::vector<u8>, 5>& infos,
-              const std::array<std::vector<u32>, 5>& spirv);
+              const std::array<std::vector<u32>, 5>& spirv, u8 occl_kind = 0);
 
     /// The records kept so far (an earlier, interrupted preparation resumed: maybe by another
     /// build), as an index over `part` for the boot check. `environments` and `record_offsets`
@@ -202,6 +246,7 @@ public:
 
     struct Totals {
         size_t records{};
+        size_t variants{};
         size_t infos{};
         size_t spirv{};
         u64 spirv_bytes{}; ///< Compressed
@@ -214,7 +259,8 @@ private:
     /// The kept records of each kind sorted by key hash, and their precompiled record offsets
     /// (graphics, then compute). Under the mutex.
     void SortedRecords(std::span<const u64> record_offsets, std::vector<Record>& graphics,
-                       std::vector<Record>& compute, std::vector<u64>& offsets) const;
+                       std::vector<Record>& compute, std::vector<u64>& offsets,
+                       std::vector<Record>& variants) const;
     u32 KeepBlob(u8 type, u64 hash, std::span<const u8> bytes);
 
     std::mutex mutex;
@@ -225,10 +271,14 @@ private:
     std::vector<std::pair<u64, u32>> blobs;
     std::vector<Record> records; ///< By record index; key_hash 0 and env_count 0 when not kept
     std::vector<u8> present;
+    /// Occlusion flag variants by record index * 8 + occl_kind (one kept again after a resume
+    /// replaces the earlier entry).
+    std::unordered_map<u64, Record> variant_records;
     size_t kept{};
     size_t resumed{};
     u64 spirv_bytes{};
     bool failed{};
+    bool variant_layout{};
 };
 
 } // namespace Vulkan::PrecompiledKept

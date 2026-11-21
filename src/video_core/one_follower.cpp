@@ -38,6 +38,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/fritchii_e_split.h"
+#include "video_core/fritchii_occl_flag.h"
 #include "video_core/fritchii_e_split_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
@@ -1545,14 +1546,27 @@ const DrawValues* NextDraw() noexcept {
 
 namespace {
 std::atomic<bool> g_amd_proprietary{};
+std::atomic<bool> g_integrated_gpu{};
+/// FRITCHII_ONEF_OCCL (boot), decided in ReadSwitches.
+bool g_occl_wanted{};
 } // Anonymous namespace
 
-void NoteAmdProprietaryDriver() noexcept {
+void NoteAmdProprietaryDriver(bool integrated) noexcept {
+    g_integrated_gpu.store(integrated, std::memory_order_relaxed);
     g_amd_proprietary.store(true, std::memory_order_relaxed);
 }
 
 bool IsAmdProprietaryDriver() noexcept {
     return g_amd_proprietary.load(std::memory_order_relaxed);
+}
+
+bool IsAmdProprietaryDiscrete() noexcept {
+    return g_amd_proprietary.load(std::memory_order_relaxed) &&
+           !g_integrated_gpu.load(std::memory_order_relaxed);
+}
+
+bool OcclWanted() noexcept {
+    return g_occl_wanted;
 }
 
 void ReadSwitches() {
@@ -1561,20 +1575,62 @@ void ReadSwitches() {
     }
     g.read = true;
     using namespace VideoCore::Nx2Debug;
-    // AMD safe default (2026-11-16): the desktop RX 7900 XT lost the device in game with the one
-    // follower on and ran clean with every FRITCHII_ONEF_* line out (EXP123=1 both times). Never
-    // run on AMD before, no AMD gate in it. Off on AMD's proprietary driver until that loss is
-    // found; FRITCHII_ONEF_AMD=1 keeps it on (tests). RADV and other vendors unchanged.
+    // FRITCHII_ONEF_OCCL (boot): occlusion flag variants (FRITCHII_OCCL_FLAG) with one follower
+    // on, lent draws and played ones (E picks a played draw's variant). An explicit value wins;
+    // unset, on only on AMD's proprietary driver on a discrete GPU (where it was measured, with
+    // EnsureVertexBindings: the AMD losses were a stale vertex-buffer table, not the flag store),
+    // off elsewhere until an A/B there. 0 is v6.2's rule: no flag variant with one follower on.
+    {
+        const char* const value = std::getenv("FRITCHII_ONEF_OCCL");
+        const bool set = value != nullptr && value[0] != '\0';
+        g_occl_wanted = set ? value[0] != '0' : IsAmdProprietaryDiscrete();
+        LOG_INFO(HW_GPU, "One follower: occlusion flags {} (FRITCHII_ONEF_OCCL={})",
+                 g_occl_wanted ? "on" : "off",
+                 set ? std::string{value}
+                     : fmt::format("unset: {}", IsAmdProprietaryDiscrete()
+                                                    ? "AMD proprietary driver, discrete GPU"
+                                                    : "not an AMD proprietary discrete GPU"));
+    }
+    // AMD (FRITCHII_ONEF_AMD, boot). 2026-11-16: the desktop RX 7900 XT lost the device in game
+    // with the one follower on, so 6.2 kept it off on AMD's proprietary driver. 2026-11-19: the
+    // loss was found with Radeon GPU Detective (AMD's vertex-buffer table in command-buffer
+    // embedded memory read through a stale pointer; MemPlayer::EnsureVertexBindings), and with
+    // occlusion flags in played draws (FRITCHII_ONEF_OCCL, its pre-pass variants) one follower
+    // beats off on an RX 9070 XT eGPU (fountain -10% idle, -3% under PCIe load; 0 losses in about
+    // 30 launches and a soak). So on by default there, only where measured: a discrete GPU, and
+    // the occlusion speed-up at Full (9) in effect (the win exists only with the pre-pass
+    // variants; at Standard one follower on against off was never measured on AMD). Otherwise
+    // off, as in 6.2. FRITCHII_ONEF_AMD=0 turns it off, =1 keeps it on anyway (tests). RADV and
+    // other vendors unchanged.
     if (g_amd_proprietary.load(std::memory_order_relaxed)) {
         const char* const keep = std::getenv("FRITCHII_ONEF_AMD");
+        const bool keep_set = keep != nullptr && keep[0] != '\0';
         const bool wanted = (std::getenv("FRITCHII_ONEF_LEAN") != nullptr &&
                              std::getenv("FRITCHII_ONEF_LEAN")[0] == '1') ||
                             (std::getenv("FRITCHII_ONEF") != nullptr &&
                              std::getenv("FRITCHII_ONEF")[0] == '1');
-        if (wanted && (keep == nullptr || keep[0] != '1')) {
-            LOG_WARNING(HW_GPU, "One follower: off on AMD's proprietary driver (device losses on "
-                                "an RX 7900 XT with it on); FRITCHII_ONEF_AMD=1 keeps it on");
+        const char* off_why = nullptr;
+        if (keep_set) {
+            off_why = keep[0] == '0' ? "FRITCHII_ONEF_AMD=0" : nullptr;
+        } else if (g_integrated_gpu.load(std::memory_order_relaxed)) {
+            off_why = "an integrated GPU: measured on a discrete one only";
+        } else if (VideoCommon::OcclFlag::RawMode() != VideoCommon::OcclFlag::Full) {
+            off_why = "the occlusion speed-up is not Full (FRITCHII_OCCL_FLAG=9): one follower "
+                      "beats off there only with its pre-pass variants";
+        }
+        if (wanted && off_why != nullptr) {
+            LOG_WARNING(HW_GPU,
+                        "One follower: off on AMD's proprietary driver ({}); FRITCHII_ONEF_AMD=1 "
+                        "keeps it on",
+                        off_why);
             return; // g.on and g.lean stay false: every FRITCHII_ONEF_* switch reads as off
+        }
+        if (wanted) {
+            LOG_INFO(HW_GPU,
+                     "One follower on AMD's proprietary driver ({}); FRITCHII_ONEF_AMD=0 turns it "
+                     "off",
+                     keep_set ? "FRITCHII_ONEF_AMD=1"
+                              : "discrete GPU, occlusion speed-up Full");
         }
     }
     g.lean = SwitchValue(g_onef_lean, "FRITCHII_ONEF_LEAN") == 1;
@@ -1618,6 +1674,13 @@ void ReadSwitches() {
     g_e_pipeline = g.on && SwitchValue(g_onef_e_pipeline, "FRITCHII_ONEF_E_PIPELINE", 1) == 1;
     if (g_e_pipeline) {
         LOG_INFO(HW_GPU, "One follower: E owns the pipeline lookup (FRITCHII_ONEF_E_PIPELINE=1)");
+        const char* const mesh_emu = std::getenv("FRITCHII_ONEF_MESH_EMU");
+        LOG_INFO(HW_GPU, "One follower: emulated mesh draws {} (FRITCHII_ONEF_MESH_EMU={})",
+                 EmulatedMeshPostable() ? "posted" : "lent",
+                 mesh_emu != nullptr && mesh_emu[0] != '\0'
+                     ? std::string{mesh_emu}
+                     : std::string{IsAmdProprietaryDriver() ? "unset: AMD proprietary driver"
+                                                            : "unset: not AMD's proprietary driver"});
     }
     if (g.on) {
         LOG_INFO(HW_GPU,
@@ -2937,7 +3000,7 @@ void EngineConsumed(u64 position) noexcept {
 }
 
 void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags,
-              const void* pipeline) {
+              const void* pipeline, u8 occl_prepass) {
     if (!Detail::t_engine || !g.thread.joinable()) {
         t_next_draw_set = false;
         return;
@@ -2950,6 +3013,7 @@ void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags
     header.draw_seq = draw_seq;
     header.buffer_number = buffer_number;
     header.pipeline = pipeline;
+    header.reserved[1] = occl_prepass;
     // Packed straight into the packet buffer, after the header: no copy, no allocation.
     u8* const buffer = PackBuffer();
     std::size_t bytes;

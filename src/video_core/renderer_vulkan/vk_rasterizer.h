@@ -178,6 +178,9 @@ public:
     void WaitForIdle() override;
     void FragmentBarrier() override;
     void TiledCacheBarrier() override;
+    [[nodiscard]] bool TiledCacheBarrierIsNoop() const noexcept override {
+        return true; // TiledCacheBarrier is empty here
+    }
     void FlushCommands() override;
     void TickFrame() override;
     bool AccelerateConditionalRendering() override;
@@ -274,6 +277,12 @@ private:
     void OneFollowerFenceLent();
     /// R: inside a posted fence (its closing gather ran on E).
     bool onef_fence_posted{};
+    /// FRITCHII_ONEF_TICK_ON_E (default 1): a frame end R reached outside a lent call (the
+    /// composite executer of an increment R played) leaves TickFrame to E, which lends it at its
+    /// next fence: TickFrame ticks E's staging pools, memory stage and caches.
+    std::atomic<bool> onef_frame_tick_deferred{};
+    /// E: runs a frame tick R left (lent: R runs it with E parked).
+    void OneFollowerDeferredTick();
     /// E: whether a fence op can be posted now (counted by why not), and the post: 0 sync
     /// point, 1 reference, 2 forced release; with FRITCHII_ONEF_SEM_E 3 a sync point whose
     /// increments E made, 4 a SignalFence whose callback E ran (`e_callback`), 5 a

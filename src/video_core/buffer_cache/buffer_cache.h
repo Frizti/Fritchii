@@ -4287,10 +4287,15 @@ void BufferCache<P>::UpdateVertexBufferSlot(u32 index, const Binding& binding) {
         ++vertex_buffers_serial;
     }
     slot = binding;
+    const u32 bit = 1u << index;
     if (binding.buffer_id != NULL_BUFFER_ID && binding.size != 0) {
-        enabled_vertex_buffers_mask |= (1u << index);
+        enabled_vertex_buffers_mask |= bit;
     } else {
-        enabled_vertex_buffers_mask &= ~(1u << index);
+        // A stream going from a binding to none (switched off, or its buffer deleted) is not
+        // bound again, so the host's remembered binding would outlive the buffer: forgotten at
+        // the next BindHostVertexBuffers, in the draw's own stream of binds.
+        forget_vertex_buffers_mask |= enabled_vertex_buffers_mask & bit;
+        enabled_vertex_buffers_mask &= ~bit;
     }
 }
 
@@ -4337,6 +4342,14 @@ void BufferCache<P>::RefreshRepackedVertexBuffers() {
 template <class P>
 void BufferCache<P>::BindHostVertexBuffers() {
     RefreshRepackedVertexBuffers();
+    if (forget_vertex_buffers_mask != 0) [[unlikely]] {
+        if constexpr (requires { runtime.ForgetVertexBinding(u32{}); }) {
+            for (u32 mask = forget_vertex_buffers_mask; mask != 0; mask &= mask - 1) {
+                runtime.ForgetVertexBinding(static_cast<u32>(std::countr_zero(mask)));
+            }
+        }
+        forget_vertex_buffers_mask = 0;
+    }
 
 #ifdef __ANDROID__
     const bool use_optimized_vertex_buffers = Settings::values.use_optimized_vertex_buffers.GetValue();
@@ -4361,6 +4374,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
                 return;
             }
             bindings.max_index = bindings.min_index + static_cast<u32>(bindings.buffers.size());
+            bindings.clean = !run_dirty;
             runtime.BindVertexBuffers(bindings);
             bindings = HostBindings<Buffer>{};
             last_index = (std::numeric_limits<u32>::max)();
@@ -7324,17 +7338,30 @@ void BufferCache<P>::UpdateVertexBuffers() {
     }
     flags[Dirty::VertexBuffers] = false;
 
+    // One copy of the inputs for the loop (nothing in it changes the override, the engine or the
+    // flags' view). A switched-off stream's dirty bit is never cleared (BindHostVertexBuffers
+    // clears only enabled streams), so every pass met ~30 sticky-dirty disabled streams and
+    // resolved each to NULL_BINDING: they take that binding directly now, with the same two
+    // stores, and the flags are still tested live per stream (a mark raised mid-loop is seen).
+    const CacheInputs inputs = Inputs();
     for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
-        UpdateVertexBuffer(index);
+        if (!flags[Dirty::VertexBuffer0 + index]) {
+            continue;
+        }
+        if (update_keep == 0 && inputs.VertexStream(index).enable == 0) [[likely]] {
+            if (BindAddrMemo()) {
+                ++bind_addr_disabled_skips;
+            }
+            channel_state->vertex_buffers[index] = NULL_BINDING;
+            UpdateVertexBufferSlot(index, NULL_BINDING);
+            continue;
+        }
+        UpdateVertexBuffer(index, inputs);
     }
 }
 
 template <class P>
-void BufferCache<P>::UpdateVertexBuffer(u32 index) {
-    const CacheInputs inputs = Inputs();
-    if (!inputs.Dirty()[Dirty::VertexBuffer0 + index]) {
-        return;
-    }
+void BufferCache<P>::UpdateVertexBuffer(u32 index, const CacheInputs& inputs) {
     const auto& array = inputs.VertexStream(index);
     const auto& limit = inputs.VertexStreamLimit(index);
     const GPUVAddr gpu_addr_begin = array.Address();

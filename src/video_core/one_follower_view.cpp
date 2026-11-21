@@ -22,6 +22,8 @@
 // reads. Flag 0 is the tables' "no flag" slot: neither side.
 
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <algorithm>
 #include <bit>
 #include <bitset>
@@ -133,6 +135,49 @@ const PageFilter* g_union_pages{}; ///< SetUnionPages (fable_b 14.4 cut 5's unio
 /// R: the last applied packet carried a draw span (VerifyView compares it then).
 thread_local bool t_draw_fresh{};
 
+/// g_e.pools published for E2's stream-write guard without holding E1 (a seqlock: NotePools,
+/// its only writer, makes the word odd around the four stores). The guard's clear verdict needs
+/// only "no overlap with E1's pools at some E1 position after it queued the write", which the
+/// hold gave and this snapshot gives too.
+std::atomic<u32> g_pools_seq{};
+std::array<std::atomic<u64>, 4> g_pools_pub{};
+
+void PublishPools() noexcept {
+    u32 seq = g_pools_seq.load(std::memory_order_relaxed);
+    while ((seq & 1) != 0 ||
+           !g_pools_seq.compare_exchange_weak(seq, seq + 1, std::memory_order_acquire,
+                                              std::memory_order_relaxed)) {
+        seq = g_pools_seq.load(std::memory_order_relaxed);
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    g_pools_pub[0].store(g_e.pools[0].first, std::memory_order_relaxed);
+    g_pools_pub[1].store(g_e.pools[0].second, std::memory_order_relaxed);
+    g_pools_pub[2].store(g_e.pools[1].first, std::memory_order_relaxed);
+    g_pools_pub[3].store(g_e.pools[1].second, std::memory_order_relaxed);
+    g_pools_seq.store(seq + 2, std::memory_order_release);
+}
+
+/// E2: true when a consistent snapshot of the published pools misses [address, end); false when
+/// it overlaps or no consistent snapshot was read (the caller then takes the held path).
+bool PublishedPoolsClear(DAddr address, DAddr end) noexcept {
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const u32 before = g_pools_seq.load(std::memory_order_acquire);
+        if ((before & 1) != 0) {
+            continue;
+        }
+        const u64 b0 = g_pools_pub[0].load(std::memory_order_relaxed);
+        const u64 e0 = g_pools_pub[1].load(std::memory_order_relaxed);
+        const u64 b1 = g_pools_pub[2].load(std::memory_order_relaxed);
+        const u64 e1 = g_pools_pub[3].load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (g_pools_seq.load(std::memory_order_relaxed) != before) {
+            continue;
+        }
+        return !(b0 < end && address < e0) && !(b1 < end && address < e1);
+    }
+    return false;
+}
+
 Pools PoolsOf(const Maxwell3D::Regs& regs) {
     Pools pools{};
     pools.tic_address = regs.tex_header.Address();
@@ -160,6 +205,7 @@ void NotePools(const Maxwell3D& engine) {
     g_e.pools[0] = range(pools.tic_address, (u64{pools.tic_limit} + 1) * EntryBytes);
     const u32 tsc_limit = pools.tsc_linked != 0 ? pools.tic_limit : pools.tsc_limit;
     g_e.pools[1] = range(pools.tsc_address, (u64{tsc_limit} + 1) * EntryBytes);
+    PublishPools();
 }
 
 void FillDraw(DrawValues& values, const Maxwell3D& engine) {
@@ -575,6 +621,23 @@ void GuardStreamWrite(DAddr address, u64 size) noexcept {
     ESplit::NoteMemoryWrite();
     if (!Detail::t_engine || size == 0 || g_texture_pages == nullptr) {
         return;
+    }
+    // FRITCHII_ESPLIT, E2 while E1 runs ahead, a write the hold below would be for: the clear
+    // verdict first, without the hold. The filters are R's (read unheld on the record path too)
+    // and the pools come from E1's published snapshot; only a possible hit (or a diagnostic
+    // mode, or no consistent snapshot) takes the held path below, unchanged.
+    // FRITCHII_ESPLIT_GUARD_HOLD=1: always the held path.
+    if (ESplit::g_async && ESplit::OnE2() && !ESplit::t_async_cb && ESplit::g_state == 0) {
+        static const bool always_hold = [] {
+            const char* const value = std::getenv("FRITCHII_ESPLIT_GUARD_HOLD");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (!always_hold && !g_texture_pages->Any(address, size) &&
+            (g_shader_pages == nullptr || !g_shader_pages->Any(address, size)) &&
+            PublishedPoolsClear(address, address + size)) {
+            Stats::StreamWriteChecked();
+            return;
+        }
     }
     // FRITCHII_ESPLIT, E2 while E1 runs ahead, a write E1 did not check (not an S4 constant
     // buffer record's: E2ExclusiveBegin skips those): the guard reads E1's pool ranges and may

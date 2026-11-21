@@ -40,6 +40,7 @@
 #include "common/dkb_frame_trace.h"
 #include "common/fritchii_page_flags.h"
 #include "common/scope_exit.h"
+#include "video_core/fritchii_occl_flag.h"
 #include "video_core/fritchii_delta_path.h"
 #include "video_core/fritchii_e_split.h"
 #include "video_core/fritchii_e_split_thread.h"
@@ -310,8 +311,14 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
     if (stream_write) {
         return LentReason::StreamWrite;
     }
+    // The DKB frame trace no longer lends every draw unless FRITCHII_ONEF_TRACE_LENDS=1 asks
+    // (it made every one-follower measurement a fully lent one).
+    static const bool trace_lends = [] {
+        const char* value = std::getenv("FRITCHII_ONEF_TRACE_LENDS");
+        return value != nullptr && value[0] == '1';
+    }();
     if (diagnostic.load(std::memory_order_relaxed) || env_traces ||
-        Common::DkbFrameTrace::Enabled()) {
+        (trace_lends && Common::DkbFrameTrace::Enabled())) {
         return LentReason::Diagnostic;
     }
     // Transient: what R's view or R's path cannot carry yet. Each test counts itself (fable_b
@@ -574,6 +581,16 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     const bool filled =
         r.mem_stage.FillRingDraw(r.buffer_cache, draw_facts, is_indexed, position, seq, 0, nullptr,
                                  nullptr, &handle_values, null_pointer_handles, list_args);
+    // FRITCHII_ONEF_MESH_EMU: a lent emulated mesh draw leaves VertexBuffer0..31 raised on E's
+    // engine (InvalidateInputState after its compute passes: the next draw binds its vertex
+    // buffers again). Posted, R raises them on its view only, and they are E's flags: E raises
+    // them here, where the lent draw left them, before the split's view takes the flags.
+    if (filled && pipeline != nullptr && pipeline->IsEmulatedMesh()) [[unlikely]] {
+        auto& dirty = r.buffer_cache.Inputs().Dirty();
+        for (u32 index = 0; index < Maxwell3D::Regs::NumVertexArrays; ++index) {
+            dirty[VideoCommon::Dirty::VertexBuffer0 + index] = true;
+        }
+    }
     if (esplit_records) [[unlikely]] {
         if (esplit_thread) {
             VideoCommon::ESplit::FillDone(engine, esplit_view);
@@ -831,6 +848,16 @@ bool OneFollowerDraw::AsyncTailFits(const Maxwell3D& engine,
     if (!VideoCommon::ESplit::g_async || pipeline == nullptr) {
         return false; // S1, or no rule 3 pipeline (the facts table's lookup reads the engine)
     }
+    // FRITCHII_ONEF_MESH_EMU: an emulated mesh draw fits too. Its fill raises VertexBuffer0..31
+    // on the cache's inputs (E2's view flags when async: E2 owns the buffer flags in the split).
+    // FRITCHII_ONEF_MESH_EMU_ASYNC=0: lockstep tails for them.
+    static const bool mesh_async = [] {
+        const char* const value = std::getenv("FRITCHII_ONEF_MESH_EMU_ASYNC");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!mesh_async && pipeline->IsEmulatedMesh()) {
+        return false;
+    }
     const MemStage::DrawFacts pipeline_facts = pipeline->MemFacts();
     if (pipeline_facts.has_texel_buffers || pipeline_facts.stage_infos == nullptr) {
         return false; // FillRing would refuse (LateFill)
@@ -952,9 +979,70 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         }
         // UNLEND's Mesh bit covers native task/mesh pipelines only (RouteDraw tests the device;
         // this is the pipeline's own word for it).
-        if (pipeline->IsEmulatedMesh()) [[unlikely]] {
+        // FRITCHII_ONEF_MESH_EMU: emulated mesh pipelines are posted too (not list draws). A
+        // mesh pipeline whose emulation was refused (no VkPipeline: R drops the draw) stays lent,
+        // as before, so the skip counters keep their meaning.
+        if (pipeline->IsEmulatedMesh() ? (list || !OneF::EmulatedMeshPostable())
+                                       : (pipeline->IsMeshPipeline() &&
+                                          !rasterizer.device.IsExtMeshShaderSupported()))
+            [[unlikely]] {
             reason = LentReason::NoPath;
             return false;
+        }
+        // FRITCHII_ONEF_OCCL (OneFollower::OcclWanted: unset = AMD's proprietary driver on a
+        // discrete GPU) with FRITCHII_OCCL_FLAG: E picks the draw's flag variant at its lookup
+        // (the pipeline cache and the registers are E's); R records it as the lent path does
+        // (the slot, the address push). Variants drawn in place, and with
+        // FRITCHII_ONEF_OCCL_PREPASS the pre-pass ones (colour or discard: R records the draw
+        // twice, as R's query state decides).
+        // FillAndPush's callers are RouteDraw (direct draws) and RouteListDraw (list draws) only:
+        // a non-list indirect draw is always lent, so it reaches the lent path's own choice,
+        // where the pre-pass refuses indirect draws (review C8). Only list draws need excluding
+        // here (their arguments are consumed once).
+        push_occl = 0;
+        if (VideoCommon::OneFollower::OcclWanted() &&
+            VideoCommon::OcclFlag::Mode() != VideoCommon::OcclFlag::Off &&
+            rasterizer.query_cache_runtime.OcclFlagAreaExists()) {
+            VideoCommon::OcclFlag::t_colour_prepass = false;
+            VideoCommon::OcclFlag::t_discard_direct = false;
+            VideoCommon::OcclFlag::t_colour_discard_prepass = false;
+            GraphicsPipeline* const flag =
+                rasterizer.pipeline_cache.OcclFlagPipeline(pipeline, engine.regs, true);
+            const bool colour_prepass = VideoCommon::OcclFlag::t_colour_prepass;
+            const bool discard_direct = VideoCommon::OcclFlag::t_discard_direct;
+            const bool colour_discard_prepass = VideoCommon::OcclFlag::t_colour_discard_prepass;
+            const bool prepass_kind = colour_prepass || colour_discard_prepass ||
+                                      (flag != nullptr && flag->IsOcclDiscardPrepass());
+            VideoCommon::OcclFlag::t_colour_prepass = false;
+            VideoCommon::OcclFlag::t_discard_direct = false;
+            VideoCommon::OcclFlag::t_colour_discard_prepass = false;
+            // FRITCHII_ONEF_OCCL_PREPASS (default 1, so it follows FRITCHII_ONEF_OCCL; 0 keeps
+            // played draws to in-place variants): a pre-pass variant too (the colour or
+            // discard pre-pass records the draw twice on R, decided there by R's query state as
+            // the lent and off paths decide it); its pre-pass state goes in the packet. Without
+            // it every such draw counted with a host query (~16k more a second at the fountain,
+            // ~1.2 ms of GPU a frame on the eGPU). Not for list draws (recording them twice
+            // consumes their arguments).
+            static const bool onef_prepass = [] {
+                const char* value = std::getenv("FRITCHII_ONEF_OCCL_PREPASS");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (flag != nullptr && flag != pipeline) {
+                if (!prepass_kind) {
+                    pipeline = flag;
+                } else if (onef_prepass && !list) {
+                    pipeline = flag;
+                    if (flag->occl_flag_parent == nullptr) [[unlikely]] {
+                        LOG_ERROR(Render_Vulkan, "One follower: E's pre-pass variant has no "
+                                                 "flag parent (kind {})",
+                                  flag->occl_flag_kind);
+                    }
+                    push_occl = static_cast<u8>(
+                        (colour_prepass ? OneF::OcclColourPrepass : 0) |
+                        (discard_direct ? OneF::OcclDiscardDirect : 0) |
+                        (colour_discard_prepass ? OneF::OcclColourDiscardPrepass : 0));
+                }
+            }
         }
     }
     // FRITCHII_OCCL_LEAN (helper CS, fritchii_occl_lean.h): a draw that writes no colour takes
@@ -992,6 +1080,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
             static_assert(std::is_trivially_copyable_v<AsyncTail>);
             tail.packet_bytes =
                 OneF::PackDraw(engine, seq, push_flags, pipeline, tail.header, slot.packet);
+            tail.header.reserved[1] = push_occl;
             std::memcpy(slot.payload, &tail, sizeof(tail));
             ESplit::PostAsync([](void* raw) {
                 AsyncTail t;
@@ -1052,7 +1141,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
             if (!FillRing(engine, pipeline, is_indexed, position, seq, number, reason, list)) {
                 return;
             }
-            OneF::PushDraw(engine, seq, number, push_flags, pipeline);
+            OneF::PushDraw(engine, seq, number, push_flags, pipeline, push_occl);
             counts.pushed.store(counts.pushed.load(std::memory_order_relaxed) + 1,
                                 std::memory_order_relaxed);
             rasterizer.gpu.TickWork();
@@ -1100,7 +1189,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     }
     {
         const Profile::FineScope push_zone{Profile::Zone::DrawPush}; // helper CP
-        OneF::PushDraw(engine, seq, buffer_number, push_flags, pipeline);
+        OneF::PushDraw(engine, seq, buffer_number, push_flags, pipeline, push_occl);
     }
     if (occl_note.timed) [[unlikely]] {
         VideoCommon::OcclLean::NoteFill(occl_note, VideoCommon::OcclLean::NowNs() - occl_start);
@@ -1157,7 +1246,7 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
     // Mesh: native task/mesh pipelines only (the emulation's buffers are not R's alone). Without
     // VK_EXT_mesh_shader every mesh pipeline is emulated or skipped.
     if (reason == LentReason::Count && kind == OneF::Mesh &&
-        !rasterizer.device.IsExtMeshShaderSupported()) {
+        !rasterizer.device.IsExtMeshShaderSupported() && !OneF::EmulatedMeshPostable()) {
         reason = LentReason::NoPath;
     }
     if (reason == LentReason::Count && FillAndPush(engine, is_indexed, seq, false, reason)) {

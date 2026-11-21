@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -21,6 +22,7 @@
 #include "video_core/memory_stage_link.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/vulkan_debug_callback.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan::vk {
@@ -559,6 +561,124 @@ const VkAllocationCallbacks* HostAllocator() noexcept {
     return callbacks;
 }
 
+// FRITCHII_VA_REPORT: the last destroys of objects whose memory the driver owns (pipeline code,
+// views, samplers, pools), for the device-loss report: a GPU read of a freed one faults in the
+// driver's own address range, which no binding report names.
+namespace DestroyRing {
+struct Entry {
+    u64 ns;
+    u64 handle;
+    const char* type;
+    u32 thread;
+    const char* thread_name;
+    std::array<u32, 8> frames; ///< return addresses as offsets into the module that holds them
+};
+constexpr size_t Size = 4096;
+std::array<Entry, Size> g_ring{};
+std::atomic<u64> g_next{};
+/// The VA report's switch (VaReport::Requested, read once): off, one static bool per destroy.
+bool Wanted() {
+    return Vulkan::VaReport::Requested();
+}
+u64 NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+u32 ThreadId() {
+#ifdef _WIN32
+    return static_cast<u32>(GetCurrentThreadId());
+#else
+    return 0;
+#endif
+}
+const char* ThreadName() {
+    thread_local std::string name = [] {
+        std::string result = "?";
+#ifdef _WIN32
+        PWSTR wide = nullptr;
+        if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &wide)) && wide != nullptr) {
+            result.clear();
+            for (const wchar_t* c = wide; *c != 0 && result.size() < 31; ++c) {
+                result.push_back(*c < 128 ? static_cast<char>(*c) : '?');
+            }
+            LocalFree(wide);
+        }
+#endif
+        return result;
+    }();
+    return name.c_str();
+}
+void Note(const char* type, u64 handle) {
+    if (!Wanted()) {
+        return;
+    }
+    Entry entry{NowNs(), handle, type, ThreadId(), ThreadName(), {}};
+#ifdef _WIN32
+    void* frames[9]{};
+    const USHORT count = RtlCaptureStackBackTrace(1, 9, frames, nullptr);
+    static const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    for (USHORT i = 0; i < count && i < entry.frames.size(); ++i) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(frames[i]);
+        entry.frames[i] = address > base ? static_cast<u32>(address - base) : 0;
+    }
+#endif
+    g_ring[g_next.fetch_add(1, std::memory_order_relaxed) % Size] = entry;
+}
+} // namespace DestroyRing
+
+void DumpRecentDestroys(u64 window_ms) {
+    if (!DestroyRing::Wanted()) {
+        return;
+    }
+    const u64 count = DestroyRing::g_next.load(std::memory_order_relaxed);
+    const u64 now = DestroyRing::NowNs();
+    // Written at once to its own file as well: the process may die before the log flushes.
+    static std::atomic<bool> written{};
+    if (!written.exchange(true)) {
+        if (const char* appdata = std::getenv("APPDATA")) {
+            const std::string path = std::string{appdata} + "/fritchii/log/destroy_report.txt";
+            if (std::FILE* file = std::fopen(path.c_str(), "w")) {
+                const u64 begin = count > DestroyRing::Size ? count - DestroyRing::Size : 0;
+                for (u64 i = count; i-- > begin;) {
+                    const DestroyRing::Entry& e = DestroyRing::g_ring[i % DestroyRing::Size];
+                    if (e.type == nullptr || now < e.ns || now - e.ns > window_ms * 1000000ULL) {
+                        continue;
+                    }
+                    std::fprintf(file, "%s %llx %.3f ms ago thread %u \"%s\" stack", e.type,
+                                 static_cast<unsigned long long>(e.handle),
+                                 static_cast<double>(now - e.ns) / 1e6, e.thread,
+                                 e.thread_name != nullptr ? e.thread_name : "?");
+                    for (const u32 frame : e.frames) {
+                        std::fprintf(file, " %x", frame);
+                    }
+                    std::fputc('\n', file);
+                }
+                std::fflush(file);
+                std::fclose(file);
+            }
+        }
+    }
+    const u64 first = count > DestroyRing::Size ? count - DestroyRing::Size : 0;
+    u32 shown = 0;
+    for (u64 i = count; i-- > first && shown < 48;) {
+        const DestroyRing::Entry& e = DestroyRing::g_ring[i % DestroyRing::Size];
+        if (e.type == nullptr || now < e.ns || now - e.ns > window_ms * 1000000ULL) {
+            continue;
+        }
+        ++shown;
+        LOG_CRITICAL(Render_Vulkan,
+                     "Destroy report: {} {:#x} destroyed {:.3f} ms ago on thread {} \"{}\"; "
+                     "stack exe+{:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                     e.type, e.handle, static_cast<double>(now - e.ns) / 1e6, e.thread,
+                     e.thread_name != nullptr ? e.thread_name : "?", e.frames[0], e.frames[1],
+                     e.frames[2], e.frames[3], e.frames[4], e.frames[5], e.frames[6],
+                     e.frames[7]);
+    }
+    LOG_CRITICAL(Render_Vulkan, "Destroy report: {} destroys in the last {} ms shown ({} kept)",
+                 shown, window_ms, count - first);
+}
+
 void Destroy(VkInstance instance, const InstanceDispatch& dld) noexcept {
     dld.vkDestroyInstance(instance, HostAllocator());
 }
@@ -568,18 +688,22 @@ void Destroy(VkDevice device, const InstanceDispatch& dld) noexcept {
 }
 
 void Destroy(VkDevice device, VkBuffer handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("Buffer", u64(handle));
     dld.vkDestroyBuffer(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkBufferView handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("BufferView", u64(handle));
     dld.vkDestroyBufferView(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkCommandPool handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("CommandPool", u64(handle));
     dld.vkDestroyCommandPool(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkDescriptorPool handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("DescriptorPool", u64(handle));
     dld.vkDestroyDescriptorPool(device, handle, nullptr);
 }
 
@@ -593,10 +717,12 @@ void Destroy(VkDevice device, VkDescriptorUpdateTemplate handle,
 }
 
 void Destroy(VkDevice device, VkDeviceMemory handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("DeviceMemory", u64(handle));
     dld.vkFreeMemory(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkEvent handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("Event", u64(handle));
     dld.vkDestroyEvent(device, handle, nullptr);
 }
 
@@ -605,18 +731,22 @@ void Destroy(VkDevice device, VkFence handle, const DeviceDispatch& dld) noexcep
 }
 
 void Destroy(VkDevice device, VkFramebuffer handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("Framebuffer", u64(handle));
     dld.vkDestroyFramebuffer(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkImage handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("Image", u64(handle));
     dld.vkDestroyImage(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkImageView handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("ImageView", u64(handle));
     dld.vkDestroyImageView(device, handle, nullptr);
 }
 
 void Destroy(VkDevice device, VkPipeline handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("Pipeline", u64(handle));
     dld.vkDestroyPipeline(device, handle, nullptr);
 }
 
@@ -629,6 +759,7 @@ void Destroy(VkDevice device, VkPipelineLayout handle, const DeviceDispatch& dld
 }
 
 void Destroy(VkDevice device, VkQueryPool handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("QueryPool", u64(handle));
     dld.vkDestroyQueryPool(device, handle, nullptr);
 }
 
@@ -637,6 +768,7 @@ void Destroy(VkDevice device, VkRenderPass handle, const DeviceDispatch& dld) no
 }
 
 void Destroy(VkDevice device, VkSampler handle, const DeviceDispatch& dld) noexcept {
+    DestroyRing::Note("Sampler", u64(handle));
     dld.vkDestroySampler(device, handle, nullptr);
 }
 

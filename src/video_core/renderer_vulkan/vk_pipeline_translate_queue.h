@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -70,10 +71,54 @@ struct TranslationJob {
     std::array<VideoCommon::GraphicsEnvironment, 6> reference_envs;
     std::unique_ptr<TranslationRecord> record;
 
+    /// FRITCHII_OCCL_FLAG_ASYNC (the pipeline cache's occl_queue): an occlusion flag variant of
+    /// `parent_key`'s pipeline (occl_kind 1-5, PipelineCache's OCCL_FLAG_BUILD_*: the thread
+    /// translates with t_occl_flag_build set to it), or with occl_kind 0 a FRITCHII_OCCL_LEAN
+    /// sibling (`key` is the parent's without its pixel program). `key` is what is translated
+    /// (kinds 4 and 5: the parent's with every attachment's writes off). Not in the disk cache;
+    /// with FRITCHII_OCCL_FLAG_PERSIST a used one is recorded in the occlusion file.
+    bool occl{};
+    u8 occl_kind{};
+    /// FRITCHII_OCCL_FLAG_PERSIST: built from its record in the occlusion file (`occl_file`: the
+    /// translation thread reads the recorded environments back, as the disk cache's prebuild
+    /// builds; `envs` unused), not from a draw's snapshot. Its texture reads are not checked
+    /// against the live state: it is attached only to a parent whose descriptor signature is
+    /// `occl_parent_signature` (the parent's when it was recorded). A record that does not read
+    /// back or build, or does not fit, leaves the variant to a later draw (never refused for it).
+    bool prebuilt{};
+    struct OcclFileRecord {
+        std::shared_ptr<const std::filesystem::path> path;
+        u64 offset{};      ///< Of the payload
+        u32 size{};        ///< Payload bytes
+        u64 hash{};        ///< CityHash64 of the payload
+        u32 envs_offset{}; ///< In the payload: where the environments start
+        u32 num_envs{};
+    };
+    OcclFileRecord occl_file;
+    u64 occl_parent_signature{};
+    GraphicsPipelineCacheKey parent_key{};
+
     // Written by the translation thread.
     Outcome outcome{Outcome::Pending};
     std::unique_ptr<GraphicsPipeline> pipeline;
     std::chrono::steady_clock::duration translation{}; ///< Time on the translation thread
+};
+
+/// What a TranslateQueue keys its jobs by: the key translated and, for the occlusion queue, the
+/// variant kind (kinds 1-3 share their parent's key). 0 for every job of the translate queue.
+struct TranslateQueueKey {
+    GraphicsPipelineCacheKey key{};
+    u8 kind{};
+
+    bool operator==(const TranslateQueueKey& rhs) const noexcept {
+        return kind == rhs.kind && key == rhs.key;
+    }
+};
+
+struct TranslateQueueKeyHash {
+    size_t operator()(const TranslateQueueKey& k) const noexcept {
+        return k.key.Hash() ^ (static_cast<size_t>(k.kind) * 0x9E3779B97F4A7C15ULL);
+    }
 };
 
 /// The queue of graphics pipelines translated on threads of their own. The pipeline cache owns
@@ -92,7 +137,10 @@ public:
     /// thread.
     using Retire = std::function<void(std::unique_ptr<GraphicsPipeline>)>;
 
-    TranslateQueue(size_t threads, size_t max_in_flight, Translate translate, Retire retire);
+    /// `name` and `placement`: its threads' (FRITCHII_OCCL_FLAG_ASYNC's queue: below normal).
+    TranslateQueue(size_t threads, size_t max_in_flight, Translate translate, Retire retire,
+                   std::string name = "VkTranslate",
+                   Common::ThreadPlacement placement = Common::ThreadPlacement::Default);
     /// Joins the threads (a translation in progress finishes); queued jobs are dropped.
     ~TranslateQueue();
 
@@ -104,23 +152,41 @@ public:
     bool Enqueue(std::unique_ptr<TranslationJob> job);
 
     /// Whether `key` is queued or translated and not taken yet.
-    [[nodiscard]] bool Contains(const GraphicsPipelineCacheKey& key) const;
+    [[nodiscard]] bool Contains(const GraphicsPipelineCacheKey& key, u8 kind = 0) const;
 
     /// The finished job of `key` (removed from the queue), or null while it still translates or
     /// when it is not queued.
-    [[nodiscard]] std::unique_ptr<TranslationJob> Take(const GraphicsPipelineCacheKey& key);
+    [[nodiscard]] std::unique_ptr<TranslationJob> Take(const GraphicsPipelineCacheKey& key,
+                                                       u8 kind = 0);
 
     /// Take, waiting up to `cap` for the translation to finish.
     [[nodiscard]] std::unique_ptr<TranslationJob> Wait(const GraphicsPipelineCacheKey& key,
-                                                       std::chrono::milliseconds cap);
+                                                       std::chrono::milliseconds cap,
+                                                       u8 kind = 0);
 
     /// Forgets `key`: a translation still running is dropped when it ends.
-    void Abandon(const GraphicsPipelineCacheKey& key);
+    void Abandon(const GraphicsPipelineCacheKey& key, u8 kind = 0);
 
     /// Abandons the jobs queued longer than `age` (a wedged translation or driver), returning
     /// their keys.
     [[nodiscard]] std::vector<GraphicsPipelineCacheKey> Sweep(
         std::chrono::steady_clock::duration age);
+
+    /// Sweep, giving each abandoned job's kind and parent key too (the occlusion queue). With
+    /// `from_start` the age counts from when a thread began translating the job (time spent
+    /// queued is not a wedge), so a job still queued is never swept. Jobs are picked and
+    /// abandoned under one lock: a job that has finished is never swept.
+    struct Swept {
+        GraphicsPipelineCacheKey key{};
+        u8 kind{};
+        GraphicsPipelineCacheKey parent_key{};
+    };
+    [[nodiscard]] std::vector<Swept> SweepJobs(std::chrono::steady_clock::duration age,
+                                               bool from_start = false);
+
+    /// Waits up to `cap` until no job is queued or translating (abandoned ones included), so no
+    /// thread of this queue queues a driver compile after it returns. True when idle.
+    [[nodiscard]] bool WaitIdle(std::chrono::milliseconds cap);
 
     /// Every finished job not taken yet (removed from the queue): the draws that asked for them
     /// have not come back, and the cache adopts them between frames.
@@ -144,16 +210,21 @@ private:
         std::unique_ptr<TranslationJob> job; ///< Null while a thread translates it
         bool done{};
         std::chrono::steady_clock::time_point enqueued{};
+        /// When a thread took the job (unset while it is queued)
+        std::chrono::steady_clock::time_point started{};
+        GraphicsPipelineCacheKey parent_key{}; ///< The job's (kept for Sweep while it runs)
     };
 
-    void Run(GraphicsPipelineCacheKey key, u64 id);
+    void Run(TranslateQueueKey key, u64 id);
 
     mutable std::mutex mutex;
     std::condition_variable done_condition;
-    std::unordered_map<GraphicsPipelineCacheKey, Entry> entries;
+    std::unordered_map<TranslateQueueKey, Entry, TranslateQueueKeyHash> entries;
     /// Jobs whose entry was abandoned while they translated, for RetireAbandoned. Under `mutex`.
     std::vector<std::unique_ptr<TranslationJob>> abandoned;
     u64 next_id{1};
+    /// Runs queued and not ended yet (abandoned ones included), for WaitIdle. Under `mutex`.
+    size_t runs_pending{};
     const size_t max_in_flight;
     Translate translate;
     Retire retire;

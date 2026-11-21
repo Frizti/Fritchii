@@ -376,6 +376,7 @@ public:
     void Record(Scheduler& scheduler, const void* descriptors,
                 const CameraMotionParameters& parameters, VkImage motion, VkExtent2D size,
                 const ActorOverlay* overlay) {
+        scheduler.DisturbVertexBindings(); // its replay binds a vertex buffer
         scheduler.Record([this, descriptors, parameters, motion, size, overlay]
                          (vk::CommandBuffer cmdbuf) {
             const VkMemoryBarrier read_depth{
@@ -445,6 +446,7 @@ public:
 
     void Record(Scheduler& scheduler, const void* descriptors, VkImage input,
                 VkExtent2D extent, const OcarinaUpscaler* require_success = nullptr) {
+        scheduler.DisturbVertexBindings(); // its replay binds a vertex buffer
         scheduler.Record([this, descriptors, input, extent, require_success](vk::CommandBuffer cmd) {
             if (require_success && require_success->EvaluationFailed()) {
                 return;
@@ -470,6 +472,7 @@ public:
     void RecordOutput(Scheduler& scheduler, const void* descriptors,
                       const OcarinaUpscaler& upscaler, VkExtent2D extent, u64 frame,
                       bool reset) {
+        scheduler.DisturbVertexBindings(); // its replay binds a vertex buffer
         scheduler.Record([this, descriptors, &upscaler, extent, frame, reset](vk::CommandBuffer cmd) {
             if (upscaler.EvaluationFailed()) {
                 return;
@@ -529,6 +532,7 @@ public:
 
     void Record(Scheduler& scheduler, const void* descriptors, VkImage image,
                 const OcarinaUpscaler& upscaler, u64 frame, VkExtent2D extent) {
+        scheduler.DisturbVertexBindings(); // its replay binds a vertex buffer
         scheduler.Record([this, descriptors, image, &upscaler, frame, extent](vk::CommandBuffer cmd) {
             const auto output = ProbeBarrier(image, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                              VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -597,6 +601,7 @@ public:
 
     void Record(Scheduler& scheduler, const void* descriptors, VkImage output, VkExtent2D extent,
                 u32 control = 0) {
+        scheduler.DisturbVertexBindings(); // its replay binds a vertex buffer
         scheduler.Record([this, descriptors, output, extent, control](vk::CommandBuffer cmd) {
             const VkMemoryBarrier inputs{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,

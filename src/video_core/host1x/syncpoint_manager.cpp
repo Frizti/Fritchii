@@ -12,9 +12,67 @@
 #include "common/nx2_timeline.h"
 #include "video_core/host1x/syncpoint_manager.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace Tegra {
 
 namespace Host1x {
+
+namespace {
+/// FRITCHII_SYNCPT_UNLOCKED (boot, default 1; 0 = actions run under the lock, as before).
+bool ActionsUnlocked() {
+    static const bool unlocked = [] {
+        const char* value = std::getenv("FRITCHII_SYNCPT_UNLOCKED");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return unlocked;
+}
+} // namespace
+
+void SyncpointManager::RunDueBatches(std::unique_lock<std::mutex>& lk) {
+    // However the loop ends (an action may throw), the runner's state is cleared under the lock
+    // and the threads waiting on it are told.
+    struct EndRun {
+        SyncpointManager& manager;
+        std::unique_lock<std::mutex>& lk;
+        ~EndRun() {
+            if (!lk.owns_lock()) {
+                lk.lock();
+            }
+            manager.running_ids.clear();
+            manager.actions_running = false;
+            manager.actions_runner = {};
+            manager.running_cv.notify_all();
+        }
+    } end_run{*this, lk};
+    while (!due_batches.empty()) {
+        DueBatch batch = std::move(due_batches.front());
+        due_batches.pop_front();
+        running_ids.clear();
+        for (const RegisteredAction& action : batch.actions) {
+            running_ids.push_back(action.id);
+        }
+        lk.unlock();
+        for (RegisteredAction& action : batch.actions) {
+            action.action();
+        }
+        lk.lock();
+        running_ids.clear();
+        batch.wait_cv->notify_all();
+        running_cv.notify_all();
+    }
+}
+
+bool SyncpointManager::ActionDue(u64 id) const {
+    if (std::ranges::find(running_ids, id) != running_ids.end()) {
+        return true;
+    }
+    return std::ranges::any_of(due_batches, [id](const DueBatch& batch) {
+        return std::ranges::any_of(batch.actions,
+                                   [id](const RegisteredAction& action) { return action.id == id; });
+    });
+}
 
 SyncpointManager::ActionHandle SyncpointManager::RegisterAction(
     std::atomic<u32>& syncpoint, std::list<RegisteredAction>& action_storage, u32 expected_value,
@@ -24,8 +82,11 @@ SyncpointManager::ActionHandle SyncpointManager::RegisterAction(
         return {};
     }
 
-    std::scoped_lock lk(guard);
+    std::unique_lock lk(guard);
     if (syncpoint.load(std::memory_order_relaxed) >= expected_value) {
+        if (ActionsUnlocked()) {
+            lk.unlock();
+        }
         action();
         return {};
     }
@@ -44,7 +105,7 @@ void SyncpointManager::DeregisterAction(std::list<RegisteredAction>& action_stor
     if (handle == 0) {
         return;
     }
-    std::scoped_lock lk(guard);
+    std::unique_lock lk(guard);
 
     for (auto it = action_storage.begin(); it != action_storage.end(); it++) {
         if (it->id == handle) {
@@ -52,6 +113,17 @@ void SyncpointManager::DeregisterAction(std::list<RegisteredAction>& action_stor
             return;
         }
     }
+    // Taken by an increment (queued or running unlocked): return once it has run. On the
+    // runner (from inside an action) a queued one is dropped instead, as if this came first:
+    // waiting there would wait for itself.
+    if (actions_running && actions_runner == std::this_thread::get_id()) {
+        for (DueBatch& batch : due_batches) {
+            std::erase_if(batch.actions,
+                          [&handle](const RegisteredAction& action) { return action.id == handle; });
+        }
+        return;
+    }
+    running_cv.wait(lk, [&] { return !ActionDue(handle); });
 }
 
 void SyncpointManager::DeregisterGuestAction(u32 syncpoint_id, const ActionHandle& handle) {
@@ -132,6 +204,26 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
 
     if (!lk.owns_lock()) {
         lk.lock();
+    }
+    if (ActionsUnlocked()) {
+        auto end = action_storage.begin();
+        while (end != action_storage.end() && end->expected_value <= new_value) {
+            ++end;
+        }
+        if (end == action_storage.begin()) {
+            wait_cv.notify_all(); // nothing due: no action to run first
+            return;
+        }
+        DueBatch& batch = due_batches.emplace_back();
+        batch.actions.splice(batch.actions.end(), action_storage, action_storage.begin(), end);
+        batch.wait_cv = &wait_cv;
+        if (actions_running) {
+            return; // the runner runs them after the ones before, then wakes the waiters
+        }
+        actions_running = true;
+        actions_runner = std::this_thread::get_id();
+        RunDueBatches(lk);
+        return;
     }
     auto it = action_storage.begin();
     while (it != action_storage.end()) {

@@ -623,6 +623,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     } else {
         VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
         FritchiiOcclusionOffer::NoteCards(vk_device_records);
+        if (ApplyHardwareDefaults()) {
+            FritchiiOcclusionOffer::NoteCards(vk_device_records); // the setting it reads moved
+        }
     }
 
     // On macOS, SDL video would pump AppKit events alongside Qt and disrupt native menus.
@@ -907,6 +910,7 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
     const u32 stored = Settings::values.frizti_settings_revision.GetValue();
     const u32 applied = (std::min)(stored, record.revision);
     bool full = applied < Frizti::Revision;
+    bool full_asked = false; // the player clicked "Use recommended" (ApplyHardwareDefaults)
     if (start == FriztiStart::Keep) {
         full = false;
     } else if (start == FriztiStart::AskFirst) {
@@ -927,6 +931,7 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
             break;
         case Frizti::StartupApply::Ask:
             full = AskUseRecommendedSettings();
+            full_asked = full;
             if (full) {
                 const QString backup = FritchiiUi::BackupSettings();
                 LOG_INFO(Frontend,
@@ -948,6 +953,8 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
     const std::string console_mode_text = docked.Canonicalize();
 #endif
 
+    frizti_full_applied = full; // ApplyHardwareDefaults, once the cards are known
+    frizti_full_chosen = full && (start == FriztiStart::Silent || full_asked);
     auto changes = Frizti::ReconcileGlobal(tuned, record, full);
     bool save = false;
 #ifdef __linux__
@@ -1045,6 +1052,65 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
     if (!moved.empty()) {
         QTimer::singleShot(0, this, [this, moved] { ShowOotSettingsMoved(this, moved); });
     }
+}
+
+// Hardware-gated recommended settings, decided once the cards are known (MigrateFriztiSettings
+// runs before them). They belong to the tuned set: applied only when this start applied the tuned
+// set in full (frizti_full_applied: a fresh install, "Use recommended" in the settings prompt,
+// Reset to defaults), never after "Keep my settings", and never over a value the player chose
+// (the setting must still be its default). Today one: the occlusion speed-up's Full on AMD's
+// proprietary driver on a discrete GPU (Windows): one follower runs there at Full
+// (FRITCHII_ONEF_AMD), and its win over off comes from Full's pre-pass variants (RX 9070 XT eGPU:
+// Full against Standard -0.4 to -1.3 ms GPU, host queries 37k -> 14.5k a second; verify 234k
+// reports, 0 disagreements). A FRITCHII_OCCL_FLAG switch still wins at boot
+// (OcclFlag::ReadAtBoot).
+bool MainWindow::ApplyHardwareDefaults() {
+    [[maybe_unused]] const bool full = std::exchange(frizti_full_applied, false);
+    [[maybe_unused]] const bool chosen = std::exchange(frizti_full_chosen, false);
+#ifndef _WIN32
+    return false; // Full is a Windows AMD default, like the offer (NoteSession)
+#else
+    if (!full || vk_device_records.empty()) {
+        return false;
+    }
+    const size_t index = VkDeviceInfo::PickedIndex(
+        vk_device_records, Settings::values.vulkan_device.GetValue(true),
+        Settings::values.vulkan_device_name.GetValue(true));
+    if (index >= vk_device_records.size()) {
+        return false;
+    }
+    const VkDeviceInfo::Record& card = vk_device_records[index];
+    if (!card.amd_proprietary || card.device_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        return false;
+    }
+    const std::string card_name = card.device_name.empty() ? card.name : card.device_name;
+    auto& setting = Settings::values.occlusion_speedup;
+    if (setting.GetValue() != Settings::OcclusionSpeedup::Standard) {
+        LOG_INFO(Frontend, "Recommended settings: occlusion speed-up left at {} on {} (not the "
+                           "default, the player's choice)",
+                 setting.ToStringGlobal(), card_name);
+        return false;
+    }
+    // The offer's mark is an answer: Full was set (and maybe turned back to Standard by the
+    // player) or offered here before. A start that applies the set only because a config looked
+    // new (qt-config.ini's revision older than frizti.ini's, e.g. after an older build wrote it)
+    // leaves that Standard alone; "Use recommended" and Reset to defaults still set Full
+    // (review R1 should-fix 5).
+    if (!chosen && FritchiiOcclusionOffer::Answered()) {
+        LOG_INFO(Frontend, "Recommended settings: occlusion speed-up left at Standard on {} (the "
+                           "offer was answered before: {})",
+                 card_name, UISettings::values.fritchii_occl_offer.GetValue());
+        return false;
+    }
+    setting.SetValue(Settings::OcclusionSpeedup::Full);
+    // The one-time offer has nothing left to ask.
+    UISettings::values.fritchii_occl_offer.SetValue("set by the recommended settings");
+    config->SaveAllValues();
+    LOG_INFO(Frontend, "Recommended settings: occlusion speed-up Full on {} (AMD's proprietary "
+                       "driver, discrete GPU)",
+             card_name);
+    return true;
+#endif
 }
 
 void MainWindow::AskOotFrameRate() {
@@ -4341,6 +4407,9 @@ void MainWindow::OnConfigure() {
             // The tuned settings now, not at the next start (the revision went back to 0).
             Settings::values.players.GetValue(true) = old_players;
             MigrateFriztiSettings();
+            if (ApplyHardwareDefaults()) {
+                FritchiiOcclusionOffer::NoteCards(vk_device_records);
+            }
             config->SaveAllValues();
         } else if (fritchii) {
             // A restored set stays as it is, and the next start does not ask about it again.

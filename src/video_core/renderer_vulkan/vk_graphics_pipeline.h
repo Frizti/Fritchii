@@ -488,6 +488,23 @@ public:
 
     // FRITCHII_STAMP_SKIP_BEGIN: left out of the Preparing shaders stamp (CMakeModules/Nx2ShaderStamp.cmake).
     // Only what can't change a pipeline the driver compiles belongs here.
+    /// FRITCHII_PREP_OCCL_VARIANTS: on a pipeline made from the kept infos and SPIR-V
+    /// (CreatePrecompiledGraphicsPipeline), the index it came from (a PrecompiledKept::Index)
+    /// and its record there (a PrecompiledKept::Record, alive as long as the index): its
+    /// occlusion flag variants are made from them (PipelineCache::MakeKeptOcclVariant).
+    /// kept_occl_tried: bit per kind looked up.
+    std::shared_ptr<const void> kept_index;
+    const void* kept_record{};
+    u8 kept_occl_tried{};
+    /// FRITCHII_PREP_OCCL_VARIANTS: a pipeline built another way (the disk cache's prebuild, a
+    /// translation) whose key the kept index holds: its record looked up at its first variant
+    /// request (PipelineCache::LookUpKeptParent; the reads on the occlusion lane), the record's
+    /// infos kept here (a KeptParentLookup, vk_pipeline_cache.cpp). kept_lookup_state: 0 not
+    /// looked up, 1 reading, 2 done (bound to a record, or none fits). kept_path: how this
+    /// pipeline was built, for the prepared variants' counter (0 other, 1 fast path, 2 disk cache).
+    std::shared_ptr<void> kept_lookup;
+    u8 kept_lookup_state{};
+    u8 kept_path{};
     /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): this pipeline's flag variant (the same key with
     /// the host flag pixel program), owned here and never in the cache; on a flag variant, the
     /// pipeline it was made from. occl_flag_state: 0 not tried, 1 made, 2 refused for good.
@@ -509,13 +526,39 @@ public:
     /// variant built from this key with every attachment's write mask and blend cleared.
     std::unique_ptr<GraphicsPipeline> occl_flag_nocolour;
     u8 occl_flag_nocolour_state{};
+    /// FRITCHII_OCCL_FLAG: the discard pre-pass for colour draws without dynamic colour write
+    /// masks: the pre-pass variant built from this key with every attachment's writes off.
+    std::unique_ptr<GraphicsPipeline> occl_flag_prepass_nocolour;
+    u8 occl_flag_prepass_nocolour_state{};
     /// On a flag variant, its kind: 1 host flag program, 2 colour, 3 pre-pass, 4 host flag
-    /// program with colour writes off in its key.
+    /// program with colour writes off in its key, 5 pre-pass with colour writes off in its key.
     static constexpr u8 OCCL_KIND_PREPASS = 3;
+    static constexpr u8 OCCL_KIND_PREPASS_NOCOLOUR = 5;
+    /// The stages its push constant range covers (what every push to its layout names).
+    [[nodiscard]] VkShaderStageFlags PushStageFlags() const noexcept {
+        return mesh_emulation ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT
+               : IsMeshPipeline()
+                   ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                         VK_SHADER_STAGE_MESH_BIT_EXT
+                   : VK_SHADER_STAGE_ALL_GRAPHICS;
+    }
+    /// Built from graphics pipeline libraries (its stages compiled apart from each other).
+    [[nodiscard]] bool UsesLibraries() const noexcept {
+        return library_cache != nullptr;
+    }
+    /// A discard pre-pass variant (drawn first, then the draw itself with its pipeline).
+    [[nodiscard]] bool IsOcclDiscardPrepass() const noexcept {
+        return occl_flag_kind == OCCL_KIND_PREPASS || occl_flag_kind == OCCL_KIND_PREPASS_NOCOLOUR;
+    }
     u8 occl_flag_kind{};
     /// On a flag variant: 1 its translation's descriptors equal its parent's (the parent can
     /// bind them for a real draw after a pre-pass), 2 they differ.
     u8 occl_same_descriptors{};
+    /// FRITCHII_OCCL_FLAG_PERSIST, as a parent (GPU thread, computed once; 0 not yet): the hash
+    /// of its descriptor lists (PipelineCache's OcclDescriptorSignature), and its refusal memo
+    /// hash (its key without the driver fields, that signature and this build).
+    u64 occl_persist_signature{};
+    u64 occl_persist_memo{};
     /// On a flag variant: its last Configure's rescaling words and render area, which the
     /// parent pushes again when it is bound for the real draw after a pre-pass
     /// (ConfigureAfterOcclPrepass).

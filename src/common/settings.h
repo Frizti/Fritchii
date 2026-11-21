@@ -677,9 +677,10 @@ struct Values {
                                                           &oot_high_refresh};
     // Ocarina of Time's occlusion tests without host queries (video_core/fritchii_occl_flag.h):
     // Standard is the core (FRITCHII_OCCL_FLAG=3), Full adds the colour variants and pre-passes
-    // (=9; offered once to AMD players, fritchii/occlusion_offer.cpp). Acts only where one
-    // follower is off (AMD's Windows driver by default). FRITCHII_OCCL_FLAG, when a switch sets
-    // it, wins. Global only; takes effect when the game starts.
+    // (=9; offered once to AMD players, fritchii/occlusion_offer.cpp). Acts where one follower
+    // is off, and with one follower on where FRITCHII_ONEF_OCCL is on (by default AMD's
+    // proprietary driver on a discrete GPU). FRITCHII_OCCL_FLAG, when a switch sets it, wins.
+    // Global only; takes effect when the game starts.
     Setting<OcclusionSpeedup> occlusion_speedup{linkage, OcclusionSpeedup::Standard,
                                                 "occlusion_speedup", Category::RendererAdvanced};
     // Which revision of the Frizti tuned settings (common/frizti_settings.h) this config has had

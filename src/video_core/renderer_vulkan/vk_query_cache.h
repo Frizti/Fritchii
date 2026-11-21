@@ -65,6 +65,8 @@ public:
     void OcclPrepassPause();
     void OcclPrepassResume();
     bool OcclFlagReady();
+    /// The flag area exists (read only: any thread; OcclFlagReady makes it, on R).
+    [[nodiscard]] bool OcclFlagAreaExists() const;
     void SetNextFlagDraw(bool flag);
 
     void EndHostConditionalRendering();

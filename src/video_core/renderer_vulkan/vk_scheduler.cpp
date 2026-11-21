@@ -1206,6 +1206,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     }
     EndPendingOperations();
     InvalidateState();
+    ++vertex_epoch; // a new command buffer: no vertex buffer is bound in it
 
     // FRITCHII_MEMSTAGE_TICKS: everything this tick holds is recorded; the memory stage
     // publishes which packet numbers it covers (vk_mem_stage.cpp, "Packet ticks").

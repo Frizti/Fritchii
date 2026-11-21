@@ -101,6 +101,7 @@ struct TranslationRecord;
 
 namespace PrecompiledKept {
 class Index;
+class PageCacheWarmer;
 struct Record;
 } // namespace PrecompiledKept
 
@@ -454,6 +455,195 @@ private:
     /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
     u64 occl_made_frame{~u64{0}};
 
+    /// FRITCHII_PREP_OCCL_VARIANTS: the occlusion flag variant kinds (bit per kind 1-5) a
+    /// pipeline can need, from its key and programs' infos alone (no draw): what the preparation
+    /// builds and keeps for it. Only kinds of OcclPrepMask (the device's; play and hints narrow them).
+    [[nodiscard]] u8 OcclPrepKinds(const GraphicsPipelineCacheKey& key,
+                                   std::span<const Shader::Info> infos,
+                                   bool emulated_mesh) const;
+    /// The kinds the preparation makes on this device at all (bit per kind; 0 none).
+    [[nodiscard]] u8 OcclPrepMask() const;
+    /// FRITCHII_PREP_OCCL_VARIANTS: `full`'s `kind` variant built from the kept infos and SPIR-V
+    /// the preparation made for it, or for kinds 1 and 4 from full's own record (full came from
+    /// the kept file), on the occlusion lane; null when there is none, it does not fit full, or
+    /// this frame's budget is spent (`later`).
+    std::unique_ptr<GraphicsPipeline> MakeKeptOcclVariant(GraphicsPipeline& full, u8 kind,
+                                                          bool& later);
+    /// FRITCHII_PREP_OCCL_VARIANTS: binds `full`, built by a path other than the fast path, to
+    /// its record in the kept index (one whose infos describe full's descriptors exactly, with
+    /// full's descriptor signature), so its prepared variants are found as a fast path
+    /// pipeline's. The record infos are read on the occlusion lane, never here. 0: none (or no
+    /// index yet), 1: reading (no variant this draw), 2: bound.
+    u8 LookUpKeptParent(GraphicsPipeline& full);
+    /// Kept variants tried a frame (fitting or not), and this frame's count.
+    static constexpr u32 OcclKeptPerFrame = 16;
+    u64 occl_kept_frame{~u64{0}};
+    u32 occl_kept_in_frame{};
+
+    /// FRITCHII_OCCL_FLAG: hangs a made `kind` variant on `full` (its state 1), or sets the
+    /// state to 2 when `made` is null or (pre-pass kinds) its descriptors differ from full's;
+    /// a refused one is retired (RetireTranslatedPipeline), never destroyed on this thread. The
+    /// variant, or null. Shared by the synchronous and the asynchronous path.
+    /// FRITCHII_OCCL_FLAG_PERSIST: `built_key` (the key it was built as) is given for a variant
+    /// made from a draw's state (not one prebuilt from the file, checked before): attached, it is
+    /// recorded in the occlusion file with `envs` (what it was translated from); a pre-pass
+    /// variant refused for its descriptors is noted in the refusal memo.
+    using OcclEnvs = std::array<VideoCommon::GraphicsEnvironment, Maxwell::MaxShaderProgram>;
+    GraphicsPipeline* AttachOcclFlag(GraphicsPipeline& full, u8 kind,
+                                     std::unique_ptr<GraphicsPipeline> made,
+                                     std::shared_ptr<const OcclEnvs> envs = nullptr,
+                                     const GraphicsPipelineCacheKey* built_key = nullptr,
+                                     bool descriptors_checked = false);
+    /// FRITCHII_OCCL_FLAG_ASYNC: queues `key`'s translation on occl_queue from snapshot
+    /// environments of the current draw (`kind` 1-5 a flag variant of `parent_key`, 0 a lean
+    /// sibling). Later when this frame's budget is spent or the queue is full (try again at a
+    /// later draw); Failed when the environments could not be read (as a failed translation).
+    enum class OcclEnqueue : u8 { Queued, Later, Failed };
+    OcclEnqueue EnqueueOcclJob(const GraphicsPipelineCacheKey& key, u8 kind,
+                               const GraphicsPipelineCacheKey& parent_key);
+    /// FRITCHII_OCCL_FLAG_ASYNC, between frames (TickFrame): attaches the translated variants
+    /// and siblings, retires the rest, sweeps wedged jobs.
+    void TickOcclVariants();
+    void AdoptOcclJob(std::unique_ptr<TranslationJob> job);
+    /// A finished lean sibling job: its pipeline when usable. Null when it made none (the
+    /// parent marked Failed, as the synchronous path's failure) or when it was unusable (a stale
+    /// texture descriptor, a guarded read that gave up: counted, and after MaxTranslateFailures
+    /// the sibling is made on the lookup thread instead).
+    std::unique_ptr<GraphicsPipeline> AdoptOcclSibling(std::unique_ptr<TranslationJob> job);
+    /// A draw whose own key is a lean sibling still on occl_queue (its entry empty): adopts the
+    /// finished job; else skips the draw (`pending`) when it may be skipped with the
+    /// asynchronous shaders on; else builds the key here from this draw, as a new key.
+    std::unique_ptr<GraphicsPipeline> AdoptOcclSiblingForDraw(bool& pending);
+    /// FRITCHII_OCCL_FLAG_ASYNC: the parent's state for variant `kind` (1-5).
+    static u8& OcclFlagStateOf(GraphicsPipeline& full, u8 kind);
+    /// FRITCHII_OCCL_FLAG_ASYNC_PER_FRAME: enqueues allowed a frame, and this frame's count.
+    u32 occl_async_per_frame{4};
+    u64 occl_enqueue_frame{~u64{0}};
+    u32 occl_enqueued_in_frame{};
+    /// FRITCHII_OCCL_FLAG_ASYNC: a parent's unusable translations by kind (0 sibling, 1-5
+    /// variants). Tied to the parent object: one made again under the same key starts afresh.
+    /// A kind's counts are cleared when one of its translations is used; the record goes when
+    /// its parent leaves graphics_cache (TickOcclVariants, every 60 frames).
+    struct OcclFailures {
+        const GraphicsPipeline* parent{};
+        std::array<u8, 6> stale{}; ///< stale texture descriptors, guarded reads that gave up
+        std::array<u8, 6> swept{}; ///< translations still running after TranslateSweepAge
+        u8 sync_only{}; ///< bit per kind: made on the lookup thread (the synchronous path)
+    };
+    std::unordered_map<GraphicsPipelineCacheKey, OcclFailures> occl_failures;
+    /// The record of `parent_key`'s pipeline `parent` (a fresh one for another object).
+    OcclFailures& OcclFailuresOf(const GraphicsPipelineCacheKey& parent_key,
+                                 const GraphicsPipeline& parent);
+    /// A translation of `kind` was used: its counts are forgotten.
+    void ClearOcclFailures(const GraphicsPipelineCacheKey& parent_key,
+                           const GraphicsPipeline& parent, u8 kind);
+    /// Whether `full`'s `kind` is made on the lookup thread (it kept going stale off it).
+    [[nodiscard]] bool OcclSyncOnly(const GraphicsPipeline& full, u8 kind) const;
+    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS: whether the build on this thread is a flag variant
+    /// whose driver compile goes to occl_compile_workers (never a cache entry, never waited on).
+    [[nodiscard]] bool OcclLaneBuild() const;
+
+    /// FRITCHII_OCCL_FLAG_PERSIST (boot, default 1; 0 = no file read or written): occlusion
+    /// variants and lean siblings used in a session are recorded in vulkan-frizti-occl beside
+    /// the disk cache (kind, the parent's key and descriptor signature, the key built, the
+    /// environments serialized as the disk cache serializes them), apart from the disk cache and
+    /// its stamps. The next boot queues them on occl_queue (built from the records, as the disk
+    /// cache's prebuild builds): when a draw asks for one, and in the background while few jobs
+    /// are in flight once their parent is in graphics_cache. One is attached only to a parent
+    /// of the same descriptor signature as when it was recorded. Pre-pass variants refused for
+    /// their descriptors in two sessions of this build are refused at once (the refusal memo).
+    /// Recording never affects rendering.
+    bool occl_persist{};
+    /// occl_queue's threads: background (prebuilt) jobs stop at one more than this in flight.
+    size_t occl_queue_threads{};
+    /// One variant record of the occlusion file (the last one of its parent key and kind): its
+    /// payload is read again from the file on the translation thread (TranslationJob::occl_file).
+    struct OcclDiskRecord {
+        u8 kind{};
+        bool done{}; ///< Queued, or no longer wanted (a draw made, refused or queued it)
+        u32 num_envs{};
+        u32 size{};   ///< Payload bytes
+        u64 offset{}; ///< Of the payload in the file
+        u64 hash{};   ///< CityHash64 of the payload
+        u64 parent_signature{};
+        GraphicsPipelineCacheKey parent_key{};
+        GraphicsPipelineCacheKey key{};
+    };
+    /// What LoadDiskResources read from the file, handed to the GPU thread (TickOcclPersist).
+    struct OcclPersistLoad {
+        u64 generation{}; ///< occl_persist_generation of the load that read it
+        std::shared_ptr<const std::filesystem::path> path;
+        std::vector<OcclDiskRecord> records;
+        /// Memo hash (OcclMemoHashOf) -> bit per pre-pass kind refused (OcclMemoSessions)
+        std::unordered_map<u64, u8> memo;
+        size_t memo_records{};
+    };
+    /// Reads, repairs and compacts the occlusion file (on the loader thread, once no append of
+    /// an earlier load is pending).
+    std::unique_ptr<OcclPersistLoad> ReadOcclPersistFile(const std::filesystem::path& path);
+    std::mutex occl_persist_mutex;
+    std::unique_ptr<OcclPersistLoad> occl_persist_incoming; ///< Under occl_persist_mutex
+    std::atomic<bool> occl_persist_ready{};
+    /// Bumped by each LoadDiskResources: the GPU thread writes records only while the load it
+    /// took over (occl_persist_taken) is the current one, so a new title's or program's
+    /// variants never go to the previous one's file.
+    std::atomic<u64> occl_persist_generation{};
+    /// Appends queued on serialization_thread and not done yet: a later load waits for them
+    /// (only them) before it reads, repairs or compacts a file.
+    std::shared_ptr<std::atomic<u32>> occl_appends = std::make_shared<std::atomic<u32>>(0U);
+    // GPU thread (the lookup thread) from here on.
+    /// The file records go to; null until a boot's read was handed over.
+    std::shared_ptr<const std::filesystem::path> occl_persist_path;
+    u64 occl_persist_taken{};
+    /// The records read (one per parent key and kind), by index: occl_disk_index finds a
+    /// parent's (index + 1 per kind), occl_disk_pending lists those not queued yet (a bounded
+    /// part of it looked at every 15 frames, and each frame while some wait for room).
+    std::vector<OcclDiskRecord> occl_disk_records;
+    std::unordered_map<GraphicsPipelineCacheKey, std::array<u32, 6>> occl_disk_index;
+    std::vector<u32> occl_disk_pending;
+    size_t occl_disk_scan_next{};
+    bool occl_disk_backlog{};
+    /// (parent key, kind bit) recorded or read: written once, again after its record failed.
+    std::unordered_map<GraphicsPipelineCacheKey, u8> occl_recorded;
+    /// The refusal memo: memo hash of a parent -> bit per pre-pass kind refused at once; and
+    /// the refusals written this session (one per parent and kind).
+    std::unordered_map<u64, u8> occl_refused_memo;
+    std::unordered_map<u64, u8> occl_refusals_written;
+    /// The synchronous path's environments of the variant it is making (CreateGraphicsPipeline
+    /// copies them here when set), for its record.
+    OcclEnvs* occl_capture_envs{};
+    /// TickFrame: takes over a finished read and queues the records that can be built.
+    void TickOcclPersist();
+    /// The pending records that could be queued now (parent built, kind wanted, not made or
+    /// queued yet); with `enqueue` they are queued (up to the per-frame and in-flight caps) and
+    /// dropped from the list, as are those no longer needed.
+    size_t ScanOcclDiskPending(bool enqueue);
+    /// Queues record `index` on occl_queue (state 3, or a sibling's empty entry): Queued, or
+    /// Later when the queue is full or has the key.
+    OcclEnqueue EnqueueOcclPrebuilt(u32 index, GraphicsPipeline& parent);
+    /// A draw asks for `parent`'s variant `kind` (0 its lean sibling): its record is queued in
+    /// place of a snapshot when the file has one not queued yet. Queued, Later (queue full), or
+    /// Failed (no such record: the draw's own snapshot then).
+    OcclEnqueue EnqueueOcclRecordFor(GraphicsPipeline& parent, u8 kind);
+    /// Whether variant `kind` (0 a lean sibling) can be wanted by a draw at the current
+    /// FRITCHII_OCCL_FLAG / FRITCHII_OCCL_LEAN level and one-follower state.
+    [[nodiscard]] bool OcclKindWanted(u8 kind) const;
+    /// Whether records are written now (a file taken over by the current load).
+    [[nodiscard]] bool OcclPersistRecording() const;
+    /// Appends the record of variant `made` (built as `key` from a draw's state; once per parent
+    /// key and kind) on the serialization thread: under the parent's descriptor signature when it
+    /// fits the parent, else (kinds 1-5) under its own (the shape of a parent it would fit next
+    /// run). Every outcome is counted for the 10 s Occlusion flags line.
+    void RecordOcclVariant(GraphicsPipeline& parent, u8 kind, const GraphicsPipeline& made,
+                           const GraphicsPipelineCacheKey& key,
+                           std::shared_ptr<const OcclEnvs> envs);
+    /// Notes a pre-pass variant refused for its descriptors (once per parent and kind a session).
+    void RecordOcclRefusal(GraphicsPipeline& parent, u8 kind);
+    [[nodiscard]] bool OcclMemoRefused(GraphicsPipeline& parent, u8 kind);
+    /// A prebuilt record of `parent_key`'s `kind` did not build or was not usable: the variant a
+    /// draw makes instead is recorded (the last record of a key is the one read).
+    void ForgetOcclRecord(const GraphicsPipelineCacheKey& parent_key, u8 kind);
+
     /// The pointer slots kept for the current key (evicted_pointer_slots), null when none
     [[nodiscard]] const VideoCommon::EvictedPointerSlots::Slots* KeptPointers() const;
     /// Answers the kept slots of each program as storage buffer pointers (KeepStoragePointers)
@@ -551,12 +741,16 @@ private:
     /// What a kept file must have been written for, beyond the prepared stamp (which holds the
     /// release, driver and GPU): the cache version, the settings SPIR-V depends on, the library
     /// split, the OoT visual workaround and canonical keys. Not the build: CheckKeptSample.
-    [[nodiscard]] std::string KeptStamp(const std::string& prepared_stamp) const;
+    /// `variants`: the file holds occlusion flag variants (FRITCHII_PREP_OCCL_VARIANTS).
+    [[nodiscard]] std::string KeptStamp(const std::string& prepared_stamp, bool variants) const;
 
     /// Set by LoadKept; read by the GPU thread when a new key is looked up.
     mutable std::mutex kept_mutex;
     std::shared_ptr<const PrecompiledKept::Index> kept_index;
     std::atomic<bool> kept_available{};
+    /// FRITCHII_PREP_FASTPATH_IO: reads the kept and precompiled files into the OS file cache
+    /// in the background (started by LoadKept, replaced under kept_mutex, stopped at exit).
+    std::unique_ptr<PrecompiledKept::PageCacheWarmer> kept_warmer;
     /// GPU thread: keys whose precompiled build failed or whose audit differed.
     std::unordered_set<u64> precompiled_rejected;
     /// GPU thread: precompiled graphics pipelines not built yet (checked by TickFrame).
@@ -573,11 +767,24 @@ private:
         u32 audit_differ{};
         std::chrono::steady_clock::duration gpu_time{};
         std::chrono::steady_clock::duration gpu_worst{};
+        /// gpu_time split: positional reads of the kept and precompiled files, the checks
+        /// (environments, infos decoded, recorded answers compared) and the pipeline objects.
+        std::chrono::steady_clock::duration read_time{};
+        std::chrono::steady_clock::duration check_time{};
+        std::chrono::steady_clock::duration create_time{};
+        /// GPU thread time of checks that sent a key back (not in gpu_time), and its reads.
+        std::chrono::steady_clock::duration miss_time{};
+        std::chrono::steady_clock::duration miss_read_time{};
         std::vector<std::pair<const char*, u32>> misses; ///< By reason (string literals)
         u64 bytes_at_window{};
         std::chrono::steady_clock::time_point window{};
     } precompiled_stats;
     void NotePrecompiledMiss(const char* reason);
+    /// The fast path's GPU thread time of one key, for the 10 s line and the frame tally:
+    /// `checks` (file reads included, `read_ns` of them) and `create`, the pipeline object.
+    /// `created` false: a miss.
+    void NoteFastPathTime(std::chrono::steady_clock::duration checks, u64 read_ns,
+                          std::chrono::steady_clock::duration create, bool created);
 
     /// Builds a disk-cached graphics pipeline from the first of its records (newest first) that
     /// loads. When none does, the GPU thread's build of it is stored again.
@@ -680,9 +887,11 @@ private:
     /// the guest's shaders and find the driver's compiled code. Runs once per precompiled file,
     /// driver and release (or again when `force`). Fritchii runs it on precompile_thread,
     /// so `callback` (the loading screen in the ported feature) is empty and progress goes to ShaderNotify.
+    /// `title_id`: the recipe whose occlusion variant hints apply (FRITCHII_PREP_OCCL_VARIANTS).
     void PreparePrecompiled(const std::filesystem::path& base_dir, std::stop_token stop_loading,
                             const VideoCore::DiskResourceLoadCallback& callback,
-                            const std::filesystem::path& file = {}, bool force = false);
+                            const std::filesystem::path& file = {}, bool force = false,
+                            u64 title_id = 0);
     /// A graphics key read from the precompiled file, as draws key it on this device: its driver
     /// fields rewritten, canonical with EDEN_NX2_CANONICAL_KEYS=1.
     void RecordedKeyForThisDevice(GraphicsPipelineCacheKey& key) const noexcept;
@@ -773,6 +982,10 @@ private:
     /// prebuild would hold the evictions behind it there, as that deque is freed from the front.
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> retired_translations; ///< (tick, pipeline)
     void RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
+    /// Before an evicted pipeline is destroyed: its occlusion flag variants not built yet go to
+    /// retired_translations, so their queued compiles never run on the GPU thread.
+    void RetireUnbuiltOcclVariants(GraphicsPipeline& parent);
+    u64 occl_variants_retired_unbuilt{}; ///< This session, GPU thread
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
     /// FRITCHII_RAM_PREBUILT_KEEP: key hashes of boot builds destroyed before any draw used them,
     /// and how many went that way / were asked for again (translated anew) this session.
@@ -848,6 +1061,24 @@ private:
     std::atomic_bool save_again{};
 
     Common::ThreadWorker workers;
+    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS (default with FRITCHII_OCCL_FLAG_ASYNC=1: 1 on AMD's
+    /// proprietary driver, elsewhere clamp((logical processors - 1) * 2 / 7, 1, 4) within
+    /// CapLegacyAmdBuildThreads; else 0; 0 none): the driver compiles of occlusion flag
+    /// variants, at the lowest priority, apart from the shared workers. Lean siblings (cache
+    /// entries draws may wait on) stay on those. Made by EnsureOcclLanes; read through
+    /// OcclCompileLane (preparation threads read it too).
+    std::unique_ptr<Common::ThreadWorker> occl_compile_workers;
+    /// The driver compiles of occlusion flag variants made in play (on the lane or the shared
+    /// workers) and the lane's kept-record lookups: cancelled at the start of the teardown, so
+    /// a backlog is given up instead of compiled before the caches are saved. Variants are never
+    /// cache entries, so nothing is lost. Shared with the builds (they may outlive the cache's
+    /// members in a worker's queue).
+    std::shared_ptr<PipelineBuild::CancelSource> occl_build_cancel{
+        std::make_shared<PipelineBuild::CancelSource>()};
+    std::atomic<Common::ThreadWorker*> occl_compile_live{};
+    [[nodiscard]] Common::ThreadWorker* OcclCompileLane() const {
+        return occl_compile_live.load(std::memory_order_acquire);
+    }
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
 
@@ -875,6 +1106,27 @@ private:
     /// EDEN_NX2_ASYNC_TRANSLATE=1/2: graphics pipelines translated off the GPU thread. Null with
     /// the switch off. Reset first in the destructor (its threads build with the members above).
     std::unique_ptr<TranslateQueue> translate_queue;
+    /// FRITCHII_OCCL_FLAG_ASYNC (default 1): occlusion flag variants and lean siblings
+    /// translated on threads of their own instead of on the lookup thread. Null with the switch
+    /// 0 (the synchronous path), or when neither feature can run this session, or until
+    /// EnsureOcclLanes makes it (FRITCHII_OCCL_FLAG_ASYNC_THREADS threads, default as the compile
+    /// lane's). Read through OcclQueue. Reset first in the destructor, with translate_queue.
+    std::unique_ptr<TranslateQueue> occl_queue;
+    std::atomic<TranslateQueue*> occl_queue_live{};
+    [[nodiscard]] TranslateQueue* OcclQueue() const {
+        return occl_queue_live.load(std::memory_order_acquire);
+    }
+    /// The occlusion threads (occl_queue, occl_compile_workers): none planned, planned but not
+    /// made (one follower decides whether a variant is ever asked for), made.
+    static constexpr u8 OcclLanesNone = 0;
+    static constexpr u8 OcclLanesPending = 1;
+    static constexpr u8 OcclLanesMade = 2;
+    std::atomic<u8> occl_lanes_state{OcclLanesNone};
+    std::once_flag occl_lanes_once;
+    /// FRITCHII_OCCL_FLAG_COMPILE_THREADS as decided at construction (0 none).
+    int occl_lane_compile_threads{};
+    /// Makes the planned occlusion threads once (thread safe); `why` logged when not null.
+    void EnsureOcclLanes(const char* why);
     /// Keys whose translations kept failing their checks or were swept: built on the GPU thread.
     std::unordered_set<GraphicsPipelineCacheKey> translate_sync_only;
     /// Unusable translations per key (a stale texture descriptor, a guarded read that gave up).

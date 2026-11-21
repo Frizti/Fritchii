@@ -263,6 +263,44 @@ TEST_CASE("HostMemory: Partial sparse middle unmap and check bindings", "[common
 }
 
 #ifdef _WIN32
+// A partial Unmap that splits a view maps the kept parts again: their protections (the write
+// traps) must survive it (ported test; credits in the commit message).
+TEST_CASE("HostMemory: Partial unmap preserves the protections of both kept pieces", "[common]") {
+    constexpr size_t Page = 0x1000;
+    constexpr size_t VirtualOffset = 0x80000;
+    constexpr size_t BackingOffset = 0x20000;
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    REQUIRE(mem.VirtualBasePointer() != nullptr);
+    mem.Map(VirtualOffset, BackingOffset, 6 * Page, PERMS, HEAP);
+    u8* const view = mem.VirtualBasePointer() + VirtualOffset;
+    const auto protection = [view](size_t page) {
+        MEMORY_BASIC_INFORMATION info{};
+        REQUIRE(VirtualQuery(view + page * Page, &info, sizeof(info)) == sizeof(info));
+        return info.Protect;
+    };
+
+    view[5 * Page] = 0x15;
+    mem.Protect(VirtualOffset, Page, Common::MemoryPermission::Read);
+    mem.Protect(VirtualOffset + 4 * Page, Page, Common::MemoryPermission{});
+    mem.Protect(VirtualOffset + 5 * Page, Page, Common::MemoryPermission::Read);
+    REQUIRE(protection(0) == PAGE_READONLY);
+    REQUIRE(protection(4) == PAGE_NOACCESS);
+
+    mem.Unmap(VirtualOffset + 2 * Page, 2 * Page, HEAP);
+
+    REQUIRE(protection(0) == PAGE_READONLY);
+    REQUIRE(protection(1) == PAGE_READWRITE);
+    REQUIRE(protection(4) == PAGE_NOACCESS);
+    REQUIRE(protection(5) == PAGE_READONLY);
+    REQUIRE(view[5 * Page] == 0x15);
+
+    mem.Protect(VirtualOffset + 4 * Page, 2 * Page, PERMS);
+    REQUIRE(protection(4) == PAGE_READWRITE);
+    REQUIRE(protection(5) == PAGE_READWRITE);
+    view[4 * Page] = 0x24;
+    REQUIRE(mem.BackingBasePointer()[BackingOffset + 4 * Page] == 0x24);
+}
+
 TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
     constexpr size_t Page = 0x1000;
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);

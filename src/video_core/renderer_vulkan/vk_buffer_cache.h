@@ -294,6 +294,11 @@ public:
 
     void BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bindings);
 
+    /// A vertex stream left without a binding: the player forgets the buffer it remembers for
+    /// it, so EnsureVertexBindings never binds it again in a new command buffer (the buffer
+    /// cache may have deleted it by then).
+    void ForgetVertexBinding(u32 index);
+
     void BindTransformFeedbackBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size);
 
     void BindTransformFeedbackBuffers(VideoCommon::HostBindings<Buffer>& bindings);

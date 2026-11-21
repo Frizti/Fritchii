@@ -56,7 +56,7 @@
 // Only this declaration: one_follower.h pulls in nvdata.h, whose enum names (BadValue, ...) the
 // X11 headers vulkan.h includes on Linux define as macros.
 namespace VideoCommon::OneFollower {
-void NoteAmdProprietaryDriver() noexcept;
+void NoteAmdProprietaryDriver(bool integrated) noexcept;
 }
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
@@ -719,7 +719,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (driver_id == VK_DRIVER_ID_AMD_PROPRIETARY) {
         // The one follower's AMD safe default reads it at the split's start (later, on the GPU
         // thread).
-        VideoCommon::OneFollower::NoteAmdProprietaryDriver();
+        VideoCommon::OneFollower::NoteAmdProprietaryDriver(
+            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
     }
 
     const bool is_nvidia = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
@@ -1688,7 +1689,19 @@ void Device::ReportLoss(std::source_location where) const {
     }
     // The report touches the driver, the log and every thread's stack, on a process in an unknown
     // state: whatever gets stuck, the process still ends and the player gets no frozen window.
-    Common::ShutdownWatch::EndProcessAfter(std::chrono::seconds{nsight_aftermath_tracker ? 50 : 35});
+    // FRITCHII_RGD_WAIT_S (default 0, at most 600): seconds the process stays up after the report
+    // so a Radeon GPU Detective capture can finish its dump (the end-process watch waits that
+    // much longer too).
+    static const u32 rgd_wait_s = [] {
+        const char* const value = std::getenv("FRITCHII_RGD_WAIT_S");
+        const long parsed = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+        return static_cast<u32>(std::clamp<long>(parsed, 0, 600));
+    }();
+    Common::ShutdownWatch::EndProcessAfter(
+        std::chrono::seconds{(nsight_aftermath_tracker ? 50 : 35) + rgd_wait_s});
+    // FRITCHII_VA_REPORT: the destroys of the last 60 s (also to destroy_report.txt), first, with
+    // the watch armed: a stuck dump still ends the process.
+    vk::DumpRecentDestroys(60000);
     u64 heap_size{};
     u64 heap_usage{};
     u64 heap_budget{};
@@ -1710,6 +1723,12 @@ void Device::ReportLoss(std::source_location where) const {
     if (nsight_aftermath_tracker) {
         // Give Nsight Aftermath time to write its dump.
         std::this_thread::sleep_for(std::chrono::seconds{15});
+    }
+    if (rgd_wait_s != 0) {
+        LOG_CRITICAL(Render_Vulkan,
+                     "Device loss: waiting {} s for a GPU crash dump (FRITCHII_RGD_WAIT_S)",
+                     rgd_wait_s);
+        std::this_thread::sleep_for(std::chrono::seconds{rgd_wait_s});
     }
     static constexpr const char* FatalError = "the GPU driver lost the Vulkan device";
 #ifdef _WIN32
@@ -3314,7 +3333,6 @@ std::optional<u32> Device::LinkHogFamily() const {
 bool Device::PrefersDescriptorSets() const {
     static const bool prefers = [this] {
         const char* const value = std::getenv("FRITCHII_DESCRIPTOR_SETS");
-        const int mode = value != nullptr ? std::atoi(value) : 0;
         VkDeviceSize window = 0;
         const auto memory = physical.GetMemoryProperties().memoryProperties;
         for (u32 type = 0; type < memory.memoryTypeCount; ++type) {
@@ -3328,12 +3346,23 @@ bool Device::PrefersDescriptorSets() const {
         // discrete card whose CPU-visible window is 7 GiB or less (no resizable BAR).
         const bool amd = GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY ||
                          GetDriverID() == VK_DRIVER_ID_AMD_OPEN_SOURCE;
-        const bool on = mode == 1 || (mode == 2 && amd && !IsIntegrated() &&
-                                      window <= VkDeviceSize{7} << 30);
+        const bool small_window = window <= VkDeviceSize{7} << 30;
+        // Unset: v6.2's =2 rule on AMD's proprietary driver (discrete, CPU-visible window 7 GiB or
+        // less). RX 9070 XT eGPU over OCuLink, 256 MiB window, OoT fountain with one follower at
+        // Full: idle 16.45 -> 16.23 ms, under PCIe load 20.70 -> 19.04 ms, GPU busy -2 ms, the
+        // picture unchanged. Cards with resizable BAR keep push descriptors (not measured there).
+        // 0 = as the driver's features allow (v6.2's default), 1 = always, 2 = v6.2's rule (both
+        // AMD drivers).
+        const bool amd_default =
+            GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY && !IsIntegrated() && small_window;
+        const int mode = value != nullptr ? std::atoi(value) : (amd_default ? 2 : 0);
+        const bool on = mode == 1 || (mode == 2 && amd && !IsIntegrated() && small_window);
         LOG_INFO(Render_Vulkan,
-                 "Descriptors: {} (FRITCHII_DESCRIPTOR_SETS={}; push descriptors {}, descriptor "
+                 "Descriptors: {} (FRITCHII_DESCRIPTOR_SETS={}{}; push descriptors {}, descriptor "
                  "buffer {}; CPU-visible device memory {} MiB)",
                  on ? "sets from pools" : "as the driver's features allow", mode,
+                 value == nullptr ? (amd_default ? ", the AMD small-window default" : ", unset")
+                                  : "",
                  IsKhrPushDescriptorSupported() ? "supported" : "not supported",
                  IsExtDescriptorBufferSupported() ? "supported" : "off", window >> 20);
         return on;

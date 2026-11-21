@@ -9,6 +9,7 @@
 
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
+#include "video_core/vulkan_common/vulkan_debug_callback.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_seam_clock.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -208,6 +209,11 @@ void MultiRangeBufferCache::RetireEntry(SeamClock& clock, Entry& entry) {
         clock.Wait(oldest);
         DrainRetired(clock);
     }
+    if (entry.sparse_handle && entry.address != 0) {
+        // The retire, not the destroy (DrainRetired destroys once its tick is free).
+        VaReport::Note(entry.address, entry.size, u64(*entry.sparse_handle), false,
+                       VaReport::OwnKind::MultiRangeSparse);
+    }
     retired.push_back(Retired{
         .handle = std::move(entry.sparse_handle),
         .gathered = std::move(entry.gathered),
@@ -306,6 +312,10 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, SeamClock& clock,
             address_handle = *entry.gathered;
         }
         entry.address = device.GetLogical().GetBufferDeviceAddress(address_handle);
+        if (entry.sparse_handle) {
+            VaReport::Note(entry.address, total, u64(address_handle), true,
+                           VaReport::OwnKind::MultiRangeSparse);
+        }
     }
 
     MultiRangeRef ref{

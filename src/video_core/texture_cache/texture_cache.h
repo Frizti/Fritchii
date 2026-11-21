@@ -872,6 +872,7 @@ void TextureCache<P>::RecordStaleDrop(const ImageBase& image) {
             return;
         }
     }
+    const u64 shape_key = RelocationShapeKey(image.info);
     stale_drops[stale_drop_next] = StaleDrop{
         .cpu_addr = image.cpu_addr,
         .size = image.guest_size_bytes,
@@ -883,19 +884,23 @@ void TextureCache<P>::RecordStaleDrop(const ImageBase& image) {
         .reason = marking_relocation ? LostReasonRelocate : static_cast<u8>(delete_reason),
         .guard = image.relocation_guard_noted,
         .why = image.lost_drop_why,
-        .shape_key = RelocationShapeKey(image.info),
+        .shape_key = shape_key,
+        .known = static_cast<u8>(
+            !cold_resampled.empty() &&
+            cold_resampled.contains(ColdResampledKey(image.gpu_addr, shape_key))),
+        .counted = 0,
     };
     stale_drop_next = (stale_drop_next + 1) % StaleDropRing;
     stale_drop_count = (std::min)(stale_drop_count + 1, StaleDropRing);
 }
 
 template <class P>
-auto TextureCache<P>::FindStaleDrop(DAddr addr, size_t size) const -> const StaleDrop* {
+auto TextureCache<P>::FindStaleDrop(DAddr addr, size_t size) -> StaleDrop* {
     // A join copied its overlaps into the new image before deleting them: another drop there,
     // if any, is the one that lost data.
-    const StaleDrop* join = nullptr;
+    StaleDrop* join = nullptr;
     for (size_t i = 0; i < stale_drop_count; ++i) {
-        const StaleDrop& drop =
+        StaleDrop& drop =
             stale_drops[(stale_drop_next + StaleDropRing - 1 - i) % StaleDropRing];
         if (drop.cpu_addr < addr + size && addr < drop.cpu_addr + drop.size) {
             if (drop.reason != static_cast<u8>(DeleteReason::Join)) {
@@ -924,11 +929,34 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
     image.lost_contents = 0; // counted once
     ++((bits & LostDrawn) != 0 ? s.sampled_drawn : s.sampled_undrawn);
     s.sampled_bytes += image.guest_size_bytes;
-    const StaleDrop* const drop = FindStaleDrop(image.cpu_addr, image.guest_size_bytes);
+    StaleDrop* const drop = FindStaleDrop(image.cpu_addr, image.guest_size_bytes);
     const size_t reason = drop == nullptr                         ? 9
                           : drop->reason == LostReasonRelocate     ? 8
                           : (std::min<size_t>)(drop->reason, 7);
     ++s.sampled_by_reason[reason];
+    // FRITCHII_COLD_SWEEP_KEEP_RESAMPLED: the game reads this memory again after the cold sweep
+    // (covered retire included) dropped it: the dropped target's address and shape, and this
+    // image's, are kept by the sweep from now on (while memory allows). Each drop counts once
+    // (later images over it are repeats); "known" is whether its key was in the set when deleted.
+    const int cold_keep_mode = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_cold_sweep_keep_resampled, "FRITCHII_COLD_SWEEP_KEEP_RESAMPLED", 1);
+    ++cold_keep_stats.lost_all;
+    cold_keep_stats.lost_not_recorded += drop == nullptr ? 1 : 0;
+    if (drop != nullptr && drop->reason == static_cast<u8>(DeleteReason::ColdSweep)) {
+        if (drop->counted != 0) {
+            ++cold_keep_stats.lost_cold_repeat;
+        } else {
+            drop->counted = 1;
+            ++cold_keep_stats.lost_cold;
+            cold_keep_stats.lost_cold_known += drop->known;
+        }
+        if (cold_keep_mode > 0) {
+            LearnColdResampled(drop->gpu_addr, drop->shape_key);
+            if (RelocationShaped(image.info)) {
+                LearnColdResampled(image.gpu_addr, RelocationShapeKey(image.info));
+            }
+        }
+    }
     if (drop != nullptr && (drop->guard & (GuardSampled | GuardLoaded)) != 0) {
         ++s.sampled_guarded;
     }
@@ -949,9 +977,11 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
                        : static_cast<u8>(LostWhyNone);
     ++s.sampled_by_why[why];
     // FRITCHII_LOST_KEEP: this memory is read after going cold; the next drop over it is written
-    // back whatever its size (relocation has its guards instead).
-    if (reason != 8 && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
-                                                        "FRITCHII_LOST_KEEP", 1) > 0) {
+    // back whatever its size (relocation has its guards instead). FRITCHII_COLD_SWEEP_KEEP_RESAMPLED=3
+    // keeps GPU-written targets over these ranges from the sweep, so it learns them too.
+    if (reason != 8 && (cold_keep_mode >= 3 ||
+                        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_keep,
+                                                         "FRITCHII_LOST_KEEP", 1) > 0)) {
         LearnLostRead(image.cpu_addr, image.guest_size_bytes);
     }
     // The first 40 of the session, then 2 per 10 s window (the flashes a tester reports come
@@ -968,7 +998,7 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
         LOG_WARNING(HW_GPU,
                     "Lost contents sampled: format {} {}x{} levels {} at {:#x} ({} KiB), {}{}{}; "
                     "the memory's GPU data was dropped by: {} (format {} {}x{} at {:#x}, {} "
-                    "frames ago, guard {:#x}, {})",
+                    "frames ago, guard {:#x}, {}{})",
                     static_cast<u32>(image.info.format), image.info.size.width,
                     image.info.size.height, image.info.resources.levels, image.gpu_addr,
                     image.guest_size_bytes >> 10,
@@ -977,7 +1007,8 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
                     (bits & LostDrawn) != 0 ? ", drawn into without a full clear" : ", not drawn into",
                     names[reason], drop ? drop->format : 0u, drop ? drop->width : 0u,
                     drop ? drop->height : 0u, drop ? drop->gpu_addr : GPUVAddr{0},
-                    drop ? frame_tick - drop->frame : 0, drop ? drop->guard : u8{0}, whys[why]);
+                    drop ? frame_tick - drop->frame : 0, drop ? drop->guard : u8{0}, whys[why],
+                    drop != nullptr && drop->known != 0 ? ", key in set at drop" : "");
     }
 }
 
@@ -2180,6 +2211,9 @@ void TextureCache<P>::TickFrame() {
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
     }
+    if (out_of_memory) {
+        cold_keep_failed_frame = (std::max)(frame_tick, u64{1}); // the cold sweep keep's gate
+    }
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
     }
@@ -2356,6 +2390,61 @@ void TextureCache<P>::WatchColdImage(ImageId image_id) {
     if (cold_watch_set.insert(image_id).second) {
         cold_watch.emplace_back(image_id, frame_tick);
     }
+}
+
+template <class P>
+void TextureCache<P>::LearnColdResampled(GPUVAddr gpu_addr, u64 shape_key) {
+    const u64 key = ColdResampledKey(gpu_addr, shape_key);
+    if (const auto it = cold_resampled.find(key); it != cold_resampled.end()) {
+        it->second = frame_tick;
+        return;
+    }
+    if (cold_resampled.size() >= ColdResampledMax) {
+        // Least recently seen out (a scan: keys are added a few times a minute).
+        auto oldest = cold_resampled.begin();
+        for (auto it = cold_resampled.begin(); it != cold_resampled.end(); ++it) {
+            if (it->second < oldest->second) {
+                oldest = it;
+            }
+        }
+        cold_resampled.erase(oldest);
+    }
+    cold_resampled.emplace(key, frame_tick);
+    ++cold_resampled_gen;
+    ++cold_keep_stats.learned;
+}
+
+template <class P>
+bool TextureCache<P>::ColdKeepResampled(ImageBase& image, int mode) {
+    if (mode >= 2 && (image.relocation_guard_noted & GuardSampled) != 0) {
+        if ((image.cold_keep & 2) == 0) {
+            image.cold_keep |= 2;
+            ++cold_keep_stats.kept_new;
+            ++cold_keep_stats.kept_sampled;
+        }
+        return true;
+    }
+    if (cold_resampled.empty()) {
+        return false;
+    }
+    if (image.cold_keep_gen != cold_resampled_gen) {
+        image.cold_keep_gen = cold_resampled_gen;
+        const auto it =
+            cold_resampled.find(ColdResampledKey(image.gpu_addr, RelocationShapeKey(image.info)));
+        const bool found = it != cold_resampled.end();
+        if (found) {
+            it->second = frame_tick; // seen again: stays in the set
+        }
+        image.cold_keep = static_cast<u8>((image.cold_keep & ~1) | (found ? 1 : 0));
+    }
+    if ((image.cold_keep & 1) == 0) {
+        return false;
+    }
+    if ((image.cold_keep & 2) == 0) {
+        image.cold_keep |= 2;
+        ++cold_keep_stats.kept_new;
+    }
+    return true;
 }
 
 template <class P>
@@ -2589,12 +2678,176 @@ void TextureCache<P>::SweepColdImages() {
     u32 covered_checks = 0;
     u32 covered_deleted = 0;
     bool covered_capped = false;
+    // FRITCHII_COLD_SWEEP_KEEP_RESAMPLED (live, default 1): GPU-written targets at an address and
+    // shape the game sampled again after an earlier sweep lost them (cold_resampled) stay, by
+    // the regular sweep and by covered retire, within a keep budget of real device memory
+    // (FRITCHII_COLD_SWEEP_KEEP_MIB) and only while nothing signals memory pressure (keep_fits).
+    const int keep_mode = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_cold_sweep_keep_resampled, "FRITCHII_COLD_SWEEP_KEEP_RESAMPLED", 1);
+    // The expected threshold: the collector starts deleting by age above minimum_memory (1.5 GiB),
+    // which play exceeds at once on large cards, so that line kept nothing in practice.
+    // The critical threshold: at the market the cache runs at 6.8-7.6 GiB during the sweep, above
+    // the expected line (6 GiB on a 16 GiB card), so that line kept nothing; the kept targets are
+    // small (~40 mostly 1280x720 a run) and above critical the collector's rules apply as before.
+    const u64 keep_limit = critical_memory;
+    // FRITCHII_COLD_SWEEP_KEEP_MIB (live, MiB; 0 = the critical line above instead): kept
+    // targets count against a budget of real device memory, whatever the cache's size. Play went
+    // past the critical line (9.7 GiB on a 16 GiB card), where the line released 1,515 of 1,642
+    // kept targets; the budget bounds the extra memory and the collector stays the backstop.
+    // The budget is resident (cold_keep_resident): an image keeps its share from its first keep
+    // until it is deleted, released, relocated or leaves cold_watch, so images kept earlier stay
+    // and an overrun turns away new candidates instead.
+    // Unset, the default is min(256 MiB, GetDeviceLocalMemory() / 32). GetDeviceLocalMemory is
+    // the driver's budget less a reserve, capped at 6 GiB + the resolution scale's GiB, not the
+    // heap: ~96 MiB on a 4 GB card, ~200 MiB on 8 GB. With a driver budget of 12 GiB or more it
+    // is min(512 MiB, GetDeviceLocalMemory() / 16): on the 16 GB 9070 XT 448 MiB at 1x and
+    // 512 MiB at 2x, as the measured peak there (408 images, 115 MiB of guest bytes) is up to
+    // ~575 MiB real when rescaled (guest + 4x scaled copy) and 256 MiB would cut it. Not yet
+    // measured at that size: the log's "in use" figure against the budget tells.
+    if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+        if (cold_keep_budget_frame == 0 || frame_tick - cold_keep_budget_frame >= 60) {
+            cold_keep_budget_frame = (std::max)(frame_tick, u64{1});
+            cold_keep_driver_budget = runtime.GetDeviceMemoryBudget();
+        }
+    }
+    int keep_default_mib = 256;
+    if constexpr (HAS_DEVICE_MEMORY_INFO) {
+        const u64 device_local = runtime.GetDeviceLocalMemory();
+        if (device_local != 0) {
+            const bool large = cold_keep_driver_budget >= 12_GiB;
+            keep_default_mib = static_cast<int>((std::max)(
+                u64{1}, (std::min)(u64{large ? 512u : 256u},
+                                   (device_local / (large ? 16 : 32)) >> 20)));
+        }
+    }
+    const int keep_mib = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_cold_sweep_keep_mib, "FRITCHII_COLD_SWEEP_KEEP_MIB",
+        keep_default_mib);
+    const u64 keep_budget = keep_mib > 0 ? static_cast<u64>(keep_mib) << 20 : 0;
+    // The pressure gate: nothing is kept (the sweep deletes as in v6.2, kept images included)
+    // while the driver's budget binds (budget_pressure), for ColdKeepFailedFrames after an image
+    // could not be made (the collector's out-of-memory signal, runtime.FailedImages()), or while
+    // the cache is past the critical line by a margin of min(max(1 GiB, critical / 4), (driver
+    // budget - critical) / 2). The plain critical line is too low: on the 9070 XT play ran the
+    // cache at 6.8-9.7 GiB with critical at 7.68 GiB, and that line released 1,515 of 1,642 kept
+    // targets; the margin puts the line at ~9.6 GiB there. The second bound keeps the line on
+    // the card where critical + 1 GiB would pass it, so it holds without budget_pressure
+    // (FRITCHII_VRAM_BUDGET_MODE=0) or failures (WDDM demotes rather than fails). Without a
+    // reported budget (no VK_EXT_memory_budget, OpenGL) there is no margin: the plain critical
+    // line.
+    // Only large cards (a driver budget of 12 GiB or more, as the default budget's test) get the
+    // margin; it was made for the 16 GB 9070 XT, where play runs the cache past critical. On
+    // smaller cards, in the band above critical, the collector is at its most eager and the
+    // thrash guard may have raised its floor (which also shields young covered keeps), so a
+    // keep there would hold up to its budget where the collector can't reach it: the plain
+    // critical line there, as without a reported budget (low-end PCs first).
+    u64 keep_margin = 0;
+    if (cold_keep_driver_budget >= 12_GiB && cold_keep_driver_budget > critical_memory) {
+        keep_margin = (std::min)((std::max)(static_cast<u64>(1_GiB), critical_memory / 4),
+                                 (cold_keep_driver_budget - critical_memory) / 2);
+    }
+    bool keep_failed = false;
+    if constexpr (requires { runtime.FailedImages(); }) {
+        // TickFrame records a failure after the sweep: one not yet recorded counts as well.
+        keep_failed = runtime.FailedImages() != seen_failed_images;
+    }
+    keep_failed = keep_failed || (cold_keep_failed_frame != 0 &&
+                                  frame_tick - cold_keep_failed_frame < ColdKeepFailedFrames);
+    const u64 keep_pressure_line = critical_memory + keep_margin;
+    const bool keep_pressure =
+        budget_pressure || keep_failed || total_used_memory > keep_pressure_line;
+    // Whether a kept image may stay; on false the caller deletes it (after ColdKeepUncharge).
+    const auto keep_fits = [&](Image& image) {
+        if (keep_pressure) {
+            return false;
+        }
+        if (keep_budget == 0) {
+            const u8 covered_bit = image.cold_keep & 4;
+            ColdKeepUncharge(image); // the line holds it, not the budget
+            image.cold_keep |= covered_bit;
+            return total_used_memory < keep_limit;
+        }
+        // Real device memory: the image plus its scaled copy when rescaled (Vulkan's ScaleUp
+        // keeps both), as total_used_memory counts it. Its own earlier share is not counted
+        // twice, so a kept image stays unless the budget shrank under what is kept.
+        const u64 bytes = (std::max)(
+            u64{1}, ImageMemoryBytes(image) +
+                        (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0));
+        const u64 others =
+            cold_keep_resident - (std::min)(cold_keep_resident, image.cold_keep_charge);
+        if (others + bytes > keep_budget) {
+            return false;
+        }
+        cold_keep_resident_count += image.cold_keep_charge == 0 ? 1 : 0;
+        cold_keep_resident = others + bytes;
+        image.cold_keep_charge = bytes;
+        return true;
+    };
+    const bool keep_room = total_used_memory < keep_limit;
+    // 3 also keeps targets whose memory overlaps a recently lost read (lost_read_ranges: at most
+    // LostReadRing ranges, scanned only for GPU-written candidates the set did not keep).
+    const auto keep_rule = [&](Image& image) {
+        if (keep_mode <= 0 || False(image.flags & ImageFlagBits::GpuModified)) {
+            return false;
+        }
+        if (ColdKeepResampled(image, keep_mode)) {
+            return true;
+        }
+        if (keep_mode < 3 || lost_read_count == 0 ||
+            !OverlapsLostRead(image.cpu_addr, image.guest_size_bytes)) {
+            return false;
+        }
+        if ((image.cold_keep & 2) == 0) {
+            image.cold_keep |= 2;
+            ++cold_keep_stats.kept_new;
+            ++cold_keep_stats.kept_range;
+        }
+        return true;
+    };
+    // FRITCHII_COLD_SWEEP_KEEP_COVERED (live, default 1): whether the keep may hold a target that
+    // newer images of another shape cover (covered retire) or overlap since its last use
+    // (ColdSuperseded). Such a target is not synced with them (they aren't aliases), so a lookup
+    // that finds it again samples its pre-cover picture. Off, those go as in v6.2 (no keep, no
+    // budget), and only targets no newer image of another shape touched since are kept: their
+    // contents are still the memory's. 1 keeps them as well (where the cover is only the images'
+    // ranges, not their real writes, that picture is the right one: the pause menu's blocky
+    // background was such a target).
+    const bool keep_covered =
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cold_sweep_keep_covered,
+                                         "FRITCHII_COLD_SWEEP_KEEP_COVERED", 1) > 0;
+    // Whether a GPU-written target's address and shape are in the re-sampled set: what mode 1
+    // keeps by (no side effects: the rule's own lookup marks the image kept and counts it).
+    const auto key_known = [&](const Image& image) {
+        return !cold_resampled.empty() &&
+               cold_resampled.find(ColdResampledKey(
+                   image.gpu_addr, RelocationShapeKey(image.info))) != cold_resampled.end();
+    };
+    // Counts a target the keep turns away as covered or superseded, when the rule would have
+    // kept it by its learned key.
+    const auto refuse_newer = [&](const Image& image) {
+        if (keep_mode > 0 && True(image.flags & ImageFlagBits::GpuModified) && key_known(image)) {
+            ++cold_keep_stats.refused_newer;
+        }
+    };
+    const auto count_kept = [&](Image& image) {
+        const u32 frame = static_cast<u32>(frame_tick);
+        if (frame_tick % 600 == 0 && image.cold_keep_frame != frame) {
+            image.cold_keep_frame = frame;
+            ++cold_keep_stats.kept_now;
+            cold_keep_stats.kept_now_bytes +=
+                ImageMemoryBytes(image) + (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
+        }
+    };
     u32 deleted = 0;
     size_t index = 0;
     while (index < cold_watch.size()) {
         const ImageId image_id = cold_watch[index].first;
         const u64 watched_at = cold_watch[index].second;
         const auto drop = [&] {
+            // Out of cold_watch, the keep no longer holds it: its share of the budget goes back.
+            if (slot_images.contains(image_id)) {
+                ColdKeepUncharge(slot_images[image_id]);
+            }
             cold_watch_set.erase(image_id);
             cold_watch[index] = cold_watch.back();
             cold_watch.pop_back();
@@ -2609,15 +2862,29 @@ void TextureCache<P>::SweepColdImages() {
             drop();
             continue;
         }
-        if (covered_frames != 0 && True(image.flags & ImageFlagBits::GpuModified) &&
-            False(image.flags & ImageFlagBits::CollectPending) &&
-            image.covered_overlap_frame > image.covered_check_frame &&
-            frame_tick - lru_cache.Tick(image.lru_index) >= covered_frames) {
-            if (covered_checks >= MaxCoveredChecks || covered_deleted >= MaxCoveredDeletes) {
+        const bool covered_candidate = covered_frames != 0 &&
+                                       True(image.flags & ImageFlagBits::GpuModified) &&
+                                       False(image.flags & ImageFlagBits::CollectPending) &&
+                                       frame_tick - lru_cache.Tick(image.lru_index) >= covered_frames;
+        // Kept by covered retire (cold_keep bit 2): looked at again every frame without a new
+        // overlap (its memory was covered; coverage only grows), so the budget and the pressure
+        // gate release it; used again (or no longer a candidate), it is ordinary cache contents
+        // from here, and its share of the budget goes back (charged again if it is kept again):
+        // the budget covers only images that are cold now, or a long session fills it with
+        // targets that are alive anyway and turns new candidates away.
+        bool covered_kept = (image.cold_keep & 4) != 0;
+        if (covered_kept && !covered_candidate) {
+            ColdKeepUncharge(image); // clears bit 2 too
+            covered_kept = false;
+        }
+        if (covered_candidate &&
+            (covered_kept || image.covered_overlap_frame > image.covered_check_frame)) {
+            if ((!covered_kept && covered_checks >= MaxCoveredChecks) ||
+                covered_deleted >= MaxCoveredDeletes) {
                 covered_capped = true; // looked at in a later frame
             } else {
-                ++covered_checks;
-                if (CoveredByNewerWrites(image_id, image)) {
+                covered_checks += covered_kept ? 0 : 1;
+                if (covered_kept || CoveredByNewerWrites(image_id, image)) {
                     if (queued(image_id, uncommitted_downloads) ||
                         std::ranges::any_of(committed_downloads, [&](const auto& downloads) {
                             return queued(image_id, downloads);
@@ -2628,13 +2895,54 @@ void TextureCache<P>::SweepColdImages() {
                         ++index;
                         continue;
                     }
+                    // FRITCHII_COLD_SWEEP_KEEP_RESAMPLED: only here, where covered retire would
+                    // delete it (covered retire was what lost them: 28 of 29 cold sweep losses
+                    // in a 3-minute market run). Kept, it is looked at here every frame (bit 2).
+                    // Covered, so only with FRITCHII_COLD_SWEEP_KEEP_COVERED=1 (above).
+                    if (!keep_covered) {
+                        refuse_newer(image);
+                    }
+                    const bool keep = keep_covered && keep_rule(image);
+                    if (keep && keep_fits(image)) {
+                        image.cold_keep |= 4;
+                        count_kept(image);
+                        ++index;
+                        continue;
+                    }
+                    ColdKeepUncharge(image); // released (or the rule no longer holds)
+                    covered_kept = false;
+                    // FRITCHII_COVERED_RETIRE_WRITEBACK (live, default 0 = off): written back to guest memory first, as
+                    // the cold sweep does (LostWriteback), so a later sample of this target is not cleared to
+                    // zero; deleted when the write-back lands, kept if used again first. Market A/B: cold sweep
+                    // losses 29 -> 12-15, but 11-14k write-backs a run for ~20 re-reads; off until a cheaper
+                    // selection (only shapes likely to be read again) is measured.
+                    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_covered_retire_writeback,
+                                                         "FRITCHII_COVERED_RETIRE_WRITEBACK", 0) != 0) {
+                        const LostWriteback wb = QueueLostWriteback(image_id, image, LostPathCold);
+                        if (wb == LostWriteback::Queued) {
+                            ++covered_deleted;
+                            ++covered_stats.sweep_deleted;
+                            ++covered_stats.written_back;
+                            drop();
+                            continue;
+                        }
+                        if (wb == LostWriteback::Keep) {
+                            ++index; // the queue is full: a later frame
+                            continue;
+                        }
+                    }
                     ++covered_deleted;
                     ++covered_stats.sweep_deleted;
+                    cold_keep_stats.released += keep ? 1 : 0;
                     RetireCovered(image_id, image);
                     drop();
                     continue;
                 }
             }
+        }
+        if (covered_kept) {
+            ++index; // kept by covered retire, its caps reached this frame: looked at next frame
+            continue;
         }
         if (False(image.flags & ImageFlagBits::BadOverlap)) {
             // The newest image of a chain has one overlap; the next drift makes it bad.
@@ -2645,8 +2953,10 @@ void TextureCache<P>::SweepColdImages() {
             }
             continue;
         }
-        // Touched (prepared, bound, sampled) in the last K host frames.
+        // Touched (prepared, bound, sampled) in the last K host frames. A kept one is hot again:
+        // its share of the keep's budget goes back (charged again if it is kept again).
         if (frame_tick - lru_cache.Tick(image.lru_index) < cold_frames) {
+            ColdKeepUncharge(image);
             ++index;
             continue;
         }
@@ -2719,6 +3029,31 @@ void TextureCache<P>::SweepColdImages() {
             ++index; // FRITCHII_COVERED_RETIRE: the rest still get their coverage checks
             continue;
         }
+        // FRITCHII_COLD_SWEEP_KEEP_RESAMPLED (above): only where the image would be deleted
+        // (after the GpuModified guards), so guarded images neither use the budget nor stay in
+        // cold_watch. Superseded, or overlapped by a newer image of another shape touched since
+        // (looked at again every frame while kept), only with FRITCHII_COLD_SWEEP_KEEP_COVERED=1.
+        // ColdSuperseded runs only for GPU-written images the rule could keep (mode 1: by their
+        // key, a hash lookup first).
+        bool keep = false;
+        if (keep_covered) {
+            keep = keep_rule(image);
+        } else if (keep_mode > 0 && True(image.flags & ImageFlagBits::GpuModified)) {
+            const bool newer =
+                superseded ||
+                ((keep_mode >= 2 || key_known(image)) && ColdSuperseded(image_id, image));
+            if (newer) {
+                refuse_newer(image);
+            } else {
+                keep = keep_rule(image);
+            }
+        }
+        if (keep && keep_fits(image)) {
+            count_kept(image);
+            ++index;
+            continue;
+        }
+        ColdKeepUncharge(image); // released (or the rule no longer holds)
         // FRITCHII_LOST_WRITEBACK (default 1): written back to guest memory first, and deleted
         // when that lands. Dropped, an image made there later (the dialogue box's text read
         // again after the UI was hidden: OoT draws it once) had no contents (#1310).
@@ -2726,6 +3061,7 @@ void TextureCache<P>::SweepColdImages() {
         case LostWriteback::Queued:
             ++deleted;
             cold_superseded += superseded ? 1 : 0;
+            cold_keep_stats.released += keep ? 1 : 0;
             drop(); // the landing deletes it; used again first, it stays
             continue;
         case LostWriteback::Keep:
@@ -2743,6 +3079,7 @@ void TextureCache<P>::SweepColdImages() {
         DeleteImage(image_id);
         ++deleted;
         cold_superseded += superseded ? 1 : 0;
+        cold_keep_stats.released += keep ? 1 : 0;
         drop();
     }
     cold_deleted += deleted;
@@ -2753,12 +3090,12 @@ void TextureCache<P>::SweepColdImages() {
         if (covered_frames != 0 || c.checked != 0) {
             LOG_INFO(HW_GPU,
                      "Covered retire (FRITCHII_COVERED_RETIRE={}) last 600 frames: {} checked "
-                     "({:.2f} ms), deleted {} by the cold sweep, {} by the collector without a "
+                     "({:.2f} ms), deleted {} by the cold sweep ({} written back first), {} by the collector without a "
                      "download, {} queued downloads dropped as covered ({} MiB in all); {} kept "
                      "as busy, caps reached in {} frames; {} sampled again where one was "
                      "deleted (must stay near 0)",
                      covered_frames, c.checked, static_cast<double>(c.check_ns) / 1e6,
-                     c.sweep_deleted, c.collect_deleted, c.landing_deleted,
+                     c.sweep_deleted, c.written_back, c.collect_deleted, c.landing_deleted,
                      c.deleted_bytes >> 20, c.busy, c.capped_frames, c.sampled_after);
         }
         c = {};
@@ -2783,6 +3120,31 @@ void TextureCache<P>::SweepColdImages() {
                  cold_kept_guarded, cold_kept_read, cold_watch.size(), slot_images.size(),
                  total_used_memory >> 20, expected_memory >> 20, nx2_sweep_guards);
         cold_deleted = cold_kept_guarded = cold_kept_read = cold_superseded = 0;
+        auto& k = cold_keep_stats;
+        LOG_INFO(HW_GPU,
+                 "Cold sweep keep (FRITCHII_COLD_SWEEP_KEEP_RESAMPLED={}) last 600 frames: {} "
+                 "images newly kept by the rule ({} as sampled after their write, {} by range), "
+                 "{} kept now ({} MiB), {} deleted all the same as memory was over the line, "
+                 "{} with a learned key deleted as newer images cover or overlap them "
+                 "(FRITCHII_COLD_SWEEP_KEEP_COVERED={}); "
+                 "re-sampled set {} entries (+{}); lost contents sampled {} ({} dropped by the "
+                 "cold sweep, {} of those in the set when deleted; {} more images over a drop "
+                 "already counted; not recorded {}); device memory {} MiB, keep line {} MiB{}; "
+                 "keep budget {} MiB (in use {} MiB by {} images, real device memory, resident), "
+                 "release line {} MiB{}",
+                 keep_mode, k.kept_new, k.kept_sampled, k.kept_range, k.kept_now,
+                 k.kept_now_bytes >> 20, k.released, k.refused_newer, keep_covered ? 1 : 0,
+                 cold_resampled.size(), k.learned, k.lost_all,
+                 k.lost_cold, k.lost_cold_known, k.lost_cold_repeat, k.lost_not_recorded,
+                 total_used_memory >> 20,
+                 keep_limit >> 20, keep_room ? "" : " (over the line)", keep_budget >> 20,
+                 cold_keep_resident >> 20, cold_keep_resident_count, keep_pressure_line >> 20,
+                 !keep_pressure     ? ""
+                 : budget_pressure ? ", releasing: budget pressure"
+                 : keep_failed     ? ", releasing: an image failed"
+                 : keep_margin != 0 ? ", releasing: over critical + margin"
+                                    : ", releasing: over critical (no margin on this card)");
+        k = {};
         // The image families made in those frames, most made first (fable52_answer_13 sec. 6).
         std::vector<std::pair<std::pair<u32, u32>, const MadeShapes*>> families;
         u64 made_total = 0;
@@ -7895,8 +8257,16 @@ void TextureCache<P>::ForEachSparseSegment(ImageBase& image, Func&& func) {
     constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
     const auto segments = gpu_memory->GetSubmappedRange(image.gpu_addr, image.guest_size_bytes);
     for (const auto& [gpu_addr, size] : segments) {
-        std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-        ASSERT(cpu_addr);
+        const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+        if (!cpu_addr) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(HW_GPU,
+                            "Skipping sparse texture segment {:#x}+{:#x}: no device address",
+                            gpu_addr, size);
+            }
+            continue;
+        }
         if constexpr (RETURNS_BOOL) {
             if (func(gpu_addr, *cpu_addr, size)) {
                 break;
@@ -8121,6 +8491,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         CensusFinish(image_id, true);
     }
     ImageBase& image = slot_images[image_id];
+    ColdKeepUncharge(image); // whichever path deletes it (the collector included)
     if (True(image.flags & ImageFlagBits::CollectPending)) [[unlikely]] {
         // EXP121: deleted by another path before its queued download landed.
         for (size_t i = 0; i < collect_downloads.size(); ++i) {
@@ -8374,6 +8745,11 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
     image.gpu_addr = gpu_addr;
     image.cpu_addr = cpu_addr;
     image.cpu_addr_end = cpu_addr + image.guest_size_bytes;
+    // The cold sweep keep's cached answer was for the old address (ColdKeepResampled), and its
+    // share of the keep budget goes back (the contents it was kept for are gone).
+    ColdKeepUncharge(image);
+    image.cold_keep_gen = 0;
+    image.cold_keep = 0;
     image.flags &= ~ImageFlagBits::GpuModified;
     image.flags |= ImageFlagBits::CpuModified;
     image.last_write_frame = ~u64{0};

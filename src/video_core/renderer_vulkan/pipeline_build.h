@@ -11,6 +11,7 @@
 #include <mutex>
 #include <utility>
 
+#include "common/common_types.h"
 #include "common/logging.h"
 #include "common/thread_worker.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
@@ -63,22 +64,62 @@ private:
 };
 
 class PipelineBuild {
+public:
+    /// Builds that may be given up: once `cancelled` is set, a build made under a CancelScope of
+    /// this source and not started yet finishes as failed without running (on whichever thread
+    /// claims it: its worker, or a destructor's Wait(true)). Used for pipelines nothing waits
+    /// for, the occlusion flag variants, at the pipeline cache's teardown: their queued driver
+    /// compiles held the exit before the caches were saved.
+    struct CancelSource {
+        std::atomic_bool cancelled{};
+        std::atomic<u64> queued{};  ///< Made on a worker and not claimed yet
+        std::atomic<u64> skipped{}; ///< Given up unbuilt after `cancelled`
+    };
+
+    /// While alive, the builds this thread makes belong to `source` (null: none). Nests.
+    class CancelScope {
+    public:
+        explicit CancelScope(std::shared_ptr<CancelSource> source)
+            : previous{std::exchange(t_cancel_source, std::move(source))} {}
+        ~CancelScope() {
+            t_cancel_source = std::move(previous);
+        }
+        CancelScope(const CancelScope&) = delete;
+        CancelScope& operator=(const CancelScope&) = delete;
+
+    private:
+        std::shared_ptr<CancelSource> previous;
+    };
+
+private:
+    static inline thread_local std::shared_ptr<CancelSource> t_cancel_source;
+
     struct State {
-        explicit State(std::function<void()> task_) : task{std::move(task_)} {}
+        explicit State(std::function<void()> task_, std::shared_ptr<CancelSource> cancel_)
+            : task{std::move(task_)}, cancel{std::move(cancel_)} {}
 
         void Run() noexcept {
             if (claimed.exchange(true)) {
                 return;
             }
-            try {
-                task();
-            } catch (const std::exception& exception) {
-                failed = true;
-                LOG_ERROR(Render_Vulkan, "Graphics pipeline worker failed: {}", exception.what());
-            } catch (...) {
-                failed = true;
-                LOG_ERROR(Render_Vulkan,
-                          "Graphics pipeline worker failed with an unknown exception");
+            if (cancel && queued) {
+                cancel->queued.fetch_sub(1, std::memory_order_relaxed);
+            }
+            if (cancel && cancel->cancelled.load(std::memory_order_acquire)) {
+                failed = true; // never built: the owner only destroys it now
+                cancel->skipped.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                try {
+                    task();
+                } catch (const std::exception& exception) {
+                    failed = true;
+                    LOG_ERROR(Render_Vulkan, "Graphics pipeline worker failed: {}",
+                              exception.what());
+                } catch (...) {
+                    failed = true;
+                    LOG_ERROR(Render_Vulkan,
+                              "Graphics pipeline worker failed with an unknown exception");
+                }
             }
             task = {};
             std::scoped_lock lock{mutex};
@@ -87,6 +128,8 @@ class PipelineBuild {
         }
 
         std::function<void()> task;
+        std::shared_ptr<CancelSource> cancel;
+        bool queued{}; ///< Counted in cancel->queued (set before it is queued)
         bool failed{};
         std::atomic_bool claimed{};
         std::atomic_bool complete{};
@@ -96,8 +139,12 @@ class PipelineBuild {
 
 public:
     PipelineBuild(Common::ThreadWorker* workers, std::function<void()> task)
-        : state{std::make_shared<State>(std::move(task))} {
+        : state{std::make_shared<State>(std::move(task), t_cancel_source)} {
         if (workers) {
+            if (state->cancel) {
+                state->queued = true;
+                state->cancel->queued.fetch_add(1, std::memory_order_relaxed);
+            }
             workers->QueueWork([state = state] { state->Run(); });
         } else {
             state->Run();

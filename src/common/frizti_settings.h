@@ -16,7 +16,7 @@ namespace Settings::Frizti {
 
 // Bump when the tuned values change, so every player gets them once more.
 // 13: v6.0 (window filter Auto); 12: v5.8.4 (8: v5.8, own data folder, DLSS modes)
-inline constexpr u32 Revision = 14; // 14: Fritchii v6.2 (asked first: recommended settings prompt)
+inline constexpr u32 Revision = 15; // 15: Fritchii v6.5 (AMD Radeon: occlusion Full by default); 14: v6.2 (asked first: recommended settings prompt)
 inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
 
 // The tuned settings. Frizti's value is each setting's default in settings.h.
@@ -28,6 +28,11 @@ struct Record {
     std::map<std::string, std::string> global;   ///< label -> value written to qt-config.ini
     std::map<std::string, std::string> per_game; ///< label -> "global" or Ocarina's override
     bool oot_folded = false; ///< Ocarina's per-game settings were moved to the main ones once
+    /// Written by 6.5 test builds' hardware defaults (the card they were decided for, and label
+    /// -> the value applied); kept through a rewrite, no longer read (ApplyHardwareDefaults now
+    /// follows the recommended settings).
+    std::string hw_card;
+    std::map<std::string, std::string> hw;
 };
 
 std::string SerializeRecord(const Record& record);
