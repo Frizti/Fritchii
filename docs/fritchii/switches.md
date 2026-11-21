@@ -1209,9 +1209,11 @@ Boot (helper BJ, 2026-11-16; changed 2026-11-19). On AMD's proprietary driver ED
 memory seam, 3 built in) is kept at its value when one follower is on, and held to 1 when it is
 off (there SEAM 3 is about 0.6 ms slower than 1 on AMD). The original SEAM 3 loss at the title was
 the ASTC decoder's submit inside a held packet, skipped by FRITCHII_ASTC_HELD_DEFER (default 1 on AMD's proprietary driver). 0 =
-held to 1; 1 = kept either way (tests). Log once: "Memory seam: EXP123=N kept on AMD's proprietary
-driver (one follower on | FRITCHII_SEAM_AMD=1)" or "... held to 1 ... (one follower off |
-FRITCHII_SEAM_AMD=0)".
+held to 1; 1 = kept either way (tests). Unset, the keep also needs FRITCHII_ASTC_HELD_DEFER on
+(2026-11-21): with the defer off SEAM 3 would bring the title loss back, so it is held to 1. Log
+once: "Memory seam: EXP123=N kept on AMD's proprietary driver (one follower on |
+FRITCHII_SEAM_AMD=1)", "... held to 1 ... (one follower off | FRITCHII_SEAM_AMD=0)", or "... held
+to 1 on AMD's proprietary driver (one follower on, but FRITCHII_ASTC_HELD_DEFER is off ...)".
 
 ### FRITCHII_ONEF_OCCL
 
@@ -1273,18 +1275,34 @@ page fault in the 0xbef0xxxxxxxx range). 1: when the tick moved between Configur
 the draw or dispatch configures again in the new command buffer (nothing on the common path). A
 played dispatch (one follower, R) cannot configure again (its packet was played): it records its
 bind with the dispatch and the scheduler forgets its descriptor buffer
-(Scheduler::ForgetDescriptorBuffer), so no compute bind leaves the tracker's chunk stale. 0: as
-before. Either way the splits are counted and logged ("Split bind: a submit between the draw's |
+(Scheduler::ForgetDescriptorBuffer), so no compute bind leaves the tracker's chunk stale. A played
+draw (one follower, R) or a served one (a ring B packet, FRITCHII_MEMSTAGE_THREAD=2) never
+configures again either (2026-11-21): its packet was played at the rest, so a second Configure took
+the unheld path into E's (or GPUMem's) buffer cache while E ran (an RTX 4080 crash in
+BindHostStageBuffers on GPURender, and a descriptor count mismatch that stopped step 4 for the
+session: every draw lent, Castle Town 47 fps instead of 77). Instead: when the scheduler still has
+its pipeline bound, the submit came before the bind (the ASTC decode inside the texture work, the
+common case) and the bind, the index and the vertex binds are in the new command buffer already
+(an index bind this draw played before the submit is bound again, MemPlayer::EnsureIndexBinding);
+otherwise the bind went with the submit and the draw is not recorded (one follower check "played
+split bind", must be 0). Logs: "Split bind on a played draw: the submit came before its bind,
+nothing to bind again (shader S; N so far)" and "... the submit came after its bind, not drawn
+...". 0: as before. Either way the splits are counted and logged ("Split bind: a submit between the draw's |
 dispatch's bind and its record (shader S; N so far; FRITCHII_SPLIT_BIND_FIX=1)"). 0 were seen at
 the fountain: insurance.
 
 ### FRITCHII_SYNCPT_UNLOCKED
 
-Boot, default 1 (2026-11-19). Sync point actions run after the manager's lock is released. A due
-action may run renderer work (the composite executer runs Composite, which with one follower
-drains R on E): under the lock that blocked every guest thread registering a wait, and deadlocked
-when R increments. Deregistering an action another thread is running waits until it returns.
-0 = under the lock, as before.
+Boot, default 1 (2026-11-19; serialized 2026-11-21). Sync point actions run after the manager's
+lock is released. A due action may run renderer work (the composite executer runs Composite, which
+with one follower drains R on E): under the lock that blocked every guest thread registering a
+wait, and deadlocked when R increments. As under the lock, one thread at a time runs the
+increments' actions, in increment order: an increment whose actions come due while another thread
+runs some queues them for that thread and returns (it never waits for a running action). Waiters
+of a value with actions due wake after those actions ran (6.2's order); a value with none due
+wakes its waiters at once. Deregistering an action that is queued or running waits until it has
+run, except from inside an action on the running thread (a queued one is dropped then). 0 = under
+the lock, as before.
 
 ### FRITCHII_ONEF_TICK_ON_E
 
@@ -1310,10 +1328,14 @@ behind recorded overwritten descriptors (garbage view and buffer handles). 0 = a
 
 ### FRITCHII_ONEF_MESH_EMU, FRITCHII_ONEF_MESH_EMU_ASYNC
 
-Boot, default 1 (2026-11-19). FRITCHII_ONEF_MESH_EMU: with one follower and E's pipeline lookup
-(FRITCHII_ONEF_E_PIPELINE), emulated mesh draws (no VK_EXT_mesh_shader, as on AMD's drivers with
-Mesh Shaders on Automatic) are posted like any draw: E fills the packet and R runs the emulation as
-for a lent one. Indirect and list emulated draws stay lent. 0 = lent, as before.
+Boot (2026-11-19; default narrowed 2026-11-21). FRITCHII_ONEF_MESH_EMU: with one follower and E's
+pipeline lookup (FRITCHII_ONEF_E_PIPELINE), emulated mesh draws (no VK_EXT_mesh_shader, as on AMD's
+drivers with Mesh Shaders on Automatic) are posted like any draw: E fills the packet and R runs the
+emulation as for a lent one. Unset: on only on AMD's proprietary driver, where it was tested;
+elsewhere (NVIDIA Pascal and older, Intel iGPUs, RADV before RDNA2) lent as in 6.2, since R then
+uses the rasterizer's staging pool, which the query and texture caches also use on E. 1 / 0 =
+posted / lent everywhere. Indirect and list emulated draws stay lent. Log once: "One follower:
+emulated mesh draws posted | lent (FRITCHII_ONEF_MESH_EMU=...)".
 FRITCHII_ONEF_MESH_EMU_ASYNC: with FRITCHII_ESPLIT's async tail they take it too (fountain idle
 18.3 -> 18.2 ms, checks 0); 0 = lockstep tails for them.
 
@@ -3127,21 +3149,20 @@ numbered "everything" 1, here it is 9); 2 verify (every flag store of 9, the hos
 decide; any game); 5 as 3 with the discard pre-pass and 8 as 9 without the colour pre-pass (A/B).
 Any other value is off.
 
-Full is set by default on AMD's proprietary driver on a discrete GPU (Windows; 2026-11-19,
-MainWindow::ApplyHardwareDefaults, right after the cards are read): one follower runs there at Full
-(FRITCHII_ONEF_AMD) and its win over off comes from Full's pre-pass variants. Only while the player
-has not chosen: nothing decided for this card yet in config/frizti.ini (hw_card), the setting still
-Standard, and the AMD offer below never answered (UISettings fritchii_occl_offer empty). Then
-frizti.ini keeps hw_card and hw.occlusion_speedup, and the offer's state reads "set by hardware
-defaults" (so the offer never asks over it). It is never set again: a player who moves off Full
-keeps their value ("changed by the player after hardware defaults"), on any card. On a card change
-a value still as set goes back to Standard, then the new card decides. No settings revision bump
-(no "Use recommended?" prompt). Log: "Hardware defaults: occlusion speed-up Full on CARD (...)",
-or "... left as the player has it ...". A FRITCHII_OCCL_FLAG switch still wins at boot. No
-shaderInt64 test (the frontend's card records have none; every AMD proprietary Windows driver has
-it, and the colour variants check it at the draw). Measured only over OCuLink x4 (Full against
-Standard: host query slots 37k -> 14.5k a second, GPU -0.4 to -1.3 ms): confirm on a desktop x16
-card before main dev takes it.
+Full is part of the recommended settings on AMD's proprietary driver on a discrete GPU (Windows;
+2026-11-19, reworked 2026-11-21, MainWindow::ApplyHardwareDefaults, right after the cards are
+read): one follower runs there at Full (FRITCHII_ONEF_AMD) and its win over off comes from Full's
+pre-pass variants. It is set only on a start that applied the tuned settings in full (a fresh
+install, "Use recommended" in the settings prompt, Reset to defaults), and only while the setting
+is still Standard; never after "Keep my settings" (then one follower stays off on AMD, as in 6.2,
+and the one-time offer below may still ask). The offer's state then reads "set by the recommended
+settings", so it never asks over it. Log: "Recommended settings: occlusion speed-up Full on CARD
+(...)" or "... left at VALUE on CARD (not the default, the player's choice)". A FRITCHII_OCCL_FLAG
+switch still wins at boot. No shaderInt64 test (the frontend's card records have none; every AMD
+proprietary Windows driver has it, and the colour variants check it at the draw). Measured only
+over OCuLink x4 (Full against Standard: host query slots 37k -> 14.5k a second, GPU -0.4 to -1.3
+ms): confirm on a desktop x16 card before main dev takes it. (config/frizti.ini's hw_card and hw.
+keys from earlier 6.5 test builds are kept but no longer read.)
 
 Full is offered once to players it can help (fritchii/occlusion_offer.cpp): when a game ends in
 which the flags acted in OoT on AMD's Windows driver with shaderInt64 (the rasterizer sets
