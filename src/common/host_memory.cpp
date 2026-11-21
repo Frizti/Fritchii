@@ -473,12 +473,16 @@ public:
 
     /// Counts Protect calls done without the lock, ones that fell back to it and ones redone
     /// under it after a split Unmap (split_unmap_seq), and logs them every 10 s while the switch
-    /// is on (the fallbacks and redos are the calls that still wait).
+    /// is on (the fallbacks and redos are the calls that still wait): at info level only when a
+    /// window had a fallback, a redo or a new split Unmap with protections put back; a window
+    /// of unlocked calls alone is a debug line (review R3 should-fix 6: 6 lines a minute for
+    /// every Windows player otherwise).
     static void NoteProtect(ProtectPath path) {
         static std::atomic<u64> fast{};
         static std::atomic<u64> locked{};
         static std::atomic<u64> redone{};
         static std::atomic<u64> next_report_ns{};
+        static std::atomic<u64> reported_splits{};
         (path == ProtectPath::Unlocked   ? fast
          : path == ProtectPath::Fallback ? locked
                                          : redone)
@@ -496,15 +500,22 @@ public:
         const u64 fast_count = fast.exchange(0, std::memory_order_relaxed);
         const u64 locked_count = locked.exchange(0, std::memory_order_relaxed);
         const u64 redone_count = redone.exchange(0, std::memory_order_relaxed);
-        if (due != 0) {
-            LOG_INFO(HW_Memory,
-                     "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): {} without the "
-                     "lock, {} took the lock (placeholder or several views), {} redone under the "
-                     "lock (a split Unmap ran alongside); this session {} split Unmaps put {} "
-                     "protected runs back on their kept parts",
-                     fast_count, locked_count, redone_count,
-                     g_split_protect_splits.load(std::memory_order_relaxed),
-                     g_split_protect_runs.load(std::memory_order_relaxed));
+        const u64 splits = g_split_protect_splits.load(std::memory_order_relaxed);
+        const bool new_splits =
+            reported_splits.exchange(splits, std::memory_order_relaxed) != splits;
+        if (due == 0) {
+            return;
+        }
+        constexpr const char* Line =
+            "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): {} without the lock, {} "
+            "took the lock (placeholder or several views), {} redone under the lock (a split "
+            "Unmap ran alongside); this session {} split Unmaps put {} protected runs back on "
+            "their kept parts";
+        const u64 runs = g_split_protect_runs.load(std::memory_order_relaxed);
+        if (locked_count != 0 || redone_count != 0 || new_splits) {
+            LOG_INFO(HW_Memory, Line, fast_count, locked_count, redone_count, splits, runs);
+        } else {
+            LOG_DEBUG(HW_Memory, Line, fast_count, locked_count, redone_count, splits, runs);
         }
     }
 

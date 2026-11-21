@@ -489,7 +489,8 @@ VirtualProtect is redone under the lock, after the restore, so its newer flags w
 Log: "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): N without the lock, M took the
 lock (placeholder or several views), R redone under the lock (a split Unmap ran alongside); this
 session S split Unmaps put P protected runs back on their kept parts" (that line only with the
-switch on). The first 3 splits that restored anything log "Split unmap: N protected runs of the
+switch on, every 10 s at most, and at info level only when the window had a fallback, a redo or a
+new split Unmap that put protections back; a window of unlocked calls alone is a debug line). The first 3 splits that restored anything log "Split unmap: N protected runs of the
 kept parts restored after the remap" in either mode.
 Measure with the "host protect" time and longest in the Hitch:
 lines around area loads.
