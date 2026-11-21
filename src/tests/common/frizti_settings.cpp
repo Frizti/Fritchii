@@ -32,7 +32,7 @@ void CheckFriztiValues(const Settings::Values& values) {
     CHECK(values.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked);
     CHECK(values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_8Gb);
     CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
-    CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::Auto);
+    CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::Fsr);
 }
 } // namespace
 
@@ -70,9 +70,9 @@ TEST_CASE("Between revisions only another build's changes are undone", "[frizti_
     REQUIRE(changes.size() == 2);
     CHECK(values->gpu_accuracy.GetValue() == Settings::GpuAccuracy::High);
     CHECK(values->vsync_mode.GetValue() == Settings::VSyncMode::Mailbox);
-    CHECK(values->scaling_filter.GetValue() == Settings::ScalingFilter::Auto);
+    CHECK(values->scaling_filter.GetValue() == Settings::ScalingFilter::Fsr);
     CHECK(Frizti::FormatChanges(changes) ==
-          "use_vsync: Fifo -> Mailbox, scaling_filter: Fsr3 -> Auto");
+          "use_vsync: Fifo -> Mailbox, scaling_filter: Fsr3 -> Fsr");
 }
 
 TEST_CASE("Ocarina's per-game overrides go back to global", "[frizti_settings]") {

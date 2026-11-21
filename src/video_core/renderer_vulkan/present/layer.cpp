@@ -103,14 +103,14 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
                                             Service::Nvnflinger::LayerStackId::Recording)) == 0;
 
     // The Auto window filter (present.h): Area while the picture is bigger than the window it
-    // fills (5% slack, so a picture that only matches the window keeps ScaleForce).
+    // fills (5% slack, so a picture that only matches the window keeps FSR 1).
     if (!is_applet && layout.screen.GetWidth() != 0 && layout.screen.GetHeight() != 0) {
         const bool bigger = scaled_width * 20 > layout.screen.GetWidth() * 21 ||
                             scaled_height * 20 > layout.screen.GetHeight() * 21;
         if (g_present_picture_bigger.exchange(bigger, std::memory_order_relaxed) != bigger &&
             Settings::values.scaling_filter.GetValue() == Settings::ScalingFilter::Auto) {
             LOG_INFO(Render_Vulkan, "Window filter Auto: {} (picture {}x{} in a {}x{} window)",
-                     bigger ? "Area" : "ScaleForce", scaled_width, scaled_height,
+                     bigger ? "Area" : "FSR 1", scaled_width, scaled_height,
                      layout.screen.GetWidth(), layout.screen.GetHeight());
         }
     }

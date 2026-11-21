@@ -1689,14 +1689,14 @@ void ConfigureGraphics::UpdateWindowFilterNote() {
     const bool known = picture != 0 && screen_height != 0;
     const bool bigger = known && picture * 20 > screen_height * 21;
     const bool smaller = known && picture * 21 < screen_height * 20;
-    const F best = bigger ? F::Area : F::ScaleForce;
+    const F best = bigger ? F::Area : F::Fsr;
     QString advice;
     if (bigger) {
         advice = tr("Your picture (%1) is bigger than your screen (%2): Area looks best.")
                      .arg(HeightName(picture), HeightName(screen_height));
     } else if (smaller) {
-        advice = tr("Your picture (%1) is smaller than your screen (%2): ScaleForce looks best, "
-                    "FSR 1 is sharper.")
+        advice = tr("Your picture (%1) is smaller than your screen (%2): FSR 1 looks best, "
+                    "ScaleForce is softer.")
                      .arg(HeightName(picture), HeightName(screen_height));
     } else if (known) {
         advice = tr("Your picture matches your screen (%1): every filter looks the same.")
@@ -1758,7 +1758,7 @@ void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
         tr("Stops the picture from tearing.\nOff has the least lag but the picture can tear."));
     set(values.scaling_filter.Id(), tr("Window filter:"),
         tr("How the picture is fitted to your window or screen.\nAuto: Area when the picture is "
-           "bigger than your screen, ScaleForce when it is smaller."));
+           "bigger than your screen, FSR 1 when it is smaller."));
     set(values.game_dlss_network.Id(), tr("Use the game's own DLSS"),
         tr("Switch 2 games with DLSS use the game's own upscaler instead of FSR 3.1.\nCan be slow "
            "on older cards."));

@@ -12,6 +12,9 @@ Fritchii v6.5: AMD gets its extra GPU thread back, and fewer stutters for everyo
 - **First start asks once: "Use the recommended settings?"** Use recommended applies the settings tuned for OoT (on AMD Radeon cards that now includes the Full occlusion speed-up) and saves your old ones first. Keep my settings changes nothing.
 - No new shader preparation: v6.5 keeps v6.2's prepared shaders.
 
+### Picture
+- **The window filter is now FSR 1 by default** (with its sharpening, set by FSR sharpness). Auto picks FSR 1 too, and still uses Area when your picture is bigger than your screen.
+
 ### AMD
 - **The crash with Fritchii's extra GPU thread is fixed.** Bakemono tracked it down with Radeon GPU Detective: the GPU read a vertex buffer list that was out of date. With that fixed, AMD Radeon cards (Windows driver, discrete cards) get the extra GPU thread back, on by default.
 - **The OoT occlusion speed-up is Full by default on AMD Radeon cards.** You can still pick Standard in Graphics > Advanced and Fritchii keeps your choice.

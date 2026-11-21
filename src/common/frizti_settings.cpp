@@ -38,7 +38,7 @@ std::vector<BasicSetting*> TunedSettings(Values& values) {
         &values.use_docked_mode,          // Docked
         &values.memory_layout_mode,       // 8 GB: Ocarina's own memory size
         &values.nvdec_emulation,          // GPU: Ocarina's cutscene videos
-        &values.scaling_filter,           // Auto: Area above the window size, else ScaleForce
+        &values.scaling_filter,           // FSR 1 (v6.5; Auto before: Area above the window size, else ScaleForce)
         &values.resolution_setup,         // 1x: a higher scale left over from other games costs fps
         &values.anti_aliasing,            // None: OoT's own AA (or DLSS) already smooths edges
         &values.cpu_accuracy,             // Auto

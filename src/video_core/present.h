@@ -10,16 +10,17 @@
 /// screen, 8K on a 4K one): set by the display layer each frame, read by the Auto filter.
 inline std::atomic<bool> g_present_picture_bigger{false};
 
-/// Auto (Fritchii's default, 2026-11-18): Area when the picture is bigger than the window (an
-/// exact average of every pixel a screen pixel covers: no shimmer), ScaleForce otherwise (an
-/// upscaler: it reads a few pixels around one spot, which skips pixels when shrinking).
+/// Auto: Area when the picture is bigger than the window (an exact average of every pixel a screen
+/// pixel covers: no shimmer), FSR 1 with its sharpening otherwise (owner 2026-11-21, v6.5: FSR 1 is
+/// also the default filter; ScaleForce before). FSR 1 is an upscaler, which skips pixels when
+/// shrinking, so Auto keeps Area for a picture bigger than the window.
 static inline Settings::ScalingFilter ResolveScalingFilter(Settings::ScalingFilter filter) {
     if (filter != Settings::ScalingFilter::Auto) {
         return filter;
     }
     return g_present_picture_bigger.load(std::memory_order_relaxed)
                ? Settings::ScalingFilter::Area
-               : Settings::ScalingFilter::ScaleForce;
+               : Settings::ScalingFilter::Fsr;
 }
 
 static inline Settings::ScalingFilter GetScalingFilter() {
