@@ -53,6 +53,17 @@ enum class Cause : u8 {
     TextureUpload,    ///< TextureCache::UploadImageContents (read, untile, staging write), bytes
     ZeroUpload,       ///< FRITCHII_ZERO_UPLOAD: the zero check of an upload, bytes looked at
     RecompileListed,  ///< Recompile of a FRITCHII_JIT_BLOCK_LIST block the warm-up had not reached
+    // Fritchii: Direct NVN (fritchii_hitch_add, in this order)
+    DnvnRecording,    ///< the replay recording submissions (its worker thread)
+    DnvnIdle,         ///< the replay worker waiting for a submission
+    DnvnSlot,         ///< the replay waiting for a command buffer slot (an older submission on the GPU)
+    DnvnUpload,       ///< the replay waiting for upload staging in flight (vka_up_throttle)
+    DnvnPipeline,     ///< the replay waiting for a pipeline another thread builds
+    DnvnImageCreate,  ///< the replay creating images
+    DnvnQueueFull,    ///< the game's thread waiting for room in the replay's queue
+    DnvnGameSync,     ///< the game's thread in SyncWait / QueueFinish
+    DnvnUnmapHold,    ///< a guest unmap held up in Direct NVN's hook (its locks, the replay's readers)
+    DnvnReaderWait,   ///< the replay's readers of guest memory held up by a guest unmap or a table edit
     Count,
 };
 
@@ -68,7 +79,12 @@ inline constexpr std::array<const char*, static_cast<size_t>(Cause::Count)> Caus
     "game code dropped by invalidations (blocks)", "game code dropped by fastmem faults (blocks)",
     "warm compiles refused (code cache full)", "staging buffers made",
     "texture uploads (CPU side)", "zero checks of texture uploads",
-    "recompiling listed game code the warm-up had not compiled yet (summed over cores)"};
+    "recompiling listed game code the warm-up had not compiled yet (summed over cores)",
+    "direct: replay recording", "direct: replay idle", "direct: replay waiting for a slot",
+    "direct: replay upload throttle", "direct: replay waiting for a pipeline",
+    "direct: replay image creates", "direct: game waiting for the replay queue",
+    "direct: game in sync waits", "direct: guest unmaps held up by the replay",
+    "direct: replay held up by guest unmaps"};
 
 struct Counters {
     std::array<std::atomic<u64>, static_cast<size_t>(Cause::Count)> ns{};

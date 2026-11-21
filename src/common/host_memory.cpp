@@ -9,10 +9,17 @@
 #ifdef _WIN32
 
 #include <iterator>
+#include <map>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
 #include <psapi.h>
+#include <algorithm>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <atomic>
 #include <vector>
 #include "common/dynamic_library.h"
 
@@ -167,6 +174,107 @@ using PFN_MapViewOfFile3 = _Ret_maybenull_ PVOID(WINAPI*)(
 using PFN_UnmapViewOfFile2 = BOOL(WINAPI*)(_In_ HANDLE Process, _In_ PVOID BaseAddress,
                                            _In_ ULONG UnmapFlags);
 
+// Windows can't shrink a view in place: a partial unmap takes the whole view down and maps back what
+// the unmap leaves (UnmapOnePlaceholder, UnmapOneAlias), and the rest of the view faults meanwhile.
+// The JIT gets past such a fault through its fastmem handler, but host code that reads guest memory
+// in place has none (NVN direct's front end). A fault in the arena or an alias region waits for the
+// remaps in progress and retries the access when the page allows it now.
+namespace {
+std::atomic<int> remaps_in_progress{};
+std::atomic<u64> remaps_started{};
+thread_local bool remapping{};
+SRWLOCK retry_ranges_lock = SRWLOCK_INIT;
+std::vector<std::pair<uintptr_t, size_t>> retry_ranges; ///< (base, size)
+
+LONG CALLBACK RetryRemappedAccess(EXCEPTION_POINTERS* pointers) {
+    const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 ||
+        remapping) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const ULONG_PTR access = record.ExceptionInformation[0]; // 0 read, 1 write, 8 execute
+    const uintptr_t address = record.ExceptionInformation[1];
+    if (access > 1) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    AcquireSRWLockShared(&retry_ranges_lock);
+    const bool in_range =
+        std::any_of(retry_ranges.begin(), retry_ranges.end(),
+                    [&](const auto& range) { return address - range.first < range.second; });
+    ReleaseSRWLockShared(&retry_ranges_lock);
+    if (!in_range) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    constexpr DWORD Writable =
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    // Another remap can start between the wait and the query: the page is then looked at again
+    // once it is done. Only a page that stays inaccessible with no remap since is a real fault.
+    u64 started;
+    bool allowed;
+    do {
+        while (remaps_in_progress.load(std::memory_order_acquire) != 0) {
+            SwitchToThread();
+        }
+        started = remaps_started.load(std::memory_order_acquire);
+        MEMORY_BASIC_INFORMATION info{};
+        allowed = VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0 &&
+                  info.State == MEM_COMMIT && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 &&
+                  (access == 0 || (info.Protect & Writable) != 0);
+    } while (!allowed && (remaps_in_progress.load(std::memory_order_acquire) != 0 ||
+                          remaps_started.load(std::memory_order_acquire) != started));
+    if (!allowed) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // A page that allows the access and faults again with no remap in between would retry
+    // forever. Faults across remaps (a reader of a view that is remapped again and again) are not
+    // counted.
+    thread_local uintptr_t last_address{};
+    thread_local u64 last_started{};
+    thread_local int retries{};
+    retries = address == last_address && started == last_started ? retries + 1 : 0;
+    last_address = address;
+    last_started = started;
+    return retries < 64 ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void AddRetryRange(const void* base, size_t size) {
+    static std::once_flag installed;
+    std::call_once(installed, [] { AddVectoredExceptionHandler(1, RetryRemappedAccess); });
+    AcquireSRWLockExclusive(&retry_ranges_lock);
+    retry_ranges.emplace_back(reinterpret_cast<uintptr_t>(base), size);
+    ReleaseSRWLockExclusive(&retry_ranges_lock);
+}
+
+void RemoveRetryRange(const void* base) {
+    AcquireSRWLockExclusive(&retry_ranges_lock);
+    std::erase_if(retry_ranges, [&](const auto& range) {
+        return range.first == reinterpret_cast<uintptr_t>(base);
+    });
+    ReleaseSRWLockExclusive(&retry_ranges_lock);
+}
+
+/// Marks the time a partial unmap leaves the rest of its view unmapped.
+class RemapScope {
+public:
+    explicit RemapScope(bool active_) : active{active_} {
+        if (active) {
+            remapping = true;
+            remaps_in_progress.fetch_add(1, std::memory_order_acq_rel);
+            remaps_started.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+    ~RemapScope() {
+        if (active) {
+            remaps_in_progress.fetch_sub(1, std::memory_order_acq_rel);
+            remapping = false;
+        }
+    }
+
+private:
+    bool active;
+};
+} // namespace
+
 template <typename T>
 static void GetFuncAddress(Common::DynamicLibrary& dll, const char* name, T& pfn) {
     if (!dll.GetSymbol(name, &pfn)) {
@@ -243,6 +351,105 @@ LONG CALLBACK ReservedPageHandler(PEXCEPTION_POINTERS info) {
     }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
+
+
+// Fritchii, FRITCHII_MAP_STACKS=1 (boot; a diagnostic): guest maps and unmaps counted by their call stack (count, bytes, time), the
+// stacks that took the most time logged every 10 s with their function names (dbghelp, in process)
+std::atomic<u64> g_um_ns[3]{}, g_um_n[3]{};
+// FRITCHII_MAP_STACKS: what guest maps would let a cheaper design skip: maps that repeat the last unmapped mapping at that address (same
+// length and backing offset), and how long mappings live (map to unmap)
+struct MapHistory {
+    std::mutex mu;
+    struct Live { size_t host, len; u64 t; };
+    std::unordered_map<size_t, Live> live;      // by virtual offset
+    std::unordered_map<size_t, Live> gone;      // the last unmapped mapping at each virtual offset
+    u64 maps{}, repeats{}, unmaps{}, life[6]{}; // lifetimes: <1 ms, <16 ms, <100 ms, <1 s, <10 s, more
+    void OnMap(size_t va, size_t host, size_t len) {
+        std::scoped_lock lk{mu}; ++maps;
+        const auto g = gone.find(va);
+        if (g != gone.end() && g->second.host == host && g->second.len == len) ++repeats;
+        live[va] = {host, len, Common::Nx2Hitch::NowNs()};
+    }
+    void OnUnmap(size_t va, size_t len) {
+        std::scoped_lock lk{mu}; ++unmaps;
+        const auto l = live.find(va);
+        if (l == live.end()) return;
+        const u64 ms = (Common::Nx2Hitch::NowNs() - l->second.t) / 1000000;
+        ++life[ms < 1 ? 0 : ms < 16 ? 1 : ms < 100 ? 2 : ms < 1000 ? 3 : ms < 10000 ? 4 : 5];
+        if (len == l->second.len) gone[va] = l->second;
+        live.erase(l);
+    }
+    std::string TakeLine() {
+        std::scoped_lock lk{mu};
+        std::string t = fmt::format("{} maps ({} repeat the last mapping unmapped at their address), {} unmaps; lifetimes <1 ms {}, <16 ms {}, <100 ms {}, <1 s {}, <10 s {}, more {}",
+                                    maps, repeats, unmaps, life[0], life[1], life[2], life[3], life[4], life[5]);
+        maps = repeats = unmaps = 0; for (auto& x : life) x = 0;
+        return t;
+    }
+};
+MapHistory g_map_history;
+   // FRITCHII_MAP_STACKS: unmap stages: 0 the view's unmap, 1 the split and remap of a partial one, 2 the coalesces
+class MapStacks {
+public:
+    static MapStacks& Get() { static MapStacks m; return m; }
+    bool On() const { return on; }
+    struct Timed {   // times its scope as one map (kind 0) or unmap (1) when the stacks are on
+        Timed(int k, size_t n) : kind{k}, bytes{n}, t0{Get().On() ? Common::Nx2Hitch::NowNs() : 0} {}
+        ~Timed() { if (t0) Get().Record(kind, bytes, Common::Nx2Hitch::NowNs() - t0); }
+        int kind; size_t bytes; u64 t0;
+    };
+    void Record(int kind, size_t bytes, u64 ns) {
+        void* frames[Depth]{};
+        const USHORT n = RtlCaptureStackBackTrace(2, Depth, frames, nullptr);
+        u64 h = static_cast<u64>(kind) * 0x9E3779B97F4A7C15ULL;
+        for (USHORT i = 0; i < n; ++i) h = (h ^ reinterpret_cast<u64>(frames[i])) * 0x100000001B3ULL;
+        std::scoped_lock lk{mutex};
+        for (size_t k = 0; k < Slots; ++k) {
+            Entry& e = table[(h + k) % Slots];
+            if (e.count == 0) { e.hash = h; e.kind = kind; std::copy(frames, frames + Depth, e.frames); }
+            if (e.hash == h) { ++e.count; e.bytes += bytes; e.ns += ns; return; }
+        }
+    }
+private:
+    static constexpr size_t Depth = 8, Slots = 1024;
+    struct Entry { u64 hash, count, bytes, ns; int kind; void* frames[Depth]; };
+    MapStacks() {
+        const char* const e = std::getenv("FRITCHII_MAP_STACKS");
+        on = e != nullptr && e[0] == '1';
+        if (on) std::thread([this] { Run(); }).detach();
+    }
+    std::string Name(void* a) {
+        struct { ULONG SizeOfStruct, TypeIndex; ULONG64 Reserved[2]; ULONG Index, Size; ULONG64 ModBase; ULONG Flags; ULONG64 Value, Address; ULONG Register, Scope, Tag, NameLen, MaxNameLen; CHAR Name[200]; } si{};
+        si.SizeOfStruct = 88; si.MaxNameLen = 199; DWORD64 d = 0;
+        if (sym_from && sym_from(GetCurrentProcess(), reinterpret_cast<DWORD64>(a), &d, &si)) return fmt::format("{}+{:#x}", si.Name, d);
+        return fmt::format("{}", a);
+    }
+    void Run() {
+        HMODULE h = LoadLibraryA("dbghelp.dll");
+        using init_t = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
+        const auto init = h ? reinterpret_cast<init_t>(GetProcAddress(h, "SymInitialize")) : nullptr;
+        sym_from = h ? reinterpret_cast<decltype(sym_from)>(GetProcAddress(h, "SymFromAddr")) : nullptr;
+        if (init) init(GetCurrentProcess(), nullptr, TRUE);
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            std::vector<Entry> v;
+            { std::scoped_lock lk{mutex}; for (Entry& e : table) if (e.count) { v.push_back(e); e = {}; } }
+            std::sort(v.begin(), v.end(), [](const Entry& a, const Entry& b) { return a.ns > b.ns; });
+            LOG_INFO(HW_Memory, "map history (10 s): {}", g_map_history.TakeLine());
+            LOG_INFO(HW_Memory, "unmap stages (10 s): view unmaps {:.1f} ms ({}), partial splits and remaps {:.1f} ms ({}), coalesces {:.1f} ms ({})",
+                     g_um_ns[0].exchange(0) / 1e6, g_um_n[0].exchange(0), g_um_ns[1].exchange(0) / 1e6, g_um_n[1].exchange(0), g_um_ns[2].exchange(0) / 1e6, g_um_n[2].exchange(0));
+            for (size_t i = 0; i < v.size() && i < 8; ++i) {
+                std::string st;
+                for (size_t f = 0; f < Depth && v[i].frames[f]; ++f) st += (f ? " < " : "") + Name(v[i].frames[f]);
+                LOG_INFO(HW_Memory, "map stacks (10 s): {} {} x{}, {} MiB, {:.1f} ms: {}", i + 1, v[i].kind ? "unmap" : "map", v[i].count, v[i].bytes >> 20, static_cast<double>(v[i].ns) / 1e6, st);
+            }
+        }
+    }
+    bool on{};
+    BOOL(WINAPI* sym_from)(HANDLE, DWORD64, PDWORD64, void*){};
+    std::mutex mutex;
+    Entry table[Slots]{};
+};
 } // Anonymous namespace
 
 class HostMemory::Impl {
@@ -354,6 +561,7 @@ public:
                          end - offset, offset, GetLastError());
             return false;
         }
+        AddRetryRange(virtual_base, virtual_size);
         return true;
     }
 
@@ -367,6 +575,7 @@ public:
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
         const GuestMappingInFlight in_flight;
+        const MapStacks::Timed stk{0, length};
         const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::HostMap, length}; // before the lock
         std::unique_lock lock{placeholder_mutex};
         if (!IsNiechePlaceholder(virtual_offset, length)) {
@@ -376,10 +585,13 @@ public:
         TrackPlaceholder(virtual_offset, host_offset, length);
 
         MapView(virtual_offset, host_offset, length);
+        if (MapStacks::Get().On()) g_map_history.OnMap(virtual_offset, host_offset, length);
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
         const GuestMappingInFlight in_flight;
+        const MapStacks::Timed stk{1, length};
+        if (MapStacks::Get().On()) g_map_history.OnUnmap(virtual_offset, length);
         const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::HostUnmap, length}; // before the lock
         std::scoped_lock lock{placeholder_mutex};
 
@@ -504,6 +716,181 @@ public:
         return host_pointer_it->second + virtual_offset - it->lower();
     }
 
+    /// HostMemory::MapBackingView: a placeholder split piece by piece from its start, each piece
+    /// replaced by a view of the backing section (a run) or of a section of the view's own that
+    /// holds its zero pages. MapViewOfFile3 takes page-aligned pieces of a placeholder; VirtualAlloc2
+    /// documents no such exception for private memory.
+    u8* MapBackingView(size_t length, std::span<const HostMemory::BackingRun> runs) {
+        size_t zero_bytes = length;
+        for (const HostMemory::BackingRun& run : runs) {
+            zero_bytes -= run.length;
+        }
+        HANDLE zero_section = nullptr;
+        if (zero_bytes != 0) {
+            zero_section = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, zero_bytes, nullptr, nullptr, 0);
+            if (!zero_section) {
+                LOG_ERROR(HW_Memory, "Backing view: no section for its {:#x} zero bytes, error {}", zero_bytes, GetLastError());
+                return nullptr;
+            }
+        }
+        u8* const view = static_cast<u8*>(pfn_VirtualAlloc2(process, nullptr, length, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+        DWORD error = view ? 0 : GetLastError();
+        std::vector<u8*> pieces;
+        size_t mapped = 0; // the placeholder left is [mapped, length)
+        size_t split = 0;  // when past mapped: [mapped, split) and [split, length) are placeholders
+        const auto map_piece = [&](HANDLE section, size_t section_offset, size_t size) {
+            u8* const address = view + mapped;
+            if (mapped + size < length) {
+                if (!VirtualFreeEx(process, address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                    error = GetLastError();
+                    return false;
+                }
+                split = mapped + size;
+            }
+            if (!pfn_MapViewOfFile3(section, process, address, section_offset, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
+                error = GetLastError();
+                return false;
+            }
+            pieces.push_back(address);
+            mapped += size;
+            return true;
+        };
+        bool ok = view != nullptr;
+        size_t zero_offset = 0;
+        for (const HostMemory::BackingRun& run : runs) {
+            if (ok && run.view_offset > mapped) {
+                const size_t size = run.view_offset - mapped;
+                ok = map_piece(zero_section, zero_offset, size);
+                zero_offset += size;
+            }
+            ok = ok && map_piece(backing_handle, run.host_offset, run.length);
+        }
+        if (ok && mapped < length) {
+            ok = map_piece(zero_section, zero_offset, length - mapped);
+        }
+        // The views keep the section.
+        if (zero_section) {
+            CloseHandle(zero_section);
+        }
+        if (!ok) {
+            LOG_ERROR(HW_Memory, "Backing view of {:#x} bytes: failed at its offset {:#x}, error {}", length, mapped, error);
+            for (u8* const piece : pieces) {
+                pfn_UnmapViewOfFile2(process, piece, 0);
+            }
+            if (view && mapped < length) {
+                VirtualFreeEx(process, view + mapped, 0, MEM_RELEASE);
+            }
+            if (view && split > mapped) {
+                VirtualFreeEx(process, view + split, 0, MEM_RELEASE);
+            }
+            return nullptr;
+        }
+        std::scoped_lock lock{view_mutex};
+        view_pieces.emplace(view, std::move(pieces));
+        return view;
+    }
+
+    void UnmapBackingView(u8* view) {
+        std::vector<u8*> pieces;
+        {
+            std::scoped_lock lock{view_mutex};
+            const auto it = view_pieces.find(view);
+            if (it == view_pieces.end()) {
+                LOG_ERROR(HW_Memory, "Backing view at {}: not a backing view", fmt::ptr(view));
+                return;
+            }
+            pieces = std::move(it->second);
+            view_pieces.erase(it);
+        }
+        for (u8* const piece : pieces) {
+            if (!pfn_UnmapViewOfFile2(process, piece, 0)) {
+                LOG_ERROR(HW_Memory, "Backing view at {}: unmapping its piece at {}, error {}", fmt::ptr(view), fmt::ptr(piece), GetLastError());
+            }
+        }
+    }
+
+    /// HostMemory::ReserveAliasRegion: one placeholder over the whole region.
+    u8* ReserveAliasRegion(size_t length) {
+        u8* const base = static_cast<u8*>(pfn_VirtualAlloc2(process, nullptr, length, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+        if (!base) {
+            LOG_ERROR(HW_Memory, "Alias region of {:#x} bytes: no placeholder, error {}", length, GetLastError());
+            return nullptr;
+        }
+        AddRetryRange(base, length);
+        std::scoped_lock lock{alias_mutex};
+        alias_regions.emplace(base, AliasRegion{.size = length});
+        return base;
+    }
+
+    /// HostMemory::MapAlias: Map's placeholder handling, within the region's own placeholders.
+    bool MapAlias(u8* address, size_t host_offset, size_t length) {
+        std::scoped_lock lock{alias_mutex};
+        const auto found = FindAliasRegion(address, length);
+        if (!found) {
+            LOG_ERROR(HW_Memory, "Alias of {:#x} bytes at {}: not in an alias region", length, fmt::ptr(address));
+            return false;
+        }
+        auto& [base, region] = **found;
+        const size_t offset = static_cast<size_t>(address - base);
+        while (UnmapOneAlias(base, region, offset, length)) {
+        }
+        // [offset, offset + length) now lies in one placeholder: the gap between its views.
+        const auto next = region.views.upper_bound({offset, offset + length});
+        const size_t gap_end = next == region.views.end() ? region.size : next->lower();
+        const size_t gap_begin = next == region.views.begin() ? 0 : std::prev(next)->upper();
+        if ((gap_begin != offset || gap_end != offset + length) &&
+            !VirtualFreeEx(process, address, length, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            LOG_ERROR(HW_Memory, "Alias at {}: splitting its placeholder, error {}", fmt::ptr(address), GetLastError());
+            return false;
+        }
+        if (!pfn_MapViewOfFile3(backing_handle, process, address, host_offset, length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
+            LOG_ERROR(HW_Memory, "Alias at {} of backing {:#x}+{:#x}: error {}", fmt::ptr(address), host_offset, length, GetLastError());
+            if (gap_begin != offset || gap_end != offset + length) {
+                VirtualFreeEx(process, base + gap_begin, gap_end - gap_begin, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            }
+            return false;
+        }
+        region.views.insert({offset, offset + length});
+        region.view_host_offsets.emplace(offset, host_offset);
+        return true;
+    }
+
+    /// HostMemory::UnmapAlias
+    void UnmapAlias(u8* address, size_t length) {
+        std::scoped_lock lock{alias_mutex};
+        const auto found = FindAliasRegion(address, length);
+        if (!found) {
+            LOG_ERROR(HW_Memory, "Alias unmap of {:#x} bytes at {}: not in an alias region", length, fmt::ptr(address));
+            return;
+        }
+        auto& [base, region] = **found;
+        while (UnmapOneAlias(base, region, static_cast<size_t>(address - base), length)) {
+        }
+    }
+
+    /// HostMemory::ReleaseAliasRegion: every view back to a placeholder, the placeholders joined
+    /// and freed.
+    void ReleaseAliasRegion(u8* base) {
+        std::scoped_lock lock{alias_mutex};
+        const auto it = alias_regions.find(base);
+        if (it == alias_regions.end()) {
+            LOG_ERROR(HW_Memory, "Alias region at {}: not an alias region", fmt::ptr(base));
+            return;
+        }
+        const AliasRegion& region = it->second;
+        for (const auto& view : region.views) {
+            pfn_UnmapViewOfFile2(process, base + view.lower(), MEM_PRESERVE_PLACEHOLDER);
+        }
+        if (!region.views.empty()) {
+            VirtualFreeEx(process, base, region.size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+        }
+        RemoveRetryRange(base);
+        if (!VirtualFreeEx(process, base, 0, MEM_RELEASE)) {
+            LOG_ERROR(HW_Memory, "Alias region at {}: freeing it, error {}", fmt::ptr(base), GetLastError());
+        }
+        alias_regions.erase(it);
+    }
+
     void EnableDirectMappedAddress() {
         // TODO
         UNREACHABLE();
@@ -532,6 +919,7 @@ private:
             Coalesce(0, virtual_size);
         }
         if (virtual_base) {
+            RemoveRetryRange(virtual_base);
             if (!VirtualFree(virtual_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free virtual memory");
             }
@@ -572,26 +960,33 @@ private:
         const bool split_left = unmap_begin > placeholder_begin;
         const bool split_right = unmap_end < placeholder_end;
 
-        if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder_begin,
-                                  MEM_PRESERVE_PLACEHOLDER)) {
-            LOG_CRITICAL(HW_Memory, "Failed to unmap placeholder");
-        }
-        // If we have to remap memory regions due to partial unmaps, we are in a data race as
-        // Windows doesn't support remapping memory without unmapping first. Avoid adding any extra
-        // logic within the panic region described below.
+        {
+            const RemapScope remap{split_left || split_right};
+            const bool stg = MapStacks::Get().On(); u64 st0 = stg ? Common::Nx2Hitch::NowNs() : 0;
+            if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder_begin,
+                                      MEM_PRESERVE_PLACEHOLDER)) {
+                LOG_CRITICAL(HW_Memory, "Failed to unmap placeholder");
+            }
+            if (stg) { const u64 t = Common::Nx2Hitch::NowNs(); g_um_ns[0] += t - st0; ++g_um_n[0]; st0 = t; }
+            // If we have to remap memory regions due to partial unmaps, we are in a data race as
+            // Windows doesn't support remapping memory without unmapping first. Avoid adding any
+            // extra logic within the panic region described below.
 
-        // Panic region, we are in a data race right now
-        if (split_left || split_right) {
-            Split(unmap_begin, unmap_end - unmap_begin);
+            // Panic region, we are in a data race right now
+            if (split_left || split_right) {
+                Split(unmap_begin, unmap_end - unmap_begin);
+            }
+            if (split_left) {
+                MapView(placeholder_begin, host_offset, unmap_begin - placeholder_begin);
+            }
+            if (split_right) {
+                MapView(unmap_end, host_offset + unmap_end - placeholder_begin,
+                        placeholder_end - unmap_end);
+            }
+            // End panic region
+            if (stg && (split_left || split_right)) { g_um_ns[1] += Common::Nx2Hitch::NowNs() - st0; ++g_um_n[1]; }
         }
-        if (split_left) {
-            MapView(placeholder_begin, host_offset, unmap_begin - placeholder_begin);
-        }
-        if (split_right) {
-            MapView(unmap_end, host_offset + unmap_end - placeholder_begin,
-                    placeholder_end - unmap_end);
-        }
-        // End panic region
+        const u64 co0 = MapStacks::Get().On() ? Common::Nx2Hitch::NowNs() : 0;
 
         size_t coalesce_begin = unmap_begin;
         if (!split_left) {
@@ -610,6 +1005,7 @@ private:
                 Coalesce(coalesce_begin, next_begin - coalesce_begin);
             }
         }
+        if (co0) { g_um_ns[2] += Common::Nx2Hitch::NowNs() - co0; ++g_um_n[2]; }
         // Remove and reinsert placeholder trackers
         UntrackPlaceholder(it);
         if (split_left) {
@@ -664,6 +1060,93 @@ private:
         return false;
     }
 
+    /// An alias region's views of the backing memory, by offset in the region; the rest of it is
+    /// placeholders, adjacent ones joined.
+    struct AliasRegion {
+        size_t size;
+        boost::icl::separate_interval_set<size_t> views;
+        ::Common::unordered_map<size_t, size_t> view_host_offsets;
+    };
+
+    /// The region [address, address + length) lies in. Caller holds alias_mutex.
+    std::optional<std::map<u8*, AliasRegion>::iterator> FindAliasRegion(u8* address, size_t length) {
+        auto it = alias_regions.upper_bound(address);
+        if (it == alias_regions.begin()) {
+            return std::nullopt;
+        }
+        --it;
+        if (static_cast<size_t>(address - it->first) + length > it->second.size) {
+            return std::nullopt;
+        }
+        return it;
+    }
+
+    /// UnmapOnePlaceholder for an alias region: one view the range reaches back to a placeholder,
+    /// the parts of it outside the range mapped again and the placeholders around it joined.
+    /// Returns false when the range reaches no view. Caller holds alias_mutex.
+    bool UnmapOneAlias(u8* base, AliasRegion& region, size_t offset, size_t length) {
+        const auto it = region.views.find({offset, offset + length});
+        if (it == region.views.end()) {
+            return false;
+        }
+        const size_t view_begin = it->lower();
+        const size_t view_end = it->upper();
+        const size_t unmap_begin = (std::max)(offset, view_begin);
+        const size_t unmap_end = (std::min)(offset + length, view_end);
+        const auto host_it = region.view_host_offsets.find(view_begin);
+        ASSERT(host_it != region.view_host_offsets.end());
+        const size_t host_offset = host_it->second;
+        const bool split_left = unmap_begin > view_begin;
+        const bool split_right = unmap_end < view_end;
+
+        {
+            const RemapScope remap{split_left || split_right};
+            if (!pfn_UnmapViewOfFile2(process, base + view_begin, MEM_PRESERVE_PLACEHOLDER)) {
+                LOG_ERROR(HW_Memory, "Alias at {}: unmapping its view, error {}", fmt::ptr(base + view_begin), GetLastError());
+            }
+            if (split_left || split_right) {
+                VirtualFreeEx(process, base + unmap_begin, unmap_end - unmap_begin, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            }
+            const auto map = [&](size_t at, size_t from, size_t size) {
+                if (!pfn_MapViewOfFile3(backing_handle, process, base + at, from, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
+                    LOG_ERROR(HW_Memory, "Alias at {}: mapping what an unmap leaves, error {}", fmt::ptr(base + at), GetLastError());
+                }
+            };
+            if (split_left) {
+                map(view_begin, host_offset, unmap_begin - view_begin);
+            }
+            if (split_right) {
+                map(unmap_end, host_offset + unmap_end - view_begin, view_end - unmap_end);
+            }
+        }
+
+        size_t coalesce_begin = unmap_begin;
+        if (!split_left) {
+            coalesce_begin = it == region.views.begin() ? 0 : std::prev(it)->upper();
+            if (coalesce_begin != view_begin) {
+                VirtualFreeEx(process, base + coalesce_begin, unmap_end - coalesce_begin, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            }
+        }
+        if (!split_right) {
+            const auto next = std::next(it);
+            const size_t next_begin = next == region.views.end() ? region.size : next->lower();
+            if (view_end != next_begin) {
+                VirtualFreeEx(process, base + coalesce_begin, next_begin - coalesce_begin, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            }
+        }
+        region.view_host_offsets.erase(host_it);
+        region.views.erase(it);
+        if (split_left) {
+            region.views.insert({view_begin, unmap_begin});
+            region.view_host_offsets.emplace(view_begin, host_offset);
+        }
+        if (split_right) {
+            region.views.insert({unmap_end, view_end});
+            region.view_host_offsets.emplace(unmap_end, host_offset + unmap_end - view_begin);
+        }
+        return true;
+    }
+
     HANDLE process{};        ///< Current process handle
     HANDLE backing_handle{}; ///< File based backing memory
 
@@ -676,6 +1159,12 @@ private:
     std::mutex placeholder_mutex;                                 ///< Mutex for placeholders
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
+
+    std::mutex view_mutex;
+    ::Common::unordered_map<u8*, std::vector<u8*>> view_pieces; ///< MapBackingView's, by view
+
+    std::mutex alias_mutex;
+    std::map<u8*, AliasRegion> alias_regions; ///< ReserveAliasRegion's, by base
 };
 
 #elif defined(__OPENORBIS__) || defined(__managarm__)
@@ -789,6 +1278,11 @@ static int shm_open_anon(int flags, mode_t mode) {
 
 class HostMemory::Impl {
 public:
+    /// The memfd behind the backing memory, -1 when there is none
+    int BackingFd() const noexcept {
+        return fd;
+    }
+
     explicit Impl(size_t backing_size_, size_t virtual_size_)
         : backing_size{backing_size_}
         , virtual_size{virtual_size_}
@@ -843,11 +1337,16 @@ public:
         if (fd >= 0) {
             unlink(template_path);
         }
+#elif defined(MFD_ALLOW_SEALING) && !defined(__ANDROID__)
+        // Sealable: sealed against shrinking below, because udmabuf takes only such memfds (the
+        // NVN direct renderer's pool imports on amdgpu, vka_mem.c import_seg). Android has no
+        // direct renderer.
+        fd = memfd_create("HostMemory", MFD_ALLOW_SEALING);
 #else
         fd = memfd_create("HostMemory", 0);
 #endif
         bool use_anon = false;
-        if (fd <= 0) {
+        if (fd < 0) {
             LOG_WARNING(Common_Memory, "memfd_create: {}", strerror(errno));
             use_anon = true;
         }
@@ -858,13 +1357,18 @@ public:
                 LOG_WARNING(Common_Memory, "ftruncate: {} (likely out-of-emory)", strerror(errno));
                 use_anon = true;
             }
+#if defined(__linux__) && !defined(__ANDROID__) && defined(F_SEAL_SHRINK)
+            if (!use_anon && fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
+                LOG_WARNING(Common_Memory, "F_SEAL_SHRINK: {}", strerror(errno));
+            }
+#endif
         }
         if (use_anon) {
             LOG_WARNING(Common_Memory, "Using private mappings instead of shared ones");
             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_NOCORE, -1, 0));
-            if (fd > 0) {
-                fd = -1;
+            if (fd >= 0) {
                 close(fd);
+                fd = -1;
             }
         } else {
             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOCORE, fd, 0));
@@ -1016,6 +1520,32 @@ public:
 #endif
         int ret = mprotect(virtual_base + virtual_offset, length, flags);
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
+    }
+
+    /// HostMemory::MapBackingView: anonymous zero pages with each run mapped from the file over
+    /// them, as Map maps the fastmem views.
+    u8* MapBackingView(size_t length, std::span<const HostMemory::BackingRun> runs) {
+        if (fd < 0 && !runs.empty()) {
+            LOG_ERROR(HW_Memory, "Backing view: private backing memory is not mapped twice");
+            return nullptr;
+        }
+        u8* const view = static_cast<u8*>(mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+        if (view == MAP_FAILED) {
+            LOG_ERROR(HW_Memory, "Backing view of {:#x} bytes: {}", length, strerror(errno));
+            return nullptr;
+        }
+        for (const HostMemory::BackingRun& run : runs) {
+            if (mmap(view + run.view_offset, run.length, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off_t(run.host_offset)) == MAP_FAILED) {
+                LOG_ERROR(HW_Memory, "Backing view of {:#x} bytes: backing {:#x}+{:#x} at its offset {:#x}: {}", length, run.host_offset, run.length, run.view_offset, strerror(errno));
+                munmap(view, length);
+                return nullptr;
+            }
+        }
+        return view;
+    }
+
+    void UnmapBackingView(u8* view, size_t length) {
+        munmap(view, length);
     }
 
     void EnableDirectMappedAddress() {
@@ -1291,6 +1821,75 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
         hint(virtual_base + *virtual_offset);
     }
 }
+
+int HostMemory::BackingFd() const noexcept {
+#if defined(__linux__)
+    return impl ? impl->BackingFd() : -1;
+#else
+    return -1;
+#endif
+}
+
+u8* HostMemory::MapBackingView(size_t length, std::span<const BackingRun> runs) {
+    ASSERT(length != 0 && length % PageAlignment == 0);
+    size_t end = 0;
+    for (const BackingRun& run : runs) {
+        ASSERT(run.view_offset % PageAlignment == 0 && run.host_offset % PageAlignment == 0);
+        ASSERT(run.length != 0 && run.length % PageAlignment == 0);
+        ASSERT(run.view_offset >= end && run.host_offset + run.length <= backing_size);
+        end = run.view_offset + run.length;
+    }
+    ASSERT(end <= length);
+#if !(defined(__OPENORBIS__) || defined(__managarm__))
+    if (impl) {
+        return impl->MapBackingView(length, runs);
+    }
+#endif
+    LOG_ERROR(HW_Memory, "Backing view: the backing memory is mapped twice only with fastmem");
+    return nullptr;
+}
+
+void HostMemory::UnmapBackingView([[maybe_unused]] u8* view, [[maybe_unused]] size_t length) {
+#if defined(_WIN32)
+    impl->UnmapBackingView(view);
+#elif !(defined(__OPENORBIS__) || defined(__managarm__))
+    impl->UnmapBackingView(view, length);
+#endif
+}
+
+#ifdef _WIN32
+u8* HostMemory::ReserveAliasRegion(size_t length) {
+    ASSERT(length != 0 && length % PageAlignment == 0);
+    if (!impl) {
+        LOG_ERROR(HW_Memory, "Alias region: the backing memory is mapped twice only with fastmem");
+        return nullptr;
+    }
+    return impl->ReserveAliasRegion(length);
+}
+
+bool HostMemory::MapAlias(u8* address, size_t host_offset, size_t length) {
+    ASSERT(reinterpret_cast<uintptr_t>(address) % PageAlignment == 0);
+    ASSERT(host_offset % PageAlignment == 0 && length != 0 && length % PageAlignment == 0);
+    if (host_offset + length > backing_size) {
+        LOG_ERROR(HW_Memory, "Alias of backing {:#x}+{:#x}: beyond the backing memory", host_offset, length);
+        return false;
+    }
+    return impl && impl->MapAlias(address, host_offset, length);
+}
+
+void HostMemory::UnmapAlias(u8* address, size_t length) {
+    ASSERT(reinterpret_cast<uintptr_t>(address) % PageAlignment == 0 && length % PageAlignment == 0);
+    if (impl && length != 0) {
+        impl->UnmapAlias(address, length);
+    }
+}
+
+void HostMemory::ReleaseAliasRegion(u8* region) {
+    if (impl) {
+        impl->ReleaseAliasRegion(region);
+    }
+}
+#endif
 
 namespace {
 std::atomic<u64> g_zero_filled_bytes{};

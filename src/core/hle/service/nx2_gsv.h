@@ -73,6 +73,7 @@
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "core/hle/service/nx2_present.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/syncpoint_manager.h"
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
@@ -1995,6 +1996,13 @@ public:
     }
 
     ~INx2Vi2Session() override {
+        {
+            std::scoped_lock lock{g_vi2_pacer_mutex};
+            if (g_vi2_pacer_owner == this) {
+                g_vi2_pacer = {};
+                g_vi2_pacer_owner = nullptr;
+            }
+        }
         // The vsync callback may be running on the HostTiming thread: empty its event list under
         // its lock first (it holds the state, not this session), then close the events.
         {
@@ -2925,6 +2933,18 @@ private:
         LOG_INFO(Service, "nx2:vi2 261 native event {} -> vsync", index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, true);
+            std::scoped_lock lock{g_vi2_pacer_mutex};
+            g_vi2_pacer = [this](u32 timing, Kernel::KProcess* process) {
+                // Fritchii: Direct NVN's presents give the hitch log its frame gaps too (nx2:vi2's own presents do above)
+                static std::chrono::steady_clock::time_point last{};
+                const auto now = std::chrono::steady_clock::now();
+                if (last != std::chrono::steady_clock::time_point{}) {
+                    Common::Nx2Hitch::OnPresent(std::chrono::duration_cast<std::chrono::microseconds>(now - last).count());
+                }
+                last = now;
+                PaceToVblank(timing, process);
+            };
+            g_vi2_pacer_owner = this;
         }
         TipcReplyWords(ctx, {});
     }
