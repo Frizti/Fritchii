@@ -3147,6 +3147,20 @@ void MemPlayer::EnsureVertexBindings() {
     }
 }
 
+void MemPlayer::EnsureIndexBinding() {
+    const u64 epoch = scheduler.VertexEpoch();
+    if (!last_index_valid || last_index_buffer == VK_NULL_HANDLE ||
+        last_index_vertex_epoch == epoch) {
+        return;
+    }
+    last_index_vertex_epoch = epoch;
+    bound_index_valid = false; // the rebind skip starts again from the next play
+    scheduler.Record([buffer = last_index_buffer, offset = last_index_offset,
+                      type = last_index_type](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindIndexBuffer(buffer, offset, type);
+    });
+}
+
 // ---------------------------------------------------------------------------------------------
 // The read log (5.3)
 
@@ -5084,6 +5098,7 @@ void MemPlayer::SetPasses(Uint8Pass* uint8, QuadIndexedPass* quad_indexed,
 
 void MemPlayer::ForgetBindings() noexcept {
     bound_index_valid = false;
+    last_index_valid = false;
     for (BoundVertexBuffer& bound : bound_vertex_buffers) {
         bound.epoch = ~u64{0};
     }
@@ -5327,6 +5342,13 @@ void MemPlayer::PlayCopy(MemStage::Cmd kind, u8 flags, VkBuffer src_buffer, VkBu
 void MemPlayer::PlayIndex(MemStage::Cmd kind, u8 flags, VkBuffer vk_buffer, VkDeviceSize vk_offset,
                           VkIndexType vk_index_type) {
     BeginPlay(flags);
+    ++index_plays;
+    // EnsureIndexBinding: bound (or still bound) in this command buffer from here on.
+    last_index_valid = (flags & MemStage::ForgetOnly) == 0;
+    last_index_buffer = vk_buffer;
+    last_index_offset = vk_offset;
+    last_index_type = vk_index_type;
+    last_index_vertex_epoch = scheduler.VertexEpoch();
     if (kind == MemStage::Cmd::BindIndexAlways) {
         bound_index_valid = false;
         if ((flags & MemStage::ForgetOnly) != 0) {
