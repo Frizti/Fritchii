@@ -44,6 +44,10 @@
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_runahead.h"
 
+#ifdef LICHII_NVN_DIRECT
+struct nvn_direct_frame;
+#endif
+
 namespace Core {
 class System;
 }
@@ -104,6 +108,10 @@ public:
                               const Device& device_, MemoryAllocator& memory_allocator_,
                               StateTracker& state_tracker_, Scheduler& scheduler_);
     ~RasterizerVulkan() override;
+
+    [[nodiscard]] const PipelineCache& GetPipelineCache() const noexcept {
+        return pipeline_cache;
+    }
 
     void Draw(bool is_indexed, u32 instance_count) override;
     void DrawIndirect() override;
@@ -225,8 +233,16 @@ public:
     std::optional<FramebufferTextureInfo> AccelerateDisplay(const Tegra::FramebufferConfig& config,
                                                             VAddr framebuffer_addr,
                                                             u32 pixel_stride);
+#ifdef LICHII_NVN_DIRECT
+    void SetDirectDisplayFrame(const nvn_direct_frame* frame) {
+        direct_display_frame = frame;
+    }
+#endif
 
 private:
+#ifdef LICHII_NVN_DIRECT
+    const nvn_direct_frame* direct_display_frame{};
+#endif
     /// One follower, part c (vk_one_follower_draw.cpp): R's draws and the verify compares reach
     /// the caches, the ring and the engine pointers.
     friend class OneFollowerDraw;

@@ -871,7 +871,7 @@ private:
         // and the process would end without a word: log it, then abort (the crash handler's
         // report and dump follow).
         try {
-            A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+            A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, true, conf.block_entry_hook});
             Optimization::Optimize(ir_block, conf, polyfill_options);
         } catch (const std::exception& error) {
             ::Common::Log::FmtCrashMessage(__FILE__, __LINE__, __func__,
@@ -916,7 +916,7 @@ private:
             block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
             ir_block.Reset(next_descriptor);
             try {
-                A64::Translate(ir_block, next_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+                A64::Translate(ir_block, next_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, true, conf.block_entry_hook});
                 Optimization::Optimize(ir_block, conf, polyfill_options);
             } catch (const std::exception& error) {
                 ::Common::Log::FmtCrashMessage(__FILE__, __LINE__, __func__,

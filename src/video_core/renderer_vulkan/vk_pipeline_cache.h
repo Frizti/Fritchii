@@ -210,6 +210,14 @@ public:
     /// flag, and RefreshGraphicsKey rewrites the unmasked types only while it is raised.
     [[nodiscard]] DeltaLookup DeltaKeeps(const GraphicsPipeline& pipeline, bool apply);
 
+    /// What this device's translations are made for (NVN2 direct mode translates with them too)
+    [[nodiscard]] const Shader::Profile& GetProfile() const noexcept {
+        return profile;
+    }
+    [[nodiscard]] const Shader::HostTranslateInfo& GetHostInfo() const noexcept {
+        return host_info;
+    }
+
     void TickFrame();
 
     /// What the "Memory owners" log line counts here (GPU thread).

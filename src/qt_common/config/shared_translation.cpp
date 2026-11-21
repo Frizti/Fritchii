@@ -324,6 +324,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "warm-up sooner. It builds only while the game is paused, or from Emulation, "
               "Prepare Shaders Now, when it shares the CPU with the game.\nTakes effect at the "
               "next game start."));
+    INSERT(Settings, nvn_direct_renderer, tr("NVN direct renderer (experimental)"),
+           tr("Runs the game's graphics calls (NVN) directly on Vulkan instead of emulating the "
+              "Switch GPU. Can be much faster, but is experimental: some games may render wrong "
+              "or crash.\nGames it cannot run use the normal renderer. It runs once per session: "
+              "restart the emulator to use it for another game launch. Vulkan only. Takes effect "
+              "when a game starts."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "

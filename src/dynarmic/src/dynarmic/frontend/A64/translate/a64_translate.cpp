@@ -18,7 +18,19 @@ namespace Dynarmic::A64 {
 
 void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options) {
     const bool single_step = descriptor.SingleStepping();
+    const BlockEntryHook hook =
+        options.block_entry_hook != nullptr ? options.block_entry_hook(descriptor.PC()) : BlockEntryHook::None;
     TranslatorVisitor visitor{block, descriptor, std::move(options)};
+    if (hook == BlockEntryHook::Thunk) {
+        visitor.ir.InstructionCacheOperationRaised(InstructionCacheOperation::BlockEntryHook, visitor.ir.Imm64(descriptor.PC()));
+        visitor.ir.SetPC(visitor.X(64, Reg::R16));
+        // X16 holds the caller's return address (the hook sets it to LR), which its BL/BLR pushed
+        // on the return stack buffer: a return's hint finds it there without the dispatch table
+        visitor.ir.SetTerm(IR::Term::CheckHalt{IR::Term::PopRSBHint{}});   // (a blocking call halts the JIT)
+        block.CycleCount()++;
+        block.SetEndLocation(descriptor.AdvancePC(4));
+        return;
+    }
 
     bool should_continue = true;
     do {

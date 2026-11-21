@@ -25,6 +25,7 @@
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
+#include "core/nvn_hook.h"
 
 #include "launch_timestamp_cache.h"
 #include "core/core_timing.h"
@@ -524,6 +525,7 @@ struct System::Impl {
 
         // Make the process created be the application
         kernel.SetApplicationProcess(process->GetHandle());
+        Core::NvnHook::Install(system, *process->GetHandle());
 
         // FRITCHII_JIT_BLOCK_LIST (boot): the title's block list, before the cores start. Its
         // warm-up runs through EDEN_NX2_JIT_WARM's idle compiles (64-bit dynarmic only, several
@@ -647,6 +649,7 @@ struct System::Impl {
         is_powered_on = false;
         exit_locked = false;
         exit_requested = false;
+        Core::NvnHook::StopDirect();
         if (gpu_core)
             gpu_core->NotifyShutdown();
 
@@ -690,6 +693,7 @@ struct System::Impl {
         }
         kernel.Shutdown();
         Kernel::ClearGuestWaitsForHangReport();
+        Core::NvnHook::Uninstall();
         stop_event = {};
         Network::RestartSocketOperations();
 

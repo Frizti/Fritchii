@@ -39,6 +39,7 @@
 #elif defined(__linux__) && !defined(__ANDROID__)
 #include "common/linux/crash_handler.h"
 #endif
+#include "core/nvn_hook.h"
 #include "video_core/churn_counters.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
@@ -65,6 +66,10 @@ void NoteAmdProprietaryDriver() noexcept;
 #if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
 #include <adrenotools/bcenabler.h>
 #include <android/api-level.h>
+#endif
+
+#ifdef LICHII_NVN_DIRECT
+extern "C" void vka_crumb_dump(void);   // nvn_direct vka_exec.c: GPU breadcrumbs at a device loss
 #endif
 
 namespace Vulkan {
@@ -701,6 +706,18 @@ bool WantsAmdFsr4(VkDriverId driver_id) {
 }
 } // Anonymous namespace
 
+namespace {
+/// NVN2 direct mode: whether buffer update-after-bind may stay beside robustBufferAccess
+bool DescriptorIndexingRobustUpdateAfterBind(vk::PhysicalDevice physical) {
+    VkPhysicalDeviceDescriptorIndexingProperties indexing{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties2{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                            .pNext = &indexing};
+    physical.GetProperties2(properties2);
+    return indexing.robustBufferAccessUpdateAfterBind == VK_TRUE;
+}
+} // Anonymous namespace
+
 Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR surface,
                const vk::InstanceDispatch& dld_)
     : instance{instance_}, dld{dld_}, physical{physical_},
@@ -735,7 +752,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 
     SetupFamilies(surface);
-    const auto queue_cis = GetDeviceQueueCreateInfos();
+    auto queue_cis = GetDeviceQueueCreateInfos();
 
     // GetSuitability has already configured the linked list of features for us.
     // Reuse it here.
@@ -999,6 +1016,33 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 
     // Descriptors feature list
+    // NVN2 direct mode: the replay's descriptor tables are update-after-bind and
+    // partially bound arrays, and its pools use buffer device addresses; those stay enabled.
+    nvn_direct = Core::NvnHook::DirectMode();
+    const VkPhysicalDeviceDescriptorIndexingFeatures supported_descriptor_indexing =
+        features.descriptor_indexing;
+    // Before any of that reaches vkCreateDevice: the replay needs Vulkan 1.3 (dynamic rendering
+    // is core there), and buffer update-after-bind is invalid beside robustBufferAccess, which
+    // stays on, unless the device has robustBufferAccessUpdateAfterBind.
+    if (nvn_direct) {
+        const bool buffer_update_after_bind =
+            supported_descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind ||
+            supported_descriptor_indexing.descriptorBindingUniformBufferUpdateAfterBind;
+        if (properties.properties.apiVersion < VK_API_VERSION_1_3) {
+            LOG_WARNING(Render_Vulkan, "NVN2 direct mode: the device is Vulkan {}.{}, it needs 1.3",
+                        VK_API_VERSION_MAJOR(properties.properties.apiVersion),
+                        VK_API_VERSION_MINOR(properties.properties.apiVersion));
+            nvn_direct = false;
+        } else if (buffer_update_after_bind &&
+                   !DescriptorIndexingRobustUpdateAfterBind(physical)) {
+            LOG_WARNING(Render_Vulkan, "NVN2 direct mode: the device has buffer update-after-bind "
+                                       "but not robustBufferAccessUpdateAfterBind");
+            nvn_direct = false;
+        }
+        if (!nvn_direct) {
+            Core::NvnHook::DirectFailed();
+        }
+    }
     {
         auto& descriptor_indexing = features.descriptor_indexing;
         descriptor_indexing.shaderInputAttachmentArrayDynamicIndexing = false;
@@ -1016,6 +1060,23 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         descriptor_indexing.descriptorBindingUpdateUnusedWhilePending = false;
         descriptor_indexing.descriptorBindingVariableDescriptorCount = false;
         descriptor_indexing.runtimeDescriptorArray = false;
+    }
+    if (nvn_direct) {
+        auto& descriptor_indexing = features.descriptor_indexing;
+        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind =
+            supported_descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind;
+        descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind =
+            supported_descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind;
+        descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind =
+            supported_descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind;
+        descriptor_indexing.descriptorBindingUniformBufferUpdateAfterBind =
+            supported_descriptor_indexing.descriptorBindingUniformBufferUpdateAfterBind;
+        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending =
+            supported_descriptor_indexing.descriptorBindingUpdateUnusedWhilePending;
+        descriptor_indexing.descriptorBindingVariableDescriptorCount =
+            supported_descriptor_indexing.descriptorBindingVariableDescriptorCount;
+        descriptor_indexing.runtimeDescriptorArray =
+            supported_descriptor_indexing.runtimeDescriptorArray;
     }
 
     // VK_EXT_descriptor_buffer requires VK_KHR_buffer_device_address
@@ -1037,7 +1098,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         extensions.buffer_device_address = false;
     } else
 #endif
-    if (!extensions.descriptor_buffer && occl_flag_wanted &&
+    if (!extensions.descriptor_buffer && !nvn_direct && occl_flag_wanted &&
         instance_version >= VK_API_VERSION_1_2 &&
         features.buffer_device_address.bufferDeviceAddress) {
         // FRITCHII_OCCL_FLAG: the flag pipelines store through buffer device addresses. As for
@@ -1045,7 +1106,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         // as they are without descriptor buffers.
         extensions.buffer_device_address = false;
         occl_flag_device_address = true;
-    } else if (!extensions.descriptor_buffer) {
+    } else if (!extensions.descriptor_buffer && !nvn_direct) {
         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     }
@@ -1073,6 +1134,116 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // Guest shaders still follow float16_math, so the AMD float16 workaround above stays in force.
     if (device_float16 && WantsAmdFsr4(driver_id)) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
+    }
+    // NVN2 direct mode: what the replay (nvn_direct/bananative/dm/gfx/vk_android)
+    // needs beyond the emulator's device: dynamic rendering (it refuses to start without),
+    // graphics pipeline libraries, host memory import for the guest's memory pools, and up to
+    // 16 queues of the graphics family: one per NVN queue plus its own work on queue 0, which
+    // is Lichii's. robustBufferAccess stays on (Lichii requires it; the replay turns it off on
+    // its own device).
+    VkPhysicalDeviceDynamicRenderingFeatures direct_dynamic_rendering{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+    };
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT direct_pipeline_library{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+    };
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR direct_shading_rate{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR,
+    };
+    VkPhysicalDeviceExclusiveScissorFeaturesNV direct_exclusive_scissor{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXCLUSIVE_SCISSOR_FEATURES_NV,
+    };
+    VkPhysicalDevicePipelineRobustnessFeaturesEXT direct_pipeline_robustness{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT,
+    };
+    std::array<float, NvnDirectMaxQueues> direct_queue_priorities{};
+    if (nvn_direct) {
+        const bool pipeline_library =
+            supported_extensions.contains(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+            supported_extensions.contains(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+        direct_pipeline_library.pNext = &direct_dynamic_rendering;
+        VkPhysicalDeviceFeatures2 query{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                        .pNext = pipeline_library
+                                                     ? static_cast<void*>(&direct_pipeline_library)
+                                                     : static_cast<void*>(&direct_dynamic_rendering)};
+        physical.GetFeatures2(query);
+        direct_dynamic_rendering.pNext = const_cast<void*>(first_next);
+        first_next = query.pNext;
+        if (pipeline_library) {
+            loaded_extensions.insert(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+            loaded_extensions.insert(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        }
+        if (supported_extensions.contains(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        }
+        // Pools as udmabufs of guest memory where host-pointer imports of it are refused
+        // (amdgpu: vka_mem.c vka_mem_import_choose)
+        if (supported_extensions.contains(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
+            supported_extensions.contains(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+            loaded_extensions.insert(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+        }
+        // GPU breadcrumbs that survive a device loss (vka_exec.c, DM_VK_CRUMBS)
+        if (supported_extensions.contains(VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+        }
+        // Counter timestamps on the guest clock (vka_exec.c gpu_offset)
+        if (supported_extensions.contains(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        } else if (supported_extensions.contains(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        }
+        // NVN state the replay maps onto extensions Lichii's renderer does not use
+        //: shading-rate images as a fragment shading rate attachment, and
+        // exclusive scissors.
+        if (supported_extensions.contains(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+            VkPhysicalDeviceFeatures2 shading_rate_query{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &direct_shading_rate};
+            physical.GetFeatures2(shading_rate_query);
+            if (direct_shading_rate.attachmentFragmentShadingRate == VK_TRUE) {
+                direct_shading_rate.pipelineFragmentShadingRate = VK_FALSE;
+                direct_shading_rate.primitiveFragmentShadingRate = VK_FALSE;
+                direct_shading_rate.pNext = const_cast<void*>(first_next);
+                first_next = &direct_shading_rate;
+                loaded_extensions.insert(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+            }
+        }
+        // The replay's pipelines without robust buffer access (vka_pso.c: VkPipelineRobustnessCreateInfo), as on its own device; the emulator's stay robust
+        if (supported_extensions.contains(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME)) {
+            VkPhysicalDeviceFeatures2 robustness_query{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                                       .pNext = &direct_pipeline_robustness};
+            physical.GetFeatures2(robustness_query);
+            if (direct_pipeline_robustness.pipelineRobustness == VK_TRUE) {
+                direct_pipeline_robustness.pNext = const_cast<void*>(first_next);
+                first_next = &direct_pipeline_robustness;
+                loaded_extensions.insert(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+            }
+        }
+        if (supported_extensions.contains(VK_NV_SCISSOR_EXCLUSIVE_EXTENSION_NAME)) {
+            VkPhysicalDeviceFeatures2 exclusive_scissor_query{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                .pNext = &direct_exclusive_scissor};
+            physical.GetFeatures2(exclusive_scissor_query);
+            if (direct_exclusive_scissor.exclusiveScissor == VK_TRUE) {
+                direct_exclusive_scissor.pNext = const_cast<void*>(first_next);
+                first_next = &direct_exclusive_scissor;
+                loaded_extensions.insert(VK_NV_SCISSOR_EXCLUSIVE_EXTENSION_NAME);
+            }
+        }
+        const auto ci = std::ranges::find(queue_cis, graphics_family,
+                                          &VkDeviceQueueCreateInfo::queueFamilyIndex);
+        const u32 available = physical.GetQueueFamilyProperties()[graphics_family].queueCount;
+        nvn_direct_queue_count = std::min(available, NvnDirectMaxQueues);
+        direct_queue_priorities.fill(1.0f);
+        ci->queueCount = nvn_direct_queue_count;
+        ci->pQueuePriorities = direct_queue_priorities.data();
+        LOG_INFO(Render_Vulkan,
+                 "NVN2 direct mode: dynamic rendering {}, graphics pipeline libraries {}, host "
+                 "memory import {}, {} of the graphics family's {} queues",
+                 direct_dynamic_rendering.dynamicRendering == VK_TRUE,
+                 direct_pipeline_library.graphicsPipelineLibrary == VK_TRUE,
+                 loaded_extensions.contains(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME),
+                 nvn_direct_queue_count, available);
     }
     // FRITCHII_QUEUE_PRIORITY (boot, default 0; helper BN, 2026-11-16, docs/fritchii/switches.md):
     // 1 = the device's queues ask for high global priority (VK_KHR/EXT_global_priority), 2 =
@@ -1131,6 +1302,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 
     graphics_queue = logical.GetQueue(graphics_family);
+    for (u32 index = 0; index < nvn_direct_queue_count; ++index) {
+        dld.vkGetDeviceQueue(*logical, graphics_family, index, &nvn_direct_queues[index]);
+    }
     present_queue = logical.GetQueue(present_family);
     if (const std::optional<u32> family = LinkHogFamily()) {
         link_hog_queue = logical.GetQueue(*family);
@@ -1706,6 +1880,9 @@ void Device::ReportLoss(std::source_location where) const {
     Common::Nx2Hitch::LogGpuBreadcrumbs("Device loss");
     // What every thread was doing, as a hang report gives it.
     Common::Nx2Hitch::LogThreadReport("Device loss", false, 0);
+#ifdef LICHII_NVN_DIRECT
+    vka_crumb_dump();
+#endif
 
     if (nsight_aftermath_tracker) {
         // Give Nsight Aftermath time to write its dump.
@@ -2517,13 +2694,17 @@ void Device::RemoveUnsuitableExtensions() {
     // VK_EXT_shader_atomic_float: storage buffer float32 atomic add in hardware instead of a
     // compare-exchange loop. Intel only for now (the GPU it was measured on): on an Arc B580 a
     // contended loop of Ocarina of Time (1e1964184a291f00, 96 groups) took 2 ms of each frame.
+    // AMD too: on an RX 6750 XT a Direct NVN compute program's loop (278f48371bcf0d58) never
+    // ended now and then, a GPU hang after 4-16 minutes in game.
     // EDEN_NX2_NO_FLOAT_ATOMICS=1 keeps the loop.
     {
         constexpr u32 intel_vendor_id = 0x8086;
+        constexpr u32 amd_vendor_id = 0x1002;
         const char* const no_float_atomics = std::getenv("EDEN_NX2_NO_FLOAT_ATOMICS");
         extensions.shader_atomic_float =
             extensions.shader_atomic_float &&
-            properties.properties.vendorID == intel_vendor_id &&
+            (properties.properties.vendorID == intel_vendor_id ||
+             properties.properties.vendorID == amd_vendor_id) &&
             features.shader_atomic_float.shaderBufferFloat32AtomicAdd &&
             !(no_float_atomics != nullptr && no_float_atomics[0] == '1');
         RemoveExtensionFeatureIfUnsuitable(extensions.shader_atomic_float,
@@ -3261,6 +3442,9 @@ void Device::CollectToolingInfo() {
 }
 
 bool Device::WantsSideQueue() const {
+    if (nvn_direct) {
+        return false;   // NVN2 direct mode: the graphics family's queues are the replay's
+    }
     // Read where the device is made: after main() applied nx2_switches.txt.
     static const bool wanted = [this] {
         const char* value = std::getenv("FRITCHII_READ_SIDE_COPY");

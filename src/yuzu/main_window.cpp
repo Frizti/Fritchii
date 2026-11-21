@@ -5753,6 +5753,16 @@ void MainWindow::UpdateStatusBar() {
     auto results = QtCommon::system->GetAndResetPerfStats();
     auto& shader_notify = QtCommon::system->GPU().ShaderNotify();
     const int shaders_building = shader_notify.ShadersBuilding();
+    {   // the count in the log too (test scripts wait for it to reach 0)
+        static auto last_log = std::chrono::steady_clock::time_point{};
+        static int last_count = -1;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_log > std::chrono::seconds{5} && (shaders_building != 0 || last_count != 0)) {
+            last_log = now;
+            last_count = shaders_building;
+            LOG_INFO(Frontend, "Shaders building: {}", shaders_building);
+        }
+    }
 
     const auto dlss = QtCommon::system->GPU().Renderer().GetDlssStatus();
     dlss_status_text.clear();

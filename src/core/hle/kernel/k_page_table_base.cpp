@@ -3,6 +3,9 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -5143,6 +5146,26 @@ void KPageTableBase::CleanupForIpcClientOnServerSetupFailure(PageLinkedList* pag
     }
 }
 
+// Fritchii, FRITCHII_MAP_STACKS=1: the game's MapPhysicalMemory calls every 10 s: how many, their sizes, and the physical blocks
+// (one host view each) their pages came in
+namespace {
+void NoteMapPhysical(size_t bytes, const KPageGroup& pg) {
+    static const bool on = [] { const char* e = std::getenv("FRITCHII_MAP_STACKS"); return e != nullptr && e[0] == '1'; }();
+    if (!on) return;
+    static std::mutex mu; static u64 calls, total, blocks, hist[5], last_ns;
+    size_t nb = 0; for (auto it = pg.begin(); it != pg.end(); ++it) ++nb;
+    std::scoped_lock lk{mu};
+    ++calls; total += bytes; blocks += nb;
+    hist[bytes < (64 << 10) ? 0 : bytes < (256 << 10) ? 1 : bytes < (1 << 20) ? 2 : bytes < (4 << 20) ? 3 : 4]++;
+    const u64 now = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
+    if (last_ns == 0) last_ns = now;
+    if (now - last_ns >= 10'000'000'000ULL) {
+        LOG_INFO(Kernel, "MapPhysicalMemory (10 s): {} calls, {} MiB, {} physical blocks; sizes <64K {}, <256K {}, <1M {}, <4M {}, >=4M {}", calls, total >> 20, blocks, hist[0], hist[1], hist[2], hist[3], hist[4]);
+        calls = total = blocks = 0; for (auto& h : hist) h = 0; last_ns = now;
+    }
+}
+} // namespace
+
 Result KPageTableBase::MapPhysicalMemory(KProcessAddress address, size_t size) {
     // Lock the physical memory lock.
     KScopedLightLock phys_lk(m_map_physical_memory_lock);
@@ -5207,6 +5230,8 @@ Result KPageTableBase::MapPhysicalMemory(KProcessAddress address, size_t size) {
             R_TRY(m_system.Kernel().MemoryManager().AllocateForProcess(
                 std::addressof(pg), (size - mapped_size) / PageSize, m_allocate_option,
                 GetCurrentProcess(m_system.Kernel()).GetId(), m_heap_fill_value));
+
+            NoteMapPhysical(size - mapped_size, pg);   // Fritchii (FRITCHII_MAP_STACKS)
 
             // If we fail in the next bit (or retry), we need to cleanup the pages.
             auto pg_guard = SCOPE_GUARD {

@@ -4524,6 +4524,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (title_id == 0) {
         return;
     }
+#ifdef LICHII_NVN_DIRECT
+    if (device.IsNvnDirect()) {
+        // The direct renderer draws with its own pipelines (and prepares the game's shaders
+        // itself: ShaderWarm::PrepareNvnDirect); these would be built and never used.
+        LOG_INFO(Render_Vulkan, "NVN direct mode: the emulated GPU's pipeline cache is not loaded");
+        return;
+    }
+#endif
     g_disk_load_start = std::chrono::steady_clock::now();
     {
         std::error_code ec;
