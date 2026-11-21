@@ -1642,7 +1642,6 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
             VRED_ONCE("mesh draw: mesh shader %016llx writes per-primitive outputs and pixel shader %016llx has no per-primitive inputs: any it reads there are undefined", (unsigned long long)sh[7]->key, (unsigned long long)sh[1]->key);
         if (dw->prim == NVN_PRIM_MESH && !dw->ind && dw->first) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("mesh draw with first workgroup %d (count %d): drawn from 0 (the translated task / mesh shaders read their workgroup index with no base; open)", dw->first, dw->count); }
         if (!dw->ind && (dw->count <= 0 || (dw->prim == NVN_PRIM_MESH_3D && (dw->instances <= 0 || dw->base_instance <= 0)))) return;
-        if (dw->ind && (!vk.vkCmdDrawMeshTasksIndirectEXT || !vk.vkCmdDrawMeshTasksIndirectCountEXT)) SKIP("indirect mesh draw on a device without vkCmdDrawMeshTasksIndirect(Count)EXT: skipped");
         if (d->tf_on) VRED_ONCE("transform feedback with a mesh draw: drawn without capture");
         { static int st = -1, sp = -1; if (st < 0) { st = (int)VKA_ENV("DM_VK_SKIP_TASK", 0); sp = (int)VKA_ENV("DM_VK_SKIP_MESHPRIM", 0); }   // diagnostics: mesh draws with a task program / per-primitive outputs skipped
           if ((st && sh[6]) || (sp && ((sh[7]->e->flags & DMSH_VK_F_MESH_PRIM) || (sh[1] && (sh[1]->e->flags & DMSH_VK_F_MESH_PRIM))))) { g_skipped++; return; } }   // DM_VK_SKIP_TASK=1: mesh draws with a task program skipped (diagnostic)
@@ -1664,6 +1663,8 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
             else { g_fb_native++; static uint64_t seen[64]; static int ns; int k2 = 0; for (; k2 < ns && seen[k2] != sh[7]->key; k2++) {}
                    if (k2 == ns && ns < 64) { seen[ns++] = sh[7]->key; VRED("mesh draw of %016llx drawn natively: %s", (unsigned long long)sh[7]->key, no); } }
         }
+        // After the emulation: its indirect draw needs no mesh entry points, only a native one does
+        if (mesh && dw->ind && (!vk.vkCmdDrawMeshTasksIndirectEXT || !vk.vkCmdDrawMeshTasksIndirectCountEXT)) SKIP("indirect mesh draw on a device without vkCmdDrawMeshTasksIndirect(Count)EXT: skipped");
     } else {
         for (int st = 0; st < 5; st++) if (!resolve(d->bst[st], st, &sh[st], &bad)) SKIP("draw skipped: a program without shaders");
         if (bad) { g_skipped++, vka_skip_line[__LINE__ & 2047]++; return; }   // a refused or missing shader (logged when it was made)
