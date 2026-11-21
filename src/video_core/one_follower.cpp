@@ -1674,6 +1674,13 @@ void ReadSwitches() {
     g_e_pipeline = g.on && SwitchValue(g_onef_e_pipeline, "FRITCHII_ONEF_E_PIPELINE", 1) == 1;
     if (g_e_pipeline) {
         LOG_INFO(HW_GPU, "One follower: E owns the pipeline lookup (FRITCHII_ONEF_E_PIPELINE=1)");
+        const char* const mesh_emu = std::getenv("FRITCHII_ONEF_MESH_EMU");
+        LOG_INFO(HW_GPU, "One follower: emulated mesh draws {} (FRITCHII_ONEF_MESH_EMU={})",
+                 EmulatedMeshPostable() ? "posted" : "lent",
+                 mesh_emu != nullptr && mesh_emu[0] != '\0'
+                     ? std::string{mesh_emu}
+                     : std::string{IsAmdProprietaryDriver() ? "unset: AMD proprietary driver"
+                                                            : "unset: not AMD's proprietary driver"});
     }
     if (g.on) {
         LOG_INFO(HW_GPU,
