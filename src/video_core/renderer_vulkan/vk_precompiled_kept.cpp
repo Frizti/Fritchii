@@ -4,6 +4,7 @@
 #include "video_core/renderer_vulkan/vk_precompiled_kept.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <istream>
@@ -12,9 +13,15 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <winioctl.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+#ifdef __linux__
+#include <fstream>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #endif
 
 #include "common/cityhash.h"
@@ -140,6 +147,74 @@ u64 FreePhysicalMemory() {
     return 0;
 #endif
 }
+
+enum class DiskKind { Unknown, SolidState, Spinning };
+
+/// What kind of disk `path` is on. Windows: the volume's seek penalty (a hard disk has one), as
+/// the storage driver reports it (no administrator rights needed); a volume over several disks, a
+/// network share or a driver that does not answer: Unknown. Linux: the block device's
+/// queue/rotational in sysfs (the device's, or its parent disk's for a partition); a device
+/// sysfs does not list (btrfs, network and FUSE file systems, Android): Unknown.
+DiskKind DiskKindOf(const std::filesystem::path& path) {
+#ifdef _WIN32
+    std::array<wchar_t, MAX_PATH + 1> mount{};
+    std::array<wchar_t, 64> volume{};
+    if (!GetVolumePathNameW(path.c_str(), mount.data(), static_cast<DWORD>(mount.size())) ||
+        !GetVolumeNameForVolumeMountPointW(mount.data(), volume.data(),
+                                           static_cast<DWORD>(volume.size()))) {
+        return DiskKind::Unknown;
+    }
+    // "\\?\Volume{GUID}\": the volume device is the name without its last backslash.
+    std::wstring device{volume.data()};
+    if (!device.empty() && device.back() == L'\\') {
+        device.pop_back();
+    }
+    const HANDLE handle = CreateFileW(device.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      nullptr, OPEN_EXISTING, 0, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return DiskKind::Unknown;
+    }
+    STORAGE_PROPERTY_QUERY query{};
+    query.PropertyId = StorageDeviceSeekPenaltyProperty;
+    query.QueryType = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR penalty{};
+    DWORD returned = 0;
+    const BOOL ok = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                                    &penalty, sizeof(penalty), &returned, nullptr);
+    CloseHandle(handle);
+    if (!ok || returned < sizeof(penalty)) {
+        return DiskKind::Unknown;
+    }
+    return penalty.IncursSeekPenalty ? DiskKind::Spinning : DiskKind::SolidState;
+#elif defined(__linux__)
+    struct stat info{};
+    if (stat(path.c_str(), &info) != 0) {
+        return DiskKind::Unknown;
+    }
+    const auto device = fmt::format("/sys/dev/block/{}:{}/", major(info.st_dev), minor(info.st_dev));
+    for (const char* const queue : {"queue/rotational", "../queue/rotational"}) {
+        std::ifstream file(device + queue);
+        int rotational = -1;
+        if (file >> rotational && (rotational == 0 || rotational == 1)) {
+            return rotational == 1 ? DiskKind::Spinning : DiskKind::SolidState;
+        }
+    }
+    return DiskKind::Unknown;
+#else
+    return DiskKind::Unknown;
+#endif
+}
+
+const char* DiskKindName(DiskKind kind) {
+    switch (kind) {
+    case DiskKind::SolidState:
+        return "solid-state";
+    case DiskKind::Spinning:
+        return "hard disk";
+    default:
+        return "unknown disk";
+    }
+}
 } // Anonymous namespace
 
 PageCacheWarmer::PageCacheWarmer(std::vector<std::filesystem::path> files)
@@ -171,7 +246,14 @@ void PageCacheWarmer::Run(std::vector<std::filesystem::path> files) {
 #endif
     const auto begin = std::chrono::steady_clock::now();
     const u64 free_bytes = FreePhysicalMemory();
-    std::vector<std::pair<std::filesystem::path, u64>> wanted;
+    // Per file: its path, size and read chunk.
+    struct Wanted {
+        std::filesystem::path path;
+        u64 size{};
+        size_t chunk{};
+        DiskKind disk{};
+    };
+    std::vector<Wanted> wanted;
     u64 planned = 0;
     for (const auto& path : files) {
         std::error_code error;
@@ -179,6 +261,19 @@ void PageCacheWarmer::Run(std::vector<std::filesystem::path> files) {
         if (error || size == 0) {
             continue;
         }
+        // On a hard disk one chunk in flight, even at very low I/O priority, puts a seek and a
+        // ~30 ms transfer in front of a fast-path read, at boot when the game's own reads peak:
+        // not read ahead there. A disk of unknown kind is read in 1 MiB chunks (a few ms each on
+        // a hard disk), a solid-state one in 4 MiB chunks as before.
+        const DiskKind disk = DiskKindOf(path);
+        if (disk == DiskKind::Spinning) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled fast path I/O: {} ({} MiB) not read ahead: it is on a hard "
+                     "disk (seek penalty)",
+                     path.filename().string(), size >> 20);
+            continue;
+        }
+        const size_t chunk = disk == DiskKind::SolidState ? size_t{4} << 20 : size_t{1} << 20;
         if ((planned + size) * 2 > free_bytes) {
             LOG_INFO(Render_Vulkan,
                      "Precompiled fast path I/O: {} ({} MiB) not read ahead: {} MiB of RAM free, "
@@ -188,32 +283,32 @@ void PageCacheWarmer::Run(std::vector<std::filesystem::path> files) {
             continue;
         }
         planned += size;
-        wanted.emplace_back(path, size);
+        wanted.push_back({path, size, chunk, disk});
     }
     if (wanted.empty()) {
         return;
     }
     std::string names;
-    for (const auto& [path, size] : wanted) {
-        names += fmt::format("{}{} ({} MiB)", names.empty() ? "" : ", ", path.filename().string(),
-                             size >> 20);
+    for (const Wanted& file : wanted) {
+        names += fmt::format("{}{} ({} MiB, {}, {} MiB chunks)", names.empty() ? "" : ", ",
+                             file.path.filename().string(), file.size >> 20,
+                             DiskKindName(file.disk), file.chunk >> 20);
     }
     LOG_INFO(Render_Vulkan,
              "Precompiled fast path I/O: reading {} into the OS file cache on an idle thread "
              "({} MiB of RAM free)",
              names, free_bytes >> 20);
-    constexpr size_t Chunk = size_t{4} << 20;
-    std::vector<u8> buffer(Chunk);
+    std::vector<u8> buffer(size_t{4} << 20);
     u64 done = 0;
     bool failed = false;
-    for (const auto& [path, size] : wanted) {
+    for (const auto& [path, size, chunk, disk] : wanted) {
         const PositionalFile file{path};
         if (!file.IsOpen()) {
             failed = true;
             continue;
         }
         for (u64 offset = 0; offset < size && !stop.load(std::memory_order_relaxed);) {
-            const size_t bytes = static_cast<size_t>((std::min<u64>)(Chunk, size - offset));
+            const size_t bytes = static_cast<size_t>((std::min<u64>)(chunk, size - offset));
             if (!file.ReadAt(offset, std::span(buffer.data(), bytes))) {
                 failed = !stop.load(std::memory_order_relaxed);
                 break;

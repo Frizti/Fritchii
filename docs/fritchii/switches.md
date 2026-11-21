@@ -466,8 +466,11 @@ Zora's Domain facing King Zora, the view must follow the camera.
 On by default on every driver since 6862d0b (2026-11-20). Earlier docs said "since 2026-11-18", but
 the code still defaulted to 0 until that commit, so 6862d0b is its first default-on exposure (owner:
 a briefly late object beats a freeze; RTX 4080 market toggle 70.1 / 71.3 fps, no cost). (Helper AK,
-2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live, Windows only,
-FRITCHII_PROTECT_UNLOCKED=0 restores the locked path. HostMemory's Protect (the write traps on
+2026-11-15, port of zortos293/Lichii #1780 by Reiixan); Windows only,
+FRITCHII_PROTECT_UNLOCKED=0 restores the locked path. The environment (nx2_switches.txt) is read
+once, at the first Protect of the session, so changing it there needs a fresh launch. Live only
+through the debug server's set_switch (FindSwitch has it, so profile_toggle.py works), which
+writes the value Protect reads on every call. HostMemory's Protect (the write traps on
 GPU-cached guest memory, 12,000-28,000 calls a second in OoT) took the placeholder lock before every
 VirtualProtect, and Map/Unmap hold that lock across their kernel calls, which slow from ~10 us to
 ~250 us while the game maps memory in bulk (zone changes): protections queued behind them and the
@@ -476,11 +479,18 @@ Protect first calls VirtualProtect on the whole range without the lock. It refus
 reaches a placeholder or a second view (a Map/Unmap under way, or a range across views); those take
 the lock and are protected view by view as before. Any interleaving ends as a Protect done wholly
 before or after the Map/Unmap, but one: a partial Unmap that splits a view unmaps it whole and maps
-the kept parts again with PAGE_READWRITE, which would wipe a protection that landed on the old view.
-A split sequence counter (odd from before that unmap until after the last remap) guards it: an
-unlocked Protect that saw it odd or changed around its VirtualProtect is redone under the lock.
+the kept parts again with PAGE_READWRITE. Until 2026-11-21 that wiped every protection on the kept
+parts, with the switch on or off (the page table still said cached, so CPU writes there were
+missed). Now the Unmap reads the kept parts' protections (VirtualQuery) before it unmaps the view
+and puts them back (VirtualProtect) after both remaps (a ported approach, credited in the commit).
+A split sequence counter (odd from before that read until after the
+restore) guards the unlocked path: an unlocked Protect that saw it odd or changed around its
+VirtualProtect is redone under the lock, after the restore, so its newer flags win.
 Log: "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): N without the lock, M took the
-lock (placeholder or several views), R redone under the lock (a split Unmap ran alongside)".
+lock (placeholder or several views), R redone under the lock (a split Unmap ran alongside); this
+session S split Unmaps put P protected runs back on their kept parts" (that line only with the
+switch on). The first 3 splits that restored anything log "Split unmap: N protected runs of the
+kept parts restored after the remap" in either mode.
 Measure with the "host protect" time and longest in the Hitch:
 lines around area loads.
 

@@ -2731,12 +2731,18 @@ void TextureCache<P>::SweepColdImages() {
     // budget - critical) / 2). The plain critical line is too low: on the 9070 XT play ran the
     // cache at 6.8-9.7 GiB with critical at 7.68 GiB, and that line released 1,515 of 1,642 kept
     // targets; the margin puts the line at ~9.6 GiB there. The second bound keeps the line on
-    // the card where critical + 1 GiB would pass it: ~1.05 GiB of margin on an 8 GB card, ~0.5 GiB
-    // on 4 GB, so it holds without budget_pressure (FRITCHII_VRAM_BUDGET_MODE=0) or failures
-    // (WDDM demotes rather than fails). Without a reported budget (no VK_EXT_memory_budget,
-    // OpenGL) there is no margin: the plain critical line.
+    // the card where critical + 1 GiB would pass it, so it holds without budget_pressure
+    // (FRITCHII_VRAM_BUDGET_MODE=0) or failures (WDDM demotes rather than fails). Without a
+    // reported budget (no VK_EXT_memory_budget, OpenGL) there is no margin: the plain critical
+    // line.
+    // Only large cards (a driver budget of 12 GiB or more, as the default budget's test) get the
+    // margin; it was made for the 16 GB 9070 XT, where play runs the cache past critical. On
+    // smaller cards, in the band above critical, the collector is at its most eager and the
+    // thrash guard may have raised its floor (which also shields young covered keeps), so a
+    // keep there would hold up to its budget where the collector can't reach it: the plain
+    // critical line there, as without a reported budget (low-end PCs first).
     u64 keep_margin = 0;
-    if (cold_keep_driver_budget > critical_memory) {
+    if (cold_keep_driver_budget >= 12_GiB && cold_keep_driver_budget > critical_memory) {
         keep_margin = (std::min)((std::max)(static_cast<u64>(1_GiB), critical_memory / 4),
                                  (cold_keep_driver_budget - critical_memory) / 2);
     }
@@ -2838,10 +2844,12 @@ void TextureCache<P>::SweepColdImages() {
         // Kept by covered retire (cold_keep bit 2): looked at again every frame without a new
         // overlap (its memory was covered; coverage only grows), so the budget and the pressure
         // gate release it; used again (or no longer a candidate), it is ordinary cache contents
-        // from here, its share of the budget kept while it stays in cold_watch.
+        // from here, and its share of the budget goes back (charged again if it is kept again):
+        // the budget covers only images that are cold now, or a long session fills it with
+        // targets that are alive anyway and turns new candidates away.
         bool covered_kept = (image.cold_keep & 4) != 0;
         if (covered_kept && !covered_candidate) {
-            image.cold_keep &= static_cast<u8>(~4);
+            ColdKeepUncharge(image); // clears bit 2 too
             covered_kept = false;
         }
         if (covered_candidate &&
@@ -2916,8 +2924,10 @@ void TextureCache<P>::SweepColdImages() {
             }
             continue;
         }
-        // Touched (prepared, bound, sampled) in the last K host frames.
+        // Touched (prepared, bound, sampled) in the last K host frames. A kept one is hot again:
+        // its share of the keep's budget goes back (charged again if it is kept again).
         if (frame_tick - lru_cache.Tick(image.lru_index) < cold_frames) {
+            ColdKeepUncharge(image);
             ++index;
             continue;
         }
@@ -3085,7 +3095,8 @@ void TextureCache<P>::SweepColdImages() {
                  !keep_pressure     ? ""
                  : budget_pressure ? ", releasing: budget pressure"
                  : keep_failed     ? ", releasing: an image failed"
-                                   : ", releasing: over critical + margin");
+                 : keep_margin != 0 ? ", releasing: over critical + margin"
+                                    : ", releasing: over critical (no margin on this card)");
         k = {};
         // The image families made in those frames, most made first (fable52_answer_13 sec. 6).
         std::vector<std::pair<std::pair<u32, u32>, const MadeShapes*>> families;

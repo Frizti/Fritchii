@@ -2819,6 +2819,21 @@ void DestroyPipelinesWithProgress(Container& pipelines) {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    // The occlusion flag variants' queued work is given up first (occl_build_cancel): a compile
+    // not started finishes as failed without running, on the lane, on the shared workers or in
+    // a destructor below (which would otherwise build it right there, on this thread), and the
+    // queued translations and kept-record lookups return without work. Variants are never
+    // cache entries, so the saves below lose nothing. Before this, a lane backlog (one
+    // lowest-priority thread on AMD, hundreds queued by a boot prebuild) was drained before the
+    // pipeline cache and the used list were saved, and the frontend cuts a teardown short.
+    occl_build_cancel->cancelled.store(true, std::memory_order_release);
+    if (const u64 backlog = occl_build_cancel->queued.load(std::memory_order_relaxed);
+        backlog != 0 || occl_compile_workers) {
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion variants at exit: {} driver compiles queued and not started, given "
+                 "up (variants are never cache entries)",
+                 backlog);
+    }
     // Stop the warm-ups and background builds first: their builds use the members below. The
     // stop callback goes first, as it writes the flags below.
     warm_stop_callback.reset();
@@ -2841,11 +2856,22 @@ PipelineCache::~PipelineCache() {
     occl_lanes_state.store(OcclLanesNone, std::memory_order_release); // none made from now
     occl_queue_live.store(nullptr, std::memory_order_release);
     occl_queue.reset();
+    Common::NoteShutdownProgress();
     StopBackgroundPipelines();
     Common::NoteShutdownProgress();
     workers.WaitForRequests();
+    Common::NoteShutdownProgress();
     if (occl_compile_workers) {
+        // Only the compiles already running (one a lane thread) are waited for.
+        const auto lane_begin = std::chrono::steady_clock::now();
         occl_compile_workers->WaitForRequests();
+        Common::NoteShutdownProgress();
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion variants at exit: lane drained in {} ms, {} compiles given up",
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - lane_begin)
+                     .count(),
+                 occl_build_cancel->skipped.load(std::memory_order_relaxed));
     }
     serialization_thread.WaitForRequests();
     Common::NoteShutdownProgress();
@@ -4937,7 +4963,11 @@ u8 PipelineCache::LookUpKeptParent(GraphicsPipeline& full) {
         Common::ThreadWorker* const lane =
             OcclCompileLane() != nullptr ? OcclCompileLane() : &workers;
         lane->QueueWork([lookup, hash = key.Hash(), present,
-                         mesh = device.IsExtMeshShaderSupported()] {
+                         mesh = device.IsExtMeshShaderSupported(), cancel = occl_build_cancel] {
+            if (cancel->cancelled.load(std::memory_order_acquire)) {
+                lookup->ready.store(true, std::memory_order_release); // exit: no candidates
+                return;
+            }
             try {
                 const PrecompiledKept::Index& kept = *lookup->index;
                 for (const PrecompiledKept::Record& record : kept.Graphics(hash)) {
@@ -5151,6 +5181,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptOcclVariant(GraphicsPip
     Common::ThreadWorker* const thread_worker =
         OcclCompileLane() != nullptr ? OcclCompileLane() : &workers;
     GraphicsPipeline::LibraryParams library_params{};
+    const PipelineBuild::CancelScope cancel_scope{occl_build_cancel}; // given up at exit
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, PlayPipelineCache(), &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, draw_templates,
@@ -7201,10 +7232,18 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // the kept file only (its NX2KEPT6 layout and the variant token in its stamp): the prepared
     // stamp never names them. The kinds are the device's (OcclPrepMask) that play will draw
     // this session (OcclPrepPlayMask: the occlusion level and one follower, decided here as
-    // play will decide them), and only with the recipe's hints (below); never in a stamp.
-    const bool prep_variants = keep && PrepOcclVariantsMode() != 0;
+    // play will decide them), and only with the recipe's hints; never in a stamp.
+    // The file holds variants (and its stamp says so) only where some would be prepared: kinds
+    // this device and play use, and hints naming at least one of them for some record. Else
+    // (NVIDIA, Intel and RADV with one follower's defaults, a recipe without hints) the switch
+    // changes nothing: the stamp and layout stay those of 0, so turning it on or off there never
+    // prepares again for no variant. The hints need only the file's header and its note, read
+    // here before the stamp.
     u8 occl_mask = 0;
-    if (prep_variants) {
+    // The recipe's variant hints for the file's records, by index in file order (the records'
+    // `index`, whatever order FRITCHII_PREP_ORDER takes them in).
+    std::optional<VideoCommon::Nx2Recipe::VariantHints> occl_hints;
+    if (keep && PrepOcclVariantsMode() != 0) {
         std::string play_why;
         const u8 device_mask = OcclPrepMask();
         const u8 play_mask = OcclPrepPlayMask(device, play_why);
@@ -7213,7 +7252,55 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                  "Precompiled occlusion variants (FRITCHII_PREP_OCCL_VARIANTS={}): kinds {:#x} "
                  "(device {:#x}, played {:#x}: {})",
                  PrepOcclVariantsMode(), occl_mask, device_mask, play_mask, play_why);
+        std::string hint_source;
+        if (occl_mask != 0) {
+            u32 record_count = 0;
+            {
+                std::ifstream header(path, std::ios::binary);
+                std::array<char, 8> magic{};
+                u32 version{}, env_count{};
+                header.read(magic.data(), magic.size())
+                    .read(reinterpret_cast<char*>(&version), sizeof(version))
+                    .read(reinterpret_cast<char*>(&env_count), sizeof(env_count))
+                    .read(reinterpret_cast<char*>(&record_count), sizeof(record_count));
+                if (!header || std::string_view{magic.data(), magic.size()} != "NX2PREP1" ||
+                    version != CACHE_VERSION) {
+                    record_count = 0; // reported below, by the full read
+                    hint_source = "the precompiled file's header did not read";
+                }
+            }
+            if (record_count != 0) {
+                occl_hints = PrepOcclHints(title_id, base_dir, path, record_count, hint_source);
+            }
+        }
+        const u8 mask = occl_mask;
+        const auto hinted = occl_hints ? std::ranges::count_if(occl_hints->kinds,
+                                                               [mask](u8 kinds) {
+                                                                   return (kinds & mask) != 0;
+                                                               })
+                                       : 0;
+        if (occl_mask != 0 && occl_hints && hinted != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled occlusion variants: hints from {} ({} occlusion files): {} of "
+                     "{} records had variants of these kinds built in play, only their kinds "
+                     "are prepared",
+                     hint_source, occl_hints->sources, hinted, occl_hints->kinds.size());
+        } else {
+            // Without hints nothing says which records' variants play builds: preparing every
+            // kind for every record cost the preparation's time and disk for variants mostly
+            // never drawn, so none is prepared (play translates them as before).
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled occlusion variants: none prepared ({}): the kept file and its "
+                     "stamp are as with FRITCHII_PREP_OCCL_VARIANTS=0",
+                     occl_mask == 0 ? std::string{"no kind this device and play use"}
+                     : occl_hints   ? std::string{"the hints name none of these kinds"}
+                     : hint_source.empty() ? std::string{"no hints: no title id"}
+                                           : fmt::format("no hints: {}", hint_source));
+            occl_mask = 0;
+            occl_hints.reset();
+        }
     }
+    const bool prep_variants = occl_mask != 0;
     const auto kept_path =
         base_dir / fmt::format("precompiled_infos.fork-v{}.bin", CACHE_VERSION);
     auto kept_part = kept_path;
@@ -7312,9 +7399,6 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     /// Which records are compute ones (the compute pass takes only those).
     std::vector<u8> record_compute;
     const auto used_keys = precompile_used_keys;
-    // FRITCHII_PREP_OCCL_VARIANTS: the recipe's variant hints for the file's records, by index in
-    // file order (the records' `index`, whatever order FRITCHII_PREP_ORDER takes them in).
-    std::optional<VideoCommon::Nx2Recipe::VariantHints> occl_hints;
     try {
         std::ifstream in(path, std::ios::binary);
         in.exceptions(std::ifstream::failbit);
@@ -7335,27 +7419,12 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged", path_text);
             return;
         }
-        if (occl_mask != 0 && !compute_only) {
-            std::string hint_source;
-            occl_hints = PrepOcclHints(title_id, base_dir, path, record_count, hint_source);
-            if (occl_hints) {
-                const auto hinted = std::ranges::count_if(
-                    occl_hints->kinds, [](u8 kinds) { return kinds != 0; });
-                LOG_INFO(Render_Vulkan,
-                         "Precompiled occlusion variants: hints from {} ({} occlusion files): "
-                         "{} of {} records had variants built in play, only their kinds are "
-                         "prepared",
-                         hint_source, occl_hints->sources, hinted, record_count);
-            } else {
-                // Without hints nothing says which records' variants play builds: preparing
-                // every kind for every record cost the preparation's time and disk for variants
-                // mostly never drawn, so none is prepared (play translates them as before).
-                occl_mask = 0;
-                LOG_INFO(Render_Vulkan,
-                         "Precompiled occlusion variants: no hints ({}), no variant is prepared "
-                         "(play translates them as before)",
-                         hint_source.empty() ? std::string{"no title id"} : hint_source);
-            }
+        // FRITCHII_PREP_OCCL_VARIANTS: the hints were read with the header before the stamp
+        // (occl_hints); a file whose record count changed since is another file (its size or
+        // time is in the stamp), and HintsForFile matched the count then.
+        if (occl_hints && occl_hints->kinds.size() != record_count) {
+            occl_mask = 0;
+            occl_hints.reset();
         }
         env_index.resize(env_count);
         in.read(reinterpret_cast<char*>(env_index.data()),
@@ -9797,6 +9866,9 @@ void PipelineCache::TickFrame() {
         price_frees ? Common::GetProcessMemoryUsage() : Common::ProcessMemoryUsage{};
     size_t freed_pipelines = 0;
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
+        if (GraphicsPipeline* const parent = evicted_pipelines.front().second.get()) {
+            RetireUnbuiltOcclVariants(*parent);
+        }
         evicted_pipelines.pop_front();
         ++freed_pipelines;
     }
@@ -9878,6 +9950,29 @@ PipelineCache::MemoryOwnerCounts PipelineCache::MemoryOwners() {
 void PipelineCache::RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline) {
     if (pipeline) {
         retired_translations.emplace_back(scheduler.CurrentTick(), std::move(pipeline));
+    }
+}
+
+void PipelineCache::RetireUnbuiltOcclVariants(GraphicsPipeline& parent) {
+    // A parent owns its occlusion flag variants. One whose driver compile still waits on the
+    // occlusion lane (one lowest-priority thread on AMD) would be compiled right here by its
+    // destructor (PipelineBuild's Wait(true)), on the GPU thread. Unbuilt ones go to the retired
+    // translations instead, destroyed once built (TickFrame). A variant is drawn only once built
+    // (OcclFlagPipeline), so an unbuilt one was never drawn; it is never drawn now either, and
+    // forgets its parent, which goes now. Built ones go with the parent, as before.
+    for (std::unique_ptr<GraphicsPipeline>* const variant :
+         {&parent.occl_flag, &parent.occl_flag_colour, &parent.occl_flag_prepass,
+          &parent.occl_flag_nocolour, &parent.occl_flag_prepass_nocolour}) {
+        if (*variant && !(*variant)->IsBuilt()) {
+            (*variant)->occl_flag_parent = nullptr;
+            RetireTranslatedPipeline(std::move(*variant));
+            if (++occl_variants_retired_unbuilt <= 4) {
+                LOG_INFO(Render_Vulkan,
+                         "Occlusion variants: evicted pipeline {:016x} had a variant still "
+                         "compiling, retired instead of compiled on this thread ({} so far)",
+                         parent.Key().Hash(), occl_variants_retired_unbuilt);
+            }
+        }
     }
 }
 
@@ -11179,6 +11274,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         build_in_parallel && !libraries_only
             ? (occl_lane ? OcclCompileLane() : &workers)
             : nullptr};
+    // A play variant's queued compile is given up at exit (occl_build_cancel); the preparation's
+    // variants build on its own thread (no worker) and are never cancelled.
+    std::optional<PipelineBuild::CancelScope> cancel_scope;
+    if (thread_worker != nullptr && t_occl_flag_build != 0 && !t_precompile_build) {
+        cancel_scope.emplace(occl_build_cancel);
+    }
     GraphicsPipeline::LibraryParams library_params{
         .library_cache = use_libraries ? &graphics_libraries : nullptr,
         .spirv_hashes = spirv_hashes,
@@ -11798,6 +11899,12 @@ bool ReadOcclRecordEnvs(const TranslationJob::OcclFileRecord& record,
 } // Anonymous namespace
 
 void PipelineCache::TranslateOnWorker(TranslationJob& job) {
+    // The teardown started (occl_build_cancel): an occlusion job is never used now, and none is
+    // ever stored, so it makes no pipeline instead of a translation and a driver compile.
+    if (job.occl && occl_build_cancel->cancelled.load(std::memory_order_acquire)) {
+        job.outcome = TranslationJob::Outcome::NoPipeline;
+        return;
+    }
     // FRITCHII_OCCL_FLAG_ASYNC: an occlusion job is translated exactly as the synchronous path
     // translates it (t_occl_flag_build set to its kind; a sibling marked for the counts), with
     // no record, and never stored.

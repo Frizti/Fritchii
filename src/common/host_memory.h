@@ -23,8 +23,10 @@ enum class MemoryPermission : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
 
-/// FRITCHII_PROTECT_UNLOCKED (live, default 1 = on, as the docs always said; -1 = not read yet): Windows Protect first tries
+/// FRITCHII_PROTECT_UNLOCKED (default 1 = on; -1 = not read yet): Windows Protect first tries
 /// VirtualProtect on the whole range without the placeholder lock (docs/fritchii/switches.md).
+/// The environment is read once, at the first Protect; live only through the debug server's
+/// set_switch (FindSwitch), which writes this value.
 inline std::atomic<int> g_protect_unlocked{-1};
 
 /// FRITCHII_ZERO_TRIM_CHUNK (live, default 0; -1 = not read yet; helper CR): the zero-page pass

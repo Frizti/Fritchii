@@ -982,6 +982,10 @@ private:
     /// prebuild would hold the evictions behind it there, as that deque is freed from the front.
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> retired_translations; ///< (tick, pipeline)
     void RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
+    /// Before an evicted pipeline is destroyed: its occlusion flag variants not built yet go to
+    /// retired_translations, so their queued compiles never run on the GPU thread.
+    void RetireUnbuiltOcclVariants(GraphicsPipeline& parent);
+    u64 occl_variants_retired_unbuilt{}; ///< This session, GPU thread
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
     /// FRITCHII_RAM_PREBUILT_KEEP: key hashes of boot builds destroyed before any draw used them,
     /// and how many went that way / were asked for again (translated anew) this session.
@@ -1064,6 +1068,13 @@ private:
     /// entries draws may wait on) stay on those. Made by EnsureOcclLanes; read through
     /// OcclCompileLane (preparation threads read it too).
     std::unique_ptr<Common::ThreadWorker> occl_compile_workers;
+    /// The driver compiles of occlusion flag variants made in play (on the lane or the shared
+    /// workers) and the lane's kept-record lookups: cancelled at the start of the teardown, so
+    /// a backlog is given up instead of compiled before the caches are saved. Variants are never
+    /// cache entries, so nothing is lost. Shared with the builds (they may outlive the cache's
+    /// members in a worker's queue).
+    std::shared_ptr<PipelineBuild::CancelSource> occl_build_cancel{
+        std::make_shared<PipelineBuild::CancelSource>()};
     std::atomic<Common::ThreadWorker*> occl_compile_live{};
     [[nodiscard]] Common::ThreadWorker* OcclCompileLane() const {
         return occl_compile_live.load(std::memory_order_acquire);
