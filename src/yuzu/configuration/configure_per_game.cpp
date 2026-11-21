@@ -28,9 +28,11 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QFont>
 #include <QIcon>
 #include <QImage>
 #include <QImageReader>
+#include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QNetworkAccessManager>
@@ -436,6 +438,16 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
         // Only the add-ons are left: no tab bar.
         ui->tabWidget->setCurrentIndex(tab_index(addons_tab.get()));
         ui->tabWidget->tabBar()->hide();
+        // Fritchii (owner 2026-11-21): say where the settings went. OoT's own settings were folded
+        // into the main ones (main_window.cpp, Frizti::FoldPerGame), so only the add-ons are here.
+        auto* const moved = new QLabel(
+            tr("Game settings are now merged with the main Settings. Change them there."), this);
+        moved->setWordWrap(true);
+        QFont moved_font = moved->font();
+        moved_font.setPointSizeF(moved_font.pointSizeF() * 1.25);
+        moved->setFont(moved_font);
+        moved->setContentsMargins(4, 4, 4, 10);
+        ui->verticalLayout_3->insertWidget(0, moved);
     }
 
     addons_tab->SetTitleId(title_id);
