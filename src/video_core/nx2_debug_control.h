@@ -606,6 +606,10 @@ inline std::atomic<int> g_cold_sweep_max{-1};
 /// FRITCHII_COLD_SWEEP_KEEP_RESAMPLED (live, default 1, 0 = off): the cold sweep keeps targets
 /// the game sampled again after an earlier sweep lost them (TextureCache::cold_resampled).
 inline std::atomic<int> g_cold_sweep_keep_resampled{-1};
+/// FRITCHII_COLD_SWEEP_KEEP_COVERED (live, default 1): the keep may hold targets newer images
+/// of another shape cover (covered retire) or overlap since (superseded); that fixed the pause
+/// menu's blocky background. 0 deletes those as in v6.2 (they could show a pre-cover picture).
+inline std::atomic<int> g_cold_sweep_keep_covered{-1};
 inline std::atomic<int> g_covered_retire_writeback{-1};
 inline std::atomic<int> g_cold_sweep_keep_mib{-1};
 /// FRITCHII_COVERED_RETIRE (live, frames, default 0 = off): a GPU-written render target whose

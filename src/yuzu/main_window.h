@@ -280,6 +280,9 @@ private:
     bool ApplyHardwareDefaults();
     /// MigrateFriztiSettings applied the tuned set in full; ApplyHardwareDefaults clears it.
     bool frizti_full_applied = false;
+    /// ... and the player asked for it this start ("Use recommended", Reset to defaults), not
+    /// only a config that looked new; ApplyHardwareDefaults clears it.
+    bool frizti_full_chosen = false;
 
     /// Updates an action's shortcut and text to reflect an updated hotkey from the hotkey registry.
     void LinkActionShortcut(QAction* action, const QString& action_name,

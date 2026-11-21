@@ -1330,7 +1330,9 @@ public:
     /// (VertexEpoch moved since). Only right after a play of this draw (IndexPlays moved).
     void EnsureIndexBinding();
 
-    /// The remembered index and vertex buffers are forgotten (SEAM changed).
+    /// The remembered index buffer is forgotten and the vertex ones are no longer trusted as
+    /// bound (SEAM changed): each is recorded again at its next bind, and bound again in a new
+    /// command buffer (EnsureVertexBindings).
     void ForgetBindings() noexcept;
 
     /// The player is the back's: counts a use on GPUMem (vk_mem_stage.cpp).
@@ -1397,6 +1399,11 @@ private:
     bool last_index_valid = false;
     u64 index_plays = 0;
 
+    /// A vertex binding the player remembers. epoch: the VertexEpoch it was last bound at;
+    /// ~0 = forgotten (nothing to bind again: never bound, left without a buffer, or a repack
+    /// that failed); StaleEpoch = remembered but not known to be bound in this command buffer
+    /// (the next PlayVertices records it, EnsureVertexBindings binds it in a new one).
+    static constexpr u64 StaleEpoch = ~u64{0} - 1;
     struct BoundVertexBuffer {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;

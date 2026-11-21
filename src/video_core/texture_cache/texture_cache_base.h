@@ -1374,6 +1374,7 @@ private:
         u64 kept_sampled{};    ///< Of kept_new: by the sampled-after-write rule (mode 2)
         u64 kept_range{};      ///< Of kept_new: over a recently lost read's range (mode 3)
         u64 released{};        ///< Would be kept, deleted as memory was over the line
+        u64 refused_newer{};   ///< Learned key, deleted: newer images cover or overlap it
         u64 learned{};         ///< Keys added to the set
         u64 lost_all{};        ///< Lost contents sampled (any drop)
         u64 lost_cold{};       ///< ... dropped by the cold sweep (each drop once)

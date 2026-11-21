@@ -489,7 +489,8 @@ VirtualProtect is redone under the lock, after the restore, so its newer flags w
 Log: "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): N without the lock, M took the
 lock (placeholder or several views), R redone under the lock (a split Unmap ran alongside); this
 session S split Unmaps put P protected runs back on their kept parts" (that line only with the
-switch on). The first 3 splits that restored anything log "Split unmap: N protected runs of the
+switch on, every 10 s at most, and at info level only when the window had a fallback, a redo or a
+new split Unmap that put protections back; a window of unlocked calls alone is a debug line). The first 3 splits that restored anything log "Split unmap: N protected runs of the
 kept parts restored after the remap" in either mode.
 Measure with the "host protect" time and longest in the Hitch:
 lines around area loads.
@@ -3166,8 +3167,13 @@ pre-pass variants. It is set only on a start that applied the tuned settings in 
 install, "Use recommended" in the settings prompt, Reset to defaults), and only while the setting
 is still Standard; never after "Keep my settings" (then one follower stays off on AMD, as in 6.2,
 and the one-time offer below may still ask). The offer's state then reads "set by the recommended
-settings", so it never asks over it. Log: "Recommended settings: occlusion speed-up Full on CARD
-(...)" or "... left at VALUE on CARD (not the default, the player's choice)". A FRITCHII_OCCL_FLAG
+settings", so it never asks over it. That mark, or any other answer in the offer's state, also
+counts as the player's answer on a start that applied the tuned set only because the config looked
+new (qt-config.ini's revision older than frizti.ini's, e.g. after an older build wrote it): Full is
+not set again over a Standard the player picked since; "Use recommended" and Reset to defaults
+still set it. Log: "Recommended settings: occlusion speed-up Full on CARD (...)", "... left at
+VALUE on CARD (not the default, the player's choice)" or "... left at Standard on CARD (the offer
+was answered before: STATE)". A FRITCHII_OCCL_FLAG
 switch still wins at boot. No shaderInt64 test (the frontend's card records have none; every AMD
 proprietary Windows driver has it, and the colour variants check it at the draw). Measured only
 over OCuLink x4 (Full against Standard: host query slots 37k -> 14.5k a second, GPU -0.4 to -1.3
@@ -6636,6 +6642,18 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   ", key in set at drop" when the drop's key was in the set at the delete. The lost-contents attribution ring (StaleDropRing) is 4,096 drops now (was 1,024):
   covered retire alone records ~140 a second there, so drops read again 7+ s later were "not
   recorded" (9-11 a run) and could not be learned.
+- FRITCHII_COLD_SWEEP_KEEP_COVERED (live, default 1, the tested 6.5 behaviour; 6.5 review R3 should-fix 3): whether the keep
+  above may hold targets that newer images of another shape cover (covered retire) or overlap
+  since the target's last use (the superseded test, ColdSuperseded). Such a kept target is not
+  synced with those images (they aren't aliases), so the next lookup that finds it samples its
+  pre-cover picture. At 0 they go as in v6.2 (deleted, no budget) and the keep holds only targets
+  no newer image of another shape touched since. 1 is the first 6.5 candidate's behaviour: it
+  keeps those too, which fixed the pause menu's blocky background (a 1280x720 target covered
+  retire took, 28 of 29 market losses came from covered retire), where the cover was the images'
+  ranges, not their real writes. The "Cold sweep keep" line counts "N with a learned key deleted
+  as newer images cover or overlap them (FRITCHII_COLD_SWEEP_KEEP_COVERED=V)": the targets 1
+  would have kept. Test it live: pause menu System tab and the market, 0 against 1; compare the
+  lost contents counts and the pictures.
 
 ### Pot room VRAM (helper CC)
 

@@ -885,6 +885,7 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
     const u32 stored = Settings::values.frizti_settings_revision.GetValue();
     const u32 applied = (std::min)(stored, record.revision);
     bool full = applied < Frizti::Revision;
+    bool full_asked = false; // the player clicked "Use recommended" (ApplyHardwareDefaults)
     if (start == FriztiStart::Keep) {
         full = false;
     } else if (start == FriztiStart::AskFirst) {
@@ -905,6 +906,7 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
             break;
         case Frizti::StartupApply::Ask:
             full = AskUseRecommendedSettings();
+            full_asked = full;
             if (full) {
                 const QString backup = FritchiiUi::BackupSettings();
                 LOG_INFO(Frontend,
@@ -922,6 +924,7 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
     }
 
     frizti_full_applied = full; // ApplyHardwareDefaults, once the cards are known
+    frizti_full_chosen = full && (start == FriztiStart::Silent || full_asked);
     auto changes = Frizti::ReconcileGlobal(tuned, record, full);
     for (auto& change : Frizti::FixDockedController(Settings::values)) {
         changes.push_back(std::move(change));
@@ -1010,6 +1013,7 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
 // (OcclFlag::ReadAtBoot).
 bool MainWindow::ApplyHardwareDefaults() {
     [[maybe_unused]] const bool full = std::exchange(frizti_full_applied, false);
+    [[maybe_unused]] const bool chosen = std::exchange(frizti_full_chosen, false);
 #ifndef _WIN32
     return false; // Full is a Windows AMD default, like the offer (NoteSession)
 #else
@@ -1032,6 +1036,17 @@ bool MainWindow::ApplyHardwareDefaults() {
         LOG_INFO(Frontend, "Recommended settings: occlusion speed-up left at {} on {} (not the "
                            "default, the player's choice)",
                  setting.ToStringGlobal(), card_name);
+        return false;
+    }
+    // The offer's mark is an answer: Full was set (and maybe turned back to Standard by the
+    // player) or offered here before. A start that applies the set only because a config looked
+    // new (qt-config.ini's revision older than frizti.ini's, e.g. after an older build wrote it)
+    // leaves that Standard alone; "Use recommended" and Reset to defaults still set Full
+    // (review R1 should-fix 5).
+    if (!chosen && FritchiiOcclusionOffer::Answered()) {
+        LOG_INFO(Frontend, "Recommended settings: occlusion speed-up left at Standard on {} (the "
+                           "offer was answered before: {})",
+                 card_name, UISettings::values.fritchii_occl_offer.GetValue());
         return false;
     }
     setting.SetValue(Settings::OcclusionSpeedup::Full);

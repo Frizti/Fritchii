@@ -925,6 +925,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_COLD_SWEEP_KEEP_RESAMPLED") {
         return &g_cold_sweep_keep_resampled;
     }
+    if (name == "FRITCHII_COLD_SWEEP_KEEP_COVERED") {
+        return &g_cold_sweep_keep_covered;
+    }
     if (name == "FRITCHII_COVERED_RETIRE_WRITEBACK") {
         return &g_covered_retire_writeback;
     }

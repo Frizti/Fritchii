@@ -2804,6 +2804,31 @@ void TextureCache<P>::SweepColdImages() {
         }
         return true;
     };
+    // FRITCHII_COLD_SWEEP_KEEP_COVERED (live, default 1): whether the keep may hold a target that
+    // newer images of another shape cover (covered retire) or overlap since its last use
+    // (ColdSuperseded). Such a target is not synced with them (they aren't aliases), so a lookup
+    // that finds it again samples its pre-cover picture. Off, those go as in v6.2 (no keep, no
+    // budget), and only targets no newer image of another shape touched since are kept: their
+    // contents are still the memory's. 1 keeps them as well (where the cover is only the images'
+    // ranges, not their real writes, that picture is the right one: the pause menu's blocky
+    // background was such a target).
+    const bool keep_covered =
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cold_sweep_keep_covered,
+                                         "FRITCHII_COLD_SWEEP_KEEP_COVERED", 1) > 0;
+    // Whether a GPU-written target's address and shape are in the re-sampled set: what mode 1
+    // keeps by (no side effects: the rule's own lookup marks the image kept and counts it).
+    const auto key_known = [&](const Image& image) {
+        return !cold_resampled.empty() &&
+               cold_resampled.find(ColdResampledKey(
+                   image.gpu_addr, RelocationShapeKey(image.info))) != cold_resampled.end();
+    };
+    // Counts a target the keep turns away as covered or superseded, when the rule would have
+    // kept it by its learned key.
+    const auto refuse_newer = [&](const Image& image) {
+        if (keep_mode > 0 && True(image.flags & ImageFlagBits::GpuModified) && key_known(image)) {
+            ++cold_keep_stats.refused_newer;
+        }
+    };
     const auto count_kept = [&](Image& image) {
         const u32 frame = static_cast<u32>(frame_tick);
         if (frame_tick % 600 == 0 && image.cold_keep_frame != frame) {
@@ -2873,7 +2898,11 @@ void TextureCache<P>::SweepColdImages() {
                     // FRITCHII_COLD_SWEEP_KEEP_RESAMPLED: only here, where covered retire would
                     // delete it (covered retire was what lost them: 28 of 29 cold sweep losses
                     // in a 3-minute market run). Kept, it is looked at here every frame (bit 2).
-                    const bool keep = keep_rule(image);
+                    // Covered, so only with FRITCHII_COLD_SWEEP_KEEP_COVERED=1 (above).
+                    if (!keep_covered) {
+                        refuse_newer(image);
+                    }
+                    const bool keep = keep_covered && keep_rule(image);
                     if (keep && keep_fits(image)) {
                         image.cold_keep |= 4;
                         count_kept(image);
@@ -3002,8 +3031,23 @@ void TextureCache<P>::SweepColdImages() {
         }
         // FRITCHII_COLD_SWEEP_KEEP_RESAMPLED (above): only where the image would be deleted
         // (after the GpuModified guards), so guarded images neither use the budget nor stay in
-        // cold_watch.
-        const bool keep = keep_rule(image);
+        // cold_watch. Superseded, or overlapped by a newer image of another shape touched since
+        // (looked at again every frame while kept), only with FRITCHII_COLD_SWEEP_KEEP_COVERED=1.
+        // ColdSuperseded runs only for GPU-written images the rule could keep (mode 1: by their
+        // key, a hash lookup first).
+        bool keep = false;
+        if (keep_covered) {
+            keep = keep_rule(image);
+        } else if (keep_mode > 0 && True(image.flags & ImageFlagBits::GpuModified)) {
+            const bool newer =
+                superseded ||
+                ((keep_mode >= 2 || key_known(image)) && ColdSuperseded(image_id, image));
+            if (newer) {
+                refuse_newer(image);
+            } else {
+                keep = keep_rule(image);
+            }
+        }
         if (keep && keep_fits(image)) {
             count_kept(image);
             ++index;
@@ -3080,14 +3124,17 @@ void TextureCache<P>::SweepColdImages() {
         LOG_INFO(HW_GPU,
                  "Cold sweep keep (FRITCHII_COLD_SWEEP_KEEP_RESAMPLED={}) last 600 frames: {} "
                  "images newly kept by the rule ({} as sampled after their write, {} by range), "
-                 "{} kept now ({} MiB), {} deleted all the same as memory was over the line; "
+                 "{} kept now ({} MiB), {} deleted all the same as memory was over the line, "
+                 "{} with a learned key deleted as newer images cover or overlap them "
+                 "(FRITCHII_COLD_SWEEP_KEEP_COVERED={}); "
                  "re-sampled set {} entries (+{}); lost contents sampled {} ({} dropped by the "
                  "cold sweep, {} of those in the set when deleted; {} more images over a drop "
                  "already counted; not recorded {}); device memory {} MiB, keep line {} MiB{}; "
                  "keep budget {} MiB (in use {} MiB by {} images, real device memory, resident), "
                  "release line {} MiB{}",
                  keep_mode, k.kept_new, k.kept_sampled, k.kept_range, k.kept_now,
-                 k.kept_now_bytes >> 20, k.released, cold_resampled.size(), k.learned, k.lost_all,
+                 k.kept_now_bytes >> 20, k.released, k.refused_newer, keep_covered ? 1 : 0,
+                 cold_resampled.size(), k.learned, k.lost_all,
                  k.lost_cold, k.lost_cold_known, k.lost_cold_repeat, k.lost_not_recorded,
                  total_used_memory >> 20,
                  keep_limit >> 20, keep_room ? "" : " (over the line)", keep_budget >> 20,
