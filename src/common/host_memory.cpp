@@ -97,6 +97,10 @@ std::atomic<int> g_guest_mapping_in_flight{};
 std::atomic<bool> g_zero_trim_unlocking{false};
 std::atomic<u64> g_guest_calls_in_unlock{0};
 std::atomic<u64> g_longest_guest_in_unlock_ns{0};
+// Split Unmaps (Windows) whose kept parts had protections put back, and those runs: for the
+// "Host protect" line.
+[[maybe_unused]] std::atomic<u64> g_split_protect_splits{0};
+[[maybe_unused]] std::atomic<u64> g_split_protect_runs{0};
 struct GuestMappingInFlight {
     GuestMappingInFlight() noexcept {
         g_guest_mapping_in_flight.fetch_add(1, std::memory_order_relaxed);
@@ -413,10 +417,11 @@ public:
         // ends as a Protect done wholly before or after the Map or Unmap: a view in place is the
         // range's final view, a placeholder sends the call to the locked path.
         // The one exception is a partial Unmap that splits a view: it unmaps the whole view and
-        // maps the kept parts again with PAGE_READWRITE (UnmapOnePlaceholder), which would wipe
-        // a protection that landed on the old view. split_unmap_seq is odd across that sequence;
-        // a call that saw it odd or changed is redone under the lock (VirtualProtect is
-        // idempotent), after the remap.
+        // maps the kept parts again read-write (UnmapOnePlaceholder), then puts back the
+        // protections it read from them after it made split_unmap_seq odd. A protection that
+        // landed on the old view after that read would be lost: split_unmap_seq is odd from
+        // before the read until after the restore, and a call that saw it odd or changed is
+        // redone under the lock (VirtualProtect is idempotent), after the restore.
         const bool unlocked = ProtectUnlocked();
         bool redo = false;
         if (unlocked) {
@@ -495,8 +500,11 @@ public:
             LOG_INFO(HW_Memory,
                      "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): {} without the "
                      "lock, {} took the lock (placeholder or several views), {} redone under the "
-                     "lock (a split Unmap ran alongside)",
-                     fast_count, locked_count, redone_count);
+                     "lock (a split Unmap ran alongside); this session {} split Unmaps put {} "
+                     "protected runs back on their kept parts",
+                     fast_count, locked_count, redone_count,
+                     g_split_protect_splits.load(std::memory_order_relaxed),
+                     g_split_protect_runs.load(std::memory_order_relaxed));
         }
     }
 
@@ -597,8 +605,23 @@ private:
         const bool split_right = unmap_end < placeholder_end;
         const bool splits = split_left || split_right;
         if (splits) {
-            // Odd until the kept parts are mapped again: unlocked Protects redo (Protect).
+            // Odd until the kept parts are mapped again and their protections restored: unlocked
+            // Protects redo (Protect).
             split_unmap_seq.fetch_add(1, std::memory_order_seq_cst);
+            // The kept parts are mapped again read-write below (a view is mapped whole with one
+            // protection), which would wipe their write traps: the page table still says
+            // RasterizerCachedMemory, so CPU writes there were missed. Their protections are read
+            // here, while the old view is still mapped, and put back once they are mapped again.
+            // Read after the increment above: a locked Protect is ordered by the lock, and an
+            // unlocked one either changed the view before this read (so it is read here) or reads
+            // split_unmap_seq again after its call and is redone under the lock after this Unmap.
+            kept_protections.clear();
+            if (split_left) {
+                SaveKeptProtections(placeholder_begin, unmap_begin);
+            }
+            if (split_right) {
+                SaveKeptProtections(unmap_end, placeholder_end);
+            }
         }
 
         if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder_begin,
@@ -622,6 +645,10 @@ private:
         }
         // End panic region
         if (splits) {
+            // After both parts are mapped again (the unmapped window stays as short as before),
+            // and before split_unmap_seq turns even, so an unlocked Protect that lands on a kept
+            // part meanwhile is redone after this restore and its newer flags win.
+            RestoreKeptProtections();
             split_unmap_seq.fetch_add(1, std::memory_order_seq_cst);
         }
 
@@ -652,6 +679,63 @@ private:
                              placeholder_end - unmap_end);
         }
         return true;
+    }
+
+    /// A run of pages of a kept part with a protection other than read-write (a write or read
+    /// trap), for a split Unmap (UnmapOnePlaceholder). Offsets from virtual_base.
+    struct KeptProtection {
+        size_t offset;
+        size_t length;
+        DWORD flags;
+    };
+
+    /// Adds the runs of [offset, end) (one mapped view) whose committed pages are not read-write
+    /// to kept_protections. Pages that are not committed (EDEN_NX2_SEC_RESERVE) have no
+    /// protection to keep and are left out, as are pages the query fails on (logged).
+    void SaveKeptProtections(size_t offset, size_t end) {
+        while (offset < end) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(virtual_base + offset, &info, sizeof(info)) != sizeof(info)) {
+                LOG_CRITICAL(HW_Memory, "Split unmap: protection query at {:#x} failed, error {}",
+                             offset, GetLastError());
+                return;
+            }
+            const size_t region_end =
+                static_cast<size_t>(static_cast<u8*>(info.BaseAddress) - virtual_base) +
+                info.RegionSize;
+            if (region_end <= offset) {
+                return; // never: the region holds the queried page
+            }
+            const size_t run_end = (std::min)(region_end, end);
+            if (info.State == MEM_COMMIT && info.Protect != PAGE_READWRITE) {
+                kept_protections.push_back({offset, run_end - offset, info.Protect});
+            }
+            offset = run_end;
+        }
+    }
+
+    /// Puts kept_protections back on the kept parts, now mapped again read-write.
+    void RestoreKeptProtections() {
+        for (const KeptProtection& run : kept_protections) {
+            DWORD old_flags{};
+            if (!VirtualProtect(virtual_base + run.offset, run.length, run.flags, &old_flags)) {
+                LOG_CRITICAL(HW_Memory,
+                             "Split unmap: protection {:#x} of {:#x} bytes at {:#x} not restored, "
+                             "error {}",
+                             run.flags, run.length, run.offset, GetLastError());
+            }
+        }
+        if (!kept_protections.empty()) {
+            g_split_protect_runs.fetch_add(kept_protections.size(), std::memory_order_relaxed);
+            const u64 splits = g_split_protect_splits.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (splits <= 3) {
+                LOG_INFO(HW_Memory,
+                         "Split unmap: {} protected runs of the kept parts restored after the "
+                         "remap (split {} with protections this session)",
+                         kept_protections.size(), splits);
+            }
+        }
+        kept_protections.clear();
     }
 
     void MapView(size_t virtual_offset, size_t host_offset, size_t length) {
@@ -709,6 +793,9 @@ private:
     /// Odd while UnmapOnePlaceholder splits a view (unmapped whole, kept parts mapped again);
     /// bumped twice per split. Read by Protect's unlocked path (FRITCHII_PROTECT_UNLOCKED).
     std::atomic<u64> split_unmap_seq{0};
+    /// A split Unmap's kept-part protections, between its unmap and its remap. Under
+    /// placeholder_mutex; kept to reuse its storage.
+    std::vector<KeptProtection> kept_protections;
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
 };
