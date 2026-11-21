@@ -264,7 +264,7 @@ TEST_CASE("HostMemory: Partial sparse middle unmap and check bindings", "[common
 
 #ifdef _WIN32
 // A partial Unmap that splits a view maps the kept parts again: their protections (the write
-// traps) must survive it. Port of dzervas/Lichii 23eb549a71's test, as zortos293 ported it (#2361).
+// traps) must survive it (ported test; credits in the commit message).
 TEST_CASE("HostMemory: Partial unmap preserves the protections of both kept pieces", "[common]") {
     constexpr size_t Page = 0x1000;
     constexpr size_t VirtualOffset = 0x80000;

@@ -482,8 +482,8 @@ before or after the Map/Unmap, but one: a partial Unmap that splits a view unmap
 the kept parts again with PAGE_READWRITE. Until 2026-11-21 that wiped every protection on the kept
 parts, with the switch on or off (the page table still said cached, so CPU writes there were
 missed). Now the Unmap reads the kept parts' protections (VirtualQuery) before it unmaps the view
-and puts them back (VirtualProtect) after both remaps (the approach of dzervas/Lichii 23eb549a71,
-ported by zortos293 as #2361). A split sequence counter (odd from before that read until after the
+and puts them back (VirtualProtect) after both remaps (a ported approach, credited in the commit).
+A split sequence counter (odd from before that read until after the
 restore) guards the unlocked path: an unlocked Protect that saw it odd or changed around its
 VirtualProtect is redone under the lock, after the restore, so its newer flags win.
 Log: "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): N without the lock, M took the
