@@ -273,11 +273,13 @@ private:
         Keep,     ///< after Restore Settings: the restored settings stay, this revision handled
     };
     void MigrateFriztiSettings(FriztiStart start = FriztiStart::Silent);
-    /// Hardware-gated defaults, once the cards are known (after NoteCards): today the occlusion
-    /// speed-up Full on AMD's proprietary driver on a discrete GPU (Windows). Set only while the
-    /// player has not chosen (config/frizti.ini remembers what it set, and for which card).
-    /// True when it changed a setting (saved already).
+    /// Hardware-gated recommended settings, once the cards are known (after NoteCards): today
+    /// the occlusion speed-up Full on AMD's proprietary driver on a discrete GPU (Windows).
+    /// Only when MigrateFriztiSettings applied the tuned set in full (frizti_full_applied) and
+    /// the setting is still its default. True when it changed a setting (saved already).
     bool ApplyHardwareDefaults();
+    /// MigrateFriztiSettings applied the tuned set in full; ApplyHardwareDefaults clears it.
+    bool frizti_full_applied = false;
 
     /// Updates an action's shortcut and text to reflect an updated hotkey from the hotkey registry.
     void LinkActionShortcut(QAction* action, const QString& action_name,
