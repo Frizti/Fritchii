@@ -1650,7 +1650,9 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
             const char *no = sh[6] ? "a task program" : (sh[7]->e->flags & DMSH_VK_F_MESH_PRIM) ? "per-primitive outputs" : (sh[1] && (sh[1]->e->flags & DMSH_VK_F_MESH_PRIM)) ? "a pixel shader with per-primitive inputs"
                            : dw->prim != NVN_PRIM_MESH ? "a 3D mesh draw" : dw->ind && (dw->mdi_cnt || dw->mdi_max > 1) ? "a multi-draw" : NULL;
             if (!no) {   // DM_VK_MESH_FB_SKIP=<keys>: those mesh programs drawn natively (to find one the emulation draws wrong)
-                static const char *skip; static int si; if (!si) { skip = getenv("DM_VK_MESH_FB_SKIP"); si = 1; }
+                // Default: Ocarina of Time's fern, whose depth prepass (a934ed1af79131cc) and colour pass with an equal depth test (edeefae4c37b0257)
+                // place the blades differently when emulated: a blade tip the colour pass misses shows the bright pass under it for a frame
+                static const char *skip; static int si; if (!si) { skip = getenv("DM_VK_MESH_FB_SKIP"); if (!skip) skip = "edeefae4c37b0257,a934ed1af79131cc"; si = 1; }
                 char kx[17]; snprintf(kx, sizeof kx, "%016llx", (unsigned long long)sh[7]->key);
                 if (skip && strstr(skip, kx)) no = "DM_VK_MESH_FB_SKIP";
                 static uint64_t em[256]; static int ne; int k3 = 0; for (; k3 < ne && em[k3] != sh[7]->key; k3++) {}
