@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <deque>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -618,7 +619,29 @@ struct GPU::Impl {
         gpu_thread.TickGPU(is_async);
     }
 
+    /// Waits for composites requested before the last `keep` (Direct NVN: a frame in flight more)
+    void WaitForCompositeDepth(size_t keep) {
+        if (pending_composite_fence != 0) {
+            composite_ring.push_back(pending_composite_fence);
+            pending_composite_fence = 0;
+        }
+        while (composite_ring.size() > keep) {
+            const u64 fence = composite_ring.front();
+            composite_ring.pop_front();
+            if (!shutting_down.load(std::memory_order_relaxed)) {
+                WaitForSyncOperation(fence);
+            }
+        }
+    }
+
     void WaitForComposite() {
+        while (!composite_ring.empty()) {
+            const u64 f = composite_ring.front();
+            composite_ring.pop_front();
+            if (!shutting_down.load(std::memory_order_relaxed)) {
+                WaitForSyncOperation(f);
+            }
+        }
         const u64 fence = pending_composite_fence;
         if (fence == 0) {
             return;
@@ -697,6 +720,7 @@ struct GPU::Impl {
     std::deque<size_t> request_swap_counters;
     std::mutex request_swap_mutex;
     u64 pending_composite_fence{};
+    std::deque<u64> composite_ring; // composites not waited for yet (WaitForCompositeDepth)
 };
 
 GPU::GPU(Core::System& system, bool is_async, bool use_nvdec)
@@ -842,6 +866,10 @@ const VideoCore::ShaderNotify& GPU::ShaderNotify() const {
 void GPU::RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,
                            std::vector<Service::Nvidia::NvFence>&& fences) {
     impl->RequestComposite(std::move(layers), std::move(fences));
+}
+
+void GPU::WaitForCompositeDepth(size_t keep) {
+    impl->WaitForCompositeDepth(keep);
 }
 
 void GPU::WaitForComposite() {

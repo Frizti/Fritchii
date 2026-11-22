@@ -16,6 +16,9 @@ add_library(core STATIC
     constants.h
     core.cpp
     core.h
+    nvn_direct_choice.h
+    nvn_hook.cpp
+    nvn_hook.h
     game_settings.cpp
     game_settings.h
     core_timing.cpp
@@ -1061,6 +1064,8 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
+    hle/service/nx2_native_image_lookup.h
+    hle/service/nx2_present.h
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
     hle/service/nx2_present_pacer.h

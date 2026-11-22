@@ -114,6 +114,9 @@
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_profile.h"
+#ifdef LICHII_NVN_DIRECT
+#include "video_core/nvn_direct/nvn_direct.h"
+#endif
 #include "video_core/one_follower.h"
 
 // One follower (one_follower.h), step 1: on E (the back) every entry into the renderer runs lent
@@ -10544,6 +10547,21 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     if (!framebuffer_addr) {
         return {};
     }
+#ifdef LICHII_NVN_DIRECT
+    if (device.IsNvnDirect()) {
+        if ((framebuffer_addr & NVN_DIRECT_FRAME_TAG) == 0 || !direct_display_frame) {
+            return {};
+        }
+        return FramebufferTextureInfo{
+            .image = direct_display_frame->image,
+            .image_view = direct_display_frame->view,
+            .width = direct_display_frame->width,
+            .height = direct_display_frame->height,
+            .scaled_width = direct_display_frame->scaled_width,
+            .scaled_height = direct_display_frame->scaled_height,
+        };
+    }
+#endif
     ONEF_LEND_RESULT(FrameEnd, AccelerateDisplay(config, framebuffer_addr, pixel_stride))
     std::scoped_lock lock{texture_cache.mutex};
     const auto [image_view, scaled] =

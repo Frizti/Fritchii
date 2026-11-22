@@ -93,4 +93,22 @@ Result BuildWarmFilesWith(Core::System& system, const std::filesystem::path& gam
                           const std::function<void(const Progress&)>& progress,
                           std::stop_token stop);
 
+struct ShaderRecord;
+
+/// Every NVN2 shader program in the game's archives (the warm-up's extraction, without
+/// conversion), for renderers that translate the programs themselves (NVN direct). `on_record`
+/// runs on the calling thread; `progress` gets the archive count. Returns an error, or nullopt.
+std::optional<std::string> ForEachProgram(Core::System& system,
+                                          const std::filesystem::path& game_path,
+                                          const std::function<void(const ShaderRecord&)>& on_record,
+                                          const std::function<void(const Progress&)>& progress,
+                                          std::stop_token stop);
+
+/// NVN direct mode, at boot before the game runs: every program of the game files translated by
+/// the direct renderer and its pipeline library made, so play compiles little. Skipped when an
+/// earlier boot did it for the same game file and translations (a marker in the direct renderer's
+/// cache folder). `progress` gets (done, total) of the current stage. Nothing in other modes.
+void PrepareNvnDirect(Core::System& system, std::stop_token stop,
+                      const std::function<void(size_t, size_t)>& progress);
+
 } // namespace VideoCommon::ShaderWarm

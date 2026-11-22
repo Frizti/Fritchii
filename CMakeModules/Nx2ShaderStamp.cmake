@@ -24,7 +24,9 @@
 
 set(SkipBlocksIn "vk_graphics_pipeline.h;vk_compute_pipeline.h")
 # v6.1, kept by 6.2: Windows (CRLF checkout), Linux (LF checkout).
-set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392")
+set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392;65645db715012eee;31c2d687b0b1233c")
+# Direct NVN (Ocarina of Time): every generic vertex output declared, the render area inside the
+# rescaling block and loop guard changes (src/shader_recompiler): shaders really change.
 # 6.2, the occlusion flag extensions (FRITCHII_OCCL_FLAG=9, "Full"): emit_spirv.*,
 # emit_spirv_special.cpp, spirv_emit_context.*, runtime_info.h and vk_graphics_pipeline.cpp
 # changed. Every new SPIR-V path runs only for a module translated with

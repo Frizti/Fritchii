@@ -5,6 +5,9 @@
 
 add_subdirectory(host_shaders)
 add_subdirectory(gpu_logging)
+if (ENABLE_NVN_DIRECT)
+    add_subdirectory(nvn_direct)
+endif()
 
 if(LIBVA_FOUND)
     set_source_files_properties(host1x/ffmpeg.cpp
@@ -284,6 +287,12 @@ add_library(video_core STATIC
     renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_master_semaphore.cpp
     renderer_vulkan/vk_master_semaphore.h
+    native_lowering.cpp
+    native_lowering.h
+    renderer_vulkan/vk_nvn_direct_astc.cpp
+    renderer_vulkan/vk_nvn_direct_astc.h
+    renderer_vulkan/vk_nvn_direct_shaders.cpp
+    renderer_vulkan/vk_nvn_direct_shaders.h
     renderer_vulkan/vk_mem_stage.cpp
     renderer_vulkan/vk_mem_stage.h
     renderer_vulkan/vk_mem_stage_hook.h
@@ -572,6 +581,9 @@ endif()
 # Shader warm-up builder: game archives use zstd (also with dictionaries) and zlib.
 target_link_libraries(video_core PRIVATE zstd::zstd ZLIB::ZLIB)
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
+if (TARGET nvn_direct)
+    target_link_libraries(video_core PUBLIC nvn_direct)
+endif()
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)
 endif()

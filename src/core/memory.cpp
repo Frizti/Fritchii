@@ -40,6 +40,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/memory.h"
+#include "core/nvn_hook.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -620,7 +621,8 @@ struct Memory::Impl {
             }();
             const bool reactive_flushing =
                 Settings::values.use_reactive_flushing.GetValue() &&
-                !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
+                !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2()) &&
+                !Core::NvnHook::DirectMode();
             if (!reactive_flushing || !cached) {
                 perm |= Common::MemoryPermission::Read;
             }
@@ -1046,6 +1048,10 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
+        if (Core::NvnHook::DirectMode()) {
+            // NVN2 direct mode: cached pages are the replay's write-tracked pools, read in place.
+            return;
+        }
         if (!Kernel::Nx2ThreadStats::g_enabled) {
             DownloadFromRasterizer(v_address, size);
             return;
@@ -1155,6 +1161,12 @@ struct Memory::Impl {
 
     /// `host_ptr`: the store's host pointer when the caller's walk already found it (null: walk).
     void HandleRasterizerWrite(VAddr v_address, size_t size, const u8* host_ptr = nullptr) {
+        if (Core::NvnHook::DirectMode()) {
+            // NVN2 direct mode: the replay's write-tracked pools, by guest address (they have no
+            // device address).
+            Core::NvnHook::OnDirectCpuWrite(v_address & 0xffffffffffffULL, size);
+            return;
+        }
         if (!Kernel::Nx2ThreadStats::g_enabled) {
             WriteToRasterizer(v_address, size, host_ptr);
             return;
@@ -1466,7 +1478,13 @@ void Memory::MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddre
 
 void Memory::UnmapRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
                          bool separate_heap) {
+    // NVN2 direct mode: pool memory the replay imported here is given back before the pages go,
+    // and the replay reads no guest memory until they are gone.
+    const bool direct = Core::NvnHook::OnGuestUnmap(page_table, GetInteger(base), size);
     impl->UnmapRegion(page_table, base, size, separate_heap);
+    if (direct) {
+        Core::NvnHook::OnGuestUnmapDone();
+    }
 }
 
 void Memory::ProtectRegion(Common::PageTable& page_table, Common::ProcessAddress vaddr, u64 size,

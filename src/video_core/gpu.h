@@ -247,6 +247,8 @@ public:
                           std::vector<Service::Nvidia::NvFence>&& fences);
 
     void WaitForComposite();
+    /// Waits for every composite but the last `keep` requested
+    void WaitForCompositeDepth(size_t keep);
 
     std::vector<u8> GetAppletCaptureBuffer();
 
