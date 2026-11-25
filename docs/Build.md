@@ -29,6 +29,14 @@ cmake --build build --target yuzu
 The executable is `build/bin/lichii.exe` (the target is still called `yuzu`; both get
 renamed later). See the root `CMakeLists.txt` for the other options.
 
+## AV1 hardware decoding
+
+The bundled Windows x64 FFmpeg provides AV1 through libdav1d. To use AV1 hardware
+decoding in a custom build, set `-DFFmpeg_CUSTOM_DIR=<path to an FFmpeg package>`
+to a compatible package that includes the native AV1 decoder, a supported AV1 hardware
+accelerator, and libdav1d. Select GPU for NVDEC emulation in Fritchii. Software decoding
+remains available for the bundled package and for streams that fail hardware startup.
+
 ## If the configure fails
 
 - Delete `<build folder>/CMakeCache.txt` and the CPM cache (`.cache/cpm`), then configure again.
