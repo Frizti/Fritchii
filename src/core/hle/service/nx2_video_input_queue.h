@@ -17,6 +17,7 @@ public:
         std::vector<u8> data;
         u64 pts;
         bool end;
+        u64 submission{};
     };
 
     static constexpr size_t ReadyWatermark = 8;
