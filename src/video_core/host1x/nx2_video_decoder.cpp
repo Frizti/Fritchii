@@ -144,21 +144,19 @@ struct Nx2VideoDecoder::Impl {
     std::unique_ptr<FFmpeg::Decoder> decoder;
     std::unique_ptr<FFmpeg::HardwareContext> hardware;
     std::unique_ptr<FFmpeg::DecoderContext> context;
-    SwsContext* scaler{};
+    Nx2VideoFrameConverter converter;
     bool open{};
     bool ever_open{};
     bool using_hardware{};
     bool received_any{};
     u64 errors_seen{};
     u32 hardware_failures{}; ///< Packets in a row that failed on the GPU
-    u32 render_faults{};
     H264PacketConverter h264_packets;
     /// Timestamps of submitted frames not yet output, for frames that come out without one.
     std::multiset<u64> pending_pts;
     std::vector<u8> packet; ///< FFmpeg reads up to AV_INPUT_BUFFER_PADDING_SIZE past the data
 
     ~Impl() {
-        sws_freeContext(scaler);
         context.reset();
         hardware.reset();
     }
@@ -384,6 +382,16 @@ void Nx2VideoDecoder::Reset() {
 
 void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width,
                              u32 height, u64 pitch, u64 chroma_offset, std::span<u8> out) {
+    impl->converter.Render(picture, format, width, height, pitch, chroma_offset, out, impl->name);
+}
+
+Nx2VideoFrameConverter::~Nx2VideoFrameConverter() {
+    sws_freeContext(scaler);
+}
+
+void Nx2VideoFrameConverter::Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width,
+                                    u32 height, u64 pitch, u64 chroma_offset, std::span<u8> out,
+                                    std::string_view mime) {
     if (!picture.frame) {
         return;
     }
@@ -391,16 +399,16 @@ void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format,
     if (!Guarded([&] { RenderUnguarded(picture, format, width, height, pitch, chroma_offset, out); },
                  code)) {
         // The image keeps what it held; the next frame tries again.
-        if (impl->render_faults++ < 8) {
+        if (render_faults++ < 8) {
             LOG_ERROR(HW_GPU, "nx2 video: converting a {}x{} frame of \"{}\" faulted ({:#x})",
-                      picture.width, picture.height, impl->name, code);
+                      picture.width, picture.height, mime, code);
         }
     }
 }
 
-void Nx2VideoDecoder::RenderUnguarded(const Nx2Picture& picture, Nx2PictureFormat format,
-                                      u32 width, u32 height, u64 pitch, u64 chroma_offset,
-                                      std::span<u8> out) {
+void Nx2VideoFrameConverter::RenderUnguarded(const Nx2Picture& picture, Nx2PictureFormat format,
+                                             u32 width, u32 height, u64 pitch, u64 chroma_offset,
+                                             std::span<u8> out) {
     const AVFrame* f = picture.frame->GetFrame();
     const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(f->format));
     if (desc == nullptr || (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) || f->data[0] == nullptr ||
@@ -450,11 +458,11 @@ void Nx2VideoDecoder::RenderUnguarded(const Nx2Picture& picture, Nx2PictureForma
         }
         return;
     }
-    impl->scaler = sws_getCachedContext(impl->scaler, f->width, f->height,
+    scaler = sws_getCachedContext(scaler, f->width, f->height,
                                         static_cast<AVPixelFormat>(f->format),
                                         static_cast<int>(width), static_cast<int>(height), target,
                                         SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (impl->scaler == nullptr) {
+    if (scaler == nullptr) {
         LOG_ERROR(HW_GPU, "nx2 video: cannot convert {} to {}",
                   av_get_pix_fmt_name(static_cast<AVPixelFormat>(f->format)),
                   av_get_pix_fmt_name(target));
@@ -475,7 +483,7 @@ void Nx2VideoDecoder::RenderUnguarded(const Nx2Picture& picture, Nx2PictureForma
                                   f->format == AV_PIX_FMT_YUVJ440P ||
                                   f->format == AV_PIX_FMT_YUVJ411P;
     const int* coefficients = sws_getCoefficients(space);
-    sws_setColorspaceDetails(impl->scaler, coefficients, full_range_source, coefficients,
+    sws_setColorspaceDetails(scaler, coefficients, full_range_source, coefficients,
                              format != Nx2PictureFormat::Nv12, 0, 1 << 16, 1 << 16);
     std::array<u8*, 4> planes{out.data(), nullptr, nullptr, nullptr};
     std::array<int, 4> strides{static_cast<int>(pitch), 0, 0, 0};
@@ -483,7 +491,7 @@ void Nx2VideoDecoder::RenderUnguarded(const Nx2Picture& picture, Nx2PictureForma
         planes[1] = out.data() + chroma_offset;
         strides[1] = static_cast<int>(pitch);
     }
-    sws_scale(impl->scaler, f->data, f->linesize, 0, f->height, planes.data(), strides.data());
+    sws_scale(scaler, f->data, f->linesize, 0, f->height, planes.data(), strides.data());
 }
 
 } // namespace Tegra::Host1x

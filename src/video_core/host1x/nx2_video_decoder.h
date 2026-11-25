@@ -11,6 +11,8 @@
 
 #include "common/common_types.h"
 
+struct SwsContext;
+
 namespace FFmpeg {
 class Frame;
 }
@@ -34,6 +36,25 @@ enum class Nx2PictureFormat : u32 {
 
 /// Checks if stream data begins with an H.264 Annex-B start code or avcC/MP4 length-prefixed NALUs.
 bool IsH264Stream(std::span<const u8> data);
+
+/// Converts decoded pictures using the calling thread's own scaling context.
+class Nx2VideoFrameConverter {
+public:
+    Nx2VideoFrameConverter() = default;
+    ~Nx2VideoFrameConverter();
+    Nx2VideoFrameConverter(const Nx2VideoFrameConverter&) = delete;
+    Nx2VideoFrameConverter& operator=(const Nx2VideoFrameConverter&) = delete;
+
+    void Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width, u32 height,
+                u64 pitch, u64 chroma_offset, std::span<u8> out, std::string_view mime);
+
+private:
+    void RenderUnguarded(const Nx2Picture& picture, Nx2PictureFormat format, u32 width, u32 height,
+                         u64 pitch, u64 chroma_offset, std::span<u8> out);
+
+    SwsContext* scaler{};
+    u32 render_faults{};
+};
 
 /// The decoder behind the Switch 2 video decoder service (nn::codec::video): FFmpeg decodes the
 /// elementary stream the game demuxed, in software or on the host GPU (NVDEC emulation setting).
@@ -71,9 +92,6 @@ public:
                 u64 pitch, u64 chroma_offset, std::span<u8> out);
 
 private:
-    void RenderUnguarded(const Nx2Picture& picture, Nx2PictureFormat format, u32 width,
-                         u32 height, u64 pitch, u64 chroma_offset, std::span<u8> out);
-
     struct Impl;
     std::unique_ptr<Impl> impl;
 };
