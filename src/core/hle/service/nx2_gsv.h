@@ -3609,6 +3609,7 @@ private:
     // images, in order.
     void DecodeLoop() {
         Common::SetCurrentThreadName("nx2:vdec");
+        system.RegisterHostThread();
         std::unique_ptr<Tegra::Host1x::Nx2VideoDecoder> decoder;
         std::vector<Tegra::Host1x::Nx2Picture> pictures;
         std::vector<u8> bytes;
@@ -3722,9 +3723,8 @@ private:
                 continue;
             }
             Input input = m_inputs.Pop();
-            if (!m_stream_ended && !m_end_queued) {
-                m_ready->room.store(m_inputs.BelowReadyWatermark(), std::memory_order_relaxed);
-            }
+            const bool notify_ready = !m_stream_ended && !m_end_queued &&
+                                      m_ready->UpdateRoom(m_inputs.BelowReadyWatermark());
             std::string codec = m_codec;
             if (codec.empty() && Tegra::Host1x::IsH264Stream(input.data)) {
                 codec = "video/avc";
@@ -3733,6 +3733,9 @@ private:
                          GetServiceName(), codec);
             }
             lk.unlock();
+            if (notify_ready) {
+                m_ready->Signal(system.Kernel());
+            }
             if (!decoder || decoder->Name() != codec) {
                 if (codec.empty()) {
                     LOG_WARNING(Service,
