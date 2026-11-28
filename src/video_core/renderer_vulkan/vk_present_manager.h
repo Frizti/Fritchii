@@ -78,6 +78,10 @@ private:
     /// Returns whether it was held.
     bool PaceFrame(Frame* frame, std::stop_token token);
 
+    /// FRITCHII_VRR_CADENCE: spaces frames by the game's rate or its recent pace, with no
+    /// display feedback (see the constructor). Returns whether the frame was held.
+    bool CadenceFrame(Frame* frame);
+
     /// Without present wait (no pacing): still reads the display's refresh rate now and then,
     /// for Ocarina of Time's "Monitor refresh rate" cap (it fell back to 60 Hz).
     void NoteDisplayRefresh();
@@ -134,11 +138,31 @@ private:
         bool lost;
     };
     bool present_wait_enabled{};
+    /// FRITCHII_VRR_CADENCE: frames spaced evenly at the game's rate, or held to its recent pace
+    /// when uncapped or below its rate (only frames clearly early); replaces the present-wait
+    /// pacer.
+    bool cadence_enabled{};
+    struct Cadence {
+        std::optional<std::chrono::steady_clock::time_point> last_release;
+        std::optional<std::chrono::steady_clock::time_point> last_arrival;
+        double interval_ns{}; ///< The game's pace: its frame arrivals' gap, moving average
+        // Reported every 10 s.
+        std::chrono::steady_clock::time_point report_start{};
+        u32 frames{}, held{}, late{}, reanchored{}, fixed{}, adaptive{}, behind{}, capped{},
+            not_waited{};
+        double hold_sum_ms{}, hold_max_ms{}, late_sum_ms{};
+        // At the game's rate: the schedule's correction of the asked interval (the game's real
+        // average differs a little: 33.4 ms against 33.33 at 30 FPS), and the rate it was made
+        // for (a new rate starts it over).
+        double rate_adjust_ns{};
+        double rate_nominal_ns{};
+    } cadence;
     HostPacer pacer;
     /// FRITCHII_PACE_FIX 2: PaceFrame's hold, taken in CopyToSwapchainImpl before the present.
     struct DeferredHold {
         std::chrono::steady_clock::time_point start;
         std::chrono::steady_clock::time_point target;
+        bool cadence = false; ///< FRITCHII_VRR_CADENCE's hold (not the pacer's)
     };
     std::optional<DeferredHold> deferred_hold;
     u64 last_present_id{};

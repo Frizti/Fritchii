@@ -42,11 +42,14 @@ static inline Settings::AntiAliasing GetAntiAliasingForAppletCapture() {
 struct PresentFilters {
     Settings::ScalingFilter (*get_scaling_filter)();
     Settings::AntiAliasing (*get_anti_aliasing)();
+    /// The window's filters: only these layers set g_present_picture_bigger (the Auto filter).
+    bool display = false;
 };
 
 constexpr PresentFilters PresentFiltersForDisplay{
     .get_scaling_filter = &GetScalingFilter,
     .get_anti_aliasing = &GetAntiAliasing,
+    .display = true,
 };
 
 constexpr PresentFilters PresentFiltersForAppletCapture{
