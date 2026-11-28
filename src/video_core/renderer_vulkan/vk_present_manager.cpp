@@ -181,10 +181,35 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     }
 
     present_wait_enabled = use_present_thread && device.IsKhrPresentWaitSupported();
+    // FRITCHII_VRR_CADENCE (boot; 1 on, 0 off; default on where the driver has no
+    // VK_KHR_present_wait, i.e. AMD on Windows): space the frames by the game's own frame rate
+    // with no display feedback, where the present-wait pacer cannot run (frames were presented
+    // as soon as ready: on an RX 9070 XT at a 60 FPS lock, 28% of them more than 2 ms off
+    // 16.67 ms). VK_KHR_present_wait2, which that driver has, is no substitute: it reports a
+    // frame 7-14 ms after its present, by a varying amount, and a pacer steered by it spread
+    // frames out more than no pacing did. A variable refresh display shows each frame when it
+    // is presented, so even presents are even frames.
+    {
+        const char* const value = std::getenv("FRITCHII_VRR_CADENCE");
+        const bool wanted = value != nullptr ? value[0] == '1'
+                                             : !device.IsKhrPresentWaitSupported();
+        cadence_enabled = use_present_thread && wanted;
+        if (cadence_enabled) {
+            present_wait_enabled = false;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Frame cadence (FRITCHII_VRR_CADENCE): {} ({}); frames are spaced evenly at "
+                 "the game's rate, or follow its pace when uncapped or below its rate",
+                 cadence_enabled ? "on" : "off",
+                 value != nullptr ? "set"
+                 : device.IsKhrPresentWaitSupported()
+                     ? "default off: this driver has present wait"
+                     : "default on: this driver has no present wait");
+    }
     LOG_INFO(Render_Vulkan, "Host pacing: present wait {}",
              present_wait_enabled ? "supported" : "unavailable, frames are not paced");
-    // What the driver offers for a pacer later (probe only, nothing uses them): AMD's Windows
-    // driver has no present wait; a present_wait2 there would let the host pacer run.
+    // What the driver offers (probe only, nothing uses them): AMD's Windows driver has no
+    // present wait, and its present_wait2 reports frames too late to pace by (see above).
     {
         const auto& extensions = device.GetAvailableExtensions();
         const auto has = [&extensions](std::string_view name) {
@@ -397,12 +422,12 @@ void PresentManager::PresentThread(std::stop_token token) {
             // FRITCHII_SIBLING_CENSUS (dry): where this thread woke up to present.
             Common::NoteCensusCpu(Common::CensusThread::Present);
             bool held = false;
-            if (present_wait_enabled) {
+            if (present_wait_enabled || cadence_enabled) {
                 // Only this thread pops the queue: the frame stays at its front, and WaitPresent
                 // keeps waiting while it is held.
                 Frame* const next = present_queue.front();
                 lock.unlock();
-                held = PaceFrame(next, token);
+                held = cadence_enabled ? CadenceFrame(next) : PaceFrame(next, token);
                 lock.lock();
             } else {
                 NoteDisplayRefresh();
@@ -550,6 +575,171 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     Common::Nx2Timeline::Span span{"present: host pacing hold"};
     HoldUntil(target, &token);
     pacer.NoteHold(start, Clock::now());
+    return true;
+}
+
+bool PresentManager::CadenceFrame(Frame* frame) {
+    using Clock = std::chrono::steady_clock;
+    using Ns = std::chrono::nanoseconds;
+    deferred_hold.reset();
+    NoteDisplayRefresh();
+    auto& c = cadence;
+    // The interval the game asks for (16.67 ms at 60 FPS, 33.33 at 30, 4.17 for a 240 Hz high
+    // refresh cap); 0 when it asks for none (Unlimited, or no speed limit).
+    const long long guest_ns =
+        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed);
+    const bool unpaced = VideoCommon::Nx2Perf::g_guest_unpaced.load(std::memory_order_relaxed);
+    const double nominal =
+        !unpaced && guest_ns >= 4'000'000 && guest_ns <= 100'000'000
+            ? static_cast<double>(guest_ns)
+            : 0.0;
+    const auto arrival = frame->queued_at;
+    const auto report = [&](Clock::time_point now) {
+        if (c.report_start == Clock::time_point{}) {
+            c.report_start = now;
+        }
+        if (now - c.report_start < std::chrono::seconds{10}) {
+            return;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Frame cadence: {} frames ({} at the game's rate, {} following its pace), pace "
+                 "{:.3f} ms (game asks {:.3f}, schedule {:+.3f}); held {} (mean {:.2f} ms, max "
+                 "{:.2f}, {} cut to the limit), late {} (mean {:.2f} ms), started over {}, behind "
+                 "{}, due without a render wait {}",
+                 c.frames, c.fixed, c.adaptive, c.interval_ns / 1e6, nominal / 1e6,
+                 c.rate_adjust_ns / 1e6, c.held, c.held ? c.hold_sum_ms / c.held : 0.0,
+                 c.hold_max_ms, c.capped, c.late, c.late ? c.late_sum_ms / c.late : 0.0,
+                 c.reanchored, c.behind, c.not_waited);
+        c.report_start = now;
+        c.frames = c.held = c.late = c.reanchored = c.fixed = c.adaptive = c.behind = c.capped =
+            c.not_waited = 0;
+        c.hold_sum_ms = c.hold_max_ms = c.late_sum_ms = 0.0;
+    };
+    ++c.frames;
+    // The game's pace: a moving average of the gaps between frame arrivals (about 16 frames).
+    // A gap over 4 times the pace (a load, a pause) starts it over. Arrivals are when the
+    // renderer queues a frame, so the holds below do not slow them down as long as no frames
+    // pile up behind a hold (see "behind").
+    if (c.last_arrival) {
+        const double gap = static_cast<double>(
+            std::chrono::duration_cast<Ns>(arrival - *c.last_arrival).count());
+        if (c.interval_ns == 0.0) {
+            c.interval_ns = gap > 0.0 ? gap : 0.0;
+        } else if (gap > c.interval_ns * 4.0 || gap > 250'000'000.0) {
+            c.interval_ns = 0.0;
+            c.last_release.reset();
+        } else if (gap > 0.0) {
+            c.interval_ns += (gap - c.interval_ns) / 16.0;
+        }
+    }
+    c.last_arrival = arrival;
+    if (nominal != c.rate_nominal_ns) {
+        c.rate_nominal_ns = nominal;
+        c.rate_adjust_ns = 0.0;
+    }
+    // Two ways to space frames:
+    //   at the game's rate: it asks for a rate and keeps up with it (within 5%): the asked
+    //     interval, which the schedule corrects to the game's real average (within 2%) and
+    //     keeps a little after the frames are ready, so they are rarely late (below);
+    //   following its pace: no asked rate it keeps up with (uncapped, or drops): frames ready
+    //     sooner than the recent pace are held to it, by at most 6 ms, so the frame rate is
+    //     never capped, and a frame on time or late is presented at once.
+    const bool keeps_up = nominal > 0.0 && c.interval_ns > 0.0 && c.interval_ns < nominal * 1.05;
+    double spacing = 0.0;
+    double margin = 0.0;
+    if (keeps_up) {
+        ++c.fixed;
+        spacing = nominal + c.rate_adjust_ns;
+        // How long after the frame is ready the schedule aims to present it: room for the
+        // usual few milliseconds of variation, 3 ms at 60 FPS, 4 ms at 30 (at 2 ms, 10-15% of
+        // the frames at 60 were still a little late; at 30, 4 ms left 2-5%).
+        margin = std::clamp(nominal * 0.18, 1'500'000.0, 4'000'000.0);
+    } else if (c.interval_ns > 0.0) {
+        ++c.adaptive;
+        spacing = (std::max)(c.interval_ns * 0.98, 2'000'000.0);
+    }
+    // Behind: another frame already waits behind this one (after a hitch the game sends the
+    // frames it owes close together). Holding this one a full interval would keep every later
+    // frame a frame late for good, and enough of them stop the renderer, which slows the
+    // arrivals the pace is measured from. Half the interval catches up in a few frames.
+    bool behind = false;
+    {
+        std::scoped_lock ql{queue_mutex};
+        behind = present_queue.size() >= 2;
+    }
+    if (behind) {
+        ++c.behind;
+        spacing *= 0.5;
+    }
+    // Release when the GPU has rendered the frame, so the hold lines up the presents. Following
+    // the pace, a frame already due is not waited for: it is presented at once anyway, and
+    // waiting here for the GPU to finish it would put its copy to the screen behind the next
+    // frame's GPU work. FRITCHII_CADENCE_RENDER_WAIT=1 always waits.
+    static const bool render_wait_always = [] {
+        const char* const value = std::getenv("FRITCHII_CADENCE_RENDER_WAIT");
+        return value != nullptr && value[0] == '1';
+    }();
+    bool wait_render = frame->render_tick != 0;
+    if (wait_render && !keeps_up && !render_wait_always && spacing > 0.0 && c.last_release &&
+        *c.last_release + Ns{static_cast<s64>(spacing)} <= Clock::now()) {
+        wait_render = false;
+        ++c.not_waited;
+    }
+    if (wait_render) {
+        Common::Nx2Timeline::Span span{"present: wait for frame render"};
+        scheduler.GetMasterSemaphore().Wait(frame->render_tick);
+    }
+    const auto now = Clock::now();
+    if (spacing == 0.0 || !c.last_release) {
+        c.last_release = now;
+        report(now);
+        return false;
+    }
+    auto slot = *c.last_release + Ns{static_cast<s64>(spacing)};
+    if (keeps_up && !behind) {
+        // The schedule follows the frames: each frame moves it a tenth of the way to "ready
+        // plus the margin", and a lasting difference (the game's real rate) corrects the
+        // interval. Late frames move it later, frames held long move it earlier (less delay).
+        const double error =
+            static_cast<double>(std::chrono::duration_cast<Ns>(slot - now).count()) - margin;
+        slot -= Ns{static_cast<s64>(error * 0.1)};
+        c.rate_adjust_ns =
+            std::clamp(c.rate_adjust_ns - error * 0.01, -nominal * 0.02, nominal * 0.02);
+    }
+    if (slot <= now) {
+        // Late: presented at once. At the game's rate a frame a little late keeps the schedule
+        // (the next one is not pushed back with it); over half a frame late, or when following
+        // the pace, the schedule counts from here.
+        const double late_ms = std::chrono::duration<double, std::milli>(now - slot).count();
+        ++c.late;
+        c.late_sum_ms += late_ms;
+        if (keeps_up && late_ms <= spacing / 2e6) {
+            c.last_release = slot;
+        } else {
+            if (keeps_up) {
+                ++c.reanchored;
+            }
+            c.last_release = now;
+        }
+        report(now);
+        return false;
+    }
+    if (!keeps_up) {
+        // Following the pace: a hold only evens out jitter, so it never grows past 6 ms.
+        const auto limit = now + std::chrono::milliseconds{6};
+        if (slot > limit) {
+            slot = limit;
+            ++c.capped;
+        }
+    }
+    const double hold_ms = std::chrono::duration<double, std::milli>(slot - now).count();
+    ++c.held;
+    c.hold_sum_ms += hold_ms;
+    c.hold_max_ms = (std::max)(c.hold_max_ms, hold_ms);
+    report(now);
+    // Held in CopyToSwapchainImpl after the copy is submitted (as FRITCHII_PACE_FIX 2), so the
+    // present itself is what lands on the slot; that sets last_release.
+    deferred_hold = DeferredHold{now, slot, true};
     return true;
 }
 
@@ -886,7 +1076,13 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
             Common::Nx2Timeline::Span span{"present: host pacing hold"};
             HoldUntil(hold.target, nullptr);
         }
-        pacer.NoteHold(hold.start, std::chrono::steady_clock::now());
+        if (hold.cadence) {
+            // FRITCHII_VRR_CADENCE: the release is the present that follows; the schedule
+            // counts from the slot, so the wake-up's few microseconds do not add up.
+            cadence.last_release = hold.target;
+        } else {
+            pacer.NoteHold(hold.start, std::chrono::steady_clock::now());
+        }
     }
 
     // Present
