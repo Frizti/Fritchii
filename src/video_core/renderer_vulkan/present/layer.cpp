@@ -103,8 +103,12 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
                                             Service::Nvnflinger::LayerStackId::Recording)) == 0;
 
     // The Auto window filter (present.h): Area while the picture is bigger than the window it
-    // fills (5% slack, so a picture that only matches the window keeps FSR 1).
-    if (!is_applet && layout.screen.GetWidth() != 0 && layout.screen.GetHeight() != 0) {
+    // fills (5% slack, so a picture that only matches the window keeps FSR 1). Only the display's
+    // layers decide it: the applet capture (a 1280x720 copy drawn every frame) flipped it back
+    // and forth each frame, so the window's Auto choice could change every frame and the log
+    // got a line per frame.
+    if (filters.display && !is_applet && layout.screen.GetWidth() != 0 &&
+        layout.screen.GetHeight() != 0) {
         const bool bigger = scaled_width * 20 > layout.screen.GetWidth() * 21 ||
                             scaled_height * 20 > layout.screen.GetHeight() * 21;
         if (g_present_picture_bigger.exchange(bigger, std::memory_order_relaxed) != bigger &&
